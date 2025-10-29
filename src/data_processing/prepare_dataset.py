@@ -1,101 +1,183 @@
-import pandas as pd
-from pathlib import Path
 import json
+import os
+import shutil
+import pandas as pd
+from datasets import Dataset, Features, Value, Sequence
+from pathlib import Path
+# Added imports for Parquet generation (required for tasks.parquet)
+import pyarrow as pa
+import pyarrow.parquet as pq
 
-
-def prepare_dataset(arg_json_path, arg_output_root=None):
+def create_tasks_parquet(root_dir: Path, task_title: str):
     """
-    Prepare a dataset from JSON data and save it as a parquet file.
-    
-    Parameters:
-    arg_json_path (str or Path): Path to the input JSON file
-    arg_output_root (str or Path, optional): Output directory path. 
-                                             If None, uses the same directory as the input JSON.
-    
-    Returns:
-    tuple: (DataFrame, parquet_path) - The processed DataFrame and path where it was saved
+    Generates the required meta/tasks.parquet file for LeRobot.
+    This file defines the available tasks in the dataset (which is mandatory).
     """
-    # === Step 1: Load JSON File ===
-    json_path = Path(arg_json_path)
+    print("--- Creating meta/tasks.parquet ---")
+    
+    # The task index (0) must match the 'task_index' used in episodes.jsonl
+    task_data = {
+        'task_index': [0],
+        'task_title': [task_title],
+        'description': [f"Teleoperation dataset for the {task_title} task."]
+    }
+    
+    # Convert to Arrow Table and write Parquet file
+    df = pd.DataFrame(task_data)
+    table = pa.Table.from_pandas(df)
 
-    if not json_path.exists():
-        raise FileNotFoundError(f"JSON file not found: {arg_json_path}")
+    tasks_dir = root_dir / "meta"
+    tasks_dir.mkdir(exist_ok=True, parents=True)
+    tasks_parquet_path = tasks_dir / "tasks.parquet"
 
-    # Set default output root if not provided
-    if arg_output_root is None:
-        arg_output_root = json_path.parent
-    else:
-        arg_output_root = Path(arg_output_root)
+    pq.write_table(table, tasks_parquet_path)
+    print(f"✅ Successfully created tasks.parquet at: {tasks_parquet_path}")
 
+def create_episodes_parquet_index(root_dir: Path):
+    """
+    Reads the data from episodes.jsonl and saves it as nested Parquet files
+    in the format LeRobot expects.
+    """
+    episodes_jsonl_path = root_dir / "meta" / "episodes.jsonl"
+    episodes_parquet_dir = root_dir / "meta" / "episodes"
+    
+    if not episodes_jsonl_path.exists():
+        print(f"❌ WARNING: {episodes_jsonl_path} not found. Skipping episodes index creation.")
+        return
+
+    print("\n--- Creating meta/episodes/ index dataset ---")
+    
+    # 1. Read the JSONL file line by line
+    with open(episodes_jsonl_path, 'r') as f:
+        episode_lines = [json.loads(line) for line in f]
+    
+    if not episode_lines:
+        print("❌ WARNING: episodes.jsonl is empty. Skipping episodes index creation.")
+        return
+
+    # 2. Create DataFrame and convert to Arrow Table
+    df = pd.DataFrame(episode_lines)
+    table = pa.Table.from_pandas(df)
+
+    # 3. Create the nested directory structure LeRobot expects
+    # This creates a subdirectory with multiple Parquet files
+    data_subdir = episodes_parquet_dir / "data"
+    data_subdir.mkdir(exist_ok=True, parents=True)
+    
+    # Write multiple Parquet files (LeRobot expects this structure)
+    pq.write_table(table, data_subdir / "0000.parquet")
+    
+    print(f"✅ Successfully created episodes index dataset at: {episodes_parquet_dir}")
+
+def process_session(json_path: Path, root_dir: Path, episode_index: int):
+    """Converts a single session (JSON + MP4) into LeRobot format."""
+    
     with open(json_path, 'r') as f:
-        raw_data = json.load(f)
+        session_data = json.load(f)
 
-    print(f"✅ Loaded data from {json_path}")
-
-    # === Step 2: Extract Session Info ===
-    session_id = raw_data.get("session_id", json_path.stem)
-    task_name = raw_data.get("task_name", f"task_{session_id}")
-
-    # Create output directory for this episode
-    output_dir = arg_output_root / session_id
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    parquet_path = output_dir / f"{session_id}.parquet"
-
-    print(f"Output will be saved to: {parquet_path}")
-
-    # === Step 3: Build DataFrame from Frames ===
-    rows = []
-
-    for frame_idx, frame in enumerate(raw_data["frames"]):
-        row = {
-            'timestamp': frame['timestamp'],
-            'frame_index': frame['frame_index'],
-            'episode_index': session_id,
-            'task_index': task_name,
-            'index': len(rows),  # global index within dataset
-            'next.done': False,
-            'next.reward': 0.0,  # Placeholder — replace with real reward if available
-        }
-
-        # Current robot state (input)
-        row['observation.state'] = frame['joint_positions']
-
-        # Image path (can be video path + frame index or extracted image path)
-        video_file = raw_data.get("video_file", None)
-        if video_file:
-            # Use video file with frame index (e.g., "video.mp4#frame_5")
-            row['observation.image'] = f"frame_{frame_idx}"
-        else:
-            row['observation.image'] = None  # or use placeholder like "no_image"
-
-        rows.append(row)
-
-    df = pd.DataFrame(rows)
-
-    print(f"📊 Created DataFrame with {len(df)} frames")
-
-    # === Step 4: Compute Action as NEXT Frame's Joint Positions ===
-
-    # Shift forward by one — action is target joint positions at next time step
-    df['action'] = df['observation.state'].shift(-1)
-
-    print('rows before dropping', len(df))
-
-    # Drop last row since it has no next action (NaN in action)
-    df.dropna(subset=['action'], inplace=True)
-    df.reset_index(drop=True, inplace=True)
-
-    print(f"🎯 Final dataset size after dropping last frame: {len(df)}")
-
-    # === Step 5: Save to Parquet (LeRobot Format) ===
-
-    df.to_parquet(parquet_path)
-
-    print(f"✅ Successfully saved LeRobot dataset to:")
-    print(f"   → {parquet_path.resolve()}")
-
-    print("\n🎉 Dataset ready for use with Metis AI training via `lerobot train`!")
+    input_video_path = Path(session_data.get("video_file", "path/to/placeholder.mp4"))
+    output_video_name = f"episode_{episode_index}_front_camera.mp4"
     
-    # Return the DataFrame and path for Jupyter notebook usage
-    return df, parquet_path
+    num_joints = len(session_data["joint_names"])
+    num_frames = len(session_data["frames"])
+    joint_positions = [frame["joint_positions"] for frame in session_data["frames"]]
+    
+    # Create frames with both state and image observations
+    lerobot_frames = []
+    for i in range(num_frames):
+        lerobot_frames.append({
+            "observation.state": joint_positions[i],
+            "observation.image": f"videos/episode_{episode_index}_front_camera.mp4",  # Video reference
+            "action": joint_positions[i + 1] if i < num_frames - 1 else joint_positions[i],
+            "timestamp": session_data["frames"][i]["timestamp"],
+            "episode_index": episode_index,
+            "frame_index": session_data["frames"][i]["frame_index"],
+            "index": episode_index * num_frames + i,
+            "next.done": i == num_frames - 1,
+            "next.reward": 0.0,
+            "task_index": 0,
+        })
+        
+    # Create dataset with proper features including image
+    hf_dataset = Dataset.from_pandas(pd.DataFrame(lerobot_frames))
+    
+    feature_config = Features({
+        "observation.state": Sequence(Value("float32"), length=num_joints),
+        "observation.image": Value("string"),  # Path to video file
+        "action": Sequence(Value("float32"), length=num_joints),
+        "timestamp": Value("float64"),
+        "episode_index": Value("int64"),
+        "frame_index": Value("int64"),
+        "index": Value("int64"),
+        "next.done": Value("bool"),
+        "next.reward": Value("float32"),
+        "task_index": Value("int64"),
+    })
+    hf_dataset = hf_dataset.cast(feature_config)
+
+    # Create directories
+    os.makedirs(root_dir / "meta", exist_ok=True)
+    os.makedirs(root_dir / "data", exist_ok=True)
+    os.makedirs(root_dir / "videos", exist_ok=True)
+
+    # Export to Parquet
+    parquet_path = f"{root_dir}/data/episode_{episode_index}.parquet"
+    hf_dataset.to_parquet(parquet_path)
+    
+    # Copy video file
+    if input_video_path.exists():
+        shutil.copy(input_video_path, root_dir / "videos" / output_video_name)
+    else:
+        print(f"⚠️ WARNING: Video file not found at {input_video_path}. Skipping video copy.")
+
+    # Update info.json to properly configure image observations
+    duration_s = session_data["frames"][-1]["timestamp"] - session_data["frames"][0]["timestamp"]
+    estimated_fps = num_frames / duration_s if duration_s > 0 else 30.0
+    
+    info_json = {
+        "codebase_version": "v3.0", 
+        "fps": round(estimated_fps, 2),
+        "num_episodes": 1,
+        "num_frames": num_frames,
+        "features": {
+            "timestamp": {"dtype": "float64", "shape": [1]},
+            "frame_index": {"dtype": "int64", "shape": [1]},
+            "episode_index": {"dtype": "int64", "shape": [1]},
+            "task_index": {"dtype": "int64", "shape": [1]},
+            "index": {"dtype": "int64", "shape": [1]},
+            "next.done": {"dtype": "bool", "shape": [1]},
+            "next.reward": {"dtype": "float32", "shape": [1]},
+            "observation.state": {
+                "shape": [num_joints],
+                "dtype": "float32"
+            },
+            "observation.image": {
+                "shape": [480, 640, 3],  # Adjust based on your actual video dimensions
+                "dtype": "uint8",
+                "path_template": "videos/episode_{episode_index}_front_camera.mp4",
+                "fps": round(estimated_fps, 2)
+            },
+            "action": {
+                "shape": [num_joints],
+                "dtype": "float32"
+            }
+        }
+    }
+    
+    with open(root_dir / "meta" / "info.json", "w") as f:
+        json.dump(info_json, f, indent=2)
+        
+    # Append to episodes.jsonl
+    episodes_jsonl = {
+        "episode_index": episode_index,
+        "task_index": 0,
+        "frame_index_offset": 0,
+        "num_frames": num_frames,
+        "start_time": session_data["start_time"],
+        "end_time": session_data["end_time"],
+    }
+    
+    with open(root_dir / "meta" / "episodes.jsonl", "a") as f:
+        f.write(json.dumps(episodes_jsonl) + "\n")
+        
+    print(f"✅ Successfully processed episode {episode_index}")

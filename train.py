@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import torch
-from pathlib import Path
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.utils import dataset_to_policy_features
@@ -19,53 +18,72 @@ def make_delta_timestamps(delta_indices: list[int] | None, fps: int) -> list[flo
     return [i / fps for i in delta_indices]
 
 
+from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
+
 def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
 
-    # This specifies the inputs the model will be expecting and the outputs it will produce
+        # Number of offline training steps (we'll only do offline training for this example.)
+    # Adjust as you prefer. 5000 steps are needed to get something worth evaluating.
+    training_steps = 5000
+    log_freq = 1
+
+    # When starting from scratch (i.e. not from a pretrained policy), we need to specify 2 things before
+    # creating the policy:
+    #   - input/output shapes: to properly size the policy
+    #   - dataset stats: for normalization and denormalization of input/outputs
     dataset_metadata = LeRobotDatasetMetadata(dataset_id)
     features = dataset_to_policy_features(dataset_metadata.features)
-
     output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     input_features = {key: ft for key, ft in features.items() if key not in output_features}
 
-    cfg = ACTConfig(input_features=input_features, output_features=output_features)
-    policy = ACTPolicy(cfg)
-    preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
+    # Policies are initialized with a configuration class, in this case `DiffusionConfig`. For this example,
+    # we'll just use the defaults and so no arguments other than input/output features need to be passed.
+    cfg = DiffusionConfig(input_features=input_features, output_features=output_features)
 
+    # We can now instantiate our policy with this config and the dataset stats.
+    policy = DiffusionPolicy(cfg)
     policy.train()
     policy.to(device)
+    preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
 
-    # To perform action chunking, ACT expects a given number of actions as targets
+    # Another policy-dataset interaction is with the delta_timestamps. Each policy expects a given number frames
+    # which can differ for inputs, outputs and rewards (if there are some).
     delta_timestamps = {
-        "action": make_delta_timestamps(cfg.action_delta_indices, dataset_metadata.fps),
+        "observation.image": [i / dataset_metadata.fps for i in cfg.observation_delta_indices],
+        "observation.state": [i / dataset_metadata.fps for i in cfg.observation_delta_indices],
+        "action": [i / dataset_metadata.fps for i in cfg.action_delta_indices],
     }
 
-    # add image features if they are present
-    delta_timestamps |= {
-        k: make_delta_timestamps(cfg.observation_delta_indices, dataset_metadata.fps) for k in cfg.image_features
+    # In this case with the standard configuration for Diffusion Policy, it is equivalent to this:
+    delta_timestamps = {
+        # Load the previous image and state at -0.1 seconds before current frame,
+        # then load current image and state corresponding to 0.0 second.
+        "observation.image": [-0.1, 0.0],
+        "observation.state": [-0.1, 0.0],
+        # Load the previous action (-0.1), the next action to be executed (0.0),
+        # and 14 future actions with a 0.1 seconds spacing. All these actions will be
+        # used to supervise the policy.
+        "action": [-0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4],
     }
 
-    # Instantiate the dataset
+    # We can then instantiate the dataset with these delta_timestamps configuration.
     dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps)
 
-    # Create the optimizer and dataloader for offline training
-    optimizer = cfg.get_optimizer_preset().build(policy.parameters())
-    batch_size = 32
+    # Then we create our optimizer and dataloader for offline training.
+    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=batch_size,
+        num_workers=4,
+        batch_size=64,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
     )
 
-    # Number of training steps and logging frequency
-    training_steps = 1
-    log_freq = 1
-
-    # Run training loop
+    # Run training loop.
     step = 0
     done = False
     while not done:
@@ -83,14 +101,13 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
                 done = True
                 break
 
-    # Save the policy checkpoint, alongside the pre/post processors
     policy.save_pretrained(output_directory)
     preprocessor.save_pretrained(output_directory)
     postprocessor.save_pretrained(output_directory)
 
     if push_to_hub:
-        # Save all assets to the Hub
-        repo = 'ISdept/piper_arm_act'
+        repo = 'ISdept/piper_arm_diffusion'
         policy.push_to_hub(repo)
         preprocessor.push_to_hub(repo)
+        postprocessor.push_to_hub(repo)
         postprocessor.push_to_hub(repo)
