@@ -88,12 +88,11 @@ def process_session(json_path: Path, root_dir: Path, episode_index: int):
     num_frames = len(session_data["frames"])
     joint_positions = [frame["joint_positions"] for frame in session_data["frames"]]
     
-    # Create frames with both state and image observations
+    # Create frames with state observations (image references are handled separately)
     lerobot_frames = []
     for i in range(num_frames):
         lerobot_frames.append({
             "observation.state": joint_positions[i],
-            "observation.image": f"videos/observation.image/chunk-{episode_index}/episode_{episode_index}_front_camera.mp4",  # Video reference
             "action": joint_positions[i + 1] if i < num_frames - 1 else joint_positions[i],
             "timestamp": session_data["frames"][i]["timestamp"],
             "episode_index": episode_index,
@@ -109,7 +108,6 @@ def process_session(json_path: Path, root_dir: Path, episode_index: int):
     
     feature_config = Features({
         "observation.state": Sequence(Value("float32"), length=num_joints),
-        "observation.image": Value("string"),  # Path to video file
         "action": Sequence(Value("float32"), length=num_joints),
         "timestamp": Value("float64"),
         "episode_index": Value("int64"),
@@ -126,8 +124,10 @@ def process_session(json_path: Path, root_dir: Path, episode_index: int):
     os.makedirs(root_dir / "data", exist_ok=True)
     os.makedirs(root_dir / "videos", exist_ok=True)
 
-    # Export to Parquet
-    parquet_path = f"{root_dir}/data/episode_{episode_index}.parquet"
+    # Export to Parquet with new directory structure
+    chunk_dir = root_dir / "data" / f"chunk-{episode_index:03d}"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    parquet_path = chunk_dir / f"file-{episode_index:03d}.parquet"
     hf_dataset.to_parquet(parquet_path)
     
     # Copy video file to the new directory structure
@@ -141,14 +141,15 @@ def process_session(json_path: Path, root_dir: Path, episode_index: int):
     estimated_fps = num_frames / duration_s if duration_s > 0 else 30.0
     
     # Get data path and video path
-    data_path = f"{root_dir}/data/episode_{episode_index}.parquet"
+    data_path = f"data/chunk-{episode_index:03d}/file-{episode_index:03d}.parquet"
     video_path = f"videos/observation.image/chunk-{episode_index}/episode_{episode_index}_front_camera.mp4"
     
     info_json = {
         "codebase_version": "v3.0", 
         "fps": round(estimated_fps, 2),
-        "num_episodes": 1,
-        "num_frames": num_frames,
+        "total_episodes": 1,
+        "total_frames": num_frames,
+        "total_tasks": 1,
         "data_path": data_path,
         "video_path": video_path,
         "features": {
@@ -165,9 +166,21 @@ def process_session(json_path: Path, root_dir: Path, episode_index: int):
             },
             "observation.image": {
                 "shape": [480, 640, 3],  # Adjust based on your actual video dimensions
-                "dtype": "uint8",
+                "dtype": "video",
                 "path_template": "videos/observation.image/chunk-{episode_index}/episode_{episode_index}_front_camera.mp4",
-                "fps": round(estimated_fps, 2)
+                "fps": round(estimated_fps, 2),
+                "names": [
+                    "height",
+                    "width",
+                    "channel"
+                ],
+                "video_info": {
+                    "video.fps": round(estimated_fps, 2),
+                    "video.codec": "av1",
+                    "video.pix_fmt": "yuv420p",
+                    "video.is_depth_map": False,
+                    "has_audio": False
+                }
             },
             "action": {
                 "shape": [num_joints],
