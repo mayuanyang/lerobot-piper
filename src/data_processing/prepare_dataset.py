@@ -3,79 +3,99 @@ from pathlib import Path
 import json
 
 
-def prepare_dataset(arg_json_path, arg_output_root):
-  # === Step 1: Load JSON File ===
-  json_path = Path(arg_json_path)
+def prepare_dataset(arg_json_path, arg_output_root=None):
+    """
+    Prepare a dataset from JSON data and save it as a parquet file.
+    
+    Parameters:
+    arg_json_path (str or Path): Path to the input JSON file
+    arg_output_root (str or Path, optional): Output directory path. 
+                                             If None, uses the same directory as the input JSON.
+    
+    Returns:
+    tuple: (DataFrame, parquet_path) - The processed DataFrame and path where it was saved
+    """
+    # === Step 1: Load JSON File ===
+    json_path = Path(arg_json_path)
 
-  if not json_path.exists():
-      raise FileNotFoundError(f"JSON file not found: {arg_json_path}")
+    if not json_path.exists():
+        raise FileNotFoundError(f"JSON file not found: {arg_json_path}")
 
-  with open(json_path, 'r') as f:
-      raw_data = json.load(f)
+    # Set default output root if not provided
+    if arg_output_root is None:
+        arg_output_root = json_path.parent
+    else:
+        arg_output_root = Path(arg_output_root)
 
-  print(f"✅ Loaded data from {json_path}")
+    with open(json_path, 'r') as f:
+        raw_data = json.load(f)
 
-  # === Step 2: Extract Session Info ===
-  session_id = raw_data.get("session_id", json_path.stem)
-  task_name = raw_data.get("task_name", f"task_{session_id}")
+    print(f"✅ Loaded data from {json_path}")
 
-  # Create output directory for this episode
-  output_dir = arg_output_root / session_id
-  output_dir.mkdir(parents=True, exist_ok=True)
+    # === Step 2: Extract Session Info ===
+    session_id = raw_data.get("session_id", json_path.stem)
+    task_name = raw_data.get("task_name", f"task_{session_id}")
 
-  parquet_path = output_dir / f"{session_id}.parquet"
+    # Create output directory for this episode
+    output_dir = arg_output_root / session_id
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-  print(f"Output will be saved to: {parquet_path}")
+    parquet_path = output_dir / f"{session_id}.parquet"
 
-  # === Step 3: Build DataFrame from Frames ===
-  rows = []
+    print(f"Output will be saved to: {parquet_path}")
 
-  for frame_idx, frame in enumerate(raw_data["frames"]):
-      row = {
-          'timestamp': frame['timestamp'],
-          'frame_index': frame['frame_index'],
-          'episode_index': session_id,
-          'task_index': task_name,
-          'index': len(rows),  # global index within dataset
-          'next.done': False,
-          'next.reward': 0.0,  # Placeholder — replace with real reward if available
-      }
+    # === Step 3: Build DataFrame from Frames ===
+    rows = []
 
-      # Current robot state (input)
-      row['observation.state'] = frame['joint_positions']
+    for frame_idx, frame in enumerate(raw_data["frames"]):
+        row = {
+            'timestamp': frame['timestamp'],
+            'frame_index': frame['frame_index'],
+            'episode_index': session_id,
+            'task_index': task_name,
+            'index': len(rows),  # global index within dataset
+            'next.done': False,
+            'next.reward': 0.0,  # Placeholder — replace with real reward if available
+        }
 
-      # Image path (can be video path + frame index or extracted image path)
-      video_file = raw_data.get("video_file", None)
-      if video_file:
-          # Use video file with frame index (e.g., "video.mp4#frame_5")
-          row['observation.image'] = f"frame_{frame_idx}"
-      else:
-          row['observation.image'] = None  # or use placeholder like "no_image"
+        # Current robot state (input)
+        row['observation.state'] = frame['joint_positions']
 
-      rows.append(row)
+        # Image path (can be video path + frame index or extracted image path)
+        video_file = raw_data.get("video_file", None)
+        if video_file:
+            # Use video file with frame index (e.g., "video.mp4#frame_5")
+            row['observation.image'] = f"frame_{frame_idx}"
+        else:
+            row['observation.image'] = None  # or use placeholder like "no_image"
 
-  df = pd.DataFrame(rows)
+        rows.append(row)
 
-  print(f"📊 Created DataFrame with {len(df)} frames")
+    df = pd.DataFrame(rows)
 
-  # === Step 4: Compute Action as NEXT Frame's Joint Positions ===
+    print(f"📊 Created DataFrame with {len(df)} frames")
 
-  # Shift forward by one — action is target joint positions at next time step
-  df['action'] = df['observation.state'].shift(-1)
+    # === Step 4: Compute Action as NEXT Frame's Joint Positions ===
 
-  print('rows before dropping', len(df))
+    # Shift forward by one — action is target joint positions at next time step
+    df['action'] = df['observation.state'].shift(-1)
 
-  # Drop last row since it has no next action (NaN in action)
-  df.dropna(subset=['action'], inplace=True)
-  df.reset_index(drop=True, inplace=True)
+    print('rows before dropping', len(df))
 
-  print(f"🎯 Final dataset size after dropping last frame: {len(df)}")
+    # Drop last row since it has no next action (NaN in action)
+    df.dropna(subset=['action'], inplace=True)
+    df.reset_index(drop=True, inplace=True)
 
-  # === Step 5: Save to Parquet (LeRobot Format) ===
+    print(f"🎯 Final dataset size after dropping last frame: {len(df)}")
 
-  df.to_parquet(parquet_path)
+    # === Step 5: Save to Parquet (LeRobot Format) ===
 
-  print(f"✅ Successfully saved LeRobot dataset to:")
-  print(f"   → {parquet_path.resolve()}")
+    df.to_parquet(parquet_path)
 
-  print("\n🎉 Dataset ready for use with Metis AI training via `lerobot train`!")
+    print(f"✅ Successfully saved LeRobot dataset to:")
+    print(f"   → {parquet_path.resolve()}")
+
+    print("\n🎉 Dataset ready for use with Metis AI training via `lerobot train`!")
+    
+    # Return the DataFrame and path for Jupyter notebook usage
+    return df, parquet_path
