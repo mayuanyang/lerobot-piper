@@ -70,7 +70,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
     }
 
     # We can then instantiate the dataset with these delta_timestamps configuration.
-    dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps)
+    dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, force_cache_sync=True, revision="main")
 
     # Then we create our optimizer and dataloader for offline training.
     optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
