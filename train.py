@@ -55,20 +55,45 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
     # Using multiples of 1/27.38 ≈ 0.0365 to match the dataset FPS
     # Note: observation.image and observation.state are handled separately by LeRobot and not included in the parquet file
     # Calculating exact multiples of 1/27.38 for delta timestamps
-    fps = 27.38
+    fps = 10
+    frame_time = 1 / fps  # 0.1 seconds
+
     delta_timestamps = {
-        # Load the previous image and state at ~-0.1095 seconds (which is -3 * 1/fps) before current frame,
-        # then load current image and state corresponding to 0.0 second.
-        "observation.image": [-3/fps, 0.0],
-        "observation.state": [-3/fps, 0.0],
-        # Load the previous action (~-0.1095s), the next action to be executed (0.0),
-        # and 14 future actions with proper spacing as multiples of 1/fps. All these actions will be
-        # used to supervise the policy.
-        "action": [-3/fps, 0.0, 1/fps, 2/fps, 3/fps, 4/fps, 5/fps, 6/fps, 7/fps, 8/fps, 9/fps, 10/fps, 11/fps, 12/fps, 13/fps, 14/fps],
+        # 1. Observation (Image and State)
+        # The policy needs the current frame (0.0) and context from previous frames.
+        # The original example used -3 * 1/fps. For FPS=10, this is -3 * 0.1 = -0.3 seconds.
+        "observation.image": [-3 * frame_time, 0.0],  # -0.3 seconds (3 frames back) and current frame (0.0)
+        "observation.state": [-3 * frame_time, 0.0],  # -0.3 seconds (3 frames back) and current frame (0.0)
+
+        # 2. Action (Future Prediction Horizon)
+        # The policy predicts a sequence of future actions.
+        # The sequence should start at the *next* action to be executed (often 0.0 or 1 * frame_time)
+        # and cover a prediction horizon (16 actions total in your example).
+        
+        # Your old action array had 16 values. We'll match that length:
+        # Action at -3/fps, then action at 0.0, then 14 future actions (16 total).
+        "action": [
+            -3 * frame_time,  # Action from 3 frames ago (-0.3s)
+            0.0 * frame_time, # Current action/action to execute now (0.0s)
+            1 * frame_time,   # Action for 1 frame ahead (+0.1s)
+            2 * frame_time,   # Action for 2 frames ahead (+0.2s)
+            3 * frame_time,
+            4 * frame_time,
+            5 * frame_time,
+            6 * frame_time,
+            7 * frame_time,
+            8 * frame_time,
+            9 * frame_time,
+            10 * frame_time,
+            11 * frame_time,
+            12 * frame_time,
+            13 * frame_time,
+            14 * frame_time,  # Action for 14 frames ahead (+1.4s)
+        ]
     }
 
     # We can then instantiate the dataset with these delta_timestamps configuration.
-    dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, force_cache_sync=True, revision="main")
+    dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, force_cache_sync=True, revision="main", tolerance_s=0.01)
 
     # Then we create our optimizer and dataloader for offline training.
     optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)

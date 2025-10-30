@@ -7,6 +7,7 @@ from pathlib import Path
 # Added imports for Parquet generation (required for tasks.parquet)
 import pyarrow as pa
 import pyarrow.parquet as pq
+from datetime import datetime
 
 def create_tasks_parquet(root_dir: Path, task_title: str):
     """
@@ -94,11 +95,12 @@ def process_session(json_path: Path, root_dir: Path, episode_index: int, global_
     
     # Create frames with state observations (image references are handled separately)
     lerobot_frames = []
+    timestamp_base = 0.0
     for i in range(num_frames):
         lerobot_frames.append({
             "observation.state": joint_positions[i],
             "action": joint_positions[i + 1] if i < num_frames - 1 else joint_positions[i],
-            "timestamp": session_data["frames"][i]["timestamp"],
+            "timestamp": timestamp_base,
             "episode_index": episode_index,
             "frame_index": session_data["frames"][i]["frame_index"],
             "index": episode_index * num_frames + i,
@@ -106,6 +108,7 @@ def process_session(json_path: Path, root_dir: Path, episode_index: int, global_
             "next.reward": 0.0,
             "task_index": 0,
         })
+        timestamp_base += 0.1
         
     # Create dataset with proper features including image
     hf_dataset = Dataset.from_pandas(pd.DataFrame(lerobot_frames))
@@ -142,11 +145,11 @@ def process_session(json_path: Path, root_dir: Path, episode_index: int, global_
 
     # Update info.json to properly configure image observations
     duration_s = session_data["frames"][-1]["timestamp"] - session_data["frames"][0]["timestamp"]
-    estimated_fps = num_frames / duration_s if duration_s > 0 else 30.0
+    estimated_fps = 10.0
     
     # Get data path and video path
     data_path = "data/episode-{episode_index:03d}/file-{episode_index:03d}.parquet"
-    video_path = "videos/observation.image/chunk-{episode_index:03d}/episode_{episode_index:03d}_front_camera.mp4"
+    video_path = "videos/observation.image/chunk-{chunk_index:03d}/episode_{chunk_index:03d}_front_camera.mp4"
     
     info_json = {
         "codebase_version": "v3.0", 
@@ -196,7 +199,8 @@ def process_session(json_path: Path, root_dir: Path, episode_index: int, global_
         
     # Append to episodes.jsonl
     
-    # 6b. episodes.jsonl (Per-episode metadata)
+    # 6b. episodes.jsonl (Per-episode metadata)   
+
     episodes_jsonl = {
         "episode_index": episode_index,
         "task_index": 0,
@@ -207,6 +211,9 @@ def process_session(json_path: Path, root_dir: Path, episode_index: int, global_
         "dataset_to_index": dataset_to_index,
         "start_time": session_data["start_time"],
         "end_time": session_data["end_time"],
+        "videos/observation.image/from_timestamp": 0.0,
+        "videos/observation.image/chunk_index": episode_index,
+        "videos/observation.image/file_index": episode_index,
     }
     
     with open(root_dir / "meta" / "episodes.jsonl", "a") as f:
