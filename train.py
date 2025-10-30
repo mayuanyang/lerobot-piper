@@ -13,7 +13,8 @@ device = torch.device("cuda" if use_cuda else "cpu")
 
 def make_delta_timestamps(delta_indices: list[int] | None, fps: int) -> list[float]:
     if delta_indices is None:
-        return [0]
+        # Return previous 1 frame, itself, and next 13 frames
+        return [i / fps for i in range(-1, 14)]  # -1, 0, 1, 2, ..., 13
 
     return [i / fps for i in delta_indices]
 
@@ -49,24 +50,21 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
     policy.to(device)
     preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
 
-    # Another policy-dataset interaction is with the delta_timestamps. Each policy expects a given number frames
-    # which can differ for inputs, outputs and rewards (if there are some).
-    delta_timestamps = {
-        "observation.image": [i / dataset_metadata.fps for i in cfg.observation_delta_indices],
-        "observation.state": [i / dataset_metadata.fps for i in cfg.observation_delta_indices],
-        "action": [i / dataset_metadata.fps for i in cfg.action_delta_indices],
-    }
-
+ 
     # In this case with the standard configuration for Diffusion Policy, it is equivalent to this:
+    # Using multiples of 1/27.38 ≈ 0.0365 to match the dataset FPS
+    # Note: observation.image and observation.state are handled separately by LeRobot and not included in the parquet file
+    # Calculating exact multiples of 1/27.38 for delta timestamps
+    fps = 27.38
     delta_timestamps = {
-        # Load the previous image and state at -0.1 seconds before current frame,
+        # Load the previous image and state at ~-0.1095 seconds (which is -3 * 1/fps) before current frame,
         # then load current image and state corresponding to 0.0 second.
-        "observation.image": [-0.1, 0.0],
-        "observation.state": [-0.1, 0.0],
-        # Load the previous action (-0.1), the next action to be executed (0.0),
-        # and 14 future actions with a 0.1 seconds spacing. All these actions will be
+        "observation.image": [-3/fps, 0.0],
+        "observation.state": [-3/fps, 0.0],
+        # Load the previous action (~-0.1095s), the next action to be executed (0.0),
+        # and 14 future actions with proper spacing as multiples of 1/fps. All these actions will be
         # used to supervise the policy.
-        "action": [-0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4],
+        "action": [-3/fps, 0.0, 1/fps, 2/fps, 3/fps, 4/fps, 5/fps, 6/fps, 7/fps, 8/fps, 9/fps, 10/fps, 11/fps, 12/fps, 13/fps, 14/fps],
     }
 
     # We can then instantiate the dataset with these delta_timestamps configuration.

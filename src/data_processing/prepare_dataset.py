@@ -33,7 +33,7 @@ def create_tasks_parquet(root_dir: Path, task_title: str):
     pq.write_table(table, tasks_parquet_path)
     print(f"✅ Successfully created tasks.parquet at: {tasks_parquet_path}")
 
-def create_episodes_parquet_index(root_dir: Path):
+def create_episodes_parquet_index(root_dir: Path, episode_index: int):
     """
     Reads the data from episodes.jsonl and saves it as nested Parquet files
     in the format LeRobot expects.
@@ -61,15 +61,15 @@ def create_episodes_parquet_index(root_dir: Path):
 
     # 3. Create the nested directory structure LeRobot expects
     # This creates a subdirectory with multiple Parquet files
-    data_subdir = episodes_parquet_dir / "data"
+    data_subdir = episodes_parquet_dir / f"episode-{episode_index:03d}"
     data_subdir.mkdir(exist_ok=True, parents=True)
     
     # Write multiple Parquet files (LeRobot expects this structure)
-    pq.write_table(table, data_subdir / "0000.parquet")
+    pq.write_table(table, data_subdir / f"file-{episode_index:03d}.parquet")
     
     print(f"✅ Successfully created episodes index dataset at: {episodes_parquet_dir}")
 
-def process_session(json_path: Path, root_dir: Path, episode_index: int):
+def process_session(json_path: Path, root_dir: Path, episode_index: int, global_index_offset: int):
     """Converts a single session (JSON + MP4) into LeRobot format."""
     
     # Ensure json_path is a Path object
@@ -80,13 +80,17 @@ def process_session(json_path: Path, root_dir: Path, episode_index: int):
 
     input_video_path = Path(session_data.get("video_file", "path/to/placeholder.mp4"))
     # Create the new directory structure for videos
-    video_chunk_dir = root_dir / "videos" / "observation.image" / f"chunk-{episode_index}"
+    video_chunk_dir = root_dir / "videos" / "observation.image" / f"chunk-{episode_index:03d}"
     video_chunk_dir.mkdir(parents=True, exist_ok=True)
-    output_video_name = f"episode_{episode_index}_front_camera.mp4"
+    output_video_name = f"episode_{episode_index:03d}_front_camera.mp4"
     
     num_joints = len(session_data["joint_names"])
     num_frames = len(session_data["frames"])
     joint_positions = [frame["joint_positions"] for frame in session_data["frames"]]
+    
+    # Define global index bounds
+    dataset_from_index = global_index_offset
+    dataset_to_index = global_index_offset + num_frames
     
     # Create frames with state observations (image references are handled separately)
     lerobot_frames = []
@@ -141,8 +145,8 @@ def process_session(json_path: Path, root_dir: Path, episode_index: int):
     estimated_fps = num_frames / duration_s if duration_s > 0 else 30.0
     
     # Get data path and video path
-    data_path = f"data/chunk-{episode_index:03d}/file-{episode_index:03d}.parquet"
-    video_path = f"videos/observation.image/chunk-{episode_index}/episode_{episode_index}_front_camera.mp4"
+    data_path = "data/episode-{episode_index:03d}/file-{episode_index:03d}.parquet"
+    video_path = "videos/observation.image/chunk-{episode_index:03d}/episode_{episode_index:03d}_front_camera.mp4"
     
     info_json = {
         "codebase_version": "v3.0", 
@@ -167,8 +171,6 @@ def process_session(json_path: Path, root_dir: Path, episode_index: int):
             "observation.image": {
                 "shape": [480, 640, 3],  # Adjust based on your actual video dimensions
                 "dtype": "video",
-                "path_template": "videos/observation.image/chunk-{episode_index}/episode_{episode_index}_front_camera.mp4",
-                "fps": round(estimated_fps, 2),
                 "names": [
                     "height",
                     "width",
@@ -193,11 +195,16 @@ def process_session(json_path: Path, root_dir: Path, episode_index: int):
         json.dump(info_json, f, indent=2)
         
     # Append to episodes.jsonl
+    
+    # 6b. episodes.jsonl (Per-episode metadata)
     episodes_jsonl = {
         "episode_index": episode_index,
         "task_index": 0,
         "frame_index_offset": 0,
         "num_frames": num_frames,
+        # *** FIX: Add the missing indices required by LeRobotDataset loader ***
+        "dataset_from_index": dataset_from_index,
+        "dataset_to_index": dataset_to_index,
         "start_time": session_data["start_time"],
         "end_time": session_data["end_time"],
     }
