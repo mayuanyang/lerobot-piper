@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import torch
+from tqdm import tqdm
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.utils import dataset_to_policy_features
@@ -28,7 +29,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
 
         # Number of offline training steps (we'll only do offline training for this example.)
     # Adjust as you prefer. 5000 steps are needed to get something worth evaluating.
-    training_steps = 5000
+    training_steps = 100
     log_freq = 1
 
     # When starting from scratch (i.e. not from a pretrained policy), we need to specify 2 things before
@@ -110,7 +111,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
     step = 0
     done = False
     while not done:
-        for batch in dataloader:
+        prog_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Training Step {step}")
+        for batch_idx, batch in prog_bar:
             batch = preprocessor(batch)
             loss, _ = policy.forward(batch)
             loss.backward()
@@ -118,7 +120,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
             optimizer.zero_grad()
 
             if step % log_freq == 0:
-                print(f"step: {step} loss: {loss.item():.3f}")
+                prog_bar.set_postfix({"step": step, "loss": f"{loss.item():.3f}"})
             step += 1
             if step >= training_steps:
                 done = True
