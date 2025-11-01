@@ -34,7 +34,20 @@ def load_model(model_path, dataset_id="ISdept/piper_arm"):
     policy = DiffusionPolicy(cfg)
     
     # Load the trained weights
-    policy.load_state_dict(torch.load(Path(model_path) / "pytorch_model.bin", map_location=device))
+    # First try safetensors format, fallback to pytorch format
+    safetensors_path = Path(model_path) / "model.safetensors"
+    pytorch_path = Path(model_path) / "pytorch_model.bin"
+    
+    if safetensors_path.exists():
+        print(f"Loading model from safetensors format: {safetensors_path}")
+        from safetensors.torch import load_file
+        state_dict = load_file(safetensors_path, device=str(device))
+        policy.load_state_dict(state_dict)
+    elif pytorch_path.exists():
+        print(f"Loading model from pytorch format: {pytorch_path}")
+        policy.load_state_dict(torch.load(pytorch_path, map_location=device))
+    else:
+        raise FileNotFoundError(f"Model weights not found at {model_path}")
     policy.eval()
     policy.to(device)
     
@@ -59,10 +72,19 @@ def predict_action(policy, preprocessor, postprocessor, observation):
     device = next(policy.parameters()).device
     
     # Prepare batch
-    batch = {
-        "observation.state": torch.tensor(observation["state"], dtype=torch.float32).unsqueeze(0).to(device),
-        "observation.image": torch.tensor(observation["image"], dtype=torch.float32).unsqueeze(0).to(device) if "image" in observation else None
-    }
+    batch = {}
+    
+    # Handle state observation
+    if "observation.state" in observation:
+        batch["observation.state"] = torch.tensor(observation["observation.state"], dtype=torch.float32).unsqueeze(0).to(device)
+    
+    # Handle front camera image observation
+    if "observation.images.front_camera" in observation:
+        batch["observation.images.front_camera"] = torch.tensor(observation["observation.images.front_camera"], dtype=torch.float32).unsqueeze(0).to(device)
+        
+    # Handle rear camera image observation
+    if "observation.images.rear_camera" in observation:
+        batch["observation.images.rear_camera"] = torch.tensor(observation["observation.images.rear_camera"], dtype=torch.float32).unsqueeze(0).to(device)
     
     # Apply preprocessing
     batch = preprocessor(batch)
@@ -100,12 +122,13 @@ def run_inference(model_path, observation, dataset_id="ISdept/piper_arm"):
 if __name__ == "__main__":
     # Example observation (you would replace this with real sensor data)
     observation = {
-        "state": np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6]),  # Joint positions
-        # "image": np.random.rand(480, 640, 3)  # Optional: Camera image
+        "observation.state": np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]),  # 7-DOF joint positions
+        "observation.images.front_camera": np.random.rand(3, 480, 640).astype(np.float32),  # Front camera image
+        "observation.images.rear_camera": np.random.rand(3, 480, 640).astype(np.float32)   # Rear camera image
     }
     
     # Path to trained model (update this to your actual model path)
-    model_path = "./model_output"
+    model_path = "src/model_output"
     
     try:
         # Run inference

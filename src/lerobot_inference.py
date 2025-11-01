@@ -69,12 +69,21 @@ class LeRobotInference:
             self.policy = DiffusionPolicy(cfg)
             
             # Load the trained weights
-            model_weights_path = self.model_path / "pytorch_model.bin"
-            if not model_weights_path.exists():
-                print(f"Model weights not found at {model_weights_path}")
+            # First try safetensors format, fallback to pytorch format
+            safetensors_path = self.model_path / "model.safetensors"
+            pytorch_path = self.model_path / "pytorch_model.bin"
+            
+            if safetensors_path.exists():
+                print(f"Loading model from safetensors format: {safetensors_path}")
+                from safetensors.torch import load_file
+                state_dict = load_file(safetensors_path, device=str(self.device))
+                self.policy.load_state_dict(state_dict)
+            elif pytorch_path.exists():
+                print(f"Loading model from pytorch format: {pytorch_path}")
+                self.policy.load_state_dict(torch.load(pytorch_path, map_location=self.device))
+            else:
+                print(f"Model weights not found at {self.model_path}")
                 return False
-                
-            self.policy.load_state_dict(torch.load(model_weights_path, map_location=self.device))
             self.policy.eval()
             self.policy.to(self.device)
             
@@ -102,18 +111,25 @@ class LeRobotInference:
         processed = {}
         
         # Handle state observation
-        if "state" in observation:
-            state_tensor = torch.tensor(observation["state"], dtype=torch.float32)
+        if "observation.state" in observation:
+            state_tensor = torch.tensor(observation["observation.state"], dtype=torch.float32)
             # Add batch dimension
             state_tensor = state_tensor.unsqueeze(0)
             processed["observation.state"] = state_tensor.to(self.device)
         
-        # Handle image observation (if present)
-        if "image" in observation:
-            image_tensor = torch.tensor(observation["image"], dtype=torch.float32)
-            # Add batch dimension
+        # Handle front camera image observation
+        if "observation.images.front_camera" in observation:
+            image_tensor = torch.tensor(observation["observation.images.front_camera"], dtype=torch.float32)
+            # Add batch dimension (B, C, H, W)
             image_tensor = image_tensor.unsqueeze(0)
-            processed["observation.image"] = image_tensor.to(self.device)
+            processed["observation.images.front_camera"] = image_tensor.to(self.device)
+            
+        # Handle rear camera image observation
+        if "observation.images.rear_camera" in observation:
+            image_tensor = torch.tensor(observation["observation.images.rear_camera"], dtype=torch.float32)
+            # Add batch dimension (B, C, H, W)
+            image_tensor = image_tensor.unsqueeze(0)
+            processed["observation.images.rear_camera"] = image_tensor.to(self.device)
             
         return processed
     
@@ -182,8 +198,9 @@ class LeRobotInference:
 def create_sample_observation():
     """Create a sample observation for testing."""
     return {
-        "state": np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6]),  # 6-DOF joint positions
-        # "image": np.random.rand(480, 640, 3).astype(np.float32)  # Sample image
+        "observation.state": np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]),  # 7-DOF joint positions
+        "observation.images.front_camera": np.random.rand(3, 480, 640).astype(np.float32),  # Front camera image
+        "observation.images.rear_camera": np.random.rand(3, 480, 640).astype(np.float32)   # Rear camera image
     }
 
 def main():
@@ -192,7 +209,7 @@ def main():
     print("=" * 30)
     
     # Initialize inference engine
-    inference_engine = LeRobotInference("./model_output")
+    inference_engine = LeRobotInference("src/model_output")
     
     # Try to load model
     print("Loading model...")
@@ -210,10 +227,10 @@ def main():
         
         # Create sample observation
         observation = create_sample_observation()
-        print(f"Input observation: {observation['state']}")
+        print(f"Input observation state: {observation['observation.state']}")
         
         # Simulate prediction
-        action = observation["state"] + np.random.normal(0, 0.01, len(observation["state"]))
+        action = observation["observation.state"] + np.random.normal(0, 0.01, len(observation["observation.state"]))
         print(f"Simulated action: {action}")
         
         return
@@ -225,7 +242,7 @@ def main():
     
     # Create sample observation
     observation = create_sample_observation()
-    print(f"Input observation: {observation['state']}")
+    print(f"Input observation state: {observation['observation.state']}")
     
     # Run inference
     result = inference_engine.run_inference(observation)

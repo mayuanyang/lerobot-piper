@@ -28,7 +28,13 @@ class WebcamInference:
         self.policy = None
         self.preprocessor = None
         self.postprocessor = None
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Determine the appropriate device
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
         self.cap = None
         
     def load_model(self) -> bool:
@@ -73,12 +79,23 @@ class WebcamInference:
             self.policy = DiffusionPolicy(cfg)
             
             # Load the trained weights
-            model_weights_path = self.model_path / "pytorch_model.bin"
-            if not model_weights_path.exists():
-                print(f"Model weights not found at {model_weights_path}")
+            # First try safetensors format, fallback to pytorch format
+            safetensors_path = self.model_path / "model.safetensors"
+            pytorch_path = self.model_path / "pytorch_model.bin"
+            
+            if safetensors_path.exists():
+                print(f"Loading model from safetensors format: {safetensors_path}")
+                from safetensors.torch import load_file
+                state_dict = load_file(safetensors_path)
+                self.policy.load_state_dict(state_dict)
+                self.policy.to(self.device)
+            elif pytorch_path.exists():
+                print(f"Loading model from pytorch format: {pytorch_path}")
+                self.policy.load_state_dict(torch.load(pytorch_path, map_location=self.device))
+                self.policy.to(self.device)
+            else:
+                print(f"Model weights not found at {self.model_path}")
                 return False
-                
-            self.policy.load_state_dict(torch.load(model_weights_path, map_location=self.device))
             self.policy.eval()
             self.policy.to(self.device)
             
@@ -147,7 +164,7 @@ class WebcamInference:
             frame (np.ndarray): Raw webcam frame
             
         Returns:
-            np.ndarray: Preprocessed frame
+            np.ndarray: Preprocessed frame in channels-first format [C, H, W]
         """
         # Convert BGR to RGB
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -159,7 +176,10 @@ class WebcamInference:
         # Normalize to [0, 1] range
         frame_normalized = frame_resized.astype(np.float32) / 255.0
         
-        return frame_normalized
+        # Convert from [H, W, C] to [C, H, W] format (channels first)
+        frame_channels_first = np.transpose(frame_normalized, (2, 0, 1))
+        
+        return frame_channels_first
     
     def preprocess_observation(self, observation: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """
@@ -183,9 +203,11 @@ class WebcamInference:
         # Handle image observation
         if "image" in observation:
             image_tensor = torch.tensor(observation["image"], dtype=torch.float32)
-            # Add batch dimension (B, H, W, C)
+            # Image is already in [C, H, W] format from preprocess_frame
+            # Add batch dimension (B, C, H, W)
             image_tensor = image_tensor.unsqueeze(0)
-            processed["observation.image"] = image_tensor.to(self.device)
+            processed["observation.images.front_camera"] = image_tensor.to(self.device)
+            processed["observation.images.rear_camera"] = image_tensor.to(self.device)
             
         return processed
     
@@ -290,7 +312,7 @@ class WebcamInference:
                     action = result["result"]["action"]
                     print(f"Predicted action: {action}")
                 else:
-                    print(f"Inference failed: {result['error']}")
+                    print(f"Inference failed: {result['error']}", result)
                 
                 # Display frame
                 cv2.imshow('Webcam Input', frame)
@@ -317,7 +339,7 @@ class WebcamInference:
 
 def create_sample_joint_state():
     """Create a sample joint state for testing."""
-    return np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+    return np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7], dtype=np.float32)
 
 def main():
     """Main function demonstrating webcam usage."""
