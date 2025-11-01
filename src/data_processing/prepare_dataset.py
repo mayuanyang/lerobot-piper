@@ -8,6 +8,9 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 from datetime import datetime
+from .episode_data import EpisodeData
+
+
 
 def create_tasks_parquet(root_dir: Path, task_title: str):
     """
@@ -70,28 +73,13 @@ def create_episodes_parquet_index(root_dir: Path, episode_index: int):
     
     print(f"✅ Successfully created episodes index dataset at: {episodes_parquet_dir}")
 
-def process_session(json_path: Path, root_dir: Path, episode_index: int, global_index_offset: int):
-    """Converts a single session (JSON + MP4) into LeRobot format."""
+def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: dict):
+    print("\n--- Generating data files ---")
+    num_joints = len(json_data["joint_names"])
+    num_frames = len(json_data["frames"])
+    joint_positions = [frame["joint_positions"] for frame in json_data["frames"]]
     
-    # Ensure json_path is a Path object
-    json_path = Path(json_path)
     
-    with open(json_path, 'r') as f:
-        session_data = json.load(f)
-
-    input_video_path = Path(session_data.get("video_file", "path/to/placeholder.mp4"))
-    # Create the new directory structure for videos
-    video_chunk_dir = root_dir / "videos" / "observation.image" / f"chunk-{episode_index:03d}"
-    video_chunk_dir.mkdir(parents=True, exist_ok=True)
-    output_video_name = f"episode_{episode_index:03d}_front_camera.mp4"
-    
-    num_joints = len(session_data["joint_names"])
-    num_frames = len(session_data["frames"])
-    joint_positions = [frame["joint_positions"] for frame in session_data["frames"]]
-    
-    # Define global index bounds
-    dataset_from_index = global_index_offset
-    dataset_to_index = global_index_offset + num_frames
     
     # Create frames with state observations (image references are handled separately)
     lerobot_frames = []
@@ -101,9 +89,9 @@ def process_session(json_path: Path, root_dir: Path, episode_index: int, global_
             "observation.state": joint_positions[i],
             "action": joint_positions[i + 1] if i < num_frames - 1 else joint_positions[i],
             "timestamp": timestamp_base,
-            "episode_index": episode_index,
-            "frame_index": session_data["frames"][i]["frame_index"],
-            "index": episode_index * num_frames + i,
+            "episode_index": episode_data.episode_index,
+            "frame_index": json_data["frames"][i]["frame_index"],
+            "index": episode_data.episode_index * num_frames + i,
             "next.done": i == num_frames - 1,
             "next.reward": 0.0,
             "task_index": 0,
@@ -126,34 +114,27 @@ def process_session(json_path: Path, root_dir: Path, episode_index: int, global_
     })
     hf_dataset = hf_dataset.cast(feature_config)
 
-    # Create directories
-    os.makedirs(root_dir / "meta", exist_ok=True)
-    os.makedirs(root_dir / "data", exist_ok=True)
-    os.makedirs(root_dir / "videos", exist_ok=True)
 
     # Export to Parquet with new directory structure
-    chunk_dir = root_dir / "data" / f"chunk-{episode_index:03d}"
+    chunk_dir = output_dir / "data" / f"chunk-{episode_data.episode_index:03d}"
     chunk_dir.mkdir(parents=True, exist_ok=True)
-    parquet_path = chunk_dir / f"file-{episode_index:03d}.parquet"
+    parquet_path = chunk_dir / f"file-{episode_data.episode_index:03d}.parquet"
     hf_dataset.to_parquet(parquet_path)
-    
-    # Copy video file to the new directory structure
-    if input_video_path.exists():
-        shutil.copy(input_video_path, video_chunk_dir / output_video_name)
-    else:
-        print(f"⚠️ WARNING: Video file not found at {input_video_path}. Skipping video copy.")
 
-    # Update info.json to properly configure image observations
-    duration_s = session_data["frames"][-1]["timestamp"] - session_data["frames"][0]["timestamp"]
-    estimated_fps = 10.0
-    
+def generate_meta_files(output_dir: Path, task_title: str, episode_data: EpisodeData, json_data: dict):
+    print("\n--- Generating meta ---")
     # Get data path and video path
     data_path = "data/episode-{episode_index:03d}/file-{episode_index:03d}.parquet"
-    video_path = "videos/observation.image/chunk-{chunk_index:03d}/episode_{chunk_index:03d}_front_camera.mp4"
+    video_path = "videos/{video_key}/chunk-{chunk_index:03d}/episode_{chunk_index:03d}.mp4"
     
+    num_joints = len(json_data["joint_names"])
+    num_frames = len(json_data["frames"])
+    joint_positions = [frame["joint_positions"] for frame in json_data["frames"]]
+    
+    # Create base info_json structure
     info_json = {
         "codebase_version": "v3.0", 
-        "fps": round(estimated_fps, 2),
+        "fps": round(episode_data.fps, 2),
         "total_episodes": 1,
         "total_frames": num_frames,
         "total_tasks": 1,
@@ -171,22 +152,6 @@ def process_session(json_path: Path, root_dir: Path, episode_index: int, global_
                 "shape": [num_joints],
                 "dtype": "float32"
             },
-            "observation.image": {
-                "shape": [480, 640, 3],  # Adjust based on your actual video dimensions
-                "dtype": "video",
-                "names": [
-                    "height",
-                    "width",
-                    "channel"
-                ],
-                "video_info": {
-                    "video.fps": round(estimated_fps, 2),
-                    "video.codec": "av1",
-                    "video.pix_fmt": "yuv420p",
-                    "video.is_depth_map": False,
-                    "has_audio": False
-                }
-            },
             "action": {
                 "shape": [num_joints],
                 "dtype": "float32"
@@ -194,29 +159,96 @@ def process_session(json_path: Path, root_dir: Path, episode_index: int, global_
         }
     }
     
-    with open(root_dir / "meta" / "info.json", "w") as f:
+    # Add camera features dynamically
+    for camera_data in episode_data.cameras:
+        camera_name = camera_data.camera
+        feature_key = f"observation.images.{camera_name}"
+        
+        info_json["features"][feature_key] = {
+            "shape": [480, 640, 3],  # Adjust based on your actual video dimensions
+            "dtype": "video",
+            "names": [
+                "height",
+                "width",
+                "channel"
+            ],
+            "video_info": {
+                "video.fps": round(episode_data.fps, 2),
+                "video.codec": "av1",
+                "video.pix_fmt": "yuv420p",
+                "video.is_depth_map": False,
+                "has_audio": False
+            }
+        }
+    
+    with open(output_dir / "meta" / "info.json", "w") as f:
         json.dump(info_json, f, indent=2)
         
-    # Append to episodes.jsonl
+    # Define global index bounds
+    dataset_from_index = episode_data.global_index_offset
+    dataset_to_index = episode_data.global_index_offset + num_frames
     
-    # 6b. episodes.jsonl (Per-episode metadata)   
-
+    # Create base episodes_jsonl structure
     episodes_jsonl = {
-        "episode_index": episode_index,
+        "episode_index": episode_data.episode_index,
         "task_index": 0,
         "frame_index_offset": 0,
         "num_frames": num_frames,
-        # *** FIX: Add the missing indices required by LeRobotDataset loader ***
         "dataset_from_index": dataset_from_index,
         "dataset_to_index": dataset_to_index,
-        "start_time": session_data["start_time"],
-        "end_time": session_data["end_time"],
-        "videos/observation.image/from_timestamp": 0.0,
-        "videos/observation.image/chunk_index": episode_index,
-        "videos/observation.image/file_index": episode_index,
+        "start_time": json_data["start_time"],
+        "end_time": json_data["end_time"],
+        # Add video metadata for each camera
     }
     
-    with open(root_dir / "meta" / "episodes.jsonl", "a") as f:
+    # Add video metadata for each camera
+    for camera_data in episode_data.cameras:
+        camera_name = camera_data.camera
+        episodes_jsonl[f"videos/observation.images.{camera_name}/from_timestamp"] = 0.0
+        episodes_jsonl[f"videos/observation.images.{camera_name}/chunk_index"] = episode_data.episode_index
+        episodes_jsonl[f"videos/observation.images.{camera_name}/file_index"] = episode_data.episode_index
+    
+    with open(output_dir / "meta" / "episodes.jsonl", "a") as f:
         f.write(json.dumps(episodes_jsonl) + "\n")
         
-    print(f"✅ Successfully processed episode {episode_index}")
+    create_tasks_parquet(output_dir, task_title)
+    create_episodes_parquet_index(output_dir, episode_data.episode_index)
+
+
+def generate_video_files(output_dir: Path, episode_data: EpisodeData, json_data: dict):
+    print("\n--- Generating videos ---")
+    input_videos_path = json_data.get("video_files", ["path/to/placeholder.mp4"])
+    
+    for camera_data in episode_data.cameras:
+        camera_name = camera_data.camera
+        cam_folder = f"observation.images.{camera_name}"
+        #os.makedirs(output_dir / cam_folder, exist_ok=True)
+    
+        # Create the new directory structure for videos
+        video_chunk_dir = output_dir / "videos" / cam_folder / f"chunk-{episode_data.episode_index:03d}"
+        video_chunk_dir.mkdir(parents=True, exist_ok=True)
+        output_video_name = f"episode_{episode_data.episode_index:03d}.mp4"
+    
+        # Copy video file to the new directory structure
+        video_file_path = Path(camera_data.video_path)
+        if video_file_path.exists():
+            shutil.copy(video_file_path, video_chunk_dir / output_video_name)
+        else:
+            print(f"⚠️ WARNING: Video file not found at {camera_data.video_path}. Skipping video copy.")
+
+def process_session(episode_data: EpisodeData, output_dir: Path):
+    # Create directories
+    os.makedirs(output_dir / "meta", exist_ok=True)
+    os.makedirs(output_dir / "data", exist_ok=True)
+    os.makedirs(output_dir / "videos", exist_ok=True)
+           
+    with open(episode_data.joint_data_json_path, 'r') as f:
+        json_data = json.load(f)
+
+    generate_video_files(output_dir, episode_data, json_data)
+        
+    generate_meta_files(output_dir, "Piper Arm Teleoperation", episode_data, json_data)   
+   
+    generate_data_files(output_dir, episode_data, json_data)
+        
+    print(f"✅ Successfully processed episode {episode_data.episode_index}")

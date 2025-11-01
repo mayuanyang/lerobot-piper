@@ -8,6 +8,8 @@ from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.policies.factory import make_pre_post_processors
+from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
@@ -19,9 +21,6 @@ def make_delta_timestamps(delta_indices: list[int] | None, fps: int) -> list[flo
 
     return [i / fps for i in delta_indices]
 
-
-from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
-from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 
 def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
     output_directory = Path(output_dir)
@@ -56,40 +55,39 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
     # Using multiples of 1/27.38 ≈ 0.0365 to match the dataset FPS
     # Note: observation.image and observation.state are handled separately by LeRobot and not included in the parquet file
     # Calculating exact multiples of 1/27.38 for delta timestamps
+
     fps = 10
     frame_time = 1 / fps  # 0.1 seconds
+    obs_temporal_window = [-3 * frame_time, 0.0] # [-0.3, 0.0]
 
     delta_timestamps = {
-        # 1. Observation (Image and State)
-        # The policy needs the current frame (0.0) and context from previous frames.
-        # The original example used -3 * 1/fps. For FPS=10, this is -3 * 0.1 = -0.3 seconds.
-        "observation.image": [-3 * frame_time, 0.0],  # -0.3 seconds (3 frames back) and current frame (0.0)
-        "observation.state": [-3 * frame_time, 0.0],  # -0.3 seconds (3 frames back) and current frame (0.0)
-
-        # 2. Action (Future Prediction Horizon)
-        # The policy predicts a sequence of future actions.
-        # The sequence should start at the *next* action to be executed (often 0.0 or 1 * frame_time)
-        # and cover a prediction horizon (16 actions total in your example).
+        # 🟢 NEW: EXPLICITLY list all camera keys with the same temporal sequence
+        "observation.images.front_camera": obs_temporal_window,  
+        "observation.images.rear_camera": obs_temporal_window,
         
-        # Your old action array had 16 values. We'll match that length:
-        # Action at -3/fps, then action at 0.0, then 14 future actions (16 total).
+        
+        # NOTE: observation.states is usually low-dimensional proprioception
+        # and should be named "observation.state" (singular) in most LeRobot datasets.
+        "observation.state": obs_temporal_window,  # Assuming 'observation.state' is correct feature name
+        
+        # Action stream remains the same, as it's independent of the cameras
         "action": [
-            -3 * frame_time,  # Action from 3 frames ago (-0.3s)
-            0.0 * frame_time, # Current action/action to execute now (0.0s)
-            1 * frame_time,   # Action for 1 frame ahead (+0.1s)
-            2 * frame_time,   # Action for 2 frames ahead (+0.2s)
-            3 * frame_time,
-            4 * frame_time,
-            5 * frame_time,
-            6 * frame_time,
-            7 * frame_time,
-            8 * frame_time,
-            9 * frame_time,
-            10 * frame_time,
-            11 * frame_time,
-            12 * frame_time,
-            13 * frame_time,
-            14 * frame_time,  # Action for 14 frames ahead (+1.4s)
+            -3 * frame_time, 
+            0.0 * frame_time, 
+            1 * frame_time, 
+            2 * frame_time, 
+            3 * frame_time, 
+            4 * frame_time, 
+            5 * frame_time, 
+            6 * frame_time, 
+            7 * frame_time, 
+            8 * frame_time, 
+            9 * frame_time, 
+            10 * frame_time, 
+            11 * frame_time, 
+            12 * frame_time, 
+            13 * frame_time, 
+            14 * frame_time, 
         ]
     }
 
