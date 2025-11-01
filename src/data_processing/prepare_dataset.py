@@ -207,6 +207,8 @@ def generate_meta_files(output_dir: Path, task_title: str, episode_data: Episode
         episodes_jsonl[f"videos/observation.images.{camera_name}/from_timestamp"] = 0.0
         episodes_jsonl[f"videos/observation.images.{camera_name}/chunk_index"] = episode_data.episode_index
         episodes_jsonl[f"videos/observation.images.{camera_name}/file_index"] = episode_data.episode_index
+        episodes_jsonl[f"videos/observation.images.{camera_name}/frame_index_offset"] = 0
+        
     
     with open(output_dir / "meta" / "episodes.jsonl", "a") as f:
         f.write(json.dumps(episodes_jsonl) + "\n")
