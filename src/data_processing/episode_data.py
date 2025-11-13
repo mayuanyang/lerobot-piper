@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import List, Optional
+import json
 
 
 class CameraData:
@@ -18,5 +19,6 @@ class EpisodeData:
         self.fps = fps
         self.global_index_offset = global_index_offset
         self.cameras = cameras
-        
+        self.num_of_frames = 0
+        self.dataset_from_index = 0
         

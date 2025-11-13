@@ -62,8 +62,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
 
     delta_timestamps = {
         # 🟢 NEW: EXPLICITLY list all camera keys with the same temporal sequence
-        "observation.images.front_camera": obs_temporal_window,  
-        "observation.images.rear_camera": obs_temporal_window,
+        "observation.images.gripper": obs_temporal_window,  
+        "observation.images.depth": obs_temporal_window,
+        "observation.images.rgb": obs_temporal_window,
         
         
         # NOTE: observation.states is usually low-dimensional proprioception

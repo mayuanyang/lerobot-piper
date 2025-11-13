@@ -120,8 +120,10 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     chunk_dir.mkdir(parents=True, exist_ok=True)
     parquet_path = chunk_dir / f"file-{episode_data.episode_index:03d}.parquet"
     hf_dataset.to_parquet(parquet_path)
+    
+    return num_frames
 
-def generate_meta_files(output_dir: Path, task_title: str, episode_data: EpisodeData, json_data: dict):
+def generate_meta_files(output_dir: Path, task_title: str, episode_data: EpisodeData, json_data: dict, is_first_episode: bool = False):
     print("\n--- Generating meta ---")
     # Get data path and video path
     data_path = "data/episode-{episode_index:03d}/file-{episode_index:03d}.parquet"
@@ -131,62 +133,76 @@ def generate_meta_files(output_dir: Path, task_title: str, episode_data: Episode
     num_frames = len(json_data["frames"])
     joint_positions = [frame["joint_positions"] for frame in json_data["frames"]]
     
-    # Create base info_json structure
-    info_json = {
-        "codebase_version": "v3.0", 
-        "fps": round(episode_data.fps, 2),
-        "total_episodes": 1,
-        "total_frames": num_frames,
-        "total_tasks": 1,
-        "data_path": data_path,
-        "video_path": video_path,
-        "features": {
-            "timestamp": {"dtype": "float64", "shape": [1]},
-            "frame_index": {"dtype": "int64", "shape": [1]},
-            "episode_index": {"dtype": "int64", "shape": [1]},
-            "task_index": {"dtype": "int64", "shape": [1]},
-            "index": {"dtype": "int64", "shape": [1]},
-            "next.done": {"dtype": "bool", "shape": [1]},
-            "next.reward": {"dtype": "float32", "shape": [1]},
-            "observation.state": {
-                "shape": [num_joints],
-                "dtype": "float32"
-            },
-            "action": {
-                "shape": [num_joints],
-                "dtype": "float32"
+    # For the first episode, we need to create a new info.json, for subsequent episodes we'll update it
+    info_json_path = output_dir / "meta" / "info.json"
+    if is_first_episode or not info_json_path.exists():
+        # Create base info_json structure
+        info_json = {
+            "codebase_version": "v3.0", 
+            "fps": round(episode_data.fps, 2),
+            "total_episodes": 1,
+            "total_frames": num_frames,
+            "total_tasks": 1,
+            "data_path": data_path,
+            "video_path": video_path,
+            "features": {
+                "timestamp": {"dtype": "float64", "shape": [1]},
+                "frame_index": {"dtype": "int64", "shape": [1]},
+                "episode_index": {"dtype": "int64", "shape": [1]},
+                "task_index": {"dtype": "int64", "shape": [1]},
+                "index": {"dtype": "int64", "shape": [1]},
+                "next.done": {"dtype": "bool", "shape": [1]},
+                "next.reward": {"dtype": "float32", "shape": [1]},
+                "observation.state": {
+                    "shape": [num_joints],
+                    "dtype": "float32"
+                },
+                "action": {
+                    "shape": [num_joints],
+                    "dtype": "float32"
+                }
             }
         }
-    }
-    
-    # Add camera features dynamically
-    for camera_data in episode_data.cameras:
-        camera_name = camera_data.camera
-        feature_key = f"observation.images.{camera_name}"
         
-        info_json["features"][feature_key] = {
-            "shape": [480, 640, 3],  # Adjust based on your actual video dimensions
-            "dtype": "video",
-            "names": [
-                "height",
-                "width",
-                "channel"
-            ],
-            "video_info": {
-                "video.fps": round(episode_data.fps, 2),
-                "video.codec": "av1",
-                "video.pix_fmt": "yuv420p",
-                "video.is_depth_map": False,
-                "has_audio": False
+        # Add camera features dynamically
+        for camera_data in episode_data.cameras:
+            camera_name = camera_data.camera
+            feature_key = f"observation.images.{camera_name}"
+            
+            info_json["features"][feature_key] = {
+                "shape": [400, 640, 3],  # Adjust based on your actual video dimensions
+                "dtype": "video",
+                "names": [
+                    "height",
+                    "width",
+                    "channel"
+                ],
+                "video_info": {
+                    "video.fps": round(episode_data.fps, 2),
+                    "video.codec": "av1",
+                    "video.pix_fmt": "yuv420p",
+                    "video.is_depth_map": False,
+                    "has_audio": False
+                }
             }
-        }
-    
-    with open(output_dir / "meta" / "info.json", "w") as f:
-        json.dump(info_json, f, indent=2)
+        
+        with open(info_json_path, "w") as f:
+            json.dump(info_json, f, indent=2)
+    else:
+        # Read existing info.json and update total_frames and total_episodes
+        with open(info_json_path, "r") as f:
+            info_json = json.load(f)
+        
+        # Update totals
+        info_json["total_frames"] = info_json.get("total_frames", 0) + num_frames
+        info_json["total_episodes"] = info_json.get("total_episodes", 0) + 1
+        
+        with open(info_json_path, "w") as f:
+            json.dump(info_json, f, indent=2)
         
     # Define global index bounds
     dataset_from_index = episode_data.global_index_offset
-    dataset_to_index = episode_data.global_index_offset + num_frames
+    dataset_to_index = episode_data.global_index_offset + num_frames - 1
     
     # Create base episodes_jsonl structure
     episodes_jsonl = {
@@ -213,7 +229,8 @@ def generate_meta_files(output_dir: Path, task_title: str, episode_data: Episode
     with open(output_dir / "meta" / "episodes.jsonl", "a") as f:
         f.write(json.dumps(episodes_jsonl) + "\n")
         
-    create_tasks_parquet(output_dir, task_title)
+    if is_first_episode:
+        create_tasks_parquet(output_dir, task_title)
     create_episodes_parquet_index(output_dir, episode_data.episode_index)
 
 
@@ -238,7 +255,58 @@ def generate_video_files(output_dir: Path, episode_data: EpisodeData, json_data:
         else:
             print(f"⚠️ WARNING: Video file not found at {camera_data.video_path}. Skipping video copy.")
 
-def process_session(episode_data: EpisodeData, output_dir: Path):
+def update_total_frames_from_episodes(output_dir: Path):
+    """
+    Reads episodes.jsonl file and calculates the total sum of num_frames,
+    then updates info.json with the calculated sum.
+    """
+    print("\n--- Updating total frames from episodes ---")
+    
+    # Path to episodes.jsonl and info.json
+    episodes_jsonl_path = output_dir / "meta" / "episodes.jsonl"
+    info_json_path = output_dir / "meta" / "info.json"
+    
+    # Check if episodes.jsonl exists
+    if not episodes_jsonl_path.exists():
+        print(f"❌ WARNING: {episodes_jsonl_path} not found. Skipping total frames update.")
+        return
+    
+    # Read episodes.jsonl and sum num_frames
+    total_frames = 0
+    total_episodes = 0
+    try:
+        with open(episodes_jsonl_path, 'r') as f:
+            for line in f:
+                if line.strip():  # Skip empty lines
+                    episode_data = json.loads(line)
+                    total_frames += episode_data.get("num_frames", 0)
+                    total_episodes += 1
+        
+        print(f"Calculated total frames: {total_frames}")
+        
+        # Read existing info.json
+        if not info_json_path.exists():
+            print(f"❌ WARNING: {info_json_path} not found. Skipping total frames update.")
+            return
+            
+        with open(info_json_path, 'r') as f:
+            info_data = json.load(f)
+        
+        # Update total_frames
+        info_data["total_frames"] = total_frames
+        info_data["total_episodes"] = total_episodes
+        
+        # Write updated info.json
+        with open(info_json_path, 'w') as f:
+            json.dump(info_data, f, indent=2)
+            
+        print(f"✅ Successfully updated total_frames in info.json to: {total_frames}")
+        
+    except Exception as e:
+        print(f"❌ ERROR: Failed to update total frames: {e}")
+
+
+def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episode: bool = False):
     # Create directories
     os.makedirs(output_dir / "meta", exist_ok=True)
     os.makedirs(output_dir / "data", exist_ok=True)
@@ -249,8 +317,6 @@ def process_session(episode_data: EpisodeData, output_dir: Path):
 
     generate_video_files(output_dir, episode_data, json_data)
         
-    generate_meta_files(output_dir, "Piper Arm Teleoperation", episode_data, json_data)   
+    generate_meta_files(output_dir, "Piper Arm Teleoperation", episode_data, json_data, is_first_episode)   
    
-    generate_data_files(output_dir, episode_data, json_data)
-        
-    print(f"✅ Successfully processed episode {episode_data.episode_index}")
+    return generate_data_files(output_dir, episode_data, json_data)
