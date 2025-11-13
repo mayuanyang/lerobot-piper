@@ -25,7 +25,14 @@ class LeRobotInference:
         self.policy = None
         self.preprocessor = None
         self.postprocessor = None
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Handle device selection with MPS support
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
+        print(f"Using device: {self.device}")
         
     def load_model(self) -> bool:
         """
@@ -55,8 +62,18 @@ class LeRobotInference:
             
             # Load dataset metadata to get input/output shapes and stats
             print("Loading dataset metadata...")
-            dataset_metadata = LeRobotDatasetMetadata(self.dataset_id, force_cache_sync=True, revision="main")
-            features = dataset_to_policy_features(dataset_metadata.features)
+            # Try to load from local dataset first
+            try:
+                from lerobot.datasets.lerobot_dataset import LeRobotDataset
+                dataset = LeRobotDataset(self.dataset_id)
+                features = dataset.features
+                dataset_metadata = dataset.meta
+            except:
+                # Fallback to loading from HuggingFace
+                dataset_metadata = LeRobotDatasetMetadata(self.dataset_id, force_cache_sync=True, revision="main")
+                features = dataset_metadata.features
+                
+            features = dataset_to_policy_features(features)
             output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
             input_features = {key: ft for key, ft in features.items() if key not in output_features}
             
@@ -117,19 +134,26 @@ class LeRobotInference:
             state_tensor = state_tensor.unsqueeze(0)
             processed["observation.state"] = state_tensor.to(self.device)
         
-        # Handle front camera image observation
-        if "observation.images.front_camera" in observation:
-            image_tensor = torch.tensor(observation["observation.images.front_camera"], dtype=torch.float32)
+        # Handle rgb camera image observation
+        if "observation.images.rgb" in observation:
+            image_tensor = torch.tensor(observation["observation.images.rgb"], dtype=torch.float32)
             # Add batch dimension (B, C, H, W)
             image_tensor = image_tensor.unsqueeze(0)
-            processed["observation.images.front_camera"] = image_tensor.to(self.device)
+            processed["observation.images.rgb"] = image_tensor.to(self.device)
             
-        # Handle rear camera image observation
-        if "observation.images.rear_camera" in observation:
-            image_tensor = torch.tensor(observation["observation.images.rear_camera"], dtype=torch.float32)
+        # Handle gripper camera image observation
+        if "observation.images.gripper" in observation:
+            image_tensor = torch.tensor(observation["observation.images.gripper"], dtype=torch.float32)
             # Add batch dimension (B, C, H, W)
             image_tensor = image_tensor.unsqueeze(0)
-            processed["observation.images.rear_camera"] = image_tensor.to(self.device)
+            processed["observation.images.gripper"] = image_tensor.to(self.device)
+            
+        # Handle depth camera image observation
+        if "observation.images.depth" in observation:
+            image_tensor = torch.tensor(observation["observation.images.depth"], dtype=torch.float32)
+            # Add batch dimension (B, C, H, W)
+            image_tensor = image_tensor.unsqueeze(0)
+            processed["observation.images.depth"] = image_tensor.to(self.device)
             
         return processed
     
@@ -199,8 +223,9 @@ def create_sample_observation():
     """Create a sample observation for testing."""
     return {
         "observation.state": np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]),  # 7-DOF joint positions
-        "observation.images.front_camera": np.random.rand(3, 480, 640).astype(np.float32),  # Front camera image
-        "observation.images.rear_camera": np.random.rand(3, 480, 640).astype(np.float32)   # Rear camera image
+        "observation.images.rgb": np.random.rand(3, 400, 640).astype(np.float32),  # RGB camera image
+        "observation.images.gripper": np.random.rand(3, 400, 640).astype(np.float32),  # Gripper camera image
+        "observation.images.depth": np.random.rand(3, 400, 640).astype(np.float32)   # Depth camera image
     }
 
 def main():

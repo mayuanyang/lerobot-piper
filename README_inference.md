@@ -8,6 +8,7 @@ This repository contains inference code for the LeRobot framework, specifically 
 2. `simple_inference.py` - Simplified inference implementation with dummy mode
 3. `lerobot_inference.py` - Object-oriented inference implementation with demo mode
 4. `webcam_inference.py` - Webcam-based inference implementation for real-time robot control
+5. `video_inference.py` - Video file-based inference implementation for processing recorded videos
 
 ## Usage
 
@@ -51,6 +52,24 @@ To customize the webcam inference:
    ```bash
    python lerobot_inference.py
    ```
+
+### Video File Inference
+
+To run inference on a video file:
+
+```bash
+python video_inference.py
+```
+
+This script will:
+1. Load a trained model from `src/model_output`
+2. Process a video file frame by frame
+3. Run inference on each frame
+4. Display results and save them to a file
+
+To use with your own video:
+1. Modify the `video_inference.py` script to specify your video path
+2. Optionally provide joint states for each frame
 
 ### Without a trained model (demo mode)
 
