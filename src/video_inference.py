@@ -9,6 +9,12 @@ import cv2
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 import time
+
+import collections
+from typing import List, Dict, Any, Tuple
+
+HISTORY_LENGTH = 4
+
 try:
     from .lerobot_inference import LeRobotInference
 except ImportError:
@@ -55,9 +61,11 @@ class VideoInference:
         
         return frame_channels_first
     
+
+
     def process_video(self, rgb_video_path: str, gripper_video_path: str, depth_video_path: str, 
-                     joint_states: List[np.ndarray], 
-                     target_size: Tuple[int, int] = (400, 640)) -> List[Dict[str, Any]]:
+                        joint_states: List[np.ndarray], 
+                        target_size: Tuple[int, int] = (400, 640)) -> List[Dict[str, Any]]:
         
         # Load videos
         rgb_cap = self.load_video(rgb_video_path)
@@ -75,6 +83,13 @@ class VideoInference:
             gripper_cap.release()
             return []
         
+        # Initialize temporal buffers (Deques)
+        # The deque size is set to HISTORY_LENGTH (4) to store the current frame and 3 past frames.
+        rgb_history = collections.deque(maxlen=HISTORY_LENGTH)
+        gripper_history = collections.deque(maxlen=HISTORY_LENGTH)
+        depth_history = collections.deque(maxlen=HISTORY_LENGTH)
+        state_history = collections.deque(maxlen=HISTORY_LENGTH)
+        
         results = []
         frame_count = 0
         
@@ -82,6 +97,7 @@ class VideoInference:
             print(f"Processing RGB video: {rgb_video_path}")
             print(f"Processing gripper video: {gripper_video_path}")
             print(f"Processing depth video: {depth_video_path}")
+            print(f"Using a {HISTORY_LENGTH}-step temporal window for inference.")
             print("Press 'q' to stop processing early")
             
             while True:
@@ -99,19 +115,56 @@ class VideoInference:
                 processed_gripper_frame = self.preprocess_frame(gripper_frame, target_size)
                 processed_depth_frame = self.preprocess_frame(depth_frame, target_size)
                 
-                # Create observation with frames from different cameras
+                # --- Temporal Buffering ---
+                # Append current frames to the history deques
+                rgb_history.append(processed_rgb_frame)
+                gripper_history.append(processed_gripper_frame)
+                depth_history.append(processed_depth_frame)
+
+                # Get the joint state for the current frame
+                current_joint_state = None
+                if frame_count < len(joint_states):
+                    current_joint_state = joint_states[frame_count]
+                elif len(joint_states) > 0:
+                    # Use last available joint state if video is longer than joint_states list
+                    current_joint_state = joint_states[-1]
+                
+                if current_joint_state is not None:
+                    state_history.append(current_joint_state)
+                
+                # --- Inference Check ---
+                # Only start inference once we have enough frames (HISTORY_LENGTH)
+                if len(rgb_history) < HISTORY_LENGTH:
+                    frame_count += 1
+                    
+                    # Display frames while buffering (optional)
+                    cv2.imshow('RGB Video Input', rgb_frame)
+                    cv2.imshow('Gripper Video Input', gripper_frame)
+                    cv2.imshow('Depth Video Input', depth_frame)
+                    
+                    # Break on 'q' key press
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        print("Processing stopped by user during buffering")
+                        break
+                    
+                    continue # Skip inference until buffer is full
+                
+                # --- Prepare Observation for Inference ---
+                # The observation keys must now contain the HISTORY_LENGTH frames/states
+                # np.stack creates an array of shape (HISTORY_LENGTH, H, W, C) for images,
+                # and (HISTORY_LENGTH, D) for the state vector.
                 observation = {
-                    "observation.images.rgb": processed_rgb_frame,
-                    "observation.images.gripper": processed_gripper_frame,
-                    "observation.images.depth": processed_depth_frame
+                    "observation.images.rgb": np.stack(rgb_history),
+                    "observation.images.gripper": np.stack(gripper_history),
+                    "observation.images.depth": np.stack(depth_history)
                 }
                 
-                # Add joint state if provided
-                if frame_count < len(joint_states):
-                    observation["observation.state"] = joint_states[frame_count]
+                # Add stacked joint state history if available
+                if len(state_history) == HISTORY_LENGTH:
+                    observation["observation.state"] = np.stack(state_history)
                 elif len(joint_states) > 0:
-                    # Use last available joint state
-                    observation["observation.state"] = joint_states[-1]
+                    # Fallback in case of mismatch, but this path is less desirable
+                    print(f"Warning: State history length {len(state_history)} != {HISTORY_LENGTH}")
                 
                 # Run inference
                 result = self.inference_engine.run_inference(observation)
@@ -125,7 +178,7 @@ class VideoInference:
                 
                 # Print progress every 30 frames
                 if frame_count % 30 == 0:
-                    print(f"Processed frame {frame_count}")
+                    print(f"Processed frame {frame_count} (Inference Started at frame {HISTORY_LENGTH - 1})")
                 
                 frame_count += 1
                 
@@ -143,7 +196,7 @@ class VideoInference:
             depth_cap.release()
             cv2.destroyAllWindows()
         
-        print(f"Finished processing {frame_count} frames")
+        print(f"Finished processing {frame_count} frames, with {len(results)} inference results")
         return results
 
     

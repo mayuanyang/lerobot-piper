@@ -42,7 +42,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
 
     # Policies are initialized with a configuration class, in this case `DiffusionConfig`. For this example,
     # we'll just use the defaults and so no arguments other than input/output features need to be passed.
-    cfg = DiffusionConfig(input_features=input_features, output_features=output_features)
+    # NOTE: We need to update n_obs_steps to match our obs_temporal_window length (4 steps)
+    # Also explicitly set horizon to match our action sequence length (16 steps)
+    cfg = DiffusionConfig(input_features=input_features, output_features=output_features, n_obs_steps=4, horizon=16)
 
     # We can now instantiate our policy with this config and the dataset stats.
     policy = DiffusionPolicy(cfg)
@@ -74,6 +76,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
         # Action stream remains the same, as it's independent of the cameras
         "action": [
             -3 * frame_time, 
+            -2 * frame_time, 
+            -1 * frame_time, 
             0.0 * frame_time, 
             1 * frame_time, 
             2 * frame_time, 
@@ -86,9 +90,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
             9 * frame_time, 
             10 * frame_time, 
             11 * frame_time, 
-            12 * frame_time, 
-            13 * frame_time, 
-            14 * frame_time, 
+            12 * frame_time
         ]
     }
 
@@ -100,7 +102,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=4,
-        batch_size=64,
+        batch_size=8,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
