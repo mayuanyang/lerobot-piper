@@ -45,7 +45,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
     # we'll just use the defaults and so no arguments other than input/output features need to be passed.
     # NOTE: We need to update n_obs_steps to match our obs_temporal_window length (4 steps)
     # Also explicitly set horizon to match our action sequence length (16 steps)
-    cfg = DiffusionConfig(input_features=input_features, output_features=output_features, n_obs_steps=4, horizon=16)
+    cfg = DiffusionConfig(input_features=input_features, output_features=output_features, n_obs_steps=10, horizon=16)
 
     # We can now instantiate our policy with this config and the dataset stats.
     policy = DiffusionPolicy(cfg)
@@ -97,7 +97,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
             4 * frame_time, 
             5 * frame_time, 
             6 * frame_time, 
-            7 * frame_time, 
+            
         ]
     }
 
