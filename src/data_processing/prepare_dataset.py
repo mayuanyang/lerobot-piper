@@ -183,7 +183,7 @@ def generate_meta_files(output_dir: Path, task_title: str, episode_data: Episode
                     "video.fps": round(episode_data.fps, 2),
                     "video.codec": "av1",
                     "video.pix_fmt": "yuv420p",
-                    "video.is_depth_map": False,
+                    "video.is_depth_map": 'depth' in camera_name.lower(),
                     "has_audio": False
                 }
             }

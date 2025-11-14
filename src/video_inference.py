@@ -231,20 +231,55 @@ class VideoInference:
         except Exception as e:
             print(f"Error saving results: {e}")
 
-def create_sample_joint_states(num_frames: int) -> List[np.ndarray]:
+def create_sample_joint_states() -> List[np.ndarray]:
     joint_states = []
-    for i in range(num_frames):
+    
         
-        joints = np.array([
-            -0.07135841252559343,
-            1.6254133016870895,
-            -1.5040269480126633,
-            0.0,
-            -0.5187594912348668,
-            -1.9740392433296308,
-            0.06600000010803342
-        ], dtype=np.float32)
-        joint_states.append(joints)
+    joints1 = np.array([
+        -0.07135841252559343,
+        1.6254133016870895,
+        -1.5040269480126633,
+        0.0,
+        -0.5187594912348668,
+        -1.9740392433296308,
+        0.06600000010803342
+    ], dtype=np.float32)
+    
+    joints2 = np.array([
+        -0.07135841252559343,
+        1.6254133016870895,
+        -1.5040269480126633,
+        0.0,
+        -0.5126108640939633,
+        -1.9740392433296308,
+        0.06600000010803342
+    ], dtype=np.float32)
+    
+    joints3 = np.array([
+        -0.07646108431757542,
+        1.6254133016870895,
+        -1.5040269480126633,
+        0.0,
+        -0.5199573625901166,
+        -1.9740392433296308,
+        0.06600000010803342
+    ], dtype=np.float32)
+    
+    joints4 = np.array([
+        -0.07646108431757542,
+        1.6254133016870895,
+        -1.5040269480126633,
+        0.0,
+        -0.5149285091397431,
+        -1.9740392433296308,
+        0.06600000010803342
+    ], dtype=np.float32)
+    
+    joint_states.append(joints1)
+    joint_states.append(joints2)
+    joint_states.append(joints3)
+    joint_states.append(joints4)
+    
     return joint_states
 
 def main():
@@ -268,8 +303,8 @@ def main():
     print("Processing video files")
     rgb_video_path = "input/robot_session_rgb_20251113_080958.mp4"
     gripper_video_path = "input/robot_session_gripper_20251113_080958.mp4"
-    depth_video_path = "input/depth_video_20251113_080958.mp4"
-    joint_states = create_sample_joint_states(4)
+    depth_video_path = "input/episode_001.mp4"
+    joint_states = create_sample_joint_states()
     
     results = inference_engine.process_video(rgb_video_path, gripper_video_path, depth_video_path, joint_states)
     inference_engine.save_results(results, "temp/inference_results.json")

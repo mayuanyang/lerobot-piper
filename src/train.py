@@ -57,10 +57,16 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
     fps = 10
     frame_time = 1 / fps  # 0.1 seconds
     obs_temporal_window = [
-        -3 * frame_time,  # Previous 3rd step
-        -2 * frame_time,  # Previous 2nd step
-        -1 * frame_time,  # Previous 1st step
-        0.0               # Current step
+        -9 * frame_time,
+        -8 * frame_time,
+        -7 * frame_time,
+        -6 * frame_time,
+        -5 * frame_time,
+        -4 * frame_time,
+        -3 * frame_time,
+        -2 * frame_time,
+        -1 * frame_time,
+        0.0              
     ]
 
     delta_timestamps = {
@@ -76,6 +82,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
         
         # Action stream remains the same, as it's independent of the cameras
         "action": [
+            -8 * frame_time,
+            -7 * frame_time,
+            -6 * frame_time,
+            -5 * frame_time,
+            -4 * frame_time,
             -3 * frame_time, 
             -2 * frame_time, 
             -1 * frame_time, 
@@ -87,11 +98,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
             5 * frame_time, 
             6 * frame_time, 
             7 * frame_time, 
-            8 * frame_time, 
-            9 * frame_time, 
-            10 * frame_time, 
-            11 * frame_time, 
-            12 * frame_time
         ]
     }
 
