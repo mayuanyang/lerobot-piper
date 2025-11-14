@@ -36,7 +36,7 @@ def test_preprocess_frame():
     print(f"Processed frame range: [{processed_frame.min():.3f}, {processed_frame.max():.3f}]")
     
     # Verify the preprocessing
-    assert processed_frame.shape == (3, 400, 640), f"Expected shape (3, 400, 640), got {processed_frame.shape}"
+    assert processed_frame.shape == (84, 84, 3), f"Expected shape (84, 84, 3), got {processed_frame.shape}"
     assert processed_frame.dtype == np.float32, f"Expected dtype float32, got {processed_frame.dtype}"
     assert 0 <= processed_frame.min() <= processed_frame.max() <= 1, "Values should be normalized to [0, 1]"
     
