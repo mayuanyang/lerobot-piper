@@ -88,8 +88,7 @@ class VideoInference:
         
         # 2. Convert to float32 and normalize
         frame_processed = frame_resized.astype(np.float32)
-        if frame_resized.dtype == np.uint8:
-            frame_processed = frame_processed / 255.0
+        
 
         # 3. CRITICAL: Ensure frame has a channel dimension (H, W, C)
         # If the frame is (H, W) (2 dimensions), we need to add a channel dimension (H, W, 1)
