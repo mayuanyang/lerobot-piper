@@ -13,7 +13,7 @@ class CameraData:
 class EpisodeData:
     """A class to handle inference with trained LeRobot policies."""
     
-    def __init__(self, joint_data_json_path: Path, episode_index: int, fps: int, global_index_offset: int, cameras: List[CameraData]):
+    def __init__(self, joint_data_json_path: Path, episode_index: int, fps: int, global_index_offset: int, cameras: List[CameraData], folder: str = ""):
         self.joint_data_json_path = joint_data_json_path
         self.episode_index = episode_index
         self.fps = fps
@@ -21,4 +21,4 @@ class EpisodeData:
         self.cameras = cameras
         self.num_of_frames = 0
         self.dataset_from_index = 0
-        
+        self.folder = folder

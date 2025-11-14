@@ -4,9 +4,11 @@ import shutil
 import pandas as pd
 from datasets import Dataset, Features, Value, Sequence
 from pathlib import Path
+import glob
 # Added imports for Parquet generation (required for tasks.parquet)
 import pyarrow as pa
 import pyarrow.parquet as pq
+import cv2
 from datetime import datetime
 from .episode_data import EpisodeData
 
@@ -235,9 +237,7 @@ def generate_meta_files(output_dir: Path, task_title: str, episode_data: Episode
 
 
 def generate_video_files(output_dir: Path, episode_data: EpisodeData, json_data: dict):
-    print("\n--- Generating videos ---")
-    input_videos_path = json_data.get("video_files", ["path/to/placeholder.mp4"])
-    
+        
     for camera_data in episode_data.cameras:
         camera_name = camera_data.camera
         cam_folder = f"observation.images.{camera_name}"
@@ -254,6 +254,75 @@ def generate_video_files(output_dir: Path, episode_data: EpisodeData, json_data:
             shutil.copy(video_file_path, video_chunk_dir / output_video_name)
         else:
             print(f"⚠️ WARNING: Video file not found at {camera_data.video_path}. Skipping video copy.")
+    
+    # Generate video from images from depth images
+    video_chunk_dir = output_dir / "videos" / "observation.images.depth" / f"chunk-{episode_data.episode_index:03d}"
+    video_chunk_dir.mkdir(parents=True, exist_ok=True)
+    output_video_name = f"episode_{episode_data.episode_index:03d}.mp4"
+    
+    # Get the only subfolder in episode_data.folder
+    folder_path = Path(episode_data.folder)
+    subfolders = [f for f in folder_path.iterdir() if f.is_dir()]
+    
+    if len(subfolders) == 1:
+        image_folder = subfolders[0]
+        create_video_from_images(image_folder, video_chunk_dir / output_video_name, fps=episode_data.fps)
+    elif len(subfolders) == 0:
+        print(f"⚠️ WARNING: No subfolders found in {folder_path}. Skipping video creation.")
+    else:
+        print(f"⚠️ WARNING: Multiple subfolders found in {folder_path}. Expected exactly one. Skipping video creation.")
+
+
+def create_video_from_images(image_folder, output_video_path, fps=30):
+    """
+    Creates a video from a sequence of PNG images in a folder.
+    
+    Parameters:
+    image_folder (str): Path to the folder containing PNG images
+    output_video_path (str): Path where the output video will be saved (e.g., 'output_video.mp4')
+    fps (int): Frames per second for the output video (default: 30)
+    """
+    
+    # Get all PNG files in the folder and sort them
+    image_files = sorted(glob.glob(os.path.join(image_folder, "*.png")))
+    
+    if not image_files:
+        print("No PNG images found in the specified folder.")
+        return
+    
+    print(f"Found {len(image_files)} PNG images")
+    
+    # Read the first image to get dimensions
+    first_image = cv2.imread(image_files[0])
+    if first_image is None:
+        print(f"Could not read the first image: {image_files[0]}")
+        return
+    
+    height, width, layers = first_image.shape
+    size = (width, height)
+    
+    # Define the codec and create VideoWriter object
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec for MP4
+    out = cv2.VideoWriter(output_video_path, fourcc, fps, size)
+    
+    # Process each image
+    for i, image_path in enumerate(image_files):
+        img = cv2.imread(image_path)
+        if img is None:
+            print(f"Warning: Could not read image {image_path}")
+            continue
+        
+        # Write the frame to the video
+        out.write(img)
+        
+        # Print progress every 100 frames
+        if (i + 1) % 100 == 0:
+            print(f"Processed {i + 1}/{len(image_files)} images")
+    
+    # Release everything when done
+    out.release()
+    print(f"Video successfully created: {output_video_path}")
+    
 
 def update_total_frames_from_episodes(output_dir: Path):
     """
