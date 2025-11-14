@@ -28,8 +28,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
 
         # Number of offline training steps (we'll only do offline training for this example.)
     # Adjust as you prefer. 5000 steps are needed to get something worth evaluating.
-    training_steps = 100
+    training_steps = 3000  # Increased to demonstrate checkpoint saving
     log_freq = 1
+    checkpoint_freq = 1000  # Save checkpoint every 1000 steps
 
     # When starting from scratch (i.e. not from a pretrained policy), we need to specify 2 things before
     # creating the policy:
@@ -122,6 +123,16 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
 
             if step % log_freq == 0:
                 prog_bar.set_postfix({"step": step, "loss": f"{loss.item():.3f}"})
+            
+            # Save checkpoint every checkpoint_freq steps
+            if step > 0 and step % checkpoint_freq == 0:
+                checkpoint_dir = output_directory / f"checkpoint-{step}"
+                checkpoint_dir.mkdir(exist_ok=True)
+                policy.save_pretrained(checkpoint_dir)
+                preprocessor.save_pretrained(checkpoint_dir)
+                postprocessor.save_pretrained(checkpoint_dir)
+                print(f"Checkpoint saved at step {step}")
+                
             step += 1
             if step >= training_steps:
                 done = True

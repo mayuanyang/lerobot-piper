@@ -251,6 +251,7 @@ def generate_video_files(output_dir: Path, episode_data: EpisodeData, json_data:
         # Copy video file to the new directory structure
         video_file_path = Path(camera_data.video_path)
         if video_file_path.exists():
+          if not 'depth' in camera_name.lower():
             shutil.copy(video_file_path, video_chunk_dir / output_video_name)
         else:
             print(f"⚠️ WARNING: Video file not found at {camera_data.video_path}. Skipping video copy.")
