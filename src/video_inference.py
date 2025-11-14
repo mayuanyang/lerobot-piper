@@ -272,7 +272,7 @@ def main():
     joint_states = create_sample_joint_states(4)
     
     results = inference_engine.process_video(rgb_video_path, gripper_video_path, depth_video_path, joint_states)
-    inference_engine.save_results(results, "inference_results.json")
+    inference_engine.save_results(results, "temp/inference_results.json")
     print(f"Processed {len(results)} frames")
     
 

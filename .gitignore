@@ -211,3 +211,4 @@ output/
 model_output/
 data/
 input/
+temp/
