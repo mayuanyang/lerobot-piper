@@ -22,47 +22,20 @@ class VideoInference:
     """A class to handle video-based inference with trained LeRobot policies."""
     
     def __init__(self, model_path: str, dataset_id: str = "ISdept/piper_arm"):
-        """
-        Initialize the video inference engine.
-        
-        Args:
-            model_path (str): Path to the trained model directory
-            dataset_id (str): ID of the dataset used for training
-        """
         self.model_path = Path(model_path)
         self.dataset_id = dataset_id
         self.inference_engine = LeRobotInference(model_path, dataset_id)
         self.device = self.inference_engine.device
         
     def load_model(self) -> bool:
-        """
-        Load the trained model and preprocessors.
-        
-        Returns:
-            bool: True if model loaded successfully, False otherwise
-        """
         print(f"Loading model from: {self.model_path}")
         return self.inference_engine.load_model()
     
     def is_model_loaded(self) -> bool:
-        """
-        Check if the model is loaded.
-        
-        Returns:
-            bool: True if model is loaded, False otherwise
-        """
         return self.inference_engine.policy is not None
     
     def load_video(self, video_path: str) -> Optional[cv2.VideoCapture]:
-        """
-        Load a video file for processing.
         
-        Args:
-            video_path (str): Path to the video file
-            
-        Returns:
-            cv2.VideoCapture: Video capture object or None if failed
-        """
         try:
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
@@ -74,46 +47,18 @@ class VideoInference:
             return None
     
     def preprocess_frame(self, frame: np.ndarray, target_size: Tuple[int, int] = (400, 640)) -> np.ndarray:
-        """
-        Preprocess a video frame for model input.
-        
-        Args:
-            frame (np.ndarray): Raw video frame
-            target_size (tuple): Target size (height, width) for resizing
-            
-        Returns:
-            np.ndarray: Preprocessed frame in channels-first format [C, H, W]
-        """
-        # Convert BGR to RGB
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
         # Resize to expected input size
-        frame_resized = cv2.resize(frame_rgb, (target_size[1], target_size[0]))  # width, height
-        
-        # Normalize to [0, 1] range
-        frame_normalized = frame_resized.astype(np.float32) / 255.0
+        frame_resized = cv2.resize(frame, (target_size[1], target_size[0]))  # width, height
         
         # Convert from [H, W, C] to [C, H, W] format (channels first)
-        frame_channels_first = np.transpose(frame_normalized, (2, 0, 1))
+        frame_channels_first = np.transpose(frame_resized, (2, 0, 1))
         
         return frame_channels_first
     
     def process_video(self, rgb_video_path: str, gripper_video_path: str, depth_video_path: str, 
-                     joint_states: Optional[List[np.ndarray]] = None, 
+                     joint_states: List[np.ndarray], 
                      target_size: Tuple[int, int] = (400, 640)) -> List[Dict[str, Any]]:
-        """
-        Process three video files (RGB, gripper, depth) and run inference on each frame.
         
-        Args:
-            rgb_video_path (str): Path to the RGB video file
-            gripper_video_path (str): Path to the gripper video file
-            depth_video_path (str): Path to the depth video file
-            joint_states (list): Optional list of joint states for each frame
-            target_size (tuple): Target size (height, width) for frame preprocessing
-            
-        Returns:
-            list: List of inference results for each frame
-        """
         # Load videos
         rgb_cap = self.load_video(rgb_video_path)
         if rgb_cap is None:
@@ -162,9 +107,9 @@ class VideoInference:
                 }
                 
                 # Add joint state if provided
-                if joint_states is not None and frame_count < len(joint_states):
+                if frame_count < len(joint_states):
                     observation["observation.state"] = joint_states[frame_count]
-                elif joint_states is not None and len(joint_states) > 0:
+                elif len(joint_states) > 0:
                     # Use last available joint state
                     observation["observation.state"] = joint_states[-1]
                 
@@ -200,57 +145,9 @@ class VideoInference:
         
         print(f"Finished processing {frame_count} frames")
         return results
-    
-    def process_single_frame(self, frame_path: str, joint_state: Optional[np.ndarray] = None,
-                           target_size: Tuple[int, int] = (400, 640)) -> Dict[str, Any]:
-        """
-        Process a single image frame and run inference.
-        
-        Args:
-            frame_path (str): Path to the image file
-            joint_state (np.ndarray): Optional joint state
-            target_size (tuple): Target size (height, width) for frame preprocessing
-            
-        Returns:
-            dict: Inference result
-        """
-        try:
-            # Load image
-            frame = cv2.imread(frame_path)
-            if frame is None:
-                print(f"Cannot load image: {frame_path}")
-                return {"success": False, "error": "Cannot load image"}
-            
-            # Preprocess frame
-            processed_frame = self.preprocess_frame(frame, target_size)
-            
-            # Create observation
-            observation = {
-                    "observation.images.rgb": processed_frame,
-                    "observation.images.gripper": processed_frame,
-                    "observation.images.depth": processed_frame  # Using same frame for both cameras
-            }
-            
-            # Add joint state if provided
-            if joint_state is not None:
-                observation["observation.state"] = joint_state
-            
-            # Run inference
-            result = self.inference_engine.run_inference(observation)
-            return result
-            
-        except Exception as e:
-            print(f"Error processing single frame: {e}")
-            return {"success": False, "error": str(e)}
+
     
     def save_results(self, results: List[Dict[str, Any]], output_path: str):
-        """
-        Save inference results to a file.
-        
-        Args:
-            results (list): List of inference results
-            output_path (str): Path to save results
-        """
         try:
             # Convert results to a serializable format
             serializable_results = []
@@ -312,23 +209,17 @@ def main():
     print("MODEL LOADED SUCCESSFULLY")
     print("=" * 35)
     
-    # Example 1: Process a single image
-    print("\nExample 1: Processing a single image")
-    # Note: You would need to provide an actual image path
-    # result = inference_engine.process_single_frame("path/to/image.jpg")
-    # print(f"Single frame result: {result}")
     
-    # Example 2: Process a video file (uncomment and provide actual video paths)
-    print("\nExample 2: Processing video files")
+    print("Processing video files")
     rgb_video_path = "input/robot_session_rgb_20251113_080958.mp4"  # Replace with actual RGB video path
     gripper_video_path = "input/robot_session_gripper_20251113_080958.mp4"  # Replace with actual gripper video path
     depth_video_path = "input/depth_video_20251113_080958.mp4"  # Replace with actual depth video path
     joint_states = create_sample_joint_states(100)  # Sample joint states
     results = inference_engine.process_video(rgb_video_path, gripper_video_path, depth_video_path, joint_states)
+    inference_engine.save_results(results, "inference_results.json")
     print(f"Processed {results} frames")
     
-    
-    
+
     
 if __name__ == "__main__":
     main()

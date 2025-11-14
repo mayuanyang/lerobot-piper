@@ -51,14 +51,14 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
     preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
 
  
-    # In this case with the standard configuration for Diffusion Policy, it is equivalent to this:
-    # Using multiples of 1/27.38 ≈ 0.0365 to match the dataset FPS
-    # Note: observation.image and observation.state are handled separately by LeRobot and not included in the parquet file
-    # Calculating exact multiples of 1/27.38 for delta timestamps
-
     fps = 10
     frame_time = 1 / fps  # 0.1 seconds
-    obs_temporal_window = [-3 * frame_time, 0.0] # [-0.3, 0.0]
+    obs_temporal_window = [
+        -3 * frame_time,  # Previous 3rd step
+        -2 * frame_time,  # Previous 2nd step
+        -1 * frame_time,  # Previous 1st step
+        0.0               # Current step
+    ]
 
     delta_timestamps = {
         # 🟢 NEW: EXPLICITLY list all camera keys with the same temporal sequence
