@@ -14,10 +14,16 @@ import collections
 fps = 10
 frame_time = 1 / fps  # 0.1 seconds
 obs_temporal_window = [
-    -3 * frame_time,  # Previous 3rd step
-    -2 * frame_time,  # Previous 2nd step
-    -1 * frame_time,  # Previous 1st step
-    0.0               # Current step
+    -9 * frame_time,
+    -8 * frame_time,
+    -7 * frame_time,
+    -6 * frame_time,
+    -5 * frame_time,
+    -4 * frame_time,
+    -3 * frame_time,
+    -2 * frame_time,
+    -1 * frame_time,
+    0.0    
 ]
 HISTORY_LENGTH = len(obs_temporal_window)
 

@@ -62,7 +62,7 @@ class LeRobotInference:
             
             # Recreate the config used during training
             print("Creating policy configuration...")
-            cfg = DiffusionConfig(input_features=input_features, output_features=output_features, n_obs_steps=4, horizon=16)
+            cfg = DiffusionConfig(input_features=input_features, output_features=output_features, n_obs_steps=10, horizon=16)
             
             # Initialize the policy
             print("Initializing policy...")

@@ -75,32 +75,50 @@ def create_episodes_parquet_index(root_dir: Path, episode_index: int):
     
     print(f"✅ Successfully created episodes index dataset at: {episodes_parquet_dir}")
 
-def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: dict):
-    print("\n--- Generating data files ---")
+def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: dict, last_frames_to_chop: int):
+    print("\n--- Generating data files (chopping last frames) ---")
+    
     num_joints = len(json_data["joint_names"])
-    num_frames = len(json_data["frames"])
+    original_num_frames = len(json_data["frames"])
+    effective_num_frames = original_num_frames - last_frames_to_chop
+    
+    if effective_num_frames <= 0:
+        print(f"❌ ERROR: Chopping {last_frames_to_chop} frames from {original_num_frames} results in 0 or fewer frames. Skipping data generation.")
+        return 0
+
     joint_positions = [frame["joint_positions"] for frame in json_data["frames"]]
     
-    
-    
-    # Create frames with state observations (image references are handled separately)
     lerobot_frames = []
     timestamp_base = 0.0
-    for i in range(num_frames):
+    
+    for i in range(effective_num_frames):
+        # Determine the action for the current frame
+        if i < effective_num_frames - 1:
+             action = joint_positions[i + 1]
+        else:
+             # For the last frame, use the current position (or zero/no-op action)
+             action = joint_positions[i] 
+
+        is_done = (i == effective_num_frames - 1)
+        
+        # 🟢 CORRECTION: Correct calculation of the global 'index'
+        # The global index is the offset + the current frame's index (i)
+        global_index = episode_data.global_index_offset + i
+        
         lerobot_frames.append({
             "observation.state": joint_positions[i],
-            "action": joint_positions[i + 1] if i < num_frames - 1 else joint_positions[i],
+            "action": action,
             "timestamp": timestamp_base,
             "episode_index": episode_data.episode_index,
-            "frame_index": json_data["frames"][i]["frame_index"],
-            "index": episode_data.episode_index * num_frames + i,
-            "next.done": i == num_frames - 1,
-            "next.reward": 0.0,
+            "frame_index": json_data["frames"][i]["frame_index"], # Local index (0, 1, 2, ...)
+            "index": global_index, # Global index (0, 1, 2, ..., N)
+            "next.done": is_done,
+            "next.reward": 1.0 if is_done else 0.0,
             "task_index": 0,
         })
         timestamp_base += 0.1
         
-    # Create dataset with proper features including image
+    # [Rest of the function remains the same, writing to Parquet]
     hf_dataset = Dataset.from_pandas(pd.DataFrame(lerobot_frames))
     
     feature_config = Features({
@@ -123,27 +141,36 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     parquet_path = chunk_dir / f"file-{episode_data.episode_index:03d}.parquet"
     hf_dataset.to_parquet(parquet_path)
     
-    return num_frames
+    return effective_num_frames
 
-def generate_meta_files(output_dir: Path, task_title: str, episode_data: EpisodeData, json_data: dict, is_first_episode: bool = False):
+# Modified signature to accept last_frames_to_chop
+def generate_meta_files(output_dir: Path, task_title: str, episode_data: EpisodeData, json_data: dict, is_first_episode: bool = False, last_frames_to_chop: int = 0):
     print("\n--- Generating meta ---")
-    # Get data path and video path
-    data_path = "data/episode-{episode_index:03d}/file-{episode_index:03d}.parquet"
+    
+    # [File path definitions and checks remain the same...]
+    data_path = "data/chunk-{episode_index:03d}/file-{episode_index:03d}.parquet"
     video_path = "videos/{video_key}/chunk-{chunk_index:03d}/episode_{chunk_index:03d}.mp4"
+    info_json_path = output_dir / "meta" / "info.json"
     
     num_joints = len(json_data["joint_names"])
-    num_frames = len(json_data["frames"])
-    joint_positions = [frame["joint_positions"] for frame in json_data["frames"]]
     
-    # For the first episode, we need to create a new info.json, for subsequent episodes we'll update it
-    info_json_path = output_dir / "meta" / "info.json"
+    # 🔴 CORE CHANGE 1: Use the effective number of frames
+    original_num_frames = len(json_data["frames"])
+    effective_num_frames = original_num_frames - last_frames_to_chop
+    
+    if effective_num_frames <= 0:
+        print(f"❌ ERROR: Effective frame count is 0 or less ({effective_num_frames}). Skipping meta generation.")
+        return
+        
+    # --- Update info.json ---
+    
     if is_first_episode or not info_json_path.exists():
         # Create base info_json structure
         info_json = {
             "codebase_version": "v3.0", 
             "fps": round(episode_data.fps, 2),
             "total_episodes": 1,
-            "total_frames": num_frames,
+            "total_frames": effective_num_frames,
             "total_tasks": 1,
             "data_path": data_path,
             "video_path": video_path,
@@ -191,35 +218,38 @@ def generate_meta_files(output_dir: Path, task_title: str, episode_data: Episode
         with open(info_json_path, "w") as f:
             json.dump(info_json, f, indent=2)
     else:
-        # Read existing info.json and update total_frames and total_episodes
+        # Read existing info.json and update totals
         with open(info_json_path, "r") as f:
             info_json = json.load(f)
         
-        # Update totals
-        info_json["total_frames"] = info_json.get("total_frames", 0) + num_frames
+        # 🔴 CORE CHANGE 2: Update totals using effective_num_frames
+        info_json["total_frames"] = info_json.get("total_frames", 0) + effective_num_frames
         info_json["total_episodes"] = info_json.get("total_episodes", 0) + 1
         
         with open(info_json_path, "w") as f:
             json.dump(info_json, f, indent=2)
-        
-    # Define global index bounds
-    dataset_from_index = episode_data.global_index_offset
-    dataset_to_index = episode_data.global_index_offset + num_frames - 1
+            
+    # --- episodes.jsonl (Index) ---
+    
+    # Calculate global index boundaries
+    dataset_from_index = episode_data.global_index_offset 
+    # 🔴 CORE CHANGE 3: dataset_to_index is now based on effective_num_frames
+    dataset_to_index = dataset_from_index + effective_num_frames - 1
     
     # Create base episodes_jsonl structure
     episodes_jsonl = {
         "episode_index": episode_data.episode_index,
         "task_index": 0,
-        "frame_index_offset": 0,
-        "num_frames": num_frames,
+        "frame_index_offset": 0, # Index offset from the start of the Parquet file (always 0 here)
+        "num_frames": effective_num_frames, # 🔴 CORE CHANGE 4: Report effective number of frames
         "dataset_from_index": dataset_from_index,
         "dataset_to_index": dataset_to_index,
         "start_time": json_data["start_time"],
         "end_time": json_data["end_time"],
-        # Add video metadata for each camera
+        # [Video metadata for each camera remains the same...]
     }
     
-    # Add video metadata for each camera
+    # [Rest of episodes.jsonl writing and parquet index creation remains the same...]
     for camera_data in episode_data.cameras:
         camera_name = camera_data.camera
         episodes_jsonl[f"videos/observation.images.{camera_name}/from_timestamp"] = 0.0
@@ -376,7 +406,12 @@ def update_total_frames_from_episodes(output_dir: Path):
         print(f"❌ ERROR: Failed to update total frames: {e}")
 
 
-def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episode: bool = False):
+def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episode: bool = False, last_frames_to_chop: int = 10):
+    """
+    Main function to process one episode.
+    
+    last_frames_to_chop (int): The number of final frames to exclude from the dataset.
+    """
     # Create directories
     os.makedirs(output_dir / "meta", exist_ok=True)
     os.makedirs(output_dir / "data", exist_ok=True)
@@ -385,8 +420,13 @@ def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episod
     with open(episode_data.joint_data_json_path, 'r') as f:
         json_data = json.load(f)
 
+    # Note: We assume generate_video_files either handles chopping internally 
+    # (if source is a video) or is called BEFORE chopping the images/joints.
+    # For now, we assume video files contain all frames and only the tabular data is chopped.
     generate_video_files(output_dir, episode_data, json_data)
         
-    generate_meta_files(output_dir, "Piper Arm Teleoperation", episode_data, json_data, is_first_episode)   
+    # Pass the chop value to meta file generator
+    generate_meta_files(output_dir, "Piper Arm Teleoperation", episode_data, json_data, is_first_episode, last_frames_to_chop)   
    
-    return generate_data_files(output_dir, episode_data, json_data)
+    # Pass the chop value to data file generator
+    return generate_data_files(output_dir, episode_data, json_data, last_frames_to_chop)
