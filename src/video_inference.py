@@ -1,8 +1,3 @@
-"""
-Video-based inference for LeRobot policies.
-This script demonstrates how to process a video file and use it for inference.
-"""
-
 import torch
 import numpy as np
 import cv2
@@ -124,6 +119,7 @@ class VideoInference:
         gripper_history = collections.deque(maxlen=HISTORY_LENGTH)
         depth_history = collections.deque(maxlen=HISTORY_LENGTH)
         state_history = collections.deque(maxlen=HISTORY_LENGTH)
+        predicted_action = None
         
         results = []
         frame_count = 0
@@ -150,13 +146,20 @@ class VideoInference:
                 gripper_history.append(processed_gripper_frame)
                 depth_history.append(processed_depth_frame)
 
-                # ... (Joint state handling remains the same) ...
+                # Handle joint state: use provided joint states for initial frames,
+                # then use predicted actions for autoregressive prediction
                 current_joint_state = None
                 if frame_count < len(joint_states):
                     current_joint_state = joint_states[frame_count]
-                elif len(joint_states) > 0:
-                    current_joint_state = joint_states[-1]
+                elif predicted_action is not None and len(state_history) > 0:
+                    # For autoregressive prediction, use the last predicted action
+                    current_joint_state = predicted_action
+                else:
+                    # Fallback to last known joint state
+                    if len(joint_states) > 0:
+                        current_joint_state = joint_states[-1]
                 
+                # Add current joint state to history
                 if current_joint_state is not None:
                     state_history.append(current_joint_state)
                 
@@ -169,8 +172,6 @@ class VideoInference:
                         break
                     continue
                 
-                
-                # --- Prepare Observation for Inference ---
                 rgb_stacked = np.stack(rgb_history).astype(np.float32)
                 gripper_stacked = np.stack(gripper_history).astype(np.float32)
                 depth_stacked = np.stack(depth_history).astype(np.float32)
@@ -179,10 +180,12 @@ class VideoInference:
                 observation = {
                     "observation.images.rgb": rgb_stacked,
                     "observation.images.gripper": gripper_stacked,
-                    "observation.images.depth": depth_stacked
+                    "observation.images.depth": depth_stacked,
                 }
                 
                 # Add stacked joint state history (T, D)
+                # This includes both actual joint states (initial frames) and
+                # predicted actions (subsequent frames) for autoregressive prediction
                 if len(state_history) == HISTORY_LENGTH:
                     observation["observation.state"] = np.stack(state_history).astype(np.float32)
                 
@@ -190,6 +193,29 @@ class VideoInference:
                 result = self.inference_engine.run_inference(observation)
                 result["frame_index"] = frame_count
                 results.append(result)
+                
+                
+                # Process the predicted action for autoregressive prediction
+                if result["success"] and "result" in result and "action" in result["result"]:
+                    predicted_action = result["result"]["action"]
+                    
+                    # Ensure the action is in the correct format (numpy array)
+                    if isinstance(predicted_action, np.ndarray):
+                        # For diffusion policies, we typically use the first action in the sequence
+                        if len(predicted_action.shape) > 1:
+                            predicted_action = predicted_action[0]
+                    else:
+                        # If it's not already a numpy array, convert it
+                        if isinstance(predicted_action, (list, tuple)):
+                            predicted_action = np.array(predicted_action, dtype=np.float32)
+                            if len(predicted_action.shape) > 1:
+                                predicted_action = predicted_action[0]
+                        else:
+                            predicted_action = np.array([predicted_action], dtype=np.float32)
+                    
+                    # Ensure the action is the correct shape (7 DOF for joint positions)
+                    if predicted_action.shape != (7,):
+                        print(f"Warning: Unexpected action shape {predicted_action.shape}, expected (7,)")
                 
                 # Display and progress updates (omitted boilerplate for brevity)
                 cv2.imshow('RGB Video Input', rgb_frame)
@@ -218,8 +244,6 @@ class VideoInference:
         return results
 
     
-    # ... (save_results and create_sample_joint_states remain the same) ...
-
     def save_results(self, results: List[Dict[str, Any]], output_path: str):
         try:
             import json
@@ -251,40 +275,8 @@ def create_sample_joint_states() -> List[np.ndarray]:
         0.06600000010803342
     ], dtype=np.float32)
     
-    joints2 = np.array([
-        -0.07135841252559343,
-        1.6254133016870895,
-        -1.5040269480126633,
-        0.0,
-        -0.5126108640939633,
-        -1.9740392433296308,
-        0.06600000010803342
-    ], dtype=np.float32)
-    
-    joints3 = np.array([
-        -0.07646108431757542,
-        1.6254133016870895,
-        -1.5040269480126633,
-        0.0,
-        -0.5199573625901166,
-        -1.9740392433296308,
-        0.06600000010803342
-    ], dtype=np.float32)
-    
-    joints4 = np.array([
-        -0.07646108431757542,
-        1.6254133016870895,
-        -1.5040269480126633,
-        0.0,
-        -0.5149285091397431,
-        -1.9740392433296308,
-        0.06600000010803342
-    ], dtype=np.float32)
-    
+      
     joint_states.append(joints1)
-    joint_states.append(joints2)
-    joint_states.append(joints3)
-    joint_states.append(joints4)
     
     return joint_states
 

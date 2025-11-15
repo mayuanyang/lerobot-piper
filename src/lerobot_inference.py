@@ -66,9 +66,10 @@ class LeRobotInference:
             
             # Initialize the policy
             print("Initializing policy...")
+            #self.policy = DiffusionPolicy.from_pretrained("ISdept/piper_arm")
             self.policy = DiffusionPolicy(cfg)
             
-            # Load the trained weights
+            
             safetensors_path = self.model_path / "model.safetensors"
             pytorch_path = self.model_path / "pytorch_model.bin"
             
