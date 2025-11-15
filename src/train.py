@@ -97,7 +97,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
             4 * frame_time, 
             5 * frame_time, 
             6 * frame_time, 
-            
+            7 * frame_time, 
         ]
     }
 
