@@ -36,7 +36,6 @@ class LeRobotInference:
         print(f"Using device: {self.device}")
         
     def load_model(self) -> bool:
-        # ... (load_model method remains unchanged) ...
         try:
             # Check if model directory exists
             if not self.model_path.exists():
@@ -48,14 +47,27 @@ class LeRobotInference:
             # Try to load from local dataset first
             try:
                 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-                dataset = LeRobotDataset(self.dataset_id)
+                #dataset = LeRobotDataset(self.dataset_id)
+                dataset = LeRobotDataset(
+                    self.dataset_id, 
+                    force_cache_sync=True,  # Ensure up-to-date metadata
+                    revision="main"
+                )
                 features = dataset.features
                 dataset_metadata = dataset.meta
-            except:
+                # CRITICAL: Get the dataset statistics for normalization
+                dataset_stats = dataset.stats  # This is what was missing!
+            except Exception as e:
+                print(f"Could not load local dataset, trying HuggingFace: {e}")
                 # Fallback to loading from HuggingFace
                 dataset_metadata = LeRobotDatasetMetadata(self.dataset_id, force_cache_sync=True, revision="main")
                 features = dataset_metadata.features
-                
+                # For HuggingFace datasets, stats might be in dataset_metadata.stats
+                dataset_stats = getattr(dataset_metadata, 'stats', None)
+                if dataset_stats is None:
+                    print("WARNING: Dataset statistics not found. Actions may not be properly unnormalized.")
+            
+                      
             features = dataset_to_policy_features(features)
             output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
             input_features = {key: ft for key, ft in features.items() if key not in output_features}
@@ -66,9 +78,7 @@ class LeRobotInference:
             
             # Initialize the policy
             print("Initializing policy...")
-            #self.policy = DiffusionPolicy.from_pretrained("ISdept/piper_arm")
             self.policy = DiffusionPolicy(cfg)
-            
             
             safetensors_path = self.model_path / "model.safetensors"
             pytorch_path = self.model_path / "pytorch_model.bin"
@@ -87,16 +97,24 @@ class LeRobotInference:
             self.policy.eval()
             self.policy.to(self.device)
             
-            # Load preprocessors
+            # Load preprocessors with proper dataset statistics
             print("Loading preprocessors...")
-            self.preprocessor, self.postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
+            if dataset_stats is not None:
+                self.preprocessor, self.postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_stats)
+                print('The dataset statistics have been loaded successfully for preprocessing.', dataset_stats)
+            else:
+                print("WARNING: Loading preprocessors without dataset statistics. Results may be incorrect.")
+                self.preprocessor, self.postprocessor = make_pre_post_processors(cfg, dataset_stats=None)
             
             print("Model loaded successfully!")
             return True
             
         except Exception as e:
             print(f"Error loading model: {e}")
+            import traceback
+            traceback.print_exc()
             return False
+
     
     def preprocess_observation(self, observation: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """

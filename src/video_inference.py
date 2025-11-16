@@ -87,9 +87,9 @@ class VideoInference:
         # 1. Resize (cv2 expects (W, H))
         frame_resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
         
-        # 2. Convert to float32 and normalize
+        # Convert to float32 and normalize to [0,1] range
         frame_processed = frame_resized.astype(np.float32)
-        
+                
 
         # 3. CRITICAL: Ensure frame has a channel dimension (H, W, C)
         # If the frame is (H, W) (2 dimensions), we need to add a channel dimension (H, W, 1)

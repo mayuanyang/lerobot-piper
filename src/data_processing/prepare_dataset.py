@@ -11,6 +11,9 @@ import pyarrow.parquet as pq
 import cv2
 from datetime import datetime
 from .episode_data import EpisodeData
+import numpy as np
+from lerobot.datasets.compute_stats import compute_episode_stats, aggregate_stats
+from lerobot.datasets.utils import load_info, write_stats
 
 
 
@@ -256,6 +259,8 @@ def generate_meta_files(output_dir: Path, task_title: str, episode_data: Episode
         episodes_jsonl[f"videos/observation.images.{camera_name}/chunk_index"] = episode_data.episode_index
         episodes_jsonl[f"videos/observation.images.{camera_name}/file_index"] = episode_data.episode_index
         episodes_jsonl[f"videos/observation.images.{camera_name}/frame_index_offset"] = 0
+        episodes_jsonl[f"data/chunk_index"] = episode_data.episode_index
+        episodes_jsonl[f"data/file_index"] = episode_data.episode_index
         
     
     with open(output_dir / "meta" / "episodes.jsonl", "a") as f:
@@ -404,6 +409,166 @@ def update_total_frames_from_episodes(output_dir: Path):
         
     except Exception as e:
         print(f"❌ ERROR: Failed to update total frames: {e}")
+
+
+def compute_and_save_dataset_stats(output_dir: Path):
+    """
+    Compute dataset statistics for all episodes and save them to stats.json.
+    """
+    print("\n--- Computing and saving dataset statistics ---")
+    
+    # Load dataset info
+    try:
+        info = load_info(output_dir)
+        features = info["features"]
+        print("✅ Successfully loaded dataset info.", features)
+    except Exception as e:
+        print(f"❌ ERROR: Failed to load dataset info: {e}")
+        return
+    
+    # Load episodes data
+    episodes_jsonl_path = output_dir / "meta" / "episodes.jsonl"
+    if not episodes_jsonl_path.exists():
+        print(f"❌ WARNING: {episodes_jsonl_path} not found. Skipping stats computation.")
+        return
+    
+    # Read all episodes
+    episodes_data = []
+    try:
+        with open(episodes_jsonl_path, 'r') as f:
+            for line in f:
+                if line.strip():
+                    episodes_data.append(json.loads(line))
+    except Exception as e:
+        print(f"❌ ERROR: Failed to read episodes data: {e}")
+        return
+    
+    if not episodes_data:
+        print("❌ WARNING: No episodes data found. Skipping stats computation.")
+        return
+    
+    # Collect statistics for all episodes
+    all_episode_stats = []
+    
+    for episode_info in episodes_data:
+        episode_index = episode_info["episode_index"]
+        
+        # Load the parquet data for this episode
+        chunk_index = episode_info.get("data/chunk_index", episode_index)
+        file_index = episode_info.get("data/file_index", episode_index)
+        parquet_path = output_dir / "data" / f"chunk-{chunk_index:03d}" / f"file-{file_index:03d}.parquet"
+        
+        if not parquet_path.exists():
+            print(f"⚠️ WARNING: Parquet file not found for episode {episode_index}: {parquet_path}")
+            continue
+            
+        try:
+            # Load parquet data
+            episode_dataset = pd.read_parquet(parquet_path)
+            
+            # Convert to the format expected by compute_episode_stats
+            episode_dict = {}
+            for column in episode_dataset.columns:
+                if column in features:
+                    if features[column]["dtype"] in ["image", "video"]:
+                        # For image/video features, collect the paths to the video files
+                        # Extract camera name from the column name (e.g., "observation.images.rgb" -> "rgb")
+                        camera_name = column.split(".")[-1]
+                        
+                        # Construct the video file path based on the episodes.jsonl info
+                        chunk_index = episode_info.get(f"videos/observation.images.{camera_name}/chunk_index", episode_index)
+                        video_path = output_dir / "videos" / f"observation.images.{camera_name}" / f"chunk-{chunk_index:03d}" / f"episode_{chunk_index:03d}.mp4"
+                        
+                        # Create a list of video paths for all frames in this episode
+                        num_frames = episode_info["num_frames"]
+                        video_paths = [str(video_path)] * num_frames
+                        
+                        episode_dict[column] = video_paths
+                    else:
+                        # Extract values and ensure they're in the right format
+                        column_data = episode_dataset[column].values
+                        
+                        # Handle fixed-size list data (common in parquet files)
+                        if len(column_data) > 0:
+                            # Check if we have array-like data that needs special handling
+                            first_element = column_data[0]
+                            # Use a very safe check to avoid boolean ambiguity errors
+                            is_array_like = False
+                            try:
+                                # Only check for __len__ if it's safe to do so
+                                if not isinstance(first_element, (str, bytes)):
+                                    is_array_like = hasattr(first_element, '__len__')
+                            except:
+                                # If any check fails, assume it's not array-like
+                                is_array_like = False
+                            
+                            if is_array_like:
+                                # For fixed-size lists, convert to proper 2D numpy array
+                                try:
+                                    # Convert to list first to handle pandas arrays properly
+                                    if hasattr(column_data, 'tolist'):
+                                        temp_list = column_data.tolist()
+                                    else:
+                                        temp_list = list(column_data)
+                                    
+                                    # Convert directly to numpy array with float32 dtype
+                                    # This should handle most cases correctly
+                                    column_data = np.array(temp_list, dtype=np.float32)
+                                except Exception as e:
+                                    print(f"Warning: Could not convert {column} data to 2D array: {e}")
+                                    # Fallback to object array to prevent issues
+                                    try:
+                                        column_data = np.array(temp_list, dtype=object)
+                                    except:
+                                        # Last resort: keep original data
+                                        pass
+                            else:
+                                # For scalar data, ensure it's a proper numpy array
+                                if not isinstance(column_data, np.ndarray):
+                                    try:
+                                        column_data = np.array(column_data)
+                                    except:
+                                        pass  # Keep as-is
+                        
+                        episode_dict[column] = column_data
+            
+            # Compute stats for this episode
+            try:
+                episode_stats = compute_episode_stats(episode_dict, features)
+                all_episode_stats.append(episode_stats)
+                print(f"✅ Computed stats for episode {episode_index}")
+            except Exception as e:
+                # Check if this is the specific error we're trying to fix
+                error_msg = str(e)
+                if "truth value of an array with more than one element is ambiguous" in error_msg:
+                    print(f"❌ ERROR: Ambiguous array truth value error for episode {episode_index}")
+                    print(f"Column data types for episode {episode_index}:")
+                    for col, data in episode_dict.items():
+                        print(f"  {col}: type={type(data)}, shape={getattr(data, 'shape', 'N/A')}")
+                        if hasattr(data, '__len__') and len(data) > 0:
+                            print(f"    first element: {type(data[0])}")
+                            if hasattr(data[0], '__len__'):
+                                print(f"    first element shape: {getattr(data[0], 'shape', 'N/A')}")
+                raise  # Re-raise the exception after logging
+            
+        except Exception as e:
+            print(f"❌ ERROR: Failed to compute stats for episode {episode_index}: {e}")
+            continue
+    
+    if not all_episode_stats:
+        print("❌ ERROR: No episode statistics computed.")
+        return
+    
+    # Aggregate statistics across all episodes
+    try:
+        aggregated_stats = aggregate_stats(all_episode_stats)
+        
+        # Save statistics to stats.json
+        write_stats(aggregated_stats, output_dir)
+        print(f"✅ Successfully computed and saved dataset statistics to: {output_dir / 'meta' / 'stats.json'}")
+        
+    except Exception as e:
+        print(f"❌ ERROR: Failed to aggregate or save statistics: {e}")
 
 
 def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episode: bool = False, last_frames_to_chop: int = 10):
