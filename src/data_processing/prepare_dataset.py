@@ -121,13 +121,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
             "task_index": 0,
         }
         
-        # Add observation images for each camera
-        for camera_data in episode_data.cameras:
-            camera_name = camera_data.camera
-            feature_key = f"observation.images.{camera_name}"
-            # Store episode index as reference to locate the video file
-            frame_data[feature_key] = episode_data.episode_index
-        
+                
         lerobot_frames.append(frame_data)
         timestamp_base += 0.1
         
@@ -147,12 +141,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         "task_index": Value("int64"),
     }
     
-    # Add camera features to the feature configuration
-    for camera_data in episode_data.cameras:
-        camera_name = camera_data.camera
-        feature_key = f"observation.images.{camera_name}"
-        feature_config_dict[feature_key] = Value("int64")  # Store episode index reference
-    
+        
     feature_config = Features(feature_config_dict)
     hf_dataset = hf_dataset.cast(feature_config)
 
@@ -530,12 +519,20 @@ def compute_and_save_dataset_stats(output_dir: Path):
             if not parquet_path.exists():
                 print(f"⚠️ WARNING: Parquet file not found for episode {episode_index}: {parquet_path}")
                 continue
-                
+            
             try:
                 # Load parquet data
                 episode_dataset = pd.read_parquet(parquet_path)
                 # Convert to the format expected by compute_episode_stats
                 episode_dict = {}
+                
+                # Ensure image columns are processed even if not in the parquet file
+                image_columns = ["observation.images.rgb", "observation.images.depth", "observation.images.gripper"]
+                for image_column in image_columns:
+                    if image_column in features and image_column not in episode_dataset.columns:
+                        # Add the image column to the dataset with episode index values
+                        episode_dataset[image_column] = episode_info["episode_index"]
+                
                 for column in episode_dataset.columns:
                     if column in features:
                         

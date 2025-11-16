@@ -102,7 +102,15 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
     }
 
     # We can then instantiate the dataset with these delta_timestamps configuration.
-    dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, force_cache_sync=True, revision="main", tolerance_s=0.01)
+    # NOTE: Using local dataset instead of remote to avoid schema mismatch
+    try:
+        dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, force_cache_sync=True, revision="main", tolerance_s=0.01)
+    except Exception as e:
+        print(f"Error loading dataset with ID {dataset_id}: {e}")
+        print("Trying to load local dataset...")
+        # Try to load from local path
+        local_dataset_path = "./src/output"  # Adjust this path as needed
+        dataset = LeRobotDataset(local_dataset_path, delta_timestamps=delta_timestamps, force_cache_sync=True, tolerance_s=0.01)
 
     # Then we create our optimizer and dataloader for offline training.
     optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
