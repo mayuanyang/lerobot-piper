@@ -9,11 +9,13 @@ import glob
 import pyarrow as pa
 import pyarrow.parquet as pq
 import cv2
+import traceback
 from datetime import datetime
 from .episode_data import EpisodeData
 import numpy as np
 from lerobot.datasets.compute_stats import compute_episode_stats, aggregate_stats
 from lerobot.datasets.utils import load_info, write_stats
+import tempfile
 
 
 
@@ -22,8 +24,7 @@ def create_tasks_parquet(root_dir: Path, task_title: str):
     Generates the required meta/tasks.parquet file for LeRobot.
     This file defines the available tasks in the dataset (which is mandatory).
     """
-    print("--- Creating meta/tasks.parquet ---")
-    
+        
     # The task index (0) must match the 'task_index' used in episodes.jsonl
     task_data = {
         'task_index': [0],
@@ -40,7 +41,7 @@ def create_tasks_parquet(root_dir: Path, task_title: str):
     tasks_parquet_path = tasks_dir / "tasks.parquet"
 
     pq.write_table(table, tasks_parquet_path)
-    print(f"✅ Successfully created tasks.parquet at: {tasks_parquet_path}")
+    
 
 def create_episodes_parquet_index(root_dir: Path, episode_index: int):
     """
@@ -54,7 +55,7 @@ def create_episodes_parquet_index(root_dir: Path, episode_index: int):
         print(f"❌ WARNING: {episodes_jsonl_path} not found. Skipping episodes index creation.")
         return
 
-    print("\n--- Creating meta/episodes/ index dataset ---")
+    
     
     # 1. Read the JSONL file line by line
     with open(episodes_jsonl_path, 'r') as f:
@@ -75,11 +76,10 @@ def create_episodes_parquet_index(root_dir: Path, episode_index: int):
     
     # Write multiple Parquet files (LeRobot expects this structure)
     pq.write_table(table, data_subdir / f"file-{episode_index:03d}.parquet")
-    
-    print(f"✅ Successfully created episodes index dataset at: {episodes_parquet_dir}")
+
 
 def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: dict, last_frames_to_chop: int):
-    print("\n--- Generating data files (chopping last frames) ---")
+    
     
     num_joints = len(json_data["joint_names"])
     original_num_frames = len(json_data["frames"])
@@ -108,7 +108,8 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         # The global index is the offset + the current frame's index (i)
         global_index = episode_data.global_index_offset + i
         
-        lerobot_frames.append({
+        # Create frame data with observation images for each camera
+        frame_data = {
             "observation.state": joint_positions[i],
             "action": action,
             "timestamp": timestamp_base,
@@ -118,13 +119,23 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
             "next.done": is_done,
             "next.reward": 1.0 if is_done else 0.0,
             "task_index": 0,
-        })
+        }
+        
+        # Add observation images for each camera
+        for camera_data in episode_data.cameras:
+            camera_name = camera_data.camera
+            feature_key = f"observation.images.{camera_name}"
+            # Store episode index as reference to locate the video file
+            frame_data[feature_key] = episode_data.episode_index
+        
+        lerobot_frames.append(frame_data)
         timestamp_base += 0.1
         
     # [Rest of the function remains the same, writing to Parquet]
     hf_dataset = Dataset.from_pandas(pd.DataFrame(lerobot_frames))
     
-    feature_config = Features({
+    # Build feature configuration including camera features
+    feature_config_dict = {
         "observation.state": Sequence(Value("float32"), length=num_joints),
         "action": Sequence(Value("float32"), length=num_joints),
         "timestamp": Value("float64"),
@@ -134,7 +145,15 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         "next.done": Value("bool"),
         "next.reward": Value("float32"),
         "task_index": Value("int64"),
-    })
+    }
+    
+    # Add camera features to the feature configuration
+    for camera_data in episode_data.cameras:
+        camera_name = camera_data.camera
+        feature_key = f"observation.images.{camera_name}"
+        feature_config_dict[feature_key] = Value("int64")  # Store episode index reference
+    
+    feature_config = Features(feature_config_dict)
     hf_dataset = hf_dataset.cast(feature_config)
 
 
@@ -148,7 +167,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
 
 # Modified signature to accept last_frames_to_chop
 def generate_meta_files(output_dir: Path, task_title: str, episode_data: EpisodeData, json_data: dict, is_first_episode: bool = False, last_frames_to_chop: int = 0):
-    print("\n--- Generating meta ---")
+    
     
     # [File path definitions and checks remain the same...]
     data_path = "data/chunk-{episode_index:03d}/file-{episode_index:03d}.parquet"
@@ -286,27 +305,29 @@ def generate_video_files(output_dir: Path, episode_data: EpisodeData, json_data:
         # Copy video file to the new directory structure
         video_file_path = Path(camera_data.video_path)
         if video_file_path.exists():
-          if not 'depth' in camera_name.lower():
             shutil.copy(video_file_path, video_chunk_dir / output_video_name)
         else:
             print(f"⚠️ WARNING: Video file not found at {camera_data.video_path}. Skipping video copy.")
     
     # Generate video from images from depth images
-    video_chunk_dir = output_dir / "videos" / "observation.images.depth" / f"chunk-{episode_data.episode_index:03d}"
-    video_chunk_dir.mkdir(parents=True, exist_ok=True)
-    output_video_name = f"episode_{episode_data.episode_index:03d}.mp4"
-    
-    # Get the only subfolder in episode_data.folder
-    folder_path = Path(episode_data.folder)
-    subfolders = [f for f in folder_path.iterdir() if f.is_dir()]
-    
-    if len(subfolders) == 1:
-        image_folder = subfolders[0]
-        create_video_from_images(image_folder, video_chunk_dir / output_video_name, fps=episode_data.fps)
-    elif len(subfolders) == 0:
-        print(f"⚠️ WARNING: No subfolders found in {folder_path}. Skipping video creation.")
-    else:
-        print(f"⚠️ WARNING: Multiple subfolders found in {folder_path}. Expected exactly one. Skipping video creation.")
+    # Check if there's a depth camera in the episode data
+    depth_cameras = [cam for cam in episode_data.cameras if 'depth' in cam.camera.lower()]
+    if depth_cameras:
+        video_chunk_dir = output_dir / "videos" / "observation.images.depth" / f"chunk-{episode_data.episode_index:03d}"
+        video_chunk_dir.mkdir(parents=True, exist_ok=True)
+        output_video_name = f"episode_{episode_data.episode_index:03d}.mp4"
+        
+        # Get the only subfolder in episode_data.folder
+        folder_path = Path(episode_data.folder)
+        subfolders = [f for f in folder_path.iterdir() if f.is_dir()]
+        
+        if len(subfolders) == 1:
+            image_folder = subfolders[0]
+            create_video_from_images(image_folder, video_chunk_dir / output_video_name, fps=episode_data.fps)
+        elif len(subfolders) == 0:
+            print(f"⚠️ WARNING: No subfolders found in {folder_path}. Skipping video creation.")
+        else:
+            print(f"⚠️ WARNING: Multiple subfolders found in {folder_path}. Expected exactly one. Skipping video creation.")
 
 
 def create_video_from_images(image_folder, output_video_path, fps=30):
@@ -326,7 +347,6 @@ def create_video_from_images(image_folder, output_video_path, fps=30):
         print("No PNG images found in the specified folder.")
         return
     
-    print(f"Found {len(image_files)} PNG images")
     
     # Read the first image to get dimensions
     first_image = cv2.imread(image_files[0])
@@ -351,21 +371,69 @@ def create_video_from_images(image_folder, output_video_path, fps=30):
         # Write the frame to the video
         out.write(img)
         
-        # Print progress every 100 frames
-        if (i + 1) % 100 == 0:
-            print(f"Processed {i + 1}/{len(image_files)} images")
-    
+            
     # Release everything when done
     out.release()
-    print(f"Video successfully created: {output_video_path}")
+
+
+def extract_video_frames_to_temp_dir(video_path: Path, temp_dir: Path) -> list[Path]:
+    """
+    Extract frames from a video file to a temporary directory.
     
+    Args:
+        video_path (Path): Path to the video file
+        temp_dir (Path): Temporary directory to store extracted frames
+        
+    Returns:
+        list[Path]: List of paths to extracted frame images
+    """
+    # Check if video file exists
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+    
+    # Create temporary directory for frames
+    frames_dir = temp_dir / "frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Open video file
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video file: {video_path}")
+    
+    frame_paths = []
+    frame_index = 0
+    
+    # Extract frames
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+            
+        # Save frame as PNG
+        frame_path = frames_dir / f"frame_{frame_index:06d}.png"
+        cv2.imwrite(str(frame_path), frame)
+        frame_paths.append(frame_path)
+        frame_index += 1
+    
+    # Release video capture
+    cap.release()
+    
+    # If no frames were extracted, create a dummy frame
+    if not frame_paths:
+        # Create a black dummy frame
+        dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        frame_path = frames_dir / f"frame_{frame_index:06d}.png"
+        cv2.imwrite(str(frame_path), dummy_frame)
+        frame_paths.append(frame_path)
+    
+    return frame_paths
 
 def update_total_frames_from_episodes(output_dir: Path):
     """
     Reads episodes.jsonl file and calculates the total sum of num_frames,
     then updates info.json with the calculated sum.
     """
-    print("\n--- Updating total frames from episodes ---")
+    
     
     # Path to episodes.jsonl and info.json
     episodes_jsonl_path = output_dir / "meta" / "episodes.jsonl"
@@ -387,7 +455,6 @@ def update_total_frames_from_episodes(output_dir: Path):
                     total_frames += episode_data.get("num_frames", 0)
                     total_episodes += 1
         
-        print(f"Calculated total frames: {total_frames}")
         
         # Read existing info.json
         if not info_json_path.exists():
@@ -405,7 +472,6 @@ def update_total_frames_from_episodes(output_dir: Path):
         with open(info_json_path, 'w') as f:
             json.dump(info_data, f, indent=2)
             
-        print(f"✅ Successfully updated total_frames in info.json to: {total_frames}")
         
     except Exception as e:
         print(f"❌ ERROR: Failed to update total frames: {e}")
@@ -415,13 +481,12 @@ def compute_and_save_dataset_stats(output_dir: Path):
     """
     Compute dataset statistics for all episodes and save them to stats.json.
     """
-    print("\n--- Computing and saving dataset statistics ---")
     
     # Load dataset info
     try:
         info = load_info(output_dir)
         features = info["features"]
-        print("✅ Successfully loaded dataset info.", features)
+        
     except Exception as e:
         print(f"❌ ERROR: Failed to load dataset info: {e}")
         return
@@ -450,110 +515,129 @@ def compute_and_save_dataset_stats(output_dir: Path):
     # Collect statistics for all episodes
     all_episode_stats = []
     
-    for episode_info in episodes_data:
-        episode_index = episode_info["episode_index"]
+    # Create a temporary directory for frame extraction (outside the loop to persist)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
         
-        # Load the parquet data for this episode
-        chunk_index = episode_info.get("data/chunk_index", episode_index)
-        file_index = episode_info.get("data/file_index", episode_index)
-        parquet_path = output_dir / "data" / f"chunk-{chunk_index:03d}" / f"file-{file_index:03d}.parquet"
-        
-        if not parquet_path.exists():
-            print(f"⚠️ WARNING: Parquet file not found for episode {episode_index}: {parquet_path}")
-            continue
+        for episode_info in episodes_data:
+            episode_index = episode_info["episode_index"]
             
-        try:
-            # Load parquet data
-            episode_dataset = pd.read_parquet(parquet_path)
+            # Load the parquet data for this episode
+            chunk_index = episode_info.get("data/chunk_index", episode_index)
+            file_index = episode_info.get("data/file_index", episode_index)
+            parquet_path = output_dir / "data" / f"chunk-{chunk_index:03d}" / f"file-{file_index:03d}.parquet"
             
-            # Convert to the format expected by compute_episode_stats
-            episode_dict = {}
-            for column in episode_dataset.columns:
-                if column in features:
-                    if features[column]["dtype"] in ["image", "video"]:
-                        # For image/video features, collect the paths to the video files
-                        # Extract camera name from the column name (e.g., "observation.images.rgb" -> "rgb")
-                        camera_name = column.split(".")[-1]
-                        
-                        # Construct the video file path based on the episodes.jsonl info
-                        chunk_index = episode_info.get(f"videos/observation.images.{camera_name}/chunk_index", episode_index)
-                        video_path = output_dir / "videos" / f"observation.images.{camera_name}" / f"chunk-{chunk_index:03d}" / f"episode_{chunk_index:03d}.mp4"
-                        
-                        # Create a list of video paths for all frames in this episode
-                        num_frames = episode_info["num_frames"]
-                        video_paths = [str(video_path)] * num_frames
-                        
-                        episode_dict[column] = video_paths
-                    else:
-                        # Extract values and ensure they're in the right format
-                        column_data = episode_dataset[column].values
-                        
-                        # Handle fixed-size list data (common in parquet files)
-                        if len(column_data) > 0:
-                            # Check if we have array-like data that needs special handling
-                            first_element = column_data[0]
-                            # Use a very safe check to avoid boolean ambiguity errors
-                            is_array_like = False
-                            try:
-                                # Only check for __len__ if it's safe to do so
-                                if not isinstance(first_element, (str, bytes)):
-                                    is_array_like = hasattr(first_element, '__len__')
-                            except:
-                                # If any check fails, assume it's not array-like
-                                is_array_like = False
-                            
-                            if is_array_like:
-                                # For fixed-size lists, convert to proper 2D numpy array
-                                try:
-                                    # Convert to list first to handle pandas arrays properly
-                                    if hasattr(column_data, 'tolist'):
-                                        temp_list = column_data.tolist()
-                                    else:
-                                        temp_list = list(column_data)
-                                    
-                                    # Convert directly to numpy array with float32 dtype
-                                    # This should handle most cases correctly
-                                    column_data = np.array(temp_list, dtype=np.float32)
-                                except Exception as e:
-                                    print(f"Warning: Could not convert {column} data to 2D array: {e}")
-                                    # Fallback to object array to prevent issues
-                                    try:
-                                        column_data = np.array(temp_list, dtype=object)
-                                    except:
-                                        # Last resort: keep original data
-                                        pass
-                            else:
-                                # For scalar data, ensure it's a proper numpy array
-                                if not isinstance(column_data, np.ndarray):
-                                    try:
-                                        column_data = np.array(column_data)
-                                    except:
-                                        pass  # Keep as-is
-                        
-                        episode_dict[column] = column_data
-            
-            # Compute stats for this episode
+            if not parquet_path.exists():
+                print(f"⚠️ WARNING: Parquet file not found for episode {episode_index}: {parquet_path}")
+                continue
+                
             try:
-                episode_stats = compute_episode_stats(episode_dict, features)
-                all_episode_stats.append(episode_stats)
-                print(f"✅ Computed stats for episode {episode_index}")
+                # Load parquet data
+                episode_dataset = pd.read_parquet(parquet_path)
+                # Convert to the format expected by compute_episode_stats
+                episode_dict = {}
+                for column in episode_dataset.columns:
+                    if column in features:
+                        
+                        if features[column]["dtype"] in ["image", "video"]:
+                            
+                            # For image/video features, collect the paths to the video files
+                            # Extract camera name from the column name (e.g., "observation.images.rgb" -> "rgb")
+                            camera_name = column.split(".")[-1]
+                            
+                            # Construct the video file path based on the episodes.jsonl info
+                            chunk_index = episode_info.get(f"videos/observation.images.{camera_name}/chunk_index", episode_index)
+                            video_path = output_dir / "videos" / f"observation.images.{camera_name}" / f"chunk-{chunk_index:03d}" / f"episode_{chunk_index:03d}.mp4"
+                            
+                            # Create a subdirectory for this episode's frames
+                            episode_temp_dir = temp_path / f"episode_{episode_index}"
+                            episode_temp_dir.mkdir(exist_ok=True)
+                            
+                            # Extract frames to temporary directory
+                            frame_paths = extract_video_frames_to_temp_dir(video_path, episode_temp_dir)
+                            
+                            # Create a list of frame paths for all frames in this episode
+                            num_frames = episode_info["num_frames"]
+                            # If we have fewer frames than expected, pad with the last frame
+                            if len(frame_paths) < num_frames:
+                                frame_paths.extend([frame_paths[-1]] * (num_frames - len(frame_paths)))
+                            # If we have more frames than expected, truncate
+                            elif len(frame_paths) > num_frames:
+                                frame_paths = frame_paths[:num_frames]
+                            
+                            episode_dict[column] = [str(path) for path in frame_paths]
+                        else:
+                            # Extract values and ensure they're in the right format
+                            column_data = episode_dataset[column].values
+                            
+                            # Handle fixed-size list data (common in parquet files)
+                            if len(column_data) > 0:
+                                # Check if we have array-like data that needs special handling
+                                first_element = column_data[0]
+                                # Use a very safe check to avoid boolean ambiguity errors
+                                is_array_like = False
+                                try:
+                                    # Only check for __len__ if it's safe to do so
+                                    if not isinstance(first_element, (str, bytes)):
+                                        is_array_like = hasattr(first_element, '__len__')
+                                except:
+                                    # If any check fails, assume it's not array-like
+                                    is_array_like = False
+                                
+                                if is_array_like:
+                                    # For fixed-size lists, convert to proper 2D numpy array
+                                    try:
+                                        # Convert to list first to handle pandas arrays properly
+                                        if hasattr(column_data, 'tolist'):
+                                            temp_list = column_data.tolist()
+                                        else:
+                                            temp_list = list(column_data)
+                                        
+                                        # Convert directly to numpy array with float32 dtype
+                                        # This should handle most cases correctly
+                                        column_data = np.array(temp_list, dtype=np.float32)
+                                    except Exception as e:
+                                        print(f"Warning: Could not convert {column} data to 2D array: {e}")
+                                        # Fallback to object array to prevent issues
+                                        try:
+                                            column_data = np.array(temp_list, dtype=object)
+                                        except:
+                                            # Last resort: keep original data
+                                            pass
+                                else:
+                                    # For scalar data, ensure it's a proper numpy array
+                                    if not isinstance(column_data, np.ndarray):
+                                        try:
+                                            column_data = np.array(column_data)
+                                        except:
+                                            pass  # Keep as-is
+                            
+                            episode_dict[column] = column_data
+                
+                # Compute stats for this episode
+                try:
+                    episode_stats = compute_episode_stats(episode_dict, features)
+                    all_episode_stats.append(episode_stats)
+                    
+                except Exception as e:
+                    # Check if this is the specific error we're trying to fix
+                    error_msg = str(e)
+                    if "truth value of an array with more than one element is ambiguous" in error_msg:
+                        print(f"❌ ERROR: Ambiguous array truth value error for episode {episode_index}")
+                        print(f"Column data types for episode {episode_index}:")
+                        for col, data in episode_dict.items():
+                            print(f"  {col}: type={type(data)}, shape={getattr(data, 'shape', 'N/A')}")
+                            if hasattr(data, '__len__') and len(data) > 0:
+                                print(f"    first element: {type(data[0])}")
+                                if hasattr(data[0], '__len__'):
+                                    print(f"    first element shape: {getattr(data[0], 'shape', 'N/A')}")
+                    raise  # Re-raise the exception after logging
+                
             except Exception as e:
-                # Check if this is the specific error we're trying to fix
-                error_msg = str(e)
-                if "truth value of an array with more than one element is ambiguous" in error_msg:
-                    print(f"❌ ERROR: Ambiguous array truth value error for episode {episode_index}")
-                    print(f"Column data types for episode {episode_index}:")
-                    for col, data in episode_dict.items():
-                        print(f"  {col}: type={type(data)}, shape={getattr(data, 'shape', 'N/A')}")
-                        if hasattr(data, '__len__') and len(data) > 0:
-                            print(f"    first element: {type(data[0])}")
-                            if hasattr(data[0], '__len__'):
-                                print(f"    first element shape: {getattr(data[0], 'shape', 'N/A')}")
-                raise  # Re-raise the exception after logging
-            
-        except Exception as e:
-            print(f"❌ ERROR: Failed to compute stats for episode {episode_index}: {e}")
-            continue
+                print(f"❌ ERROR: Failed to compute stats for episode {episode_index}: {e}")
+                print("Full stacktrace:")
+                traceback.print_exc()
+                continue
     
     if not all_episode_stats:
         print("❌ ERROR: No episode statistics computed.")
@@ -565,7 +649,7 @@ def compute_and_save_dataset_stats(output_dir: Path):
         
         # Save statistics to stats.json
         write_stats(aggregated_stats, output_dir)
-        print(f"✅ Successfully computed and saved dataset statistics to: {output_dir / 'meta' / 'stats.json'}")
+        
         
     except Exception as e:
         print(f"❌ ERROR: Failed to aggregate or save statistics: {e}")
