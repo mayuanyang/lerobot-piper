@@ -13,7 +13,7 @@ import json
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.configs.types import FeatureType
-from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 # ...
@@ -21,8 +21,8 @@ from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 class LeRobotInference:
     """A class to handle inference with trained LeRobot policies."""
     
-    def __init__(self, model_path: str, dataset_id: str = "ISdept/piper_arm"):
-        self.model_path = Path(model_path)
+    def __init__(self, model_id: str, dataset_id: str = "ISdept/piper_arm"):
+        self.model_id = model_id
         self.dataset_id = dataset_id
         self.policy = None
         self.preprocessor = None
@@ -37,63 +37,29 @@ class LeRobotInference:
         
     def load_model(self) -> bool:
         try:
-            # Check if model directory exists
-            if not self.model_path.exists():
-                print(f"Model directory {self.model_path} not found.")
-                return False
-                
+
             # Load dataset metadata to get input/output shapes and stats
             print("Loading dataset metadata...")
-            # Try to load from local dataset first
-            try:
-                from lerobot.datasets.lerobot_dataset import LeRobotDataset
-                #dataset = LeRobotDataset(self.dataset_id)
-                dataset = LeRobotDataset(
-                    self.dataset_id, 
-                    force_cache_sync=True,  # Ensure up-to-date metadata
-                    revision="main"
-                )
-                features = dataset.features
-                dataset_metadata = dataset.meta
-                # CRITICAL: Get the dataset statistics for normalization
-                dataset_stats = dataset.stats  # This is what was missing!
-            except Exception as e:
-                print(f"Could not load local dataset, trying HuggingFace: {e}")
-                # Fallback to loading from HuggingFace
-                dataset_metadata = LeRobotDatasetMetadata(self.dataset_id, force_cache_sync=True, revision="main")
-                features = dataset_metadata.features
-                # For HuggingFace datasets, stats might be in dataset_metadata.stats
-                dataset_stats = getattr(dataset_metadata, 'stats', None)
-                if dataset_stats is None:
-                    print("WARNING: Dataset statistics not found. Actions may not be properly unnormalized.")
-            
-                      
+            dataset_metadata = LeRobotDatasetMetadata(self.dataset_id, force_cache_sync=True, revision="main")
+
+            features = dataset_metadata.features
             features = dataset_to_policy_features(features)
+
+            dataset_stats = dataset_metadata.stats  # This is what was missing!
+                      
             output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
             input_features = {key: ft for key, ft in features.items() if key not in output_features}
             
             # Recreate the config used during training
             print("Creating policy configuration...")
+            # Match the configuration from train.py
             cfg = DiffusionConfig(input_features=input_features, output_features=output_features, n_obs_steps=10, horizon=16)
             
             # Initialize the policy
             print("Initializing policy...")
-            self.policy = DiffusionPolicy(cfg)
+            self.policy = DiffusionPolicy.from_pretrained("ISdept/piper_arm")
             
-            safetensors_path = self.model_path / "model.safetensors"
-            pytorch_path = self.model_path / "pytorch_model.bin"
             
-            if safetensors_path.exists():
-                print(f"Loading model from safetensors format: {safetensors_path}")
-                from safetensors.torch import load_file
-                state_dict = load_file(safetensors_path, device=str(self.device))
-                self.policy.load_state_dict(state_dict)
-            elif pytorch_path.exists():
-                print(f"Loading model from pytorch format: {pytorch_path}")
-                self.policy.load_state_dict(torch.load(pytorch_path, map_location=self.device))
-            else:
-                print(f"Model weights not found at {self.model_path}")
-                return False
             self.policy.eval()
             self.policy.to(self.device)
             
@@ -101,7 +67,7 @@ class LeRobotInference:
             print("Loading preprocessors...")
             if dataset_stats is not None:
                 self.preprocessor, self.postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_stats)
-                print('The dataset statistics have been loaded successfully for preprocessing.', dataset_stats)
+                print('The dataset statistics have been loaded successfully for preprocessing.')
             else:
                 print("WARNING: Loading preprocessors without dataset statistics. Results may be incorrect.")
                 self.preprocessor, self.postprocessor = make_pre_post_processors(cfg, dataset_stats=None)
@@ -117,27 +83,14 @@ class LeRobotInference:
 
     
     def preprocess_observation(self, observation: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        """
-        Preprocess observation data for model input.
-        Ensures all tensors are in the shape expected by the LeRobot Preprocessor.
-        Images are converted from (T, H, W, C) to (T, C, H, W).
-        """
-        processed = {}
-        
+                
         # --- 1. Handle state observation (must be (T, D)) ---
+        input_observation = {}
         if "observation.state" in observation:
-            try:
-                state_np = observation["observation.state"]
-                state_tensor = torch.tensor(state_np, dtype=torch.float32)
-                # Remove the unsqueeze(0) to match image tensor dimensions
-                # Both state and image tensors should have the same number of dimensions
-                # before the preprocessor adds batch dimensions
-                if len(state_tensor.shape) == 2:  
-                    # Keep as (T, D) to match image tensor dimensions (T, C, H, W)
-                    pass
-                processed["observation.state"] = state_tensor.to(self.device)
-            except Exception as e:
-                print(f"Error processing 'observation.state': {e}")
+            state_np = observation["observation.state"]
+            state_tensor = torch.tensor(state_np, dtype=torch.float32)
+            input_observation["observation.state"] = state_tensor.to(self.device)
+            
         
         # --- 2. Helper for Image Preprocessing (convert to (T, C, H, W)) ---
         def process_image(key):
@@ -148,19 +101,15 @@ class LeRobotInference:
                 if len(image_tensor.shape) == 4:
                     # Transpose from (T, H, W, C) to (T, C, H, W)
                     image_tensor = image_tensor.permute(0, 3, 1, 2)
-                    
-                    # Do NOT add the batch dimension. 
-                    # The preprocessor will handle converting (T, C, H, W) to (1, T, C, H, W)
-                    # or flattening to (T, C, H, W) for the image encoder.
                 
-                processed[key] = image_tensor.to(self.device)
+                input_observation[key] = image_tensor.to(self.device)
 
         # Apply helper to all image streams
         process_image("observation.images.rgb")
         process_image("observation.images.gripper")
         process_image("observation.images.depth")
             
-        return processed
+        return input_observation
     
     # ... (predict_action and run_inference methods remain unchanged) ...
     def predict_action(self, observation: Dict[str, Any]) -> Dict[str, Any]:
@@ -169,15 +118,20 @@ class LeRobotInference:
         
         batch = self.preprocess_observation(observation)
         
-        if self.preprocessor is not None:
-            batch = self.preprocessor(batch)
+        print('observation.state shape:', batch['observation.state'].shape if 'observation.state' in batch else 'No state')
+        print('observation.images.rgb shape:', batch['observation.images.rgb'].shape if 'observation.images.rgb' in batch else 'No state')
+        print('observation.images.depth shape:', batch['observation.images.depth'].shape if 'observation.images.depth' in batch else 'No state')
+        print('observation.images.gripper shape:', batch['observation.images.gripper'].shape if 'observation.images.gripper' in batch else 'No state')
+        
+        batch = self.preprocessor(batch)
         
         with torch.no_grad():
             action = self.policy.select_action(batch)
+            
+        print('the raw action output shape:', action.shape)
         
-        if self.postprocessor is not None:
-            action = self.postprocessor(action)
-        
+        action = self.postprocessor(action)
+
         if isinstance(action, torch.Tensor):
             action_np = action.cpu().numpy()
         else:
@@ -190,17 +144,13 @@ class LeRobotInference:
         }
     
     def run_inference(self, observation: Dict[str, Any]) -> Dict[str, Any]:
-        try:
-            result = self.predict_action(observation)
-            return {
-                "success": True,
-                "result": result
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
+      
+        result = self.predict_action(observation)
+        return {
+            "success": True,
+            "result": result
+        }
+
 
 def create_sample_observation():
     # ... (create_sample_observation remains the same) ...

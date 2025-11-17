@@ -40,12 +40,18 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
     features = dataset_to_policy_features(dataset_metadata.features)
     output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     input_features = {key: ft for key, ft in features.items() if key not in output_features}
+    
+    print('input_features:', input_features)
+    print('output_features:', output_features)
 
     # Policies are initialized with a configuration class, in this case `DiffusionConfig`. For this example,
     # we'll just use the defaults and so no arguments other than input/output features need to be passed.
     # NOTE: We need to update n_obs_steps to match our obs_temporal_window length (4 steps)
     # Also explicitly set horizon to match our action sequence length (16 steps)
     cfg = DiffusionConfig(input_features=input_features, output_features=output_features, n_obs_steps=10, horizon=16)
+    
+    if dataset_metadata.stats is None:
+        raise ValueError("Dataset stats are required to initialize the policy.")
 
     # We can now instantiate our policy with this config and the dataset stats.
     policy = DiffusionPolicy(cfg)

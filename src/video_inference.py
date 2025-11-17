@@ -42,6 +42,7 @@ class VideoInference:
         self.device = self.inference_engine.device
         
         # Use the size specified by the preprocessor if available
+        # Default to the size from dataset info (400, 640) based on info.json
         self.target_size: Tuple[int, int] = self._get_image_size()
 
     def _get_image_size(self) -> Tuple[int, int]:
@@ -85,11 +86,11 @@ class VideoInference:
         target_h, target_w = self.target_size
         
         # 1. Resize (cv2 expects (W, H))
-        frame_resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        #frame_resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
         
         # Convert to float32 and normalize to [0,1] range
-        frame_processed = frame_resized.astype(np.float32)
-                
+        frame_processed = frame.astype(np.float32) / 255.0
+                        
 
         # 3. CRITICAL: Ensure frame has a channel dimension (H, W, C)
         # If the frame is (H, W) (2 dimensions), we need to add a channel dimension (H, W, 1)
@@ -133,6 +134,7 @@ class VideoInference:
                 gripper_ret, gripper_frame = gripper_cap.read()
                 depth_ret, depth_frame = depth_cap.read()
                 
+                
                 if not (rgb_ret and gripper_ret and depth_ret):
                     break
                 
@@ -151,7 +153,7 @@ class VideoInference:
                 current_joint_state = None
                 if frame_count < len(joint_states):
                     current_joint_state = joint_states[frame_count]
-                elif predicted_action is not None and len(state_history) > 0:
+                elif predicted_action is not None:
                     # For autoregressive prediction, use the last predicted action
                     current_joint_state = predicted_action
                 else:
@@ -159,18 +161,21 @@ class VideoInference:
                     if len(joint_states) > 0:
                         current_joint_state = joint_states[-1]
                 
+                
                 # Add current joint state to history
                 if current_joint_state is not None:
                     state_history.append(current_joint_state)
                 
                 # --- Inference Check ---
                 if len(rgb_history) < HISTORY_LENGTH:
+                    print('No enough observation.state shape:', len(state_history), len(rgb_history), len(gripper_history), len(depth_history))
                     frame_count += 1
                     cv2.imshow('RGB Video Input', rgb_frame)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         print("Processing stopped by user during buffering")
                         break
                     continue
+                
                 
                 rgb_stacked = np.stack(rgb_history).astype(np.float32)
                 gripper_stacked = np.stack(gripper_history).astype(np.float32)
@@ -197,25 +202,27 @@ class VideoInference:
                 
                 # Process the predicted action for autoregressive prediction
                 if result["success"] and "result" in result and "action" in result["result"]:
-                    predicted_action = result["result"]["action"]
+                    predicted_actions = result["result"]["action"]
+                    print('The predicted actions:', predicted_actions[0])
                     
                     # Ensure the action is in the correct format (numpy array)
-                    if isinstance(predicted_action, np.ndarray):
+                    if isinstance(predicted_actions, np.ndarray):
                         # For diffusion policies, we typically use the first action in the sequence
-                        if len(predicted_action.shape) > 1:
-                            predicted_action = predicted_action[0]
+                        if len(predicted_actions.shape) > 1:
+                            predicted_action = predicted_actions[0]
                     else:
                         # If it's not already a numpy array, convert it
-                        if isinstance(predicted_action, (list, tuple)):
-                            predicted_action = np.array(predicted_action, dtype=np.float32)
-                            if len(predicted_action.shape) > 1:
-                                predicted_action = predicted_action[0]
+                        if isinstance(predicted_actions, (list, tuple)):
+                            predicted_actions = np.array(predicted_actions, dtype=np.float32)
+                            if len(predicted_actions.shape) > 1:
+                                predicted_action = predicted_actions[0]
                         else:
-                            predicted_action = np.array([predicted_action], dtype=np.float32)
+                            predicted_action = np.array([predicted_actions], dtype=np.float32)
                     
                     # Ensure the action is the correct shape (7 DOF for joint positions)
                     if predicted_action.shape != (7,):
                         print(f"Warning: Unexpected action shape {predicted_action.shape}, expected (7,)")
+                
                 
                 # Display and progress updates (omitted boilerplate for brevity)
                 cv2.imshow('RGB Video Input', rgb_frame)
@@ -261,22 +268,120 @@ class VideoInference:
         except Exception as e:
             print(f"Error saving results: {e}")
 
-def create_sample_joint_states() -> List[np.ndarray]:
+def create_sample_joint_states(num_states: int = 1) -> List[np.ndarray]:
     joint_states = []
     
-        
-    joints1 = np.array([
-        -0.07135841252559343,
-        1.6254133016870895,
-        -1.5040269480126633,
-        0.0,
-        -0.5187594912348668,
-        -1.9740392433296308,
-        0.06600000010803342
+    joint1 = np.array([
+      -0.07135841252559343,
+      1.6254133016870895,
+      -1.5040269480126633,
+      0.0,
+      -0.5187594912348668,
+      -1.9740392433296308,
+      0.06600000010803342
     ], dtype=np.float32)
     
-      
-    joint_states.append(joints1)
+    joint2 = np.array([
+      -0.07135841252559343,
+      1.6254133016870895,
+      -1.5040269480126633,
+      0.0,
+      -0.5126108640939633,
+      -1.9740392433296308,
+      0.06600000010803342
+    ], dtype=np.float32)
+    
+    joint3 = np.array([
+      -0.07646108431757542,
+      1.6254133016870895,
+      -1.5040269480126633,
+      0.0,
+      -0.5199573625901166,
+      -1.9740392433296308,
+      0.06600000010803342
+    ], dtype=np.float32)
+    
+    joint4 = np.array([
+      -0.07646108431757542,
+      1.6254133016870895,
+      -1.5040269480126633,
+      0.0,
+      -0.5149285091397431,
+      -1.9740392433296308,
+      0.06600000010803342
+    ], dtype=np.float32)
+    
+    joint5 = np.array([
+      -0.07646108431757542,
+      1.6254133016870895,
+      -1.5040269480126633,
+      0.0,
+      -0.5087066170015353,
+      -1.9740392433296308,
+      0.06600000010803342
+    ], dtype=np.float32)
+    
+    joint6 = np.array([
+      -0.07646108431757542,
+      1.6305201519712142,
+      -1.4986762048193536,
+      0.0,
+      -0.4750235552232973,
+      -1.9795398927035222,
+      0.06600000010803342
+    ], dtype=np.float32)
+    
+    joint7 = np.array([
+      -0.07646108431757542,
+      1.6305201519712142,
+      -1.4935502920670063,
+      0.0,
+      -0.45560003367332236,
+      -1.9795398927035222,
+      0.06600000010803342
+    ], dtype=np.float32)
+    
+    joint8 = np.array([
+      -0.07646108431757542,
+      1.6357126271802183,
+      -1.4822171915922306,
+      0.0,
+      -0.4159471486837887,
+      -1.9735139931408519,
+      0.06600000010803342
+    ], dtype=np.float32)
+    
+    joint9 = np.array([
+      -0.08183392338877422,
+      1.640827258285155,
+      -1.465499136121798,
+      0.0,
+      -0.33167883512396523,
+      -1.948991358374198,
+      0.06600000010803342
+    ], dtype=np.float32)
+    
+    joint10 = np.array([
+      -0.09229239619950506,
+      1.6517972728622805,
+      -1.465499136121798,
+      0.0,
+      -0.31898505046066106,
+      -1.9439470648174262,
+      0.06600000010803342
+    ], dtype=np.float32)
+    
+    joint_states.append(joint1)
+    joint_states.append(joint2)
+    joint_states.append(joint3)
+    joint_states.append(joint4)
+    joint_states.append(joint5)
+    joint_states.append(joint6)
+    joint_states.append(joint7)
+    joint_states.append(joint8)
+    joint_states.append(joint9)
+    joint_states.append(joint10)
+    
     
     return joint_states
 

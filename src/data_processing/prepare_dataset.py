@@ -407,13 +407,6 @@ def extract_video_frames_to_temp_dir(video_path: Path, temp_dir: Path) -> list[P
     # Release video capture
     cap.release()
     
-    # If no frames were extracted, create a dummy frame
-    if not frame_paths:
-        # Create a black dummy frame
-        dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        frame_path = frames_dir / f"frame_{frame_index:06d}.png"
-        cv2.imwrite(str(frame_path), dummy_frame)
-        frame_paths.append(frame_path)
     
     return frame_paths
 
