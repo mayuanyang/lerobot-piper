@@ -48,7 +48,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
     # we'll just use the defaults and so no arguments other than input/output features need to be passed.
     # NOTE: We need to update n_obs_steps to match our obs_temporal_window length (4 steps)
     # Also explicitly set horizon to match our action sequence length (16 steps)
-    cfg = DiffusionConfig(input_features=input_features, output_features=output_features, n_obs_steps=10, horizon=16)
+    # Fixed: Set use_group_norm=False when using pretrained weights to avoid BatchNorm replacement error
+    cfg = DiffusionConfig(input_features=input_features, output_features=output_features, n_obs_steps=10, horizon=16, pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1", use_group_norm=False)
     
     if dataset_metadata.stats is None:
         raise ValueError("Dataset stats are required to initialize the policy.")
