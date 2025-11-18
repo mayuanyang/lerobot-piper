@@ -52,13 +52,16 @@ class LeRobotInference:
             
             # Recreate the config used during training
             print("Creating policy configuration...")
-            # Match the configuration from train.py
-            cfg = DiffusionConfig(input_features=input_features, output_features=output_features, n_obs_steps=10, horizon=16)
+            # Match the configuration from train.py - using pretrained backbone weights
+            cfg = DiffusionConfig(input_features=input_features, output_features=output_features, n_obs_steps=10, horizon=16, pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1", use_group_norm=False)
+            
+            # Force download to ensure we're using the latest model
+            print("Force downloading model...")
             
             # Initialize the policy
             print("Initializing policy...")
-            self.policy = DiffusionPolicy.from_pretrained("ISdept/piper_arm")
-            
+            self.policy = DiffusionPolicy.from_pretrained(self.model_id, config=cfg)
+                        
             
             self.policy.eval()
             self.policy.to(self.device)
@@ -84,31 +87,27 @@ class LeRobotInference:
     
     def preprocess_observation(self, observation: Dict[str, Any]) -> Dict[str, torch.Tensor]:
                 
-        # --- 1. Handle state observation (must be (T, D)) ---
+        # --- 1. Handle state observation ---
         input_observation = {}
         if "observation.state" in observation:
             state_np = observation["observation.state"]
+            # Ensure state is in correct format [B, T, D] where B=1, T=10, D=7
+            
+            # Already in correct format [1, T, D]
             state_tensor = torch.tensor(state_np, dtype=torch.float32)
+            
             input_observation["observation.state"] = state_tensor.to(self.device)
             
         
-        # --- 2. Helper for Image Preprocessing (convert to (T, C, H, W)) ---
-        def process_image(key):
+        # --- 2. Handle image observations ---
+        for key in ["observation.images.rgb", "observation.images.gripper", "observation.images.depth"]:
             if key in observation:
-                # 1. Convert NumPy (T, H, W, C) to PyTorch tensor
-                image_tensor = torch.tensor(observation[key], dtype=torch.float32) # (T, H, W, C)
-                
-                if len(image_tensor.shape) == 4:
-                    # Transpose from (T, H, W, C) to (T, C, H, W)
-                    image_tensor = image_tensor.permute(0, 3, 1, 2)
-                
-                input_observation[key] = image_tensor.to(self.device)
+                img_tensor = observation[key]
+                # Ensure the tensor is in the correct format [B, T, C, H, W]
+                # The video_inference.py should already provide this format
+                # Make sure we don't stack the images as that causes tensor shape issues
+                input_observation[key] = img_tensor.to(self.device)
 
-        # Apply helper to all image streams
-        process_image("observation.images.rgb")
-        process_image("observation.images.gripper")
-        process_image("observation.images.depth")
-            
         return input_observation
     
     # ... (predict_action and run_inference methods remain unchanged) ...
@@ -125,8 +124,13 @@ class LeRobotInference:
         
         batch = self.preprocessor(batch)
         
-        with torch.no_grad():
-            action = self.policy.select_action(batch)
+        print('after observation.state shape:', batch['observation.state'].shape if 'observation.state' in batch else 'No state')
+        print('after observation.images.rgb shape:', batch['observation.images.rgb'].shape if 'observation.images.rgb' in batch else 'No state')
+        print('after observation.images.depth shape:', batch['observation.images.depth'].shape if 'observation.images.depth' in batch else 'No state')
+        print('after observation.images.gripper shape:', batch['observation.images.gripper'].shape if 'observation.images.gripper' in batch else 'No state')
+        
+        #with torch.no_grad():
+        action = self.policy.select_action(batch)
             
         print('the raw action output shape:', action.shape)
         

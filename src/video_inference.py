@@ -4,6 +4,7 @@ import cv2
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 import collections
+import traceback
 
 # Define temporal window to match train.py configuration
 fps = 10
@@ -35,10 +36,10 @@ except ImportError:
 class VideoInference:
     """A class to handle video-based inference with trained LeRobot policies."""
     
-    def __init__(self, model_path: str, dataset_id: str = "ISdept/piper_arm"):
-        self.model_path = Path(model_path)
+    def __init__(self, model_id: str, dataset_id: str = "ISdept/piper_arm"):
+        self.model_id = model_id
         self.dataset_id = dataset_id
-        self.inference_engine = LeRobotInference(model_path, dataset_id)
+        self.inference_engine = LeRobotInference(model_id, dataset_id)
         self.device = self.inference_engine.device
         
         # Use the size specified by the preprocessor if available
@@ -46,25 +47,10 @@ class VideoInference:
         self.target_size: Tuple[int, int] = self._get_image_size()
 
     def _get_image_size(self) -> Tuple[int, int]:
-        """Tries to determine the expected image size from the preprocessor config."""
-        try:
-            pp = self.inference_engine.preprocessor
-            if hasattr(pp.config, 'image_size') and pp.config.image_size:
-                # LeRobot format is usually (H, W)
-                return tuple(pp.config.image_size)
-            elif hasattr(pp.config, 'input_shape') and len(pp.config.input_shape) >= 3:
-                # Fallback to general input shape, assuming (C, H, W)
-                _, h, w = pp.config.input_shape
-                return (h, w)
-        except Exception:
-            pass # Use default fallback
-        
-        # Default size based on the error message [..., 84, 84]
-        print("Warning: Could not auto-detect image size. Using default (84, 84).")
-        return (84, 84) # (Height, Width)
+        return (400, 640) # (Height, Width)
 
     def load_model(self) -> bool:
-        print(f"Loading model from: {self.model_path}")
+        print(f"Loading model from: {self.model_id}")
         return self.inference_engine.load_model()
     
     def load_video(self, video_path: str) -> Optional[cv2.VideoCapture]:
@@ -103,7 +89,7 @@ class VideoInference:
 
 
     def process_video(self, rgb_video_path: str, gripper_video_path: str, depth_video_path: str, 
-                        joint_states: List[np.ndarray]) -> List[Dict[str, Any]]:
+                        joint_states: List[np.ndarray], frames_to_skip: int) -> List[Dict[str, Any]]:
         
         print(f"Expected Image Size: {self.target_size}")
 
@@ -138,6 +124,9 @@ class VideoInference:
                 if not (rgb_ret and gripper_ret and depth_ret):
                     break
                 
+                if frame_count < frames_to_skip:
+                    frame_count += 1
+                    continue
                 # Preprocess frames (returns H, W, C)
                 processed_rgb_frame = self.preprocess_frame(rgb_frame)
                 processed_gripper_frame = self.preprocess_frame(gripper_frame)
@@ -177,22 +166,28 @@ class VideoInference:
                     continue
                 
                 
-                rgb_stacked = np.stack(rgb_history).astype(np.float32)
-                gripper_stacked = np.stack(gripper_history).astype(np.float32)
-                depth_stacked = np.stack(depth_history).astype(np.float32)
-
+                # Stack the temporal history and prepare tensors in the correct format
+                # Expected format for diffusion policy: [B, T, C, H, W] where B=1 (batch size)
+                rgb_stacked = np.stack(rgb_history).astype(np.float32)  # [T, H, W, C]
+                rgb_tensor = torch.from_numpy(rgb_stacked).permute(0, 3, 1, 2).unsqueeze(0)  # [1, T, C, H, W]
+                
+                gripper_stacked = np.stack(gripper_history).astype(np.float32)  # [T, H, W, C]
+                gripper_tensor = torch.from_numpy(gripper_stacked).permute(0, 3, 1, 2).unsqueeze(0)  # [1, T, C, H, W]
+                
+                depth_stacked = np.stack(depth_history).astype(np.float32)  # [T, H, W, C]
+                depth_tensor = torch.from_numpy(depth_stacked).permute(0, 3, 1, 2).unsqueeze(0)  # [1, T, C, H, W]
 
                 observation = {
-                    "observation.images.rgb": rgb_stacked,
-                    "observation.images.gripper": gripper_stacked,
-                    "observation.images.depth": depth_stacked,
+                    "observation.images.rgb": rgb_tensor,
+                    "observation.images.gripper": gripper_tensor,
+                    "observation.images.depth": depth_tensor,
                 }
                 
                 # Add stacked joint state history (T, D)
                 # This includes both actual joint states (initial frames) and
                 # predicted actions (subsequent frames) for autoregressive prediction
                 if len(state_history) == HISTORY_LENGTH:
-                    observation["observation.state"] = np.stack(state_history).astype(np.float32)
+                    observation["observation.state"] = np.expand_dims(np.stack(state_history).astype(np.float32), axis=0)
                 
                 # Run inference
                 result = self.inference_engine.run_inference(observation)
@@ -240,6 +235,7 @@ class VideoInference:
                     
         except Exception as e:
             print(f"Error during video processing: {e}")
+            traceback.print_exc()
         finally:
             # Clean up
             rgb_cap.release()
@@ -272,103 +268,103 @@ def create_sample_joint_states(num_states: int = 1) -> List[np.ndarray]:
     joint_states = []
     
     joint1 = np.array([
-      -0.07135841252559343,
-      1.6254133016870895,
-      -1.5040269480126633,
-      0.0,
-      -0.5187594912348668,
-      -1.9740392433296308,
-      0.06600000010803342
+      -0.10316456313447532,
+        1.6569679719419241,
+        -1.46040415849622,
+        0.0,
+        -0.29512739584082315,
+        -1.930865117372324,
+        0.06600000010803342
     ], dtype=np.float32)
     
     joint2 = np.array([
-      -0.07135841252559343,
-      1.6254133016870895,
-      -1.5040269480126633,
-      0.0,
-      -0.5126108640939633,
-      -1.9740392433296308,
-      0.06600000010803342
+      -0.11872356248640539,
+        1.66713693674247,
+        -1.46040415849622,
+        0.0,
+        -0.28385817484180054,
+        -1.9367876682948635,
+        0.06600000010803342
     ], dtype=np.float32)
     
     joint3 = np.array([
-      -0.07646108431757542,
-      1.6254133016870895,
-      -1.5040269480126633,
-      0.0,
-      -0.5199573625901166,
-      -1.9740392433296308,
-      0.06600000010803342
+      -0.13669206887600455,
+        1.67255364287783,
+        -1.4550079679582415,
+        0.0,
+        -0.27119455808135773,
+        -1.9502419748567668,
+        0.06600000010803342
     ], dtype=np.float32)
     
     joint4 = np.array([
-      -0.07646108431757542,
-      1.6254133016870895,
-      -1.5040269480126633,
-      0.0,
-      -0.5149285091397431,
-      -1.9740392433296308,
-      0.06600000010803342
+      -0.16607040828132943,
+        1.6775646391409609,
+        -1.4550079679582415,
+        0.0,
+        -0.2649360510845218,
+        -1.9713307577253194,
+        0.06600000010803342
     ], dtype=np.float32)
     
     joint5 = np.array([
-      -0.07646108431757542,
-      1.6254133016870895,
-      -1.5040269480126633,
-      0.0,
-      -0.5087066170015353,
-      -1.9740392433296308,
-      0.06600000010803342
+      -0.20023264660469156,
+        1.6826370623073252,
+        -1.4550079679582415,
+        0.0,
+        -0.2590718129709446,
+        -1.983222477236864,
+        0.06600000010803342
     ], dtype=np.float32)
     
     joint6 = np.array([
-      -0.07646108431757542,
-      1.6305201519712142,
-      -1.4986762048193536,
-      0.0,
-      -0.4750235552232973,
-      -1.9795398927035222,
-      0.06600000010803342
+      -0.23463441735599533,
+        1.6826370623073252,
+        -1.4550079679582415,
+        0.0,
+        -0.25395658381199215,
+        -1.9889879338630276,
+        0.06600000010803342
     ], dtype=np.float32)
     
     joint7 = np.array([
-      -0.07646108431757542,
-      1.6305201519712142,
-      -1.4935502920670063,
-      0.0,
-      -0.45560003367332236,
-      -1.9795398927035222,
-      0.06600000010803342
+      -0.2647606645273449,
+        1.6826370623073252,
+        -1.4499828529018746,
+        0.0,
+        -0.24269516975692507,
+        -2.000894697768732,
+        0.06600000010803342
     ], dtype=np.float32)
     
     joint8 = np.array([
-      -0.07646108431757542,
-      1.6357126271802183,
-      -1.4822171915922306,
-      0.0,
-      -0.4159471486837887,
-      -1.9735139931408519,
-      0.06600000010803342
+      -0.3003712076950401,
+        1.6826370623073252,
+        -1.4499828529018746,
+        0.0,
+        -0.23707634903541175,
+        -2.000894697768732,
+        0.06600000010803342
     ], dtype=np.float32)
     
     joint9 = np.array([
-      -0.08183392338877422,
-      1.640827258285155,
-      -1.465499136121798,
-      0.0,
-      -0.33167883512396523,
-      -1.948991358374198,
-      0.06600000010803342
+     -0.3325528993194336,
+        1.6877621900614073,
+        -1.4447530708920395,
+        0.0,
+        -0.22376535446019763,
+        -2.000894697768732,
+        0.06600000010803342
     ], dtype=np.float32)
     
     joint10 = np.array([
-      -0.09229239619950506,
-      1.6517972728622805,
-      -1.465499136121798,
-      0.0,
-      -0.31898505046066106,
-      -1.9439470648174262,
-      0.06600000010803342
+      -0.38476982230440804,
+        1.7096250496426613,
+        -1.4447530708920395,
+        0.0,
+        -0.21812836740703911,
+        -1.9954850241477573,
+        0.06600000010803342
     ], dtype=np.float32)
     
     joint_states.append(joint1)
@@ -390,7 +386,7 @@ def main():
     print("Video LeRobot Inference Demo")
     print("=" * 35)
     
-    inference_engine = VideoInference("./model_output")
+    inference_engine = VideoInference("ISdept/piper_arm")
     
     print("Loading model...")
     if not inference_engine.load_model():
@@ -409,7 +405,7 @@ def main():
     depth_video_path = "input/episode_001.mp4"
     joint_states = create_sample_joint_states()
     
-    results = inference_engine.process_video(rgb_video_path, gripper_video_path, depth_video_path, joint_states)
+    results = inference_engine.process_video(rgb_video_path, gripper_video_path, depth_video_path, joint_states, 50)
     inference_engine.save_results(results, "temp/inference_results.json")
     print(f"Processed {len(results)} frames")
     
