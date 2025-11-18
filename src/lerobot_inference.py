@@ -66,6 +66,12 @@ class LeRobotInference:
             self.policy.eval()
             self.policy.to(self.device)
             
+            # Debug: Print the image features expected by the policy
+            print(f"Policy config image features: {self.policy.config.image_features}")
+            print(f"Policy config crop_shape: {self.policy.config.crop_shape}")
+            print(f"Policy config use_group_norm: {self.policy.config.use_group_norm}")
+            print(f"Policy config pretrained_backbone_weights: {self.policy.config.pretrained_backbone_weights}")
+            
             # Load preprocessors with proper dataset statistics
             print("Loading preprocessors...")
             if dataset_stats is not None:
@@ -103,9 +109,6 @@ class LeRobotInference:
         for key in ["observation.images.rgb", "observation.images.gripper", "observation.images.depth"]:
             if key in observation:
                 img_tensor = observation[key]
-                # Ensure the tensor is in the correct format [B, T, C, H, W]
-                # The video_inference.py should already provide this format
-                # Make sure we don't stack the images as that causes tensor shape issues
                 input_observation[key] = img_tensor.to(self.device)
 
         return input_observation
@@ -116,23 +119,19 @@ class LeRobotInference:
             raise RuntimeError("Model not loaded. Call load_model() first.")
         
         batch = self.preprocess_observation(observation)
-        
-        print('observation.state shape:', batch['observation.state'].shape if 'observation.state' in batch else 'No state')
-        print('observation.images.rgb shape:', batch['observation.images.rgb'].shape if 'observation.images.rgb' in batch else 'No state')
-        print('observation.images.depth shape:', batch['observation.images.depth'].shape if 'observation.images.depth' in batch else 'No state')
-        print('observation.images.gripper shape:', batch['observation.images.gripper'].shape if 'observation.images.gripper' in batch else 'No state')
-        
+                
         batch = self.preprocessor(batch)
         
-        print('after observation.state shape:', batch['observation.state'].shape if 'observation.state' in batch else 'No state')
-        print('after observation.images.rgb shape:', batch['observation.images.rgb'].shape if 'observation.images.rgb' in batch else 'No state')
-        print('after observation.images.depth shape:', batch['observation.images.depth'].shape if 'observation.images.depth' in batch else 'No state')
-        print('after observation.images.gripper shape:', batch['observation.images.gripper'].shape if 'observation.images.gripper' in batch else 'No state')
-        
-        #with torch.no_grad():
-        action = self.policy.select_action(batch)
-            
-        print('the raw action output shape:', action.shape)
+                
+        the_new_batch = {}
+        for key in ["observation.images.rgb", "observation.images.gripper", "observation.images.depth", "observation.state"]:
+            if key in batch:
+                v = batch[key]
+                B, T = v.shape[:2]
+                the_new_batch[key] = v.reshape(B * T, *v.shape[2:])
+                print(f"{key} shape after reshape: {the_new_batch[key].shape}")
+                
+        action = self.policy.select_action(the_new_batch)
         
         action = self.postprocessor(action)
 

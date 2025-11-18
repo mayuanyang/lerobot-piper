@@ -76,12 +76,7 @@ class VideoInference:
         
         # Convert to float32 and normalize to [0,1] range
         frame_processed = frame.astype(np.float32) / 255.0
-                        
 
-        # 3. CRITICAL: Ensure frame has a channel dimension (H, W, C)
-        # If the frame is (H, W) (2 dimensions), we need to add a channel dimension (H, W, 1)
-        if len(frame_processed.shape) == 2:
-            frame_processed = frame_processed[:, :, np.newaxis]
             
         # At this point, all frames (RGB, Gripper, Depth) must be 3D (H, W, C)
         # (Where C is 3 for RGB/Gripper, and 1 for grayscale Depth)
@@ -183,11 +178,13 @@ class VideoInference:
                     "observation.images.depth": depth_tensor,
                 }
                 
+                
                 # Add stacked joint state history (T, D)
                 # This includes both actual joint states (initial frames) and
                 # predicted actions (subsequent frames) for autoregressive prediction
                 if len(state_history) == HISTORY_LENGTH:
-                    observation["observation.state"] = np.expand_dims(np.stack(state_history).astype(np.float32), axis=0)
+                    #observation["observation.state"] = np.expand_dims(np.stack(state_history).astype(np.float32), axis=0)
+                    observation["observation.state"] = torch.from_numpy(np.stack(state_history).astype(np.float32)).unsqueeze(0)  # [1, T, D]
                 
                 # Run inference
                 result = self.inference_engine.run_inference(observation)
@@ -405,7 +402,7 @@ def main():
     depth_video_path = "input/episode_001.mp4"
     joint_states = create_sample_joint_states()
     
-    results = inference_engine.process_video(rgb_video_path, gripper_video_path, depth_video_path, joint_states, 50)
+    results = inference_engine.process_video(rgb_video_path, gripper_video_path, depth_video_path, joint_states, 10)
     inference_engine.save_results(results, "temp/inference_results.json")
     print(f"Processed {len(results)} frames")
     
