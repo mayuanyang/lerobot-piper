@@ -2,7 +2,7 @@ import pyarrow.parquet as pq
 import sys
 
 # Path to a local parquet file
-parquet_path = "output/data/chunk-001/file-001.parquet"
+parquet_path = "src/output/data/chunk-001/file-001.parquet"
 
 try:
     # Read the parquet file

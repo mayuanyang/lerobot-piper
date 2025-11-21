@@ -54,8 +54,8 @@ def extract_actions_from_inference(input_file, output_file):
 
 if __name__ == "__main__":
     # Define input and output file paths for joint positions
-    input_file = "temp/metadata_20251113_080958.json"
-    output_file = "temp/metadata_20251113_080958_gt.json"
+    input_file = "temp/metadata_20251121_174833.json"
+    output_file = "temp/metadata_20251121_174833_gt.json"
     
     # Extract joint positions
     extract_joint_positions(input_file, output_file)

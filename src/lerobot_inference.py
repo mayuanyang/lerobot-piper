@@ -8,6 +8,7 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, Any, Optional
 import json
+import random
 
 # ... (LeRobot imports assumed to be correct) ...
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
@@ -53,14 +54,14 @@ class LeRobotInference:
             # Recreate the config used during training
             print("Creating policy configuration...")
             # Match the configuration from train.py - using pretrained backbone weights
-            cfg = DiffusionConfig(input_features=input_features, output_features=output_features, n_obs_steps=10, horizon=16, pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1", use_group_norm=False)
+            cfg = DiffusionConfig(input_features=input_features, output_features=output_features, n_obs_steps=10, horizon=16)
             
             # Force download to ensure we're using the latest model
             print("Force downloading model...")
             
             # Initialize the policy
             print("Initializing policy...")
-            self.policy = DiffusionPolicy.from_pretrained(self.model_id, config=cfg)
+            self.policy = DiffusionPolicy.from_pretrained(self.model_id)
                         
             
             self.policy.eval()
@@ -71,6 +72,7 @@ class LeRobotInference:
             print(f"Policy config crop_shape: {self.policy.config.crop_shape}")
             print(f"Policy config use_group_norm: {self.policy.config.use_group_norm}")
             print(f"Policy config pretrained_backbone_weights: {self.policy.config.pretrained_backbone_weights}")
+            print('The output feature', output_features)
             
             # Load preprocessors with proper dataset statistics
             print("Loading preprocessors...")
@@ -113,7 +115,6 @@ class LeRobotInference:
 
         return input_observation
     
-    # ... (predict_action and run_inference methods remain unchanged) ...
     def predict_action(self, observation: Dict[str, Any]) -> Dict[str, Any]:
         if self.policy is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
@@ -130,9 +131,18 @@ class LeRobotInference:
                 B, T = v.shape[:2]
                 the_new_batch[key] = v.reshape(B * T, *v.shape[2:])
                 print(f"{key} shape after reshape: {the_new_batch[key].shape}")
-                
-        action = self.policy.select_action(the_new_batch)
         
+        # Create a fixed noise tensor for deterministic inference
+        # This ensures that the diffusion model produces the same results for the same input
+        noise = torch.randn(
+            size=(1, 10, self.policy.diffusion.config.action_feature.shape[0]),
+            dtype=torch.float32,
+            device=self.device,
+            generator=torch.Generator(self.device).manual_seed(42)
+        )
+        
+        action = self.policy.select_action(the_new_batch)
+                
         action = self.postprocessor(action)
 
         if isinstance(action, torch.Tensor):

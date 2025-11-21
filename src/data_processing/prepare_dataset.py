@@ -96,11 +96,10 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     
     for i in range(effective_num_frames):
         # Determine the action for the current frame
-        if i < effective_num_frames - 1:
-             action = joint_positions[i + 1]
+        if i < len(joint_positions) - 1:
+            action = joint_positions[i + 1]  # Next state as action
         else:
-             # For the last frame, use the current position (or zero/no-op action)
-             action = joint_positions[i] 
+            action = joint_positions[i]  # Last frame, use current state
 
         is_done = (i == effective_num_frames - 1)
         
@@ -279,44 +278,138 @@ def generate_meta_files(output_dir: Path, task_title: str, episode_data: Episode
     create_episodes_parquet_index(output_dir, episode_data.episode_index)
 
 
-def generate_video_files(output_dir: Path, episode_data: EpisodeData, json_data: dict):
+def generate_video_files(output_dir: Path, episode_data: EpisodeData, json_data: dict, last_frames_to_chop: int = 0):
+    """
+    Generate video files, properly handling frame chopping to match tabular data.
+    """
+    
+    # Calculate effective number of frames
+    original_num_frames = len(json_data["frames"])
+    effective_num_frames = original_num_frames - last_frames_to_chop
+    
+    if effective_num_frames <= 0:
+        print(f"❌ ERROR: Effective frame count is 0 or less ({effective_num_frames}). Skipping video generation.")
+        return
         
     for camera_data in episode_data.cameras:
         camera_name = camera_data.camera
         cam_folder = f"observation.images.{camera_name}"
-        #os.makedirs(output_dir / cam_folder, exist_ok=True)
     
         # Create the new directory structure for videos
         video_chunk_dir = output_dir / "videos" / cam_folder / f"chunk-{episode_data.episode_index:03d}"
         video_chunk_dir.mkdir(parents=True, exist_ok=True)
         output_video_name = f"episode_{episode_data.episode_index:03d}.mp4"
+        output_video_path = video_chunk_dir / output_video_name
     
-        # Copy video file to the new directory structure
+        # Handle video processing based on source type
         video_file_path = Path(camera_data.video_path)
-        if video_file_path.exists():
-            shutil.copy(video_file_path, video_chunk_dir / output_video_name)
+        if video_file_path.exists() and video_file_path.suffix.lower() == '.mp4':
+            # If it's a video file, we need to chop it to match the effective frame count
+            chop_video_to_frame_count(video_file_path, output_video_path, effective_num_frames, episode_data.fps)
+        elif video_file_path.exists():
+            # For other file types, just copy
+            shutil.copy(video_file_path, output_video_path)
         else:
             print(f"⚠️ WARNING: Video file not found at {camera_data.video_path}. Skipping video copy.")
     
-    # Generate video from images from depth images
-    # Check if there's a depth camera in the episode data
-    depth_cameras = [cam for cam in episode_data.cameras if 'depth' in cam.camera.lower()]
-    if depth_cameras:
-        video_chunk_dir = output_dir / "videos" / "observation.images.depth" / f"chunk-{episode_data.episode_index:03d}"
-        video_chunk_dir.mkdir(parents=True, exist_ok=True)
-        output_video_name = f"episode_{episode_data.episode_index:03d}.mp4"
+    # # Generate video from images from depth images
+    # # Check if there's a depth camera in the episode data
+    # depth_cameras = [cam for cam in episode_data.cameras if 'depth' in cam.camera.lower()]
+    # if depth_cameras:
+    #     video_chunk_dir = output_dir / "videos" / "observation.images.depth" / f"chunk-{episode_data.episode_index:03d}"
+    #     video_chunk_dir.mkdir(parents=True, exist_ok=True)
+    #     output_video_name = f"episode_{episode_data.episode_index:03d}.mp4"
+    #     output_video_path = video_chunk_dir / output_video_name
         
-        # Get the only subfolder in episode_data.folder
-        folder_path = Path(episode_data.folder)
-        subfolders = [f for f in folder_path.iterdir() if f.is_dir()]
+    #     # Get the only subfolder in episode_data.folder
+    #     folder_path = Path(episode_data.folder)
+    #     subfolders = [f for f in folder_path.iterdir() if f.is_dir()]
         
-        if len(subfolders) == 1:
-            image_folder = subfolders[0]
-            create_video_from_images(image_folder, video_chunk_dir / output_video_name, fps=episode_data.fps)
-        elif len(subfolders) == 0:
-            print(f"⚠️ WARNING: No subfolders found in {folder_path}. Skipping video creation.")
-        else:
-            print(f"⚠️ WARNING: Multiple subfolders found in {folder_path}. Expected exactly one. Skipping video creation.")
+    #     if len(subfolders) == 1:
+    #         image_folder = subfolders[0]
+    #         # Create video from images, limiting to effective_num_frames
+    #         create_video_from_images_limited(image_folder, output_video_path, fps=episode_data.fps, max_frames=effective_num_frames)
+    #     elif len(subfolders) == 0:
+    #         print(f"⚠️ WARNING: No subfolders found in {folder_path}. Skipping video creation.")
+    #     else:
+    #         print(f"⚠️ WARNING: Multiple subfolders found in {folder_path}. Expected exactly one. Skipping video creation.")
+
+
+def chop_video_to_frame_count(input_video_path: Path, output_video_path: Path, target_frame_count: int, fps: float):
+    """
+    Chop a video to contain exactly target_frame_count frames.
+    """
+    try:
+        # Use ffmpeg to extract only the required number of frames
+        cmd = [
+            "ffmpeg",
+            "-i", str(input_video_path),
+            "-vframes", str(target_frame_count),
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-y",
+            str(output_video_path)
+        ]
+        
+        import subprocess
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"⚠️ WARNING: Failed to chop video {input_video_path} to {target_frame_count} frames: {result.stderr}")
+            # Fallback: copy the original video
+            shutil.copy(input_video_path, output_video_path)
+    except Exception as e:
+        print(f"⚠️ WARNING: Error chopping video {input_video_path}: {e}")
+        # Fallback: copy the original video
+        shutil.copy(input_video_path, output_video_path)
+
+
+def create_video_from_images_limited(image_folder, output_video_path, fps=30, max_frames=None):
+    """
+    Creates a video from a sequence of PNG images in a folder, limited to max_frames.
+    
+    Parameters:
+    image_folder (str): Path to the folder containing PNG images
+    output_video_path (str): Path where the output video will be saved (e.g., 'output_video.mp4')
+    fps (int): Frames per second for the output video (default: 30)
+    max_frames (int): Maximum number of frames to include (default: None, no limit)
+    """
+    
+    # Get all PNG files in the folder and sort them
+    image_files = sorted(glob.glob(os.path.join(image_folder, "*.png")))
+    
+    # Limit to max_frames if specified
+    if max_frames is not None and len(image_files) > max_frames:
+        image_files = image_files[:max_frames]
+    
+    if not image_files:
+        print("No PNG images found in the specified folder.")
+        return
+    
+    # Read the first image to get dimensions
+    first_image = cv2.imread(image_files[0])
+    if first_image is None:
+        print(f"Could not read the first image: {image_files[0]}")
+        return
+    
+    height, width, layers = first_image.shape
+    size = (width, height)
+    
+    # Define the codec and create VideoWriter object
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec for MP4
+    out = cv2.VideoWriter(output_video_path, fourcc, fps, size)
+    
+    # Process each image
+    for i, image_path in enumerate(image_files):
+        img = cv2.imread(image_path)
+        if img is None:
+            print(f"Warning: Could not read image {image_path}")
+            continue
+        
+        # Write the frame to the video
+        out.write(img)
+        
+    # Release everything when done
+    out.release()
 
 
 def create_video_from_images(image_folder, output_video_path, fps=30):
@@ -662,7 +755,7 @@ def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episod
     # Note: We assume generate_video_files either handles chopping internally 
     # (if source is a video) or is called BEFORE chopping the images/joints.
     # For now, we assume video files contain all frames and only the tabular data is chopped.
-    generate_video_files(output_dir, episode_data, json_data)
+    generate_video_files(output_dir, episode_data, json_data, last_frames_to_chop)
         
     # Pass the chop value to meta file generator
     generate_meta_files(output_dir, "Piper Arm Teleoperation", episode_data, json_data, is_first_episode, last_frames_to_chop)   

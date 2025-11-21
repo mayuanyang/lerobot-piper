@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 import collections
 import traceback
+import random
 
 # Define temporal window to match train.py configuration
 fps = 10
@@ -84,7 +85,7 @@ class VideoInference:
 
 
     def process_video(self, rgb_video_path: str, gripper_video_path: str, depth_video_path: str, 
-                        joint_states: List[np.ndarray], frames_to_skip: int) -> List[Dict[str, Any]]:
+                        joint_states: List[np.ndarray]) -> List[Dict[str, Any]]:
         
         print(f"Expected Image Size: {self.target_size}")
 
@@ -119,9 +120,6 @@ class VideoInference:
                 if not (rgb_ret and gripper_ret and depth_ret):
                     break
                 
-                if frame_count < frames_to_skip:
-                    frame_count += 1
-                    continue
                 # Preprocess frames (returns H, W, C)
                 processed_rgb_frame = self.preprocess_frame(rgb_frame)
                 processed_gripper_frame = self.preprocess_frame(gripper_frame)
@@ -132,14 +130,10 @@ class VideoInference:
                 gripper_history.append(processed_gripper_frame)
                 depth_history.append(processed_depth_frame)
 
-                # Handle joint state: use provided joint states for initial frames,
-                # then use predicted actions for autoregressive prediction
+                # Handle joint state: always use provided joint states for prediction
                 current_joint_state = None
                 if frame_count < len(joint_states):
                     current_joint_state = joint_states[frame_count]
-                elif predicted_action is not None:
-                    # For autoregressive prediction, use the last predicted action
-                    current_joint_state = predicted_action
                 else:
                     # Fallback to last known joint state
                     if len(joint_states) > 0:
@@ -180,8 +174,7 @@ class VideoInference:
                 
                 
                 # Add stacked joint state history (T, D)
-                # This includes both actual joint states (initial frames) and
-                # predicted actions (subsequent frames) for autoregressive prediction
+                # This includes the actual joint states for all frames
                 if len(state_history) == HISTORY_LENGTH:
                     #observation["observation.state"] = np.expand_dims(np.stack(state_history).astype(np.float32), axis=0)
                     observation["observation.state"] = torch.from_numpy(np.stack(state_history).astype(np.float32)).unsqueeze(0)  # [1, T, D]
@@ -261,120 +254,24 @@ class VideoInference:
         except Exception as e:
             print(f"Error saving results: {e}")
 
-def create_sample_joint_states(num_states: int = 1) -> List[np.ndarray]:
+def create_sample_joint_states() -> List[np.ndarray]:
+    import json
+    from pathlib import Path
+    
+    # Load joint positions from metadata JSON file
+    metadata_path = Path(__file__).parent / "temp" / "metadata_20251121_174833.json"
+    with open(metadata_path, 'r') as f:
+        metadata = json.load(f)
+    
+    # Extract all joint positions from the metadata
+    frames = metadata["frames"]
     joint_states = []
     
-    joint1 = np.array([
-      -0.10316456313447532,
-        1.6569679719419241,
-        -1.46040415849622,
-        0.0,
-        -0.29512739584082315,
-        -1.930865117372324,
-        0.06600000010803342
-    ], dtype=np.float32)
-    
-    joint2 = np.array([
-      -0.11872356248640539,
-        1.66713693674247,
-        -1.46040415849622,
-        0.0,
-        -0.28385817484180054,
-        -1.9367876682948635,
-        0.06600000010803342
-    ], dtype=np.float32)
-    
-    joint3 = np.array([
-      -0.13669206887600455,
-        1.67255364287783,
-        -1.4550079679582415,
-        0.0,
-        -0.27119455808135773,
-        -1.9502419748567668,
-        0.06600000010803342
-    ], dtype=np.float32)
-    
-    joint4 = np.array([
-      -0.16607040828132943,
-        1.6775646391409609,
-        -1.4550079679582415,
-        0.0,
-        -0.2649360510845218,
-        -1.9713307577253194,
-        0.06600000010803342
-    ], dtype=np.float32)
-    
-    joint5 = np.array([
-      -0.20023264660469156,
-        1.6826370623073252,
-        -1.4550079679582415,
-        0.0,
-        -0.2590718129709446,
-        -1.983222477236864,
-        0.06600000010803342
-    ], dtype=np.float32)
-    
-    joint6 = np.array([
-      -0.23463441735599533,
-        1.6826370623073252,
-        -1.4550079679582415,
-        0.0,
-        -0.25395658381199215,
-        -1.9889879338630276,
-        0.06600000010803342
-    ], dtype=np.float32)
-    
-    joint7 = np.array([
-      -0.2647606645273449,
-        1.6826370623073252,
-        -1.4499828529018746,
-        0.0,
-        -0.24269516975692507,
-        -2.000894697768732,
-        0.06600000010803342
-    ], dtype=np.float32)
-    
-    joint8 = np.array([
-      -0.3003712076950401,
-        1.6826370623073252,
-        -1.4499828529018746,
-        0.0,
-        -0.23707634903541175,
-        -2.000894697768732,
-        0.06600000010803342
-    ], dtype=np.float32)
-    
-    joint9 = np.array([
-     -0.3325528993194336,
-        1.6877621900614073,
-        -1.4447530708920395,
-        0.0,
-        -0.22376535446019763,
-        -2.000894697768732,
-        0.06600000010803342
-    ], dtype=np.float32)
-    
-    joint10 = np.array([
-      -0.38476982230440804,
-        1.7096250496426613,
-        -1.4447530708920395,
-        0.0,
-        -0.21812836740703911,
-        -1.9954850241477573,
-        0.06600000010803342
-    ], dtype=np.float32)
-    
-    joint_states.append(joint1)
-    joint_states.append(joint2)
-    joint_states.append(joint3)
-    joint_states.append(joint4)
-    joint_states.append(joint5)
-    joint_states.append(joint6)
-    joint_states.append(joint7)
-    joint_states.append(joint8)
-    joint_states.append(joint9)
-    joint_states.append(joint10)
-    
+    # Process all frames in the metadata
+    for frame in frames:
+        joint_positions = frame["joint_positions"]
+        joint_state = np.array(joint_positions, dtype=np.float32)
+        joint_states.append(joint_state)
     
     return joint_states
 
@@ -397,12 +294,13 @@ def main():
     
     
     print("Processing video files")
-    rgb_video_path = "input/robot_session_rgb_20251113_080958.mp4"
-    gripper_video_path = "input/robot_session_gripper_20251113_080958.mp4"
-    depth_video_path = "input/episode_001.mp4"
+    rgb_video_path = "input/episode_001_rgb.mp4"
+    gripper_video_path = "input/episode_001_gripper.mp4"
+    depth_video_path = "input/episode_001_depth.mp4"
+    
     joint_states = create_sample_joint_states()
     
-    results = inference_engine.process_video(rgb_video_path, gripper_video_path, depth_video_path, joint_states, 10)
+    results = inference_engine.process_video(rgb_video_path, gripper_video_path, depth_video_path, joint_states)
     inference_engine.save_results(results, "temp/inference_results.json")
     print(f"Processed {len(results)} frames")
     

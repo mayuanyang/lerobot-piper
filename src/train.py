@@ -28,7 +28,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
 
         # Number of offline training steps (we'll only do offline training for this example.)
     # Adjust as you prefer. 5000 steps are needed to get something worth evaluating.
-    training_steps = 3000  # Increased to demonstrate checkpoint saving
+    training_steps = 30000  # Increased to demonstrate checkpoint saving
     log_freq = 1
     checkpoint_freq = 1000  # Save checkpoint every 1000 steps
 
@@ -49,7 +49,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
     # NOTE: We need to update n_obs_steps to match our obs_temporal_window length (4 steps)
     # Also explicitly set horizon to match our action sequence length (16 steps)
     # Fixed: Set use_group_norm=False when using pretrained weights to avoid BatchNorm replacement error
-    cfg = DiffusionConfig(input_features=input_features, output_features=output_features, n_obs_steps=10, horizon=16, pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1", use_group_norm=False)
+    cfg = DiffusionConfig(input_features=input_features, output_features=output_features, n_obs_steps=10, horizon=16, pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1", use_group_norm=False, use_separate_rgb_encoder_per_camera=True)
     
     if dataset_metadata.stats is None:
         raise ValueError("Dataset stats are required to initialize the policy.")
@@ -79,7 +79,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
     delta_timestamps = {
         # 🟢 NEW: EXPLICITLY list all camera keys with the same temporal sequence
         "observation.images.gripper": obs_temporal_window,  
-        "observation.images.depth": obs_temporal_window,
         "observation.images.rgb": obs_temporal_window,
         
         
@@ -89,14 +88,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
         
         # Action stream remains the same, as it's independent of the cameras
         "action": [
-            -8 * frame_time,
-            -7 * frame_time,
-            -6 * frame_time,
-            -5 * frame_time,
-            -4 * frame_time,
-            -3 * frame_time, 
-            -2 * frame_time, 
-            -1 * frame_time, 
             0.0 * frame_time, 
             1 * frame_time, 
             2 * frame_time, 
@@ -124,7 +115,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=4,
-        batch_size=8,
+        batch_size=16,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
