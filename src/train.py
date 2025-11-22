@@ -80,6 +80,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
         # 🟢 NEW: EXPLICITLY list all camera keys with the same temporal sequence
         "observation.images.gripper": obs_temporal_window,  
         "observation.images.rgb": obs_temporal_window,
+        "observation.images.depth": obs_temporal_window,
         
         
         # NOTE: observation.states is usually low-dimensional proprioception
@@ -96,6 +97,14 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
             5 * frame_time, 
             6 * frame_time, 
             7 * frame_time, 
+            8 * frame_time, 
+            9 * frame_time, 
+            10 * frame_time, 
+            11 * frame_time, 
+            12 * frame_time, 
+            13 * frame_time, 
+            14 * frame_time, 
+            15 * frame_time, 
         ]
     }
 
