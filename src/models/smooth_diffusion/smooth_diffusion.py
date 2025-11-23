@@ -34,15 +34,21 @@ class SmoothDiffusion(DiffusionPolicy):
         # Compute the main diffusion loss
         loss = self.diffusion.compute_loss(batch)
         
-        # Since we can't directly access predicted actions from compute_loss,
-        # we need to sample them to calculate velocity loss
-        # Note: This approach breaks the gradient flow through the sampling process,
-        # but it's necessary for compatibility with the lerobot DiffusionPolicy implementation.
-        with torch.no_grad():
-            predicted_actions = self.diffusion.generate_actions(batch)
-        
+        """
+        The Regularization GoalIn Imitation Learning (IL), the goal is for the policy to match the distribution of the expert's demonstrations.
+        When you add the velocity loss to the ground-truth actions 
+        You are effectively telling the model:"Learn the noise distribution required to reconstruct this ground-truth action sequence via L(diff). 
+        And, by the way, the ground-truth action sequence itself is smooth (via $L_{\text{vel}}(\mathbf{a}_{\text{GT}})$).
+        This regularizer works by:Penalizing Jagged Data: If a demonstration happens to be slightly jagged, $L_{\text{vel}}(\mathbf{a}_{\text{GT}})$ will be high, 
+        increasing the total loss for that sample.
+        Biasing the Policy: The model learns that high-loss samples (jagged ground-truth) are "bad" and tries to predict noise that 
+        leads to a distribution closer to low-loss samples (smooth ground-truth).The end result is that the policy's learned action distribution 
+        is biased toward the smoother parts of the expert data, forcing the final generated actions during inference to be smoother than they would be without the regularizer.
+        """
+        ground_truth_actions = batch[ACTION]
+                
         # Calculate velocity loss to encourage smooth action sequences
-        velocity_loss = self._calculate_velocity_loss(predicted_actions)
+        velocity_loss = self._calculate_velocity_loss(ground_truth_actions)
         
         # Combine losses with weighting
         total_loss = loss + self.velocity_loss_weight * velocity_loss

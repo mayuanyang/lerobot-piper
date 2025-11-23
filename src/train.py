@@ -9,8 +9,8 @@ from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
-# Import SmoothDiffusion instead of DiffusionPolicy
-from models.smooth_diffusion import SmoothDiffusion
+# Import JointSmoothDiffusion instead of DiffusionPolicy
+from models.smooth_diffusion.joint_smooth_diffusion import JointSmoothDiffusion
 
 # Detect the best available device
 if torch.cuda.is_available():
@@ -78,7 +78,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         print(f"Resuming training from checkpoint at step {step}")
         
         # Load policy, preprocessor, and postprocessor from checkpoint
-        policy = SmoothDiffusion.from_pretrained(checkpoint_path)
+        policy = JointSmoothDiffusion.from_pretrained(checkpoint_path)
         policy.train()
         policy.to(device)
         
@@ -103,8 +103,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             print("No optimizer state found in checkpoint")
     else:
         # We can now instantiate our policy with this config and the dataset stats.
-        # Use SmoothDiffusion instead of DiffusionPolicy
-        policy = SmoothDiffusion(cfg, velocity_loss_weight=1.0)  # Add velocity loss weight parameter
+        # Use JointSmoothDiffusion instead of DiffusionPolicy
+        policy = JointSmoothDiffusion(cfg, velocity_loss_weight=1.0, acceleration_loss_weight=0.5, jerk_loss_weight=0.1)  # Add all loss weight parameters
         policy.train()
         policy.to(device)
         preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
