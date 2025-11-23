@@ -73,10 +73,10 @@ class VideoInference:
         target_h, target_w = self.target_size
         
         # 1. Resize (cv2 expects (W, H))
-        #frame_resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        frame_resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
         
         # Convert to float32 and normalize to [0,1] range
-        frame_processed = frame.astype(np.float32) / 255.0
+        frame_processed = frame_resized.astype(np.float32) / 255.0
 
             
         # At this point, all frames (RGB, Gripper, Depth) must be 3D (H, W, C)

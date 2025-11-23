@@ -30,7 +30,7 @@ def make_delta_timestamps(delta_indices: list[int] | None, fps: int) -> list[flo
     return [i / fps for i in delta_indices]
 
 
-def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
+def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_from_checkpoint=None):
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
 
@@ -62,12 +62,55 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
     if dataset_metadata.stats is None:
         raise ValueError("Dataset stats are required to initialize the policy.")
 
-    # We can now instantiate our policy with this config and the dataset stats.
-    # Use SmoothDiffusion instead of DiffusionPolicy
-    policy = SmoothDiffusion(cfg, velocity_loss_weight=1.0)  # Add velocity loss weight parameter
-    policy.train()
-    policy.to(device)
-    preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
+    # Check if we're resuming from a checkpoint
+    if resume_from_checkpoint is not None:
+        checkpoint_path = Path(resume_from_checkpoint)
+        if not checkpoint_path.exists():
+            raise ValueError(f"Checkpoint path {resume_from_checkpoint} does not exist")
+        
+        # Extract step number from checkpoint directory name
+        checkpoint_name = checkpoint_path.name
+        if checkpoint_name.startswith("checkpoint-"):
+            step = int(checkpoint_name.split("-")[1])
+        else:
+            raise ValueError(f"Invalid checkpoint directory name: {checkpoint_name}. Expected format: checkpoint-<step>")
+        
+        print(f"Resuming training from checkpoint at step {step}")
+        
+        # Load policy, preprocessor, and postprocessor from checkpoint
+        policy = SmoothDiffusion.from_pretrained(checkpoint_path)
+        policy.train()
+        policy.to(device)
+        
+        # Try to load preprocessors from checkpoint, fallback to creating new ones
+        try:
+            from lerobot.policies.factory import load_pre_post_processors
+            preprocessor, postprocessor = load_pre_post_processors(checkpoint_path)
+        except Exception as e:
+            print(f"Could not load preprocessors from checkpoint: {e}. Creating new preprocessors.")
+            preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
+            
+        # Create optimizer and try to load its state
+        optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
+        optimizer_state_path = checkpoint_path / "optimizer_state.pth"
+        if optimizer_state_path.exists():
+            try:
+                optimizer.load_state_dict(torch.load(optimizer_state_path))
+                print(f"Optimizer state loaded from checkpoint")
+            except Exception as e:
+                print(f"Could not load optimizer state from checkpoint: {e}")
+        else:
+            print("No optimizer state found in checkpoint")
+    else:
+        # We can now instantiate our policy with this config and the dataset stats.
+        # Use SmoothDiffusion instead of DiffusionPolicy
+        policy = SmoothDiffusion(cfg, velocity_loss_weight=1.0)  # Add velocity loss weight parameter
+        policy.train()
+        policy.to(device)
+        preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
+        step = 0
+        # Create optimizer
+        optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
 
  
     fps = 10
@@ -128,8 +171,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
         local_dataset_path = "./src/output"  # Adjust this path as needed
         dataset = LeRobotDataset(local_dataset_path, delta_timestamps=delta_timestamps, force_cache_sync=True, tolerance_s=0.01)
 
-    # Then we create our optimizer and dataloader for offline training.
-    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
+    # Then we create our dataloader for offline training.
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=4,
@@ -165,6 +207,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
                 policy.save_pretrained(checkpoint_dir)
                 preprocessor.save_pretrained(checkpoint_dir)
                 postprocessor.save_pretrained(checkpoint_dir)
+                # Save optimizer state
+                torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer_state.pth")
                 print(f"Checkpoint saved at step {step}")
                 
             step += 1
@@ -182,3 +226,22 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
         preprocessor.push_to_hub(repo)
         postprocessor.push_to_hub(repo)
         postprocessor.push_to_hub(repo)
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Train the diffusion policy")
+    parser.add_argument("--output_dir", type=str, required=True, help="Output directory for checkpoints and final model")
+    parser.add_argument("--dataset_id", type=str, default="ISdept/piper_arm", help="Dataset ID to use for training")
+    parser.add_argument("--push_to_hub", action="store_true", help="Whether to push the model to Hugging Face Hub")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint directory to resume training from")
+    
+    args = parser.parse_args()
+    
+    train(
+        output_dir=args.output_dir,
+        dataset_id=args.dataset_id,
+        push_to_hub=args.push_to_hub,
+        resume_from_checkpoint=args.resume_from_checkpoint
+    )
