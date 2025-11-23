@@ -2,7 +2,7 @@ import json
 import os
 import shutil
 import pandas as pd
-from datasets import Dataset, Features, Value, Sequence
+from datasets import Dataset, Features, Value, Sequence, List
 from pathlib import Path
 import glob
 # Added imports for Parquet generation (required for tasks.parquet)
@@ -19,7 +19,7 @@ import tempfile
 
 
 
-def create_tasks_parquet(root_dir: Path, task_title: str):
+def create_tasks_parquet(root_dir: Path, task_description: str):
     """
     Generates the required meta/tasks.parquet file for LeRobot.
     This file defines the available tasks in the dataset (which is mandatory).
@@ -28,8 +28,8 @@ def create_tasks_parquet(root_dir: Path, task_title: str):
     # The task index (0) must match the 'task_index' used in episodes.jsonl
     task_data = {
         'task_index': [0],
-        'task_title': [task_title],
-        'description': [f"Teleoperation dataset for the {task_title} task."]
+        'task_title': [task_description],
+        'description': [f"Teleoperation dataset for the {task_description} task."]
     }
     
     # Convert to Arrow Table and write Parquet file
@@ -55,7 +55,6 @@ def create_episodes_parquet_index(root_dir: Path, episode_index: int):
         print(f"❌ WARNING: {episodes_jsonl_path} not found. Skipping episodes index creation.")
         return
 
-    
     
     # 1. Read the JSONL file line by line
     with open(episodes_jsonl_path, 'r') as f:
@@ -117,7 +116,8 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
             "index": global_index, # Global index (0, 1, 2, ..., N)
             "next.done": is_done,
             "next.reward": 1.0 if is_done else 0.0,
-            "task_index": 0,
+            "task_index": 0
+            #"task_description": episode_data.task_description  # Use the actual task description string
         }
         
                 
@@ -137,7 +137,8 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         "index": Value("int64"),
         "next.done": Value("bool"),
         "next.reward": Value("float32"),
-        "task_index": Value("int64"),
+        "task_index": Value("int64")
+        #"task_description": Value("string")  # Changed from int64 to string
     }
     
         
@@ -154,7 +155,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     return effective_num_frames
 
 # Modified signature to accept last_frames_to_chop
-def generate_meta_files(output_dir: Path, task_title: str, episode_data: EpisodeData, json_data: dict, is_first_episode: bool = False, last_frames_to_chop: int = 0):
+def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: dict, is_first_episode: bool = False, last_frames_to_chop: int = 0):
     
     
     # [File path definitions and checks remain the same...]
@@ -274,7 +275,7 @@ def generate_meta_files(output_dir: Path, task_title: str, episode_data: Episode
         f.write(json.dumps(episodes_jsonl) + "\n")
         
     if is_first_episode:
-        create_tasks_parquet(output_dir, task_title)
+        create_tasks_parquet(output_dir, episode_data.task_description)
     create_episodes_parquet_index(output_dir, episode_data.episode_index)
 
 
@@ -311,28 +312,6 @@ def generate_video_files(output_dir: Path, episode_data: EpisodeData, json_data:
             shutil.copy(video_file_path, output_video_path)
         else:
             print(f"⚠️ WARNING: Video file not found at {camera_data.video_path}. Skipping video copy.")
-    
-    # # Generate video from images from depth images
-    # # Check if there's a depth camera in the episode data
-    # depth_cameras = [cam for cam in episode_data.cameras if 'depth' in cam.camera.lower()]
-    # if depth_cameras:
-    #     video_chunk_dir = output_dir / "videos" / "observation.images.depth" / f"chunk-{episode_data.episode_index:03d}"
-    #     video_chunk_dir.mkdir(parents=True, exist_ok=True)
-    #     output_video_name = f"episode_{episode_data.episode_index:03d}.mp4"
-    #     output_video_path = video_chunk_dir / output_video_name
-        
-    #     # Get the only subfolder in episode_data.folder
-    #     folder_path = Path(episode_data.folder)
-    #     subfolders = [f for f in folder_path.iterdir() if f.is_dir()]
-        
-    #     if len(subfolders) == 1:
-    #         image_folder = subfolders[0]
-    #         # Create video from images, limiting to effective_num_frames
-    #         create_video_from_images_limited(image_folder, output_video_path, fps=episode_data.fps, max_frames=effective_num_frames)
-    #     elif len(subfolders) == 0:
-    #         print(f"⚠️ WARNING: No subfolders found in {folder_path}. Skipping video creation.")
-    #     else:
-    #         print(f"⚠️ WARNING: Multiple subfolders found in {folder_path}. Expected exactly one. Skipping video creation.")
 
 
 def chop_video_to_frame_count(input_video_path: Path, output_video_path: Path, target_frame_count: int, fps: float):
@@ -361,101 +340,6 @@ def chop_video_to_frame_count(input_video_path: Path, output_video_path: Path, t
         print(f"⚠️ WARNING: Error chopping video {input_video_path}: {e}")
         # Fallback: copy the original video
         shutil.copy(input_video_path, output_video_path)
-
-
-def create_video_from_images_limited(image_folder, output_video_path, fps=30, max_frames=None):
-    """
-    Creates a video from a sequence of PNG images in a folder, limited to max_frames.
-    
-    Parameters:
-    image_folder (str): Path to the folder containing PNG images
-    output_video_path (str): Path where the output video will be saved (e.g., 'output_video.mp4')
-    fps (int): Frames per second for the output video (default: 30)
-    max_frames (int): Maximum number of frames to include (default: None, no limit)
-    """
-    
-    # Get all PNG files in the folder and sort them
-    image_files = sorted(glob.glob(os.path.join(image_folder, "*.png")))
-    
-    # Limit to max_frames if specified
-    if max_frames is not None and len(image_files) > max_frames:
-        image_files = image_files[:max_frames]
-    
-    if not image_files:
-        print("No PNG images found in the specified folder.")
-        return
-    
-    # Read the first image to get dimensions
-    first_image = cv2.imread(image_files[0])
-    if first_image is None:
-        print(f"Could not read the first image: {image_files[0]}")
-        return
-    
-    height, width, layers = first_image.shape
-    size = (width, height)
-    
-    # Define the codec and create VideoWriter object
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec for MP4
-    out = cv2.VideoWriter(output_video_path, fourcc, fps, size)
-    
-    # Process each image
-    for i, image_path in enumerate(image_files):
-        img = cv2.imread(image_path)
-        if img is None:
-            print(f"Warning: Could not read image {image_path}")
-            continue
-        
-        # Write the frame to the video
-        out.write(img)
-        
-    # Release everything when done
-    out.release()
-
-
-def create_video_from_images(image_folder, output_video_path, fps=30):
-    """
-    Creates a video from a sequence of PNG images in a folder.
-    
-    Parameters:
-    image_folder (str): Path to the folder containing PNG images
-    output_video_path (str): Path where the output video will be saved (e.g., 'output_video.mp4')
-    fps (int): Frames per second for the output video (default: 30)
-    """
-    
-    # Get all PNG files in the folder and sort them
-    image_files = sorted(glob.glob(os.path.join(image_folder, "*.png")))
-    
-    if not image_files:
-        print("No PNG images found in the specified folder.")
-        return
-    
-    
-    # Read the first image to get dimensions
-    first_image = cv2.imread(image_files[0])
-    if first_image is None:
-        print(f"Could not read the first image: {image_files[0]}")
-        return
-    
-    height, width, layers = first_image.shape
-    size = (width, height)
-    
-    # Define the codec and create VideoWriter object
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec for MP4
-    out = cv2.VideoWriter(output_video_path, fourcc, fps, size)
-    
-    # Process each image
-    for i, image_path in enumerate(image_files):
-        img = cv2.imread(image_path)
-        if img is None:
-            print(f"Warning: Could not read image {image_path}")
-            continue
-        
-        # Write the frame to the video
-        out.write(img)
-        
-            
-    # Release everything when done
-    out.release()
 
 
 def extract_video_frames_to_temp_dir(video_path: Path, temp_dir: Path) -> list[Path]:
@@ -758,7 +642,7 @@ def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episod
     generate_video_files(output_dir, episode_data, json_data, last_frames_to_chop)
         
     # Pass the chop value to meta file generator
-    generate_meta_files(output_dir, "Piper Arm Teleoperation", episode_data, json_data, is_first_episode, last_frames_to_chop)   
+    generate_meta_files(output_dir, episode_data, json_data, is_first_episode, last_frames_to_chop)   
    
     # Pass the chop value to data file generator
     return generate_data_files(output_dir, episode_data, json_data, last_frames_to_chop)

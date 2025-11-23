@@ -11,7 +11,8 @@ import json
 import random
 
 # ... (LeRobot imports assumed to be correct) ...
-from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
+# Import SmoothDiffusion instead of DiffusionPolicy
+from models.smooth_diffusion import SmoothDiffusion
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
@@ -54,14 +55,15 @@ class LeRobotInference:
             # Recreate the config used during training
             print("Creating policy configuration...")
             # Match the configuration from train.py - using pretrained backbone weights
-            cfg = DiffusionConfig(input_features=input_features, output_features=output_features, n_obs_steps=10, horizon=16)
+            cfg = DiffusionConfig(input_features=input_features, output_features=output_features, n_obs_steps=10, horizon=24)
             
             # Force download to ensure we're using the latest model
             print("Force downloading model...")
             
             # Initialize the policy
             print("Initializing policy...")
-            self.policy = DiffusionPolicy.from_pretrained(self.model_id)
+            # Use SmoothDiffusion instead of DiffusionPolicy
+            self.policy = SmoothDiffusion.from_pretrained(self.model_id)
                         
             
             self.policy.eval()

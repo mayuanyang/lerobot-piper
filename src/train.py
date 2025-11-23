@@ -9,10 +9,18 @@ from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
-from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
+# Import SmoothDiffusion instead of DiffusionPolicy
+from models.smooth_diffusion import SmoothDiffusion
 
-use_cuda = torch.cuda.is_available()
-device = torch.device("cuda" if use_cuda else "cpu")
+# Detect the best available device
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
+
+print(f"Using device: {device}")
 
 def make_delta_timestamps(delta_indices: list[int] | None, fps: int) -> list[float]:
     if delta_indices is None:
@@ -55,7 +63,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
         raise ValueError("Dataset stats are required to initialize the policy.")
 
     # We can now instantiate our policy with this config and the dataset stats.
-    policy = DiffusionPolicy(cfg)
+    # Use SmoothDiffusion instead of DiffusionPolicy
+    policy = SmoothDiffusion(cfg, velocity_loss_weight=1.0)  # Add velocity loss weight parameter
     policy.train()
     policy.to(device)
     preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
@@ -137,6 +146,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False):
         prog_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Training Step {step}")
         for batch_idx, batch in prog_bar:
             batch = preprocessor(batch)
+            # Move batch tensors to the correct device
+            for key in batch:
+                if isinstance(batch[key], torch.Tensor):
+                    batch[key] = batch[key].to(device)
             loss, _ = policy.forward(batch)
             loss.backward()
             optimizer.step()
