@@ -64,43 +64,50 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
     # Check if we're resuming from a checkpoint
     if resume_from_checkpoint is not None:
-        checkpoint_path = Path(resume_from_checkpoint)
-        if not checkpoint_path.exists():
-            raise ValueError(f"Checkpoint path {resume_from_checkpoint} does not exist")
-        
-        # Extract step number from checkpoint directory name
-        checkpoint_name = checkpoint_path.name
-        if checkpoint_name.startswith("checkpoint-"):
-            step = int(checkpoint_name.split("-")[1])
-        else:
-            raise ValueError(f"Invalid checkpoint directory name: {checkpoint_name}. Expected format: checkpoint-<step>")
-        
-        print(f"Resuming training from checkpoint at step {step}")
+        print(f"Resuming training from checkpoint: {resume_from_checkpoint}")
         
         # Load policy, preprocessor, and postprocessor from checkpoint
-        policy = JointSmoothDiffusion.from_pretrained(checkpoint_path)
+        # The from_pretrained method handles both local paths and Hugging Face model_ids
+        policy = JointSmoothDiffusion.from_pretrained(resume_from_checkpoint)
         policy.train()
         policy.to(device)
         
         # Try to load preprocessors from checkpoint, fallback to creating new ones
         try:
             from lerobot.policies.factory import load_pre_post_processors
-            preprocessor, postprocessor = load_pre_post_processors(checkpoint_path)
+            preprocessor, postprocessor = load_pre_post_processors(resume_from_checkpoint)
         except Exception as e:
             print(f"Could not load preprocessors from checkpoint: {e}. Creating new preprocessors.")
             preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
             
-        # Create optimizer and try to load its state
+        # Create optimizer
         optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
-        optimizer_state_path = checkpoint_path / "optimizer_state.pth"
-        if optimizer_state_path.exists():
-            try:
-                optimizer.load_state_dict(torch.load(optimizer_state_path))
-                print(f"Optimizer state loaded from checkpoint")
-            except Exception as e:
-                print(f"Could not load optimizer state from checkpoint: {e}")
+        
+        # Try to load optimizer state if it's a local checkpoint
+        if not resume_from_checkpoint.startswith("http") and not resume_from_checkpoint.startswith("huggingface.co"):
+            # This is likely a local path
+            checkpoint_path = Path(resume_from_checkpoint)
+            if checkpoint_path.exists():
+                optimizer_state_path = checkpoint_path / "optimizer_state.pth"
+                if optimizer_state_path.exists():
+                    try:
+                        optimizer.load_state_dict(torch.load(optimizer_state_path))
+                        print(f"Optimizer state loaded from checkpoint")
+                    except Exception as e:
+                        print(f"Could not load optimizer state from checkpoint: {e}")
+                else:
+                    print("No optimizer state found in checkpoint")
+            # Extract step number from checkpoint directory name if possible
+            checkpoint_name = checkpoint_path.name
+            if checkpoint_name.startswith("checkpoint-"):
+                step = int(checkpoint_name.split("-")[1])
+            else:
+                print("Could not extract step number from checkpoint directory name. Starting from step 0.")
+                step = 0
         else:
-            print("No optimizer state found in checkpoint")
+            # This is a remote checkpoint (Hugging Face model_id)
+            print("Optimizer state not available for remote checkpoints. Starting with fresh optimizer.")
+            step = 0
     else:
         # We can now instantiate our policy with this config and the dataset stats.
         # Use JointSmoothDiffusion instead of DiffusionPolicy
@@ -235,7 +242,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory for checkpoints and final model")
     parser.add_argument("--dataset_id", type=str, default="ISdept/piper_arm", help="Dataset ID to use for training")
     parser.add_argument("--push_to_hub", action="store_true", help="Whether to push the model to Hugging Face Hub")
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint directory to resume training from")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint directory or Hugging Face model_id to resume training from")
     
     args = parser.parse_args()
     
