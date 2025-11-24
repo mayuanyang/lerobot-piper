@@ -11,8 +11,8 @@ import json
 import random
 
 # ... (LeRobot imports assumed to be correct) ...
-# Import SmoothDiffusion instead of DiffusionPolicy
-from models.smooth_diffusion import SmoothDiffusion
+# Import JointSmoothDiffusion instead of DiffusionPolicy
+from models.smooth_diffusion.joint_smooth_diffusion import JointSmoothDiffusion
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
@@ -62,8 +62,8 @@ class LeRobotInference:
             
             # Initialize the policy
             print("Initializing policy...")
-            # Use SmoothDiffusion instead of DiffusionPolicy
-            self.policy = SmoothDiffusion.from_pretrained(self.model_id)
+            # Use JointSmoothDiffusion instead of DiffusionPolicy
+            self.policy = JointSmoothDiffusion.from_pretrained(self.model_id)
                         
             
             self.policy.eval()
