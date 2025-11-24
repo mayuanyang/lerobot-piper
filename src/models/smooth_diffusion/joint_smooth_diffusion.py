@@ -116,11 +116,11 @@ class JointSmoothDiffusion(DiffusionPolicy):
             # Need at least 4 time steps for jerk calculation
             return torch.tensor(0.0, device=actions.device, dtype=actions.dtype)
         
-        # Calculate velocities (first differences) for each joint
+        # Calculate velocities (first differences) for the specified joint
         velocities = actions[:, 1:, joint_index] - actions[:, :-1, joint_index]
         
-        # Calculate accelerations (second differences) for each joint
-        accelerations = velocities[:, 1:, joint_index] - velocities[:, :-1, joint_index]
+        # Calculate accelerations (second differences) for the specified joint
+        accelerations = velocities[:, 1:] - velocities[:, :-1]
         
         # Calculate squared L2 norm for each acceleration per joint
         squared_acc = accelerations ** 2
