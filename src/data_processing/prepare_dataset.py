@@ -1,6 +1,5 @@
 import json
 import os
-import torch
 import shutil
 import pandas as pd
 from datasets import Dataset, Features, Value, Sequence, List
@@ -80,6 +79,7 @@ def create_episodes_parquet_index(root_dir: Path, episode_index: int):
 
 def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: dict, last_frames_to_chop: int):
     
+    
     num_joints = len(json_data["joint_names"])
     original_num_frames = len(json_data["frames"])
     effective_num_frames = original_num_frames - last_frames_to_chop
@@ -92,7 +92,6 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     
     lerobot_frames = []
     timestamp_base = 0.0
-    MAX_DEPTH_MM = 1000.0  # e.g., 1 meters in mm
     
     for i in range(effective_num_frames):
         # Determine the action for the current frame
@@ -106,15 +105,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         # 🟢 CORRECTION: Correct calculation of the global 'index'
         # The global index is the offset + the current frame's index (i)
         global_index = episode_data.global_index_offset + i
-                
-        depth_path = os.path.join(episode_data.folder, json_data["frames"][i]["depth_image_file"])
-                
-        raw_depth_image = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
-        depth_float = raw_depth_image.astype(np.float32)
-        depth_normalized = depth_float / MAX_DEPTH_MM
         
-        depth_normalized = np.expand_dims(depth_normalized, axis=-1)
-                        
         # Create frame data with observation images for each camera
         frame_data = {
             "observation.state": joint_positions[i],
@@ -125,8 +116,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
             "index": global_index, # Global index (0, 1, 2, ..., N)
             "next.done": is_done,
             "next.reward": 1.0 if is_done else 0.0,
-            "task_index": 0,
-            "observation.images.depth": depth_normalized.tolist()
+            "task_index": 0
             #"task_description": episode_data.task_description  # Use the actual task description string
         }
         
@@ -147,8 +137,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         "index": Value("int64"),
         "next.done": Value("bool"),
         "next.reward": Value("float32"),
-        "task_index": Value("int64"),
-        "observation.images.depth": Sequence(Sequence(Sequence(Value("float32")), length=640), length=400)  # Depth images are 400x640x1
+        "task_index": Value("int64")
         #"task_description": Value("string")  # Changed from int64 to string
     }
     
@@ -167,6 +156,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
 
 # Modified signature to accept last_frames_to_chop
 def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: dict, is_first_episode: bool = False, last_frames_to_chop: int = 0):
+    
     
     # [File path definitions and checks remain the same...]
     data_path = "data/chunk-{episode_index:03d}/file-{episode_index:03d}.parquet"
@@ -218,10 +208,12 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         for camera_data in episode_data.cameras:
             camera_name = camera_data.camera
             feature_key = f"observation.images.{camera_name}"
+            channel = 3
+            if camera_name.lower() == 'depth':
+                channel = 1
             
-          
             info_json["features"][feature_key] = {
-                "shape": [400, 640, 3],  # Adjust based on your actual video dimensions
+                "shape": [400, 640, channel],  # Adjust based on your actual video dimensions
                 "dtype": "video",
                 "names": [
                     "height",
@@ -237,15 +229,6 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
                 }
             }
         
-        info_json["features"]['observation.images.depth'] = {
-                  "shape": [400, 640, 1],  # Adjust based on your actual video dimensions
-                  "dtype": "image",
-                  "names": [
-                      "height",
-                      "width",
-                      "channel"
-                  ]
-                }
         with open(info_json_path, "w") as f:
             json.dump(info_json, f, indent=2)
     else:
@@ -313,26 +296,25 @@ def generate_video_files(output_dir: Path, episode_data: EpisodeData, json_data:
         return
         
     for camera_data in episode_data.cameras:
-        if not 'depth' in camera_data.camera.lower():
-          camera_name = camera_data.camera
-          cam_folder = f"observation.images.{camera_name}"
-      
-          # Create the new directory structure for videos
-          video_chunk_dir = output_dir / "videos" / cam_folder / f"chunk-{episode_data.episode_index:03d}"
-          video_chunk_dir.mkdir(parents=True, exist_ok=True)
-          output_video_name = f"episode_{episode_data.episode_index:03d}.mp4"
-          output_video_path = video_chunk_dir / output_video_name
-      
-          # Handle video processing based on source type
-          video_file_path = Path(camera_data.video_path)
-          if video_file_path.exists() and video_file_path.suffix.lower() == '.mp4':
-              # If it's a video file, we need to chop it to match the effective frame count
-              chop_video_to_frame_count(video_file_path, output_video_path, effective_num_frames, episode_data.fps)
-          elif video_file_path.exists():
-              # For other file types, just copy
-              shutil.copy(video_file_path, output_video_path)
-          else:
-              print(f"⚠️ WARNING: Video file not found at {camera_data.video_path}. Skipping video copy.")
+        camera_name = camera_data.camera
+        cam_folder = f"observation.images.{camera_name}"
+    
+        # Create the new directory structure for videos
+        video_chunk_dir = output_dir / "videos" / cam_folder / f"chunk-{episode_data.episode_index:03d}"
+        video_chunk_dir.mkdir(parents=True, exist_ok=True)
+        output_video_name = f"episode_{episode_data.episode_index:03d}.mp4"
+        output_video_path = video_chunk_dir / output_video_name
+    
+        # Handle video processing based on source type
+        video_file_path = Path(camera_data.video_path)
+        if video_file_path.exists() and video_file_path.suffix.lower() == '.mp4':
+            # If it's a video file, we need to chop it to match the effective frame count
+            chop_video_to_frame_count(video_file_path, output_video_path, effective_num_frames, episode_data.fps)
+        elif video_file_path.exists():
+            # For other file types, just copy
+            shutil.copy(video_file_path, output_video_path)
+        else:
+            print(f"⚠️ WARNING: Video file not found at {camera_data.video_path}. Skipping video copy.")
 
 
 def chop_video_to_frame_count(input_video_path: Path, output_video_path: Path, target_frame_count: int, fps: float):
@@ -457,11 +439,9 @@ def update_total_frames_from_episodes(output_dir: Path):
         print(f"❌ ERROR: Failed to update total frames: {e}")
 
 
-def compute_and_save_dataset_stats(output_dir: Path, root_dir: Path):
+def compute_and_save_dataset_stats(output_dir: Path):
     """
     Compute dataset statistics for all episodes and save them to stats.json.
-    For depth images, we calculate stats from the data in parquet files or from image files.
-    Depth images are normalized by dividing by 1000.0.
     """
     
     # Load dataset info
@@ -639,7 +619,7 @@ def compute_and_save_dataset_stats(output_dir: Path, root_dir: Path):
         
         # Save statistics to stats.json
         write_stats(aggregated_stats, output_dir)
-        print("✅ Successfully computed and saved dataset statistics.")
+        
         
     except Exception as e:
         print(f"❌ ERROR: Failed to aggregate or save statistics: {e}")
