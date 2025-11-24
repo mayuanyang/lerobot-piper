@@ -294,9 +294,9 @@ def main():
     
     
     print("Processing video files")
-    rgb_video_path = "input/episode_001_rgb.mp4"
-    gripper_video_path = "input/episode_001_gripper.mp4"
-    depth_video_path = "input/episode_001_depth.mp4"
+    rgb_video_path = "input/camera_rgb_20251121_174953.mp4"
+    gripper_video_path = "input/camera_gripper_20251121_174953.mp4"
+    depth_video_path = "input/camera_depth_20251121_174953.mp4"
     
     joint_states = create_sample_joint_states()
     
