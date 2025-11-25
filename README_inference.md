@@ -129,6 +129,23 @@ The inference code follows the LeRobot framework patterns:
 2. **Preprocessing**: Normalizes input observations using dataset statistics
 3. **Inference**: Runs the policy to predict actions
 4. **Postprocessing**: Denormalizes output actions to real-world values
+5. **Smoothing**: Applies Exponential Moving Average (EMA) smoothing to action sequences for smoother robot movements
+
+## EMA Smoothing
+
+The `lerobot_inference.py` implementation includes Exponential Moving Average (EMA) smoothing as a post-processing step to produce smoother action sequences. This is especially useful for reducing jitter in robot movements.
+
+The EMA smoothing is controlled by the `ema_alpha` parameter in the `LeRobotInference` class constructor:
+- Default value: 0.2
+- Range: 0 < alpha ≤ 1
+- Lower values give more weight to historical smoothed values (more smoothing)
+- Higher values give more weight to recent observations (less smoothing)
+
+Example usage:
+```python
+# Create inference engine with custom EMA smoothing factor
+inference_engine = LeRobotInference("src/model_output", ema_alpha=0.1)  # More smoothing
+```
 
 ## Customization
 
