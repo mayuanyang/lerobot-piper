@@ -209,8 +209,12 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
             camera_name = camera_data.camera
             feature_key = f"observation.images.{camera_name}"
             channel = 3
+            codec = "av1"
+            pix_fmt = "yuv420p"
             if camera_name.lower() == 'depth':
                 channel = 1
+                codec = "ffv1"
+                pix_fmt = "gray16le"
             
             info_json["features"][feature_key] = {
                 "shape": [400, 640, channel],  # Adjust based on your actual video dimensions
@@ -222,8 +226,8 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
                 ],
                 "video_info": {
                     "video.fps": round(episode_data.fps, 2),
-                    "video.codec": "av1",
-                    "video.pix_fmt": "yuv420p",
+                    "video.codec": codec,
+                    "video.pix_fmt": pix_fmt,
                     "video.is_depth_map": 'depth' in camera_name.lower(),
                     "has_audio": False
                 }

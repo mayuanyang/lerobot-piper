@@ -1,8 +1,4 @@
-"""
-Webcam-based inference for LeRobot policies.
-This script demonstrates how to capture frames from a webcam and use them for inference.
-"""
-
+from models.smooth_diffusion.joint_smooth_diffusion import JointSmoothDiffusion
 import torch
 import numpy as np
 import cv2
@@ -10,24 +6,44 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 import time
 
+
+from lerobot.policies.factory import make_pre_post_processors
+from lerobot.configs.types import FeatureType
+from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+from lerobot.datasets.utils import dataset_to_policy_features
+from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+
 class WebcamInference:
     """A class to handle webcam-based inference with trained LeRobot policies."""
     
-    def __init__(self, model_path: str, dataset_id: str = "ISdept/piper_arm", webcam_id: int = 0):
+    def __init__(self, model_id: str = "ISdept/piper_arm", dataset_id: str = "ISdept/piper_arm", 
+                 webcam_rgb_id: int = 0, webcam_depth_id: int = 1, webcam_gripper_id: int = 2):
         """
         Initialize the webcam inference engine.
         
         Args:
-            model_path (str): Path to the trained model directory
+            model_id (str): ID or path to the trained model
             dataset_id (str): ID of the dataset used for training
-            webcam_id (int): ID of the webcam to use (default: 0)
+            webcam_rgb_id (int): ID of the RGB webcam (default: 0)
+            webcam_depth_id (int): ID of the depth webcam (default: 1)
+            webcam_gripper_id (int): ID of the gripper webcam (default: 2)
         """
-        self.model_path = Path(model_path)
+        self.model_id = model_id
         self.dataset_id = dataset_id
-        self.webcam_id = webcam_id
+        
+        self.rgb_webcam_id = webcam_rgb_id  
+        self.depth_webcam_id = webcam_depth_id
+        self.gripper_webcam_id = webcam_gripper_id
+        
         self.policy = None
         self.preprocessor = None
         self.postprocessor = None
+        
+        # Camera capture objects
+        self.rgb_cap = None
+        self.depth_cap = None
+        self.gripper_cap = None
+        
         # Determine the appropriate device
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -35,7 +51,10 @@ class WebcamInference:
             self.device = torch.device("mps")
         else:
             self.device = torch.device("cpu")
-        self.cap = None
+            
+        # Use the size specified by the preprocessor if available
+        # Default to the size from dataset info (400, 640) based on info.json
+        self.target_size = (400, 640)  # (Height, Width)
         
     def load_model(self) -> bool:
         """
@@ -45,24 +64,6 @@ class WebcamInference:
             bool: True if model loaded successfully, False otherwise
         """
         try:
-            # Check if model directory exists
-            if not self.model_path.exists():
-                print(f"Model directory {self.model_path} not found.")
-                return False
-                
-            # Import LeRobot components
-            try:
-                from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
-                from lerobot.policies.factory import make_pre_post_processors
-                from lerobot.configs.types import FeatureType
-                from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-                from lerobot.datasets.utils import dataset_to_policy_features
-                from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
-            except ImportError as e:
-                print(f"LeRobot not installed or not in path: {e}")
-                print("Please install lerobot: pip install lerobot")
-                return False
-            
             # Load dataset metadata to get input/output shapes and stats
             print("Loading dataset metadata...")
             dataset_metadata = LeRobotDatasetMetadata(self.dataset_id, force_cache_sync=True, revision="main")
@@ -76,26 +77,8 @@ class WebcamInference:
             
             # Initialize the policy
             print("Initializing policy...")
-            self.policy = DiffusionPolicy(cfg)
+            self.policy = JointSmoothDiffusion.from_pretrained(self.model_id)
             
-            # Load the trained weights
-            # First try safetensors format, fallback to pytorch format
-            safetensors_path = self.model_path / "model.safetensors"
-            pytorch_path = self.model_path / "pytorch_model.bin"
-            
-            if safetensors_path.exists():
-                print(f"Loading model from safetensors format: {safetensors_path}")
-                from safetensors.torch import load_file
-                state_dict = load_file(safetensors_path)
-                self.policy.load_state_dict(state_dict)
-                self.policy.to(self.device)
-            elif pytorch_path.exists():
-                print(f"Loading model from pytorch format: {pytorch_path}")
-                self.policy.load_state_dict(torch.load(pytorch_path, map_location=self.device))
-                self.policy.to(self.device)
-            else:
-                print(f"Model weights not found at {self.model_path}")
-                return False
             self.policy.eval()
             self.policy.to(self.device)
             
@@ -108,52 +91,80 @@ class WebcamInference:
             
         except Exception as e:
             print(f"Error loading model: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
-    def initialize_webcam(self) -> bool:
+    def initialize_webcams(self) -> bool:
         """
-        Initialize the webcam.
+        Initialize all webcams.
         
         Returns:
-            bool: True if webcam initialized successfully, False otherwise
+            bool: True if all webcams initialized successfully, False otherwise
         """
         try:
-            self.cap = cv2.VideoCapture(self.webcam_id)
-            if not self.cap.isOpened():
-                print(f"Cannot open webcam {self.webcam_id}")
+            # Initialize RGB camera
+            self.rgb_cap = cv2.VideoCapture(self.rgb_webcam_id)
+            if not self.rgb_cap.isOpened():
+                print(f"Cannot open RGB webcam {self.rgb_webcam_id}")
                 return False
             
-            # Set webcam properties (optional)
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            self.cap.set(cv2.CAP_PROP_FPS, 30)
+            # Initialize depth camera
+            self.depth_cap = cv2.VideoCapture(self.depth_webcam_id)
+            if not self.depth_cap.isOpened():
+                print(f"Cannot open depth webcam {self.depth_webcam_id}")
+                return False
             
-            print(f"Webcam {self.webcam_id} initialized successfully")
+            # Initialize gripper camera
+            self.gripper_cap = cv2.VideoCapture(self.gripper_webcam_id)
+            if not self.gripper_cap.isOpened():
+                print(f"Cannot open gripper webcam {self.gripper_webcam_id}")
+                return False
+            
+            # Set FPS (more reliable than setting resolution)
+            for cap in [self.rgb_cap, self.depth_cap, self.gripper_cap]:
+                cap.set(cv2.CAP_PROP_FPS, 30)
+            
+            print("All webcams initialized successfully")
             return True
         except Exception as e:
-            print(f"Error initializing webcam: {e}")
+            print(f"Error initializing webcams: {e}")
             return False
     
-    def capture_frame(self) -> Optional[np.ndarray]:
+    def capture_frames(self) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """
-        Capture a frame from the webcam.
+        Capture frames from all webcams.
         
         Returns:
-            np.ndarray: Captured frame or None if failed
+            Tuple[np.ndarray, np.ndarray, np.ndarray]: Captured frames (RGB, Depth, Gripper) or None if failed
         """
-        if self.cap is None:
-            print("Webcam not initialized")
+        if self.rgb_cap is None or self.depth_cap is None or self.gripper_cap is None:
+            print("Webcams not initialized")
             return None
             
         try:
-            ret, frame = self.cap.read()
-            if not ret:
-                print("Failed to capture frame")
+            # Capture frames from all cameras
+            rgb_ret, rgb_frame = self.rgb_cap.read()
+            depth_ret, depth_frame = self.depth_cap.read()
+            gripper_ret, gripper_frame = self.gripper_cap.read()
+            
+            if not (rgb_ret and depth_ret and gripper_ret):
+                print("Failed to capture frames from one or more cameras")
                 return None
             
-            return frame
+            # Log actual frame sizes for debugging
+            rgb_h, rgb_w = rgb_frame.shape[:2]
+            depth_h, depth_w = depth_frame.shape[:2]
+            gripper_h, gripper_w = gripper_frame.shape[:2]
+            target_h, target_w = self.target_size
+            
+            if (rgb_h, rgb_w) != (target_h, target_w) or (depth_h, depth_w) != (target_h, target_w) or (gripper_h, gripper_w) != (target_h, target_w):
+                print(f"Frame sizes - RGB: {rgb_w}x{rgb_h}, Depth: {depth_w}x{depth_h}, Gripper: {gripper_w}x{gripper_h}")
+                print(f"Target size: {target_w}x{target_h} (will resize)")
+            
+            return rgb_frame, depth_frame, gripper_frame
         except Exception as e:
-            print(f"Error capturing frame: {e}")
+            print(f"Error capturing frames: {e}")
             return None
     
     def preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
@@ -166,12 +177,13 @@ class WebcamInference:
         Returns:
             np.ndarray: Preprocessed frame in channels-first format [C, H, W]
         """
+        target_h, target_w = self.target_size
+        
         # Convert BGR to RGB
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # Resize to expected input size (adjust as needed)
-        # Based on the prepare_dataset.py, it seems to expect 640x480
-        frame_resized = cv2.resize(frame_rgb, (640, 480))
+        # Resize to expected input size
+        frame_resized = cv2.resize(frame_rgb, (target_w, target_h))
         
         # Normalize to [0, 1] range
         frame_normalized = frame_resized.astype(np.float32) / 255.0
@@ -196,18 +208,18 @@ class WebcamInference:
         # Handle state observation
         if "state" in observation:
             state_tensor = torch.tensor(observation["state"], dtype=torch.float32)
-            # Add batch dimension
+            # Add batch dimension [1, D] where D is the number of joints
             state_tensor = state_tensor.unsqueeze(0)
             processed["observation.state"] = state_tensor.to(self.device)
         
-        # Handle image observation
-        if "image" in observation:
-            image_tensor = torch.tensor(observation["image"], dtype=torch.float32)
-            # Image is already in [C, H, W] format from preprocess_frame
-            # Add batch dimension (B, C, H, W)
-            image_tensor = image_tensor.unsqueeze(0)
-            processed["observation.images.front_camera"] = image_tensor.to(self.device)
-            processed["observation.images.rear_camera"] = image_tensor.to(self.device)
+        # Handle image observations
+        for key in ["observation.images.rgb", "observation.images.depth", "observation.images.gripper"]:
+            if key in observation:
+                image_tensor = torch.tensor(observation[key], dtype=torch.float32)
+                # Image is already in [C, H, W] format from preprocess_frame
+                # Add batch dimension (B, C, H, W) where B=1
+                image_tensor = image_tensor.unsqueeze(0)
+                processed[key] = image_tensor.to(self.device)
             
         return processed
     
@@ -280,25 +292,31 @@ class WebcamInference:
         Args:
             joint_state (np.ndarray): Current joint state (if available)
         """
-        if not self.initialize_webcam():
-            print("Failed to initialize webcam")
+        if not self.initialize_webcams():
+            print("Failed to initialize webcams")
             return
         
         print("Starting webcam inference. Press 'q' to quit.")
         
         try:
             while True:
-                # Capture frame
-                frame = self.capture_frame()
-                if frame is None:
+                # Capture frames from all cameras
+                frames = self.capture_frames()
+                if frames is None:
                     continue
                 
-                # Preprocess frame
-                processed_frame = self.preprocess_frame(frame)
+                rgb_frame, depth_frame, gripper_frame = frames
+                
+                # Preprocess frames
+                processed_rgb_frame = self.preprocess_frame(rgb_frame)
+                processed_depth_frame = self.preprocess_frame(depth_frame)
+                processed_gripper_frame = self.preprocess_frame(gripper_frame)
                 
                 # Create observation
                 observation = {
-                    "image": processed_frame
+                    "observation.images.rgb": processed_rgb_frame,
+                    "observation.images.depth": processed_depth_frame,
+                    "observation.images.gripper": processed_gripper_frame
                 }
                 
                 # Add joint state if provided
@@ -312,10 +330,12 @@ class WebcamInference:
                     action = result["result"]["action"]
                     print(f"Predicted action: {action}")
                 else:
-                    print(f"Inference failed: {result['error']}", result)
+                    print(f"Inference failed: {result['error']}")
                 
-                # Display frame
-                cv2.imshow('Webcam Input', frame)
+                # Display frames
+                cv2.imshow('RGB Input', rgb_frame)
+                cv2.imshow('Depth Input', depth_frame)
+                cv2.imshow('Gripper Input', gripper_frame)
                 
                 # Break on 'q' key press
                 if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -325,16 +345,20 @@ class WebcamInference:
             print("Inference interrupted by user")
         except Exception as e:
             print(f"Error during webcam inference: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             # Clean up
-            if self.cap is not None:
-                self.cap.release()
-            cv2.destroyAllWindows()
+            self.cleanup()
     
     def cleanup(self):
         """Clean up resources."""
-        if self.cap is not None:
-            self.cap.release()
+        if self.rgb_cap is not None:
+            self.rgb_cap.release()
+        if self.depth_cap is not None:
+            self.depth_cap.release()
+        if self.gripper_cap is not None:
+            self.gripper_cap.release()
         cv2.destroyAllWindows()
 
 def create_sample_joint_state():
@@ -347,7 +371,7 @@ def main():
     print("=" * 35)
     
     # Initialize webcam inference engine
-    inference_engine = WebcamInference("./model_output")
+    inference_engine = WebcamInference("ISdept/piper_arm")
     
     # Try to load model
     print("Loading model...")
@@ -358,25 +382,28 @@ def main():
         print("2. Ensure the model is saved to ./model_output")
         print("3. Make sure lerobot is installed")
         
-        # Demonstrate with webcam but without model
+        # Demonstrate with webcams but without model
         print("\n" + "=" * 35)
-        print("DEMO MODE - Webcam Only")
+        print("DEMO MODE - Webcams Only")
         print("=" * 35)
         
-        if inference_engine.initialize_webcam():
-            print("Webcam initialized successfully")
-            print("Displaying webcam feed. Press 'q' to quit.")
+        if inference_engine.initialize_webcams():
+            print("Webcams initialized successfully")
+            print("Displaying webcam feeds. Press 'q' to quit.")
             
             try:
                 while True:
-                    frame = inference_engine.capture_frame()
-                    if frame is not None:
-                        # Show frame
-                        cv2.imshow('Webcam Demo', frame)
+                    frames = inference_engine.capture_frames()
+                    if frames is not None:
+                        rgb_frame, depth_frame, gripper_frame = frames
+                        # Show frames
+                        cv2.imshow('RGB Demo', rgb_frame)
+                        cv2.imshow('Depth Demo', depth_frame)
+                        cv2.imshow('Gripper Demo', gripper_frame)
                         
                         # Simulate processing
                         if np.random.random() < 0.02:  # Print every ~50 frames
-                            print("Processing frame...")
+                            print("Processing frames...")
                         
                         # Break on 'q' key press
                         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -386,7 +413,7 @@ def main():
             finally:
                 inference_engine.cleanup()
         else:
-            print("Failed to initialize webcam")
+            print("Failed to initialize webcams")
         
         return
     
