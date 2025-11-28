@@ -91,7 +91,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         horizon=16, 
         n_action_steps=8, 
         pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1", 
-        use_group_norm=False
+        use_group_norm=False,
+        crop_shape=None
     )
     
     if dataset_metadata.stats is None:
