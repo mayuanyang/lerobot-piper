@@ -44,6 +44,8 @@ def extract_actions_from_inference(input_file, output_file):
             # Get the first action from the action array
             if item['result']['action'] and len(item['result']['action']) > 0:
                 actions_array.append(item['result']['action'][0])
+            else:
+                print("Warning: Empty action array found in an inference result")
     
     # Save the array of actions to the output file
     with open(output_file, 'w') as f:
@@ -54,8 +56,8 @@ def extract_actions_from_inference(input_file, output_file):
 
 if __name__ == "__main__":
     # Define input and output file paths for joint positions
-    input_file = "input/data_20251126_191253.json"
-    output_file = "temp/data_20251126_191253_gt.json"
+    input_file = "temp/data_20251128_095915.json"
+    output_file = "temp/data_20251128_095915_gt.json"
     
     # Extract joint positions
     extract_joint_positions(input_file, output_file)

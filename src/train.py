@@ -7,6 +7,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetad
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+from models.smooth_diffusion.custom_diffusion_config import CustomDiffusionConfig
 from lerobot.policies.factory import make_pre_post_processors
 
 # 🟢 ADDED: Import torchvision for augmentation
@@ -46,21 +47,35 @@ def get_augmentations():
 # 🟢 ADDED: Helper to apply augmentations to video batches
 def apply_augmentations(batch, transforms):
     for key, value in batch.items():
-        # Apply only to image keys
+        # strict check: must have "image" in name AND be a tensor
         if "image" in key and isinstance(value, torch.Tensor):
-            # Shape expected: (Batch, Time, Channel, Height, Width)
-            # v2 transforms can often handle (B, C, H, W) or (C, H, W)
-            # We treat (Batch * Time) as a large batch of images for transformation consistency
-            B, T, C, H, W = value.shape
             
-            # Flatten Batch and Time dimensions
-            flat_imgs = value.view(B * T, C, H, W)
-            
-            # Apply transform
-            aug_imgs = transforms(flat_imgs)
-            
-            # Reshape back to (B, T, C, H, W)
-            batch[key] = aug_imgs.view(B, T, C, H, W)
+            # Case 1: Standard Video Tensor (Batch, Time, Channel, Height, Width)
+            # This is what we expect for Diffusion Policy (ndim=5)
+            if value.ndim == 5:
+                B, T, C, H, W = value.shape
+                # Flatten Batch and Time dimensions so transforms can process them
+                flat_imgs = value.view(B * T, C, H, W)
+                
+                # Apply transform
+                aug_imgs = transforms(flat_imgs)
+                
+                # Reshape back to (B, T, C, H, W)
+                batch[key] = aug_imgs.view(B, T, C, H, W)
+
+            # Case 2: Single Frame Tensor (Batch, Channel, Height, Width)
+            # (ndim=4) - Rare for your config, but good for safety
+            elif value.ndim == 4:
+                batch[key] = transforms(value)
+
+            # Case 3: Metadata/Masks (ndim < 4)
+            # If the tensor is 2D or 3D (e.g. validity masks [B, T]), 
+            # we skip it. It cannot be color-jittered.
+            else:
+                # Optional: Uncomment to see what key was skipped
+                # print(f"Skipping augmentation for key '{key}' with shape {value.shape}")
+                pass
+                
     return batch
 
 
@@ -84,7 +99,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     print('input_features:', input_features)
     print('output_features:', output_features)
 
-    cfg = DiffusionConfig(
+    cfg = CustomDiffusionConfig(
         input_features=input_features, 
         output_features=output_features, 
         n_obs_steps=10, 
@@ -92,7 +107,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         n_action_steps=8, 
         pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1", 
         use_group_norm=False,
-        crop_shape=None
+        crop_shape=(400, 400),
+        crop_is_random=False,
+        use_separate_rgb_encoder_per_camera=True
     )
     
     if dataset_metadata.stats is None:
@@ -158,8 +175,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         "observation.images.rgb": obs_temporal_window,
         "observation.images.depth": obs_temporal_window,
         "observation.state": obs_temporal_window,
-        # 0 to 15 is 16 frames (matches horizon=16)
-        "action": [i * frame_time for i in range(16)] 
+        # 8 steps before 0 and 8 steps after 0 (16 frames total)
+        "action": [-(8 - i) * frame_time for i in range(8)] + [i * frame_time for i in range(8)]
     }
 
     try:
@@ -173,7 +190,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=4,
-        batch_size=16,
+        batch_size=4,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,

@@ -95,10 +95,13 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     
     for i in range(effective_num_frames):
         # Determine the action for the current frame
+        
+        current_state = joint_positions[i]
+        next_state = joint_positions[i + 1] if i + 1 < effective_num_frames else joint_positions[i]
+        
         if i < len(joint_positions) - 1:
-            action = joint_positions[i + 1]  # Next state as action
-        else:
-            action = joint_positions[i]  # Last frame, use current state
+            action = next_state
+        
 
         is_done = (i == effective_num_frames - 1)
         
@@ -108,7 +111,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         
         # Create frame data with observation images for each camera
         frame_data = {
-            "observation.state": joint_positions[i],
+            "observation.state": current_state,
             "action": action,
             "timestamp": timestamp_base,
             "episode_index": episode_data.episode_index,
@@ -117,9 +120,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
             "next.done": is_done,
             "next.reward": 1.0 if is_done else 0.0,
             "task_index": 0
-            #"task_description": episode_data.task_description  # Use the actual task description string
-        }
-        
+        }        
                 
         lerobot_frames.append(frame_data)
         timestamp_base += 0.1
@@ -138,7 +139,6 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         "next.done": Value("bool"),
         "next.reward": Value("float32"),
         "task_index": Value("int64")
-        #"task_description": Value("string")  # Changed from int64 to string
     }
     
         
