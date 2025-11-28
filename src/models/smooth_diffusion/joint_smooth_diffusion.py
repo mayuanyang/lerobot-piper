@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+from .custom_diffusion_config import CustomDiffusionConfig
 
 class JointSmoothDiffusion(DiffusionPolicy):
     """
@@ -9,9 +10,9 @@ class JointSmoothDiffusion(DiffusionPolicy):
     Inherits from DiffusionPolicy and overrides the forward method.
     """
     
-    def __init__(self, *args, velocity_loss_weight=1.0, acceleration_loss_weight=0.5, 
+    def __init__(self, config: CustomDiffusionConfig, *args, velocity_loss_weight=1.0, acceleration_loss_weight=0.5, 
                  jerk_loss_weight=0.1, **kwargs):
-        super().__init__(*args, **kwargs)
+        super().__init__(config, *args, **kwargs)
         self.velocity_loss_weight = velocity_loss_weight
         self.acceleration_loss_weight = acceleration_loss_weight
         self.jerk_loss_weight = jerk_loss_weight
