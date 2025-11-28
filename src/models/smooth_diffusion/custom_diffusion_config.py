@@ -17,8 +17,10 @@
 from dataclasses import dataclass, field
 
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+from lerobot.configs.policies import PreTrainedConfig
 
 
+@PreTrainedConfig.register_subclass("custom_diffusion")
 @dataclass
 class CustomDiffusionConfig(DiffusionConfig):
     """Custom DiffusionConfig that allows different image shapes for different cameras."""
