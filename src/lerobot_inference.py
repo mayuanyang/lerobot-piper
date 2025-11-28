@@ -55,7 +55,7 @@ class LeRobotInference:
             # Recreate the config used during training
             print("Creating policy configuration...")
             # Match the configuration from train.py - using pretrained backbone weights
-            cfg = DiffusionConfig(input_features=input_features, output_features=output_features, n_obs_steps=10, horizon=24)
+            cfg = DiffusionConfig(input_features=input_features, output_features=output_features, n_obs_steps=10, horizon=24, n_action_steps=10)
             
             # Force download to ensure we're using the latest model
             print("Force downloading model...")
