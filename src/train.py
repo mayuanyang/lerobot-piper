@@ -104,11 +104,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         output_features=output_features, 
         n_obs_steps=10, 
         horizon=16, 
-        n_action_steps=8, 
+        n_action_steps=16, 
         pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1", 
         use_group_norm=False,
         crop_shape=(400, 400),
-        crop_is_random=False,
+        crop_is_random=True,
         use_separate_rgb_encoder_per_camera=True
     )
     
