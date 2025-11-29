@@ -27,7 +27,7 @@ HISTORY_LENGTH = len(obs_temporal_window)
 # --- Assuming lerobot_inference import is correct from original context ---
 try:
     from .lerobot_inference import LeRobotInference
-except ImportError:
+except (ImportError, ValueError):
     # Fallback for when running as a script directly
     import sys
     sys.path.append(str(Path(__file__).parent))
@@ -37,9 +37,10 @@ except ImportError:
 class VideoInference:
     """A class to handle video-based inference with trained LeRobot policies."""
     
-    def __init__(self, model_id: str, dataset_id: str = "ISdept/piper_arm"):
+    def __init__(self, model_id: str, dataset_id: str = "ISdept/piper_arm", closed_loop: bool = False):
         self.model_id = model_id
         self.dataset_id = dataset_id
+        self.closed_loop = closed_loop  # Flag for closed-loop prediction
         self.inference_engine = LeRobotInference(model_id, dataset_id)
         self.device = self.inference_engine.device
         
@@ -88,6 +89,7 @@ class VideoInference:
                         joint_states: List[np.ndarray]) -> List[Dict[str, Any]]:
         
         print(f"Expected Image Size: {self.target_size}")
+        print(f"Closed-loop mode: {self.closed_loop}")
 
         # Load videos (omitted boilerplate for brevity)
         rgb_cap = self.load_video(rgb_video_path);
@@ -102,7 +104,7 @@ class VideoInference:
         gripper_history = collections.deque(maxlen=HISTORY_LENGTH)
         depth_history = collections.deque(maxlen=HISTORY_LENGTH)
         state_history = collections.deque(maxlen=HISTORY_LENGTH)
-        predicted_action = None
+        predicted_action = None  # Track the most recent predicted action for closed-loop
         
         results = []
         frame_count = 0
@@ -130,14 +132,28 @@ class VideoInference:
                 gripper_history.append(processed_gripper_frame)
                 depth_history.append(processed_depth_frame)
 
-                # Handle joint state: always use provided joint states for prediction
+                # Handle joint state based on mode (open-loop vs closed-loop)
                 current_joint_state = None
-                if frame_count < len(joint_states):
-                    current_joint_state = joint_states[frame_count]
+                if not self.closed_loop or frame_count < HISTORY_LENGTH:
+                    # Open-loop mode or initial buffer filling in closed-loop mode
+                    # Use provided joint states for prediction
+                    if frame_count < len(joint_states):
+                        current_joint_state = joint_states[frame_count]
+                    else:
+                        # Fallback to last known joint state
+                        if len(joint_states) > 0:
+                            current_joint_state = joint_states[-1]
+                            print('appending joint state', joint_states[-1])
                 else:
-                    # Fallback to last known joint state
-                    if len(joint_states) > 0:
-                        current_joint_state = joint_states[-1]
+                    # Closed-loop mode: use predicted action from previous step
+                    if predicted_action is not None and predicted_action.shape == (7,):
+                        current_joint_state = predicted_action
+                        print(f'Using predicted action as state for frame {frame_count}')
+                    else:
+                        # Fallback to last known joint state if no valid prediction
+                        if len(joint_states) > 0:
+                            current_joint_state = joint_states[-1]
+                            print('Fallback to last known joint state', joint_states[-1])
                 
                 
                 # Add current joint state to history
@@ -188,7 +204,7 @@ class VideoInference:
                 # Process the predicted action for autoregressive prediction
                 if result["success"] and "result" in result and "action" in result["result"]:
                     predicted_actions = result["result"]["action"]
-                    print('The predicted actions:', predicted_actions[0])
+                    print(f'The predicted action for frame {frame_count}:', predicted_actions[0])
                     
                     # Ensure the action is in the correct format (numpy array)
                     if isinstance(predicted_actions, np.ndarray):
@@ -275,12 +291,12 @@ def create_sample_joint_states() -> List[np.ndarray]:
     
     return joint_states
 
-def main():
+def main(closed_loop=False):
     """Main function demonstrating video inference usage."""
     print("Video LeRobot Inference Demo")
     print("=" * 35)
     
-    inference_engine = VideoInference("ISdept/piper_arm")
+    inference_engine = VideoInference("ISdept/piper_arm", closed_loop=closed_loop)
     
     print("Loading model...")
     if not inference_engine.load_model():
@@ -307,4 +323,7 @@ def main():
 
     
 if __name__ == "__main__":
-    main()
+    import sys
+    # Check if closed-loop mode is requested
+    closed_loop = "--closed-loop" in sys.argv
+    main(True)

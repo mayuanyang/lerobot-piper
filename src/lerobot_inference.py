@@ -3,6 +3,7 @@ Inference script for LeRobot policies.
 This script demonstrates how to load a trained policy and use it for inference.
 """
 
+from models.smooth_diffusion.custom_diffusion_config import CustomDiffusionConfig
 import torch
 import numpy as np
 from pathlib import Path
@@ -48,21 +49,11 @@ class LeRobotInference:
             features = dataset_to_policy_features(features)
 
             dataset_stats = dataset_metadata.stats  # This is what was missing!
-                      
             output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
-            input_features = {key: ft for key, ft in features.items() if key not in output_features}
-            
-            # Recreate the config used during training
-            print("Creating policy configuration...")
-            # Match the configuration from train.py - using pretrained backbone weights
-            cfg = DiffusionConfig(input_features=input_features, output_features=output_features, n_obs_steps=10, horizon=24, n_action_steps=10)
-            
-            # Force download to ensure we're using the latest model
-            print("Force downloading model...")
+                        
             
             # Initialize the policy
             print("Initializing policy...")
-            # Use JointSmoothDiffusion instead of DiffusionPolicy
             self.policy = JointSmoothDiffusion.from_pretrained(self.model_id)
                         
             
@@ -79,11 +70,11 @@ class LeRobotInference:
             # Load preprocessors with proper dataset statistics
             print("Loading preprocessors...")
             if dataset_stats is not None:
-                self.preprocessor, self.postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_stats)
+                self.preprocessor, self.postprocessor = make_pre_post_processors(self.policy.config, dataset_stats=dataset_stats)
                 print('The dataset statistics have been loaded successfully for preprocessing.')
             else:
                 print("WARNING: Loading preprocessors without dataset statistics. Results may be incorrect.")
-                self.preprocessor, self.postprocessor = make_pre_post_processors(cfg, dataset_stats=None)
+                self.preprocessor, self.postprocessor = make_pre_post_processors(self.policy.config, dataset_stats=None)
             
             print("Model loaded successfully!")
             return True
@@ -121,10 +112,12 @@ class LeRobotInference:
         if self.policy is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
         
-        batch = self.preprocess_observation(observation)
                 
+        batch = self.preprocess_observation(observation)
+        
         batch = self.preprocessor(batch)
         
+               
                 
         the_new_batch = {}
         for key in ["observation.images.rgb", "observation.images.gripper", "observation.images.depth", "observation.state"]:
@@ -132,7 +125,14 @@ class LeRobotInference:
                 v = batch[key]
                 B, T = v.shape[:2]
                 the_new_batch[key] = v.reshape(B * T, *v.shape[2:])
-                print(f"{key} shape after reshape: {the_new_batch[key].shape}")
+                
+        
+        # the_new_batch = {}
+        # for key in ["observation.images.rgb", "observation.images.gripper", "observation.images.depth", "observation.state"]:
+        #     if key in batch:
+        #         v = batch[key]
+        #         the_new_batch[key] = v
+        #         print(f"{key} shape after reshape: {the_new_batch[key].shape}")
         
         # Create a fixed noise tensor for deterministic inference
         # This ensures that the diffusion model produces the same results for the same input
@@ -143,6 +143,7 @@ class LeRobotInference:
             generator=torch.Generator(self.device).manual_seed(42)
         )
         
+                
         action = self.policy.select_action(the_new_batch)
                 
         action = self.postprocessor(action)
