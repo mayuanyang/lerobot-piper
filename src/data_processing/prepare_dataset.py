@@ -93,14 +93,16 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     lerobot_frames = []
     timestamp_base = 0.0
     
+    factor = 100000
+    
     for i in range(effective_num_frames):
         # Determine the action for the current frame
         
-        current_state = joint_positions[i]
+        current_state = [pos / factor for pos in joint_positions[i]]
         next_state = joint_positions[i + 1] if i + 1 < effective_num_frames else joint_positions[i]
-        
-        if i < len(joint_positions) - 1:
-            action = next_state
+        # Compute element-wise difference between next_state and current_state
+        action_diff = [next_pos - current_pos for next_pos, current_pos in zip(next_state, current_state)]
+        action_diff = [pos / factor for pos in action_diff]
         
 
         is_done = (i == effective_num_frames - 1)
@@ -112,7 +114,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         # Create frame data with observation images for each camera
         frame_data = {
             "observation.state": current_state,
-            "action": action,
+            "action": action_diff,
             "timestamp": timestamp_base,
             "episode_index": episode_data.episode_index,
             "frame_index": json_data["frames"][i]["frame_index"], # Local index (0, 1, 2, ...)

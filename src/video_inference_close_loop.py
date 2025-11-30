@@ -28,20 +28,21 @@ HISTORY_LENGTH = len(obs_temporal_window)
 # --- Assuming lerobot_inference import is correct from original context ---
 try:
     from .lerobot_inference import LeRobotInference
-except (ImportError, ValueError):
+except (ImportError, ValueError, SystemError):
     # Fallback for when running as a script directly
     import sys
-    sys.path.append(str(Path(__file__).parent))
+    script_dir = Path(__file__).parent.absolute()
+    sys.path.insert(0, str(script_dir))
     from lerobot_inference import LeRobotInference
 # ------------------------------------------------------------------------
 
 class VideoInference:
     """A class to handle video-based inference with trained LeRobot policies."""
     
-    def __init__(self, model_id: str, dataset_id: str = "ISdept/piper_arm", closed_loop: bool = False):
+    def __init__(self, model_id: str, dataset_id: str = "ISdept/piper_arm"):
         self.model_id = model_id
         self.dataset_id = dataset_id
-        self.closed_loop = closed_loop  # Flag for closed-loop prediction
+        self.closed_loop = True  # Always use closed-loop prediction
         self.inference_engine = LeRobotInference(model_id, dataset_id)
         self.device = self.inference_engine.device
         
@@ -107,6 +108,9 @@ class VideoInference:
         state_history = collections.deque(maxlen=HISTORY_LENGTH)
         predicted_action = None  # Track the most recent predicted action for closed-loop
         
+        # Create a copy of joint_states for closed-loop operation
+        joint_states_copy = joint_states.copy()
+        
         results = []
         frame_count = 0
         
@@ -133,15 +137,30 @@ class VideoInference:
                 gripper_history.append(processed_gripper_frame)
                 depth_history.append(processed_depth_frame)
                 
-                current_joint_state = joint_states.popleft()
-                # Divide every value in current_joint_state by 100000
-                current_joint_state = current_joint_state / 100000.0
+                # For closed-loop operation, use predicted actions instead of ground truth after the first prediction
+                if predicted_action is not None:
+                    # Use the predicted action as the current joint state (in closed-loop mode)
+                    current_joint_state = predicted_action.copy()  # Already normalized, no need to scale
+                    print(f"Using predicted action for frame {frame_count}: {current_joint_state}")
+                else:
+                    # Use ground truth joint states for initialization
+                    if len(joint_states_copy) > 0:
+                        current_joint_state = joint_states_copy.popleft()
+                        # Divide every value in current_joint_state by 100000 for normalization
+                        current_joint_state = current_joint_state / 100000.0
+                    else:
+                        # If we've run out of joint states, use the last predicted action
+                        if predicted_action is not None:
+                            current_joint_state = predicted_action.copy()  # Already normalized
+                        else:
+                            # If we don't have any joint states or predictions, break
+                            break
                 state_history.append(current_joint_state)
 
                                 
                 # --- Inference Check ---
                 if len(rgb_history) < HISTORY_LENGTH:
-                    print('No enough observation.state shape:', len(state_history), len(rgb_history), len(gripper_history), len(depth_history))
+                    print('Not enough observation.state shape:', len(state_history), len(rgb_history), len(gripper_history), len(depth_history))
                     frame_count += 1
                     cv2.imshow('RGB Video Input', rgb_frame)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -202,6 +221,9 @@ class VideoInference:
                     # Ensure the action is the correct shape (7 DOF for joint positions)
                     if predicted_action.shape != (7,):
                         print(f"Warning: Unexpected action shape {predicted_action.shape}, expected (7,)")
+                    else:
+                        # Store the predicted action for use in closed-loop mode
+                        print(f"Stored predicted action for next frame: {predicted_action}")
                 
                 
                 # Display and progress updates (omitted boilerplate for brevity)
@@ -270,12 +292,12 @@ def create_sample_joint_states() -> deque:
     
     return joint_states_queue
 
-def main(closed_loop=False):
+def main():
     """Main function demonstrating video inference usage."""
     print("Video LeRobot Inference Demo")
     print("=" * 35)
     
-    inference_engine = VideoInference("ISdept/piper_arm", closed_loop=closed_loop)
+    inference_engine = VideoInference("ISdept/piper_arm")
     
     print("Loading model...")
     if not inference_engine.load_model():
@@ -298,13 +320,10 @@ def main(closed_loop=False):
     print('the length of joint_states', len(joint_states))
     
     results = inference_engine.process_video(rgb_video_path, gripper_video_path, depth_video_path, joint_states)
-    inference_engine.save_results(results, "temp/inference_results.json")
+    inference_engine.save_results(results, "temp/inference_results_close_loop.json")
     print(f"Processed {len(results)} frames")
     
 
     
 if __name__ == "__main__":
-    import sys
-    # Check if closed-loop mode is requested
-    closed_loop = "--closed-loop" in sys.argv
-    main(True)
+    main()
