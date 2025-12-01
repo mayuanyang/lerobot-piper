@@ -110,6 +110,9 @@ class VideoInference:
         results = []
         frame_count = 0
         
+        state_scale = 100000.0
+        action_diff_scale = 10000.0
+        
         try:
             print(f"Processing videos with {HISTORY_LENGTH}-step temporal window.")
             
@@ -135,7 +138,7 @@ class VideoInference:
                 
                 current_joint_state = joint_states.popleft()
                 # Divide every value in current_joint_state by 100000
-                current_joint_state = current_joint_state / 100000.0
+                current_joint_state = current_joint_state / state_scale
                 state_history.append(current_joint_state)
 
                                 
@@ -183,25 +186,34 @@ class VideoInference:
                 # Process the predicted action for autoregressive prediction
                 if result["success"] and "result" in result and "action" in result["result"]:
                     predicted_actions = result["result"]["action"]
-                    print(f'The predicted action for frame {frame_count}:', predicted_actions[0])
+                    print(f'The predicted action diff for frame {frame_count}:', predicted_actions[0])
                     
                     # Ensure the action is in the correct format (numpy array)
                     if isinstance(predicted_actions, np.ndarray):
                         # For diffusion policies, we typically use the first action in the sequence
                         if len(predicted_actions.shape) > 1:
-                            predicted_action = predicted_actions[0]
+                            predicted_action_diff = predicted_actions[0]
                     else:
                         # If it's not already a numpy array, convert it
                         if isinstance(predicted_actions, (list, tuple)):
                             predicted_actions = np.array(predicted_actions, dtype=np.float32)
                             if len(predicted_actions.shape) > 1:
-                                predicted_action = predicted_actions[0]
+                                predicted_action_diff = predicted_actions[0]
                         else:
-                            predicted_action = np.array([predicted_actions], dtype=np.float32)
+                            predicted_action_diff = np.array([predicted_actions], dtype=np.float32)
                     
-                    # Ensure the action is the correct shape (7 DOF for joint positions)
-                    if predicted_action.shape != (7,):
-                        print(f"Warning: Unexpected action shape {predicted_action.shape}, expected (7,)")
+                    # Ensure the action diff is the correct shape (7 DOF for joint positions)
+                    if predicted_action_diff.shape != (7,):
+                        print(f"Warning: Unexpected action diff shape {predicted_action_diff.shape}, expected (7,)")
+                    else:
+                        # Apply the action diff to the current state to get the next state
+                        predicted_action = current_joint_state * state_scale + predicted_action_diff * action_diff_scale
+                        print(f'Applied action diff to get next state: {predicted_action}')
+                    
+                    # Set the accumulated action back to the result
+                    print('The final predicted_action', predicted_action)
+                    result["result"]["action"][0] = predicted_action
+                    
                 
                 
                 # Display and progress updates (omitted boilerplate for brevity)

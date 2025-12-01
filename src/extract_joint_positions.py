@@ -37,8 +37,7 @@ def extract_actions_from_inference(input_file, output_file):
     with open(input_file, 'r') as f:
         inference_results = json.load(f)
     
-    # Define the denormalization factor
-    factor = 100000
+    
     
     # Extract the first action from each result and denormalize
     actions_array = []
@@ -47,8 +46,8 @@ def extract_actions_from_inference(input_file, output_file):
             # Get the first action from the action array
             if item['result']['action'] and len(item['result']['action']) > 0:
                 # Denormalize by multiplying each value in the action by the factor
-                denormalized_action = [val * factor for val in item['result']['action'][0]]
-                actions_array.append(denormalized_action)
+                #denormalized_action = [val for val in item['result']['action'][0]]
+                actions_array.append(item['result']['action'][0])
             else:
                 print("Warning: Empty action array found in an inference result")
     
