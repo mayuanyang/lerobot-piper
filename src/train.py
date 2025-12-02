@@ -92,7 +92,7 @@ def apply_joint_augmentations(batch):
                 # Generate random crop percentage between [-0.005, 0.005]
                 crop_percentage = (torch.rand(1).item() - 0.5) * 0.01  # [-0.005, 0.005]
                 # Add noise in the range [-crop_percentage, crop_percentage] to each joint value
-                noise = torch.randn_like(value) * abs(crop_percentage)
+                noise = torch.randn_like(value) * crop_percentage
                 batch[key] = value + noise
     return batch
 
