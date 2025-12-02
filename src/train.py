@@ -89,10 +89,13 @@ def apply_joint_augmentations(batch):
         for key in ["observation.state", "action"]:
             if key in batch and isinstance(batch[key], torch.Tensor):
                 value = batch[key]
-                # Generate random crop percentage between [-0.005, 0.005]
-                crop_percentage = (torch.rand(1).item() - 0.5) * 0.01  # [-0.005, 0.005]
-                # Add noise in the range [-crop_percentage, crop_percentage] to each joint value
-                noise = torch.randn_like(value) * crop_percentage
+                # Generate a smaller random crop percentage (reduced to 0.05% max)
+                max_crop_percentage = 0.0005  # 0.05%
+                # Generate random crop percentage between [-max_crop_percentage, max_crop_percentage]
+                crop_percentage = (torch.rand(1).item() - 0.5) * 2 * max_crop_percentage
+                # Add independent Gaussian noise scaled by crop_percentage to each joint value
+                # Using crop_percentage directly (with its sign) rather than abs(crop_percentage)
+                noise = value * crop_percentage
                 batch[key] = value + noise
     return batch
 
