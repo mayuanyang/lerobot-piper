@@ -11,19 +11,8 @@ from collections import deque
 # Define temporal window to match train.py configuration
 fps = 10
 frame_time = 1 / fps  # 0.1 seconds
-obs_temporal_window = [
-    -9 * frame_time,
-    -8 * frame_time,
-    -7 * frame_time,
-    -6 * frame_time,
-    -5 * frame_time,
-    -4 * frame_time,
-    -3 * frame_time,
-    -2 * frame_time,
-    -1 * frame_time,
-    0.0    
-]
-HISTORY_LENGTH = len(obs_temporal_window)
+
+HISTORY_LENGTH = 10
 
 # --- Assuming lerobot_inference import is correct from original context ---
 try:
@@ -138,9 +127,10 @@ class VideoInference:
                 
                 
                 if predicted_action is None:
-                    current_joint_state = joint_states.popleft()
+                    print('No predicted action yet', frame_count)
+                    current_joint_state = joint_states.popleft()    
                     current_joint_state_scaled = current_joint_state / state_scale
-                    predicted_action = current_joint_state
+                    #predicted_action = current_joint_state
                 else:
                     current_joint_state_scaled = predicted_action / state_scale
                 
@@ -211,6 +201,8 @@ class VideoInference:
                     if predicted_action_diff.shape != (7,):
                         print(f"Warning: Unexpected action diff shape {predicted_action_diff.shape}, expected (7,)")
                     else:
+                        if predicted_action is None:
+                            predicted_action = current_joint_state
                         predicted_action = predicted_action + predicted_action_diff * action_diff_scale
                     
                     result["result"]["action"][0] = predicted_action
@@ -281,7 +273,7 @@ def create_sample_joint_states() -> deque:
     
     return joint_states_queue
 
-def main():
+def main(num_of_frames_to_skip=0):
     """Main function demonstrating video inference usage."""
     print("Video LeRobot Inference Demo")
     print("=" * 35)
@@ -304,7 +296,10 @@ def main():
     gripper_video_path = "input/episode_001_gripper.mp4"
     depth_video_path = "input/episode_001_depth.mp4"
     
+    
     joint_states = create_sample_joint_states()
+    for i in range(num_of_frames_to_skip):
+        joint_states.popleft()
     
     print('the length of joint_states', len(joint_states))
     

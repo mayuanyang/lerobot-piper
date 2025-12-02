@@ -108,6 +108,9 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         action_diff = [next_pos - current_pos for next_pos, current_pos in zip(next_state, current_state)]
         action_diff_scaled = [diff / diff_factor for diff in action_diff]
         
+        # Add small random noise to zero values
+        action_diff_scaled = [diff + np.random.uniform(-0.0001, 0.0001) if diff == 0.0 else diff for diff in action_diff_scaled]
+        
 
         is_done = (i == effective_num_frames - 1)
         

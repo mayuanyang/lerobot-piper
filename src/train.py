@@ -46,36 +46,54 @@ def get_augmentations():
 
 # 🟢 ADDED: Helper to apply augmentations to video batches
 def apply_augmentations(batch, transforms):
-    for key, value in batch.items():
-        # strict check: must have "image" in name AND be a tensor
-        if "image" in key and isinstance(value, torch.Tensor):
-            
-            # Case 1: Standard Video Tensor (Batch, Time, Channel, Height, Width)
-            # This is what we expect for Diffusion Policy (ndim=5)
-            if value.ndim == 5:
-                B, T, C, H, W = value.shape
-                # Flatten Batch and Time dimensions so transforms can process them
-                flat_imgs = value.view(B * T, C, H, W)
+    """Apply image augmentations with random selection"""
+    # Randomly decide whether to apply augmentation (50% chance)
+    if torch.rand(1).item() > 0.5:
+        for key, value in batch.items():
+            # strict check: must have "image" in name AND be a tensor
+            if "image" in key and isinstance(value, torch.Tensor):
                 
-                # Apply transform
-                aug_imgs = transforms(flat_imgs)
-                
-                # Reshape back to (B, T, C, H, W)
-                batch[key] = aug_imgs.view(B, T, C, H, W)
+                # Case 1: Standard Video Tensor (Batch, Time, Channel, Height, Width)
+                # This is what we expect for Diffusion Policy (ndim=5)
+                if value.ndim == 5:
+                    B, T, C, H, W = value.shape
+                    # Flatten Batch and Time dimensions so transforms can process them
+                    flat_imgs = value.view(B * T, C, H, W)
+                    
+                    # Apply transform
+                    aug_imgs = transforms(flat_imgs)
+                    
+                    # Reshape back to (B, T, C, H, W)
+                    batch[key] = aug_imgs.view(B, T, C, H, W)
 
-            # Case 2: Single Frame Tensor (Batch, Channel, Height, Width)
-            # (ndim=4) - Rare for your config, but good for safety
-            elif value.ndim == 4:
-                batch[key] = transforms(value)
+                # Case 2: Single Frame Tensor (Batch, Channel, Height, Width)
+                # (ndim=4) - Rare for your config, but good for safety
+                elif value.ndim == 4:
+                    batch[key] = transforms(value)
 
-            # Case 3: Metadata/Masks (ndim < 4)
-            # If the tensor is 2D or 3D (e.g. validity masks [B, T]), 
-            # we skip it. It cannot be color-jittered.
-            else:
-                # Optional: Uncomment to see what key was skipped
-                # print(f"Skipping augmentation for key '{key}' with shape {value.shape}")
-                pass
-                
+                # Case 3: Metadata/Masks (ndim < 4)
+                # If the tensor is 2D or 3D (e.g. validity masks [B, T]), 
+                # we skip it. It cannot be color-jittered.
+                else:
+                    # Optional: Uncomment to see what key was skipped
+                    # print(f"Skipping augmentation for key '{key}' with shape {value.shape}")
+                    pass
+                    
+    return batch
+
+# 🟢 ADDED: Helper to apply joint data augmentation
+def apply_joint_augmentations(batch):
+    """Apply random cropping to joint data (observation.state and action)"""
+    # Randomly decide whether to apply augmentation (50% chance)
+    if torch.rand(1).item() > 0.5:
+        for key in ["observation.state", "action"]:
+            if key in batch and isinstance(batch[key], torch.Tensor):
+                value = batch[key]
+                # Generate random crop percentage between [-0.005, 0.005]
+                crop_percentage = (torch.rand(1).item() - 0.5) * 0.01  # [-0.005, 0.005]
+                # Add noise in the range [-crop_percentage, crop_percentage] to each joint value
+                noise = torch.randn_like(value) * abs(crop_percentage)
+                batch[key] = value + noise
     return batch
 
 
@@ -208,14 +226,17 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].to(device, non_blocking=True)
 
-            # 2. Apply Augmentation (On GPU, before normalization)
+            # 2. Apply Image Augmentation (On GPU, before normalization)
             # We usually augment raw images (0-255 or 0-1) before the preprocessor normalizes them using stats
             batch = apply_augmentations(batch, image_transforms)
 
-            # 3. Preprocess (Normalize)
+            # 3. Apply Joint Data Augmentation
+            batch = apply_joint_augmentations(batch)
+
+            # 4. Preprocess (Normalize)
             batch = preprocessor(batch)
 
-            # 4. Forward & Backward
+            # 5. Forward & Backward
             loss, _ = policy.forward(batch)
             loss.backward()
             optimizer.step()
