@@ -86,7 +86,7 @@ def apply_joint_augmentations(batch):
     """Apply random cropping to joint data (observation.state and action)"""
     # Randomly decide whether to apply augmentation (50% chance)
     if torch.rand(1).item() > 0.5:
-        for key in ["observation.state", "action"]:
+        for key in ["observation.state"]:
             if key in batch and isinstance(batch[key], torch.Tensor):
                 value = batch[key]
                 # Generate a smaller random crop percentage (reduced to 0.05% max)
@@ -104,7 +104,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
 
-    training_steps = 30000 
+    training_steps = 100000 
     log_freq = 10 # Reduced frequency to reduce console spam
     checkpoint_freq = 1000 
 
@@ -124,7 +124,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         input_features=input_features, 
         output_features=output_features, 
         n_obs_steps=10, 
-        horizon=16, 
+        horizon=24, 
         n_action_steps=16, 
         pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1", 
         use_group_norm=False,
@@ -177,7 +177,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         policy.to(device)
         preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
         step = 0
-        optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
+        optimizer = torch.optim.Adam(policy.parameters(), lr=3e-5)
 
     # Ensure preprocessors are on the correct device
     # (Some LeRobot versions keep them as modules)
@@ -197,7 +197,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         "observation.images.depth": obs_temporal_window,
         "observation.state": obs_temporal_window,
         # 8 steps before 0 and 8 steps after 0 (16 frames total)
-        "action": [-(8 - i) * frame_time for i in range(8)] + [i * frame_time for i in range(8)]
+        "action": [-(8 - i) * frame_time for i in range(8)] + [i * frame_time for i in range(16)]
     }
 
     try:
@@ -211,7 +211,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=4,
-        batch_size=4,
+        batch_size=6,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
