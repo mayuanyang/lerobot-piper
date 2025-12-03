@@ -196,8 +196,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         "observation.images.rgb": obs_temporal_window,
         "observation.images.depth": obs_temporal_window,
         "observation.state": obs_temporal_window,
-        # 8 steps before 0 and 8 steps after 0 (16 frames total)
-        "action": [-(8 - i) * frame_time for i in range(8)] + [i * frame_time for i in range(16)]
+        "action": [i * frame_time for i in range(24)]
     }
 
     try:
