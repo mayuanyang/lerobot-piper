@@ -178,15 +178,16 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     fps = 10
     frame_time = 1 / fps
     
-    # 0 to -9 is exactly 10 frames (matches n_obs_steps=10)
-    obs_temporal_window = [ -i * frame_time for i in range(10) ][::-1] # Reverse to get [-0.9, ... 0.0]
+    # Align with piper_smolvla.config chunk_size of 50
+    # Using 25 observation frames to balance with action frames
+    obs_temporal_window = [ -i * frame_time for i in range(25) ][::-1] # 25 frames
     
     delta_timestamps = {
         "observation.images.gripper": obs_temporal_window,  
         "observation.images.rgb": obs_temporal_window,
         "observation.images.depth": obs_temporal_window,
         "observation.state": obs_temporal_window,
-        "action": [i * frame_time for i in range(24)]
+        "action": [i * frame_time for i in range(50)]  # Match chunk_size of 50
     }
 
     try:
