@@ -141,7 +141,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             preprocessor, postprocessor = load_pre_post_processors(resume_from_checkpoint)
         except Exception as e:
             print(f"Could not load preprocessors: {e}. Creating new ones.")
-            preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
+            preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
             
         optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
         

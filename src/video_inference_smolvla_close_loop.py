@@ -11,7 +11,7 @@ from collections import deque
 # Define temporal window to match train.py configuration
 fps = 10
 frame_time = 1 / fps  # 0.1 seconds
-HISTORY_LENGTH = 1
+HISTORY_LENGTH = 25
 
 # --- Assuming lerobot_inference import is correct from original context ---
 try:
