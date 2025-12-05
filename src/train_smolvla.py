@@ -84,20 +84,20 @@ def apply_augmentations(batch, transforms):
 
 # 🟢 ADDED: Helper to apply joint data augmentation
 def apply_joint_augmentations(batch):
-    """Apply random cropping to joint data (observation.state and action)"""
+    """Apply margin-based augmentation to joint data (observation.state) with per-joint variations"""
     # Randomly decide whether to apply augmentation (50% chance)
     if torch.rand(1).item() > 0.5:
-        for key in ["observation.state"]:
-            if key in batch and isinstance(batch[key], torch.Tensor):
-                value = batch[key]
-                # Generate a smaller random crop percentage (reduced to 0.05% max)
-                max_crop_percentage = 0.0005  # 0.05%
-                # Generate random crop percentage between [-max_crop_percentage, max_crop_percentage]
-                crop_percentage = (torch.rand(1).item() - 0.5) * 2 * max_crop_percentage
-                # Add independent Gaussian noise scaled by crop_percentage to each joint value
-                # Using crop_percentage directly (with its sign) rather than abs(crop_percentage)
-                noise = value * crop_percentage
-                batch[key] = value + noise
+        key = "observation.state"
+        if key in batch and isinstance(batch[key], torch.Tensor):
+            value = batch[key]
+            # Generate per-joint random margin percentages (reduced to 0.05% max per joint)
+            max_margin_percentage = 0.0005  # 0.05%
+            # Generate random margin percentage for each joint independently
+            # Shape will be [1, 1, num_joints] to broadcast correctly with [batch, time, joints]
+            joint_margins = (torch.rand(1, 1, value.shape[-1]).to(value.device) - 0.5) * 2 * max_margin_percentage
+            # Apply margin-based noise (multiplicative to simulate proportional variations)
+            noise = value * joint_margins
+            batch[key] = value + noise
     return batch
 
 
@@ -161,13 +161,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         else:
             step = 0
     else:
-        # Initialize Fresh Policy
-        policy = JointSmoothDiffusion(cfg, velocity_loss_weight=1.0, acceleration_loss_weight=0.5, jerk_loss_weight=0.1)
-        policy.train()
-        policy.to(device)
-        preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
-        step = 0
-        optimizer = torch.optim.Adam(policy.parameters(), lr=3e-5)
+        raise NotImplemented
 
     # Ensure preprocessors are on the correct device
     # (Some LeRobot versions keep them as modules)
@@ -214,20 +208,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         prog_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Training Step {step}")
         for batch_idx, batch in prog_bar:
             
-            # 1. Move to Device FIRST (Efficient)
-            for key in batch:
-                if isinstance(batch[key], torch.Tensor):
-                    batch[key] = batch[key].to(device, non_blocking=True)
-
-            # Ensure task_description is also moved to device if it's a string
-            if "task_description" in batch and not isinstance(batch["task_description"], torch.Tensor):
-                # Convert string to tensor if needed, or ensure it's properly handled
-                if isinstance(batch["task_description"], str):
-                    # Keep as string but ensure it's on the right device context
-                    pass
-                elif isinstance(batch["task_description"], list) and all(isinstance(x, str) for x in batch["task_description"]):
-                    # Keep as list of strings
-                    pass
 
             # 2. Apply Image Augmentation (On GPU, before normalization)
             # We usually augment raw images (0-255 or 0-1) before the preprocessor normalizes them using stats
