@@ -124,11 +124,12 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
             "action": action_diff_scaled,
             "timestamp": timestamp_base,
             "episode_index": episode_data.episode_index,
-            "frame_index": json_data["frames"][i]["frame_index"], # Local index (0, 1, 2, ...)
-            "index": global_index, # Global index (0, 1, 2, ..., N)
+            "frame_index": json_data["frames"][i]["frame_index"],  # 局部索引 (0, 1, 2, ...)
+            "index": global_index,  # 全局索引 (0, 1, 2, ..., N)
             "next.done": is_done,
             "next.reward": 1.0 if is_done else 0.0,
-            "task_index": 0
+            "task_index": 0,
+            "task_description": episode_data.task_description
         }        
                 
         lerobot_frames.append(frame_data)
@@ -147,8 +148,10 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         "index": Value("int64"),
         "next.done": Value("bool"),
         "next.reward": Value("float32"),
-        "task_index": Value("int64")
+        "task_index": Value("int64"),
+        "task_description": Value("string"),
     }
+
     
         
     feature_config = Features(feature_config_dict)
@@ -209,9 +212,14 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
                 "action": {
                     "shape": [num_joints],
                     "dtype": "float32"
+                },
+                "task_description": {  # 新增：任务字段定义
+                    "shape": [1],
+                    "dtype": "string"
                 }
             }
         }
+
         
         # Add camera features dynamically
         for camera_data in episode_data.cameras:
@@ -273,6 +281,7 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         "dataset_to_index": dataset_to_index,
         "start_time": json_data["start_time"],
         "end_time": json_data["end_time"],
+        "task_description": episode_data.task_description
         # [Video metadata for each camera remains the same...]
     }
     
