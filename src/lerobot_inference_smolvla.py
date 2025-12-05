@@ -105,7 +105,7 @@ class LeRobotInference:
             
         
         # --- 2. Handle image observations ---
-        for key in ["observation.images.camera1", "observation.images.camera2", "observation.images.camera3"]:
+        for key in ["observation.images.rgb", "observation.images.depth", "observation.images.gripper"]:
             if key in observation:
                 img_tensor = observation[key]
                 input_observation[key] = img_tensor.to(self.device)
@@ -123,12 +123,6 @@ class LeRobotInference:
         batch = self.preprocess_observation(observation)
         
         batch = self.preprocessor(batch)
-        
-        for key in batch.keys():
-            if isinstance(batch[key], torch.Tensor):
-                print('The shape', key, batch[key].shape)
-            else:
-                print('The value', batch[key])
                         
         action = self.policy.select_action(batch)
                 

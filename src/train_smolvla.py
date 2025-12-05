@@ -101,7 +101,7 @@ def apply_joint_augmentations(batch):
     return batch
 
 
-def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_from_checkpoint=None):
+def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_from_checkpoint='ISdept/smolvla-piper'):
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
 
@@ -215,10 +215,18 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             
             # 1. Move to Device FIRST (Efficient)
             for key in batch:
-                if key == 'task_description':
-                    print('handling key', key, batch[key])
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].to(device, non_blocking=True)
+
+            # Ensure task_description is also moved to device if it's a string
+            if "task_description" in batch and not isinstance(batch["task_description"], torch.Tensor):
+                # Convert string to tensor if needed, or ensure it's properly handled
+                if isinstance(batch["task_description"], str):
+                    # Keep as string but ensure it's on the right device context
+                    pass
+                elif isinstance(batch["task_description"], list) and all(isinstance(x, str) for x in batch["task_description"]):
+                    # Keep as list of strings
+                    pass
 
             # 2. Apply Image Augmentation (On GPU, before normalization)
             # We usually augment raw images (0-255 or 0-1) before the preprocessor normalizes them using stats
@@ -227,12 +235,18 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             # 3. Apply Joint Data Augmentation
             batch = apply_joint_augmentations(batch)
 
+            # 4. Ensure task information is properly formatted for tokenizer
+            # The tokenizer processor expects a "task" key in the batch
+            if "task_description" in batch:
+                # Map task_description to task key for tokenizer processor
+                batch["task"] = batch["task_description"]
+
             # 4. Preprocess (Normalize)
             batch = preprocessor(batch)
 
             # 5. Forward & Backward
-            #loss, _ = policy.forward(batch)
-            #loss.backward()
+            loss, _ = policy.forward(batch)
+            loss.backward()
             optimizer.step()
             optimizer.zero_grad()
 

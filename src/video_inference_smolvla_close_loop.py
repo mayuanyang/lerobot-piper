@@ -158,9 +158,9 @@ class VideoInference:
                 depth_tensor = torch.from_numpy(depth_stacked).permute(0, 3, 1, 2).unsqueeze(0)  # [1, T, C, H, W]
 
                 observation = {
-                    "observation.images.camera2": rgb_tensor,
-                    "observation.images.camera1": gripper_tensor,
-                    "observation.images.camera3": depth_tensor,
+                    "observation.images.rgb": rgb_tensor,
+                    "observation.images.gripper": gripper_tensor,
+                    "observation.images.depth": depth_tensor,
                 }
                 
                 
