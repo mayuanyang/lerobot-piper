@@ -13,6 +13,7 @@ from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy, SmolVLAConf
 
 # 🟢 ADDED: Import torchvision for augmentation
 from torchvision.transforms import v2
+from lerobot.datasets.transforms import ImageTransforms, ImageTransformsConfig, ImageTransformConfig
 
 # Import JointSmoothDiffusion instead of DiffusionPolicy
 # Ensure this path is reachable from your running directory
@@ -35,15 +36,42 @@ print(f"Using device: {device}")
 
 # 🟢 ADDED: Data Augmentation Setup
 def get_augmentations():
-    # Basic augmentation for Diffusion Policy often includes:
-    # 1. Color Jitter (lighting invariance)
-    # 2. Small translations/rotations (position invariance)
-    return v2.Compose([
-        v2.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
-        # Using RandomAffine instead of Crop because we don't know your exact image dimensions 
-        # and don't want to accidentally crop out the gripper.
-        v2.RandomAffine(degrees=5, translate=(0.05, 0.05), scale=(0.95, 1.05)),
-    ])
+    # Create ImageTransformsConfig with desired augmentations
+    cfg = ImageTransformsConfig(
+        enable=True,
+        max_num_transforms=3,
+        random_order=True,
+        tfs={
+            "brightness": ImageTransformConfig(
+                weight=1.0,
+                type="ColorJitter",
+                kwargs={"brightness": (0.7, 1.3)},
+            ),
+            "contrast": ImageTransformConfig(
+                weight=1.0,
+                type="ColorJitter",
+                kwargs={"contrast": (0.7, 1.3)},
+            ),
+            "saturation": ImageTransformConfig(
+                weight=1.0,
+                type="ColorJitter",
+                kwargs={"saturation": (0.7, 1.3)},
+            ),
+            "hue": ImageTransformConfig(
+                weight=1.0,
+                type="ColorJitter",
+                kwargs={"hue": (-0.05, 0.05)},
+            ),
+            "affine": ImageTransformConfig(
+                weight=1.0,
+                type="RandomAffine",
+                kwargs={"degrees": (-5.0, 5.0), "translate": (0.05, 0.05), "scale": (0.95, 1.05)},
+            ),
+        }
+    )
+    
+    # Create ImageTransforms object from config
+    return ImageTransforms(cfg)
 
 # 🟢 ADDED: Helper to apply augmentations to video batches
 def apply_augmentations(batch, transforms):
@@ -91,7 +119,7 @@ def apply_joint_augmentations(batch):
         if key in batch and isinstance(batch[key], torch.Tensor):
             value = batch[key]
             # Generate per-joint random margin percentages (reduced to 0.05% max per joint)
-            max_margin_percentage = 0.0005  # 0.05%
+            max_margin_percentage = 0.05  # 0.05%
             # Generate random margin percentage for each joint independently
             # Shape will be [1, 1, num_joints] to broadcast correctly with [batch, time, joints]
             joint_margins = (torch.rand(1, 1, value.shape[-1]).to(value.device) - 0.5) * 2 * max_margin_percentage
@@ -185,12 +213,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     }
 
     try:
-        dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, force_cache_sync=True, revision="main", tolerance_s=0.01)
+        dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, image_transforms=image_transforms, force_cache_sync=True, revision="main", tolerance_s=0.01)
     except Exception as e:
         print(f"Error loading remote dataset: {e}")
         local_dataset_path = "./src/output" 
         print(f"Trying local dataset at {local_dataset_path}...")
-        dataset = LeRobotDataset(local_dataset_path, delta_timestamps=delta_timestamps, force_cache_sync=True, tolerance_s=0.01)
+        dataset = LeRobotDataset(local_dataset_path, delta_timestamps=delta_timestamps, image_transforms=image_transforms, force_cache_sync=True, tolerance_s=0.01)
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -209,11 +237,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         for batch_idx, batch in prog_bar:
             
 
-            # 2. Apply Image Augmentation (On GPU, before normalization)
-            # We usually augment raw images (0-255 or 0-1) before the preprocessor normalizes them using stats
-            batch = apply_augmentations(batch, image_transforms)
-
-            # 3. Apply Joint Data Augmentation
+            # 2. Apply Joint Data Augmentation
             batch = apply_joint_augmentations(batch)
 
             # 4. Ensure task information is properly formatted for tokenizer

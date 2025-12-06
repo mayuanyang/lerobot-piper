@@ -15,7 +15,7 @@ obs_temporal_window = [
     -1 * frame_time,
     0.0    
 ]
-HISTORY_LENGTH = len(obs_temporal_window)
+HISTORY_LENGTH = 25 #len(obs_temporal_window)
 
 # --- Assuming lerobot_inference import is correct from original context ---
 try:
@@ -132,10 +132,10 @@ class VideoInference:
                 # Divide every value in current_joint_state by 100000
                 current_joint_state = current_joint_state / state_scale
                 
-                noise = np.random.uniform(-0.1, 0.1, size=current_joint_state.shape)
+                # noise = np.random.uniform(-0.01, 0.01, size=current_joint_state.shape)
 
-                # Add noise to current_joint_state
-                current_joint_state = current_joint_state + noise
+                # # Add noise to current_joint_state
+                # current_joint_state = current_joint_state + noise
 
                 state_history.append(current_joint_state)
 
