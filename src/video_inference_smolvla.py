@@ -131,6 +131,12 @@ class VideoInference:
                 current_joint_state = joint_states.popleft()
                 # Divide every value in current_joint_state by 100000
                 current_joint_state = current_joint_state / state_scale
+                
+                noise = np.random.uniform(-0.1, 0.1, size=current_joint_state.shape)
+
+                # Add noise to current_joint_state
+                current_joint_state = current_joint_state + noise
+
                 state_history.append(current_joint_state)
 
                                 

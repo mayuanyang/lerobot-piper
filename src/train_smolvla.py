@@ -225,7 +225,13 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             # 4. Preprocess (Normalize)
             batch = preprocessor(batch)
 
-            # 5. Forward & Backward
+            # 5. Move all tensor values in batch to device
+            # Note: Some items may be strings or other non-tensor types that cannot be moved to device
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor):
+                    batch[key] = value.to(device)
+
+            # 6. Forward & Backward
             loss, _ = policy.forward(batch)
             loss.backward()
             optimizer.step()
@@ -234,7 +240,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             if step % log_freq == 0:
                 prog_bar.set_postfix({"step": step, "loss": f"{loss.item():.3f}"})
             
-            # 5. Save Checkpoint
+            # 7. Save Checkpoint
             if step > 0 and step % checkpoint_freq == 0:
                 checkpoint_dir = output_directory / f"checkpoint-{step}"
                 checkpoint_dir.mkdir(exist_ok=True)
