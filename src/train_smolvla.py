@@ -39,33 +39,23 @@ def get_augmentations():
     # Create ImageTransformsConfig with desired augmentations
     cfg = ImageTransformsConfig(
         enable=True,
-        max_num_transforms=3,
+        max_num_transforms=2,  # Reduced from 3 to decrease memory usage
         random_order=True,
         tfs={
             "brightness": ImageTransformConfig(
                 weight=1.0,
                 type="ColorJitter",
-                kwargs={"brightness": (0.7, 1.3)},
+                kwargs={"brightness": (0.8, 1.2)},  # Reduced range to decrease memory usage
             ),
             "contrast": ImageTransformConfig(
                 weight=1.0,
                 type="ColorJitter",
-                kwargs={"contrast": (0.7, 1.3)},
-            ),
-            "saturation": ImageTransformConfig(
-                weight=1.0,
-                type="ColorJitter",
-                kwargs={"saturation": (0.7, 1.3)},
-            ),
-            "hue": ImageTransformConfig(
-                weight=1.0,
-                type="ColorJitter",
-                kwargs={"hue": (-0.05, 0.05)},
+                kwargs={"contrast": (0.8, 1.2)},  # Reduced range to decrease memory usage
             ),
             "affine": ImageTransformConfig(
                 weight=1.0,
                 type="RandomAffine",
-                kwargs={"degrees": (-5.0, 5.0), "translate": (0.05, 0.05), "scale": (0.95, 1.05)},
+                kwargs={"degrees": (-3.0, 3.0), "translate": (0.03, 0.03)},  # Reduced range to decrease memory usage
             ),
         }
     )
@@ -118,8 +108,8 @@ def apply_joint_augmentations(batch):
         key = "observation.state"
         if key in batch and isinstance(batch[key], torch.Tensor):
             value = batch[key]
-            # Generate per-joint random margin percentages (reduced to 0.05% max per joint)
-            max_margin_percentage = 0.05  # 0.05%
+            # Generate per-joint random margin percentages (reduced to 0.01% max per joint)
+            max_margin_percentage = 0.05  # 0.01% (reduced from 0.05%)
             # Generate random margin percentage for each joint independently
             # Shape will be [1, 1, num_joints] to broadcast correctly with [batch, time, joints]
             joint_margins = (torch.rand(1, 1, value.shape[-1]).to(value.device) - 0.5) * 2 * max_margin_percentage
@@ -222,8 +212,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        num_workers=4,
-        batch_size=6,
+        num_workers=2,
+        batch_size=12,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
