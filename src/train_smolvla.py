@@ -1,4 +1,5 @@
 from pathlib import Path
+import gc
 
 import torch
 from tqdm import tqdm
@@ -45,60 +46,24 @@ def get_augmentations():
             "brightness": ImageTransformConfig(
                 weight=1.0,
                 type="ColorJitter",
-                kwargs={"brightness": (0.8, 1.2)},  # Reduced range to decrease memory usage
+                kwargs={"brightness": (0.9, 1.1)},  # Reduced range to decrease memory usage
             ),
             "contrast": ImageTransformConfig(
                 weight=1.0,
                 type="ColorJitter",
-                kwargs={"contrast": (0.8, 1.2)},  # Reduced range to decrease memory usage
+                kwargs={"contrast": (0.9, 1.1)},  # Reduced range to decrease memory usage
             ),
-            "affine": ImageTransformConfig(
-                weight=1.0,
-                type="RandomAffine",
-                kwargs={"degrees": (-3.0, 3.0), "translate": (0.03, 0.03)},  # Reduced range to decrease memory usage
-            ),
+            # "affine": ImageTransformConfig(
+            #     weight=1.0,
+            #     type="RandomAffine",
+            #     kwargs={"degrees": (-3.0, 3.0), "translate": (0.03, 0.03)},  # Reduced range to decrease memory usage
+            # ),
         }
     )
     
     # Create ImageTransforms object from config
     return ImageTransforms(cfg)
 
-# 🟢 ADDED: Helper to apply augmentations to video batches
-def apply_augmentations(batch, transforms):
-    """Apply image augmentations with random selection"""
-    # Randomly decide whether to apply augmentation (50% chance)
-    if torch.rand(1).item() > 0.5:
-        for key, value in batch.items():
-            # strict check: must have "image" in name AND be a tensor
-            if "image" in key and isinstance(value, torch.Tensor):
-                
-                # Case 1: Standard Video Tensor (Batch, Time, Channel, Height, Width)
-                # This is what we expect for Diffusion Policy (ndim=5)
-                if value.ndim == 5:
-                    B, T, C, H, W = value.shape
-                    # Flatten Batch and Time dimensions so transforms can process them
-                    flat_imgs = value.view(B * T, C, H, W)
-                    
-                    # Apply transform
-                    aug_imgs = transforms(flat_imgs)
-                    
-                    # Reshape back to (B, T, C, H, W)
-                    batch[key] = aug_imgs.view(B, T, C, H, W)
-
-                # Case 2: Single Frame Tensor (Batch, Channel, Height, Width)
-                # (ndim=4) - Rare for your config, but good for safety
-                elif value.ndim == 4:
-                    batch[key] = transforms(value)
-
-                # Case 3: Metadata/Masks (ndim < 4)
-                # If the tensor is 2D or 3D (e.g. validity masks [B, T]), 
-                # we skip it. It cannot be color-jittered.
-                else:
-                    # Optional: Uncomment to see what key was skipped
-                    # print(f"Skipping augmentation for key '{key}' with shape {value.shape}")
-                    pass
-                    
-    return batch
 
 # 🟢 ADDED: Helper to apply joint data augmentation
 def apply_joint_augmentations(batch):
@@ -212,7 +177,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        num_workers=2,
+        num_workers=8,
         batch_size=12,
         shuffle=True,
         pin_memory=device.type != "cpu",
@@ -251,8 +216,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             optimizer.step()
             optimizer.zero_grad()
 
+            
+
             if step % log_freq == 0:
                 prog_bar.set_postfix({"step": step, "loss": f"{loss.item():.3f}"})
+                # Explicitly delete variables to free up memory
+                del loss
             
             # 7. Save Checkpoint
             if step > 0 and step % checkpoint_freq == 0:
@@ -264,10 +233,20 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer_state.pth")
                 print(f"\nCheckpoint saved at step {step}")
                 
+                # Force garbage collection after checkpoint save
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
             step += 1
             if step >= training_steps:
                 done = True
                 break
+                
+        # Force garbage collection after each epoch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # Final Save
     policy.save_pretrained(output_directory)
