@@ -522,7 +522,7 @@ def compute_and_save_dataset_stats(output_dir: Path):
                 episode_dict = {}
                 
                 # Ensure image columns are processed even if not in the parquet file
-                image_columns = ["observation.images.rgb", "observation.images.depth", "observation.images.gripper"]
+                image_columns = ["observation.images.front", "observation.images.right", "observation.images.gripper"]
                 for image_column in image_columns:
                     if image_column in features and image_column not in episode_dataset.columns:
                         # Add the image column to the dataset with episode index values

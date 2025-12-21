@@ -161,8 +161,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     
     delta_timestamps = {
         "observation.images.gripper": obs_temporal_window,  
-        "observation.images.rgb": obs_temporal_window,
-        "observation.images.depth": obs_temporal_window,
+        "observation.images.right": obs_temporal_window,
+        "observation.images.front": obs_temporal_window,
         "observation.state": obs_temporal_window,
         "action": [i * frame_time for i in range(50)]  # Match chunk_size of 50
     }

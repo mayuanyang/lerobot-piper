@@ -105,7 +105,7 @@ class LeRobotInference:
             
         
         # --- 2. Handle image observations ---
-        for key in ["observation.images.rgb", "observation.images.depth", "observation.images.gripper"]:
+        for key in ["observation.images.front", "observation.images.right", "observation.images.gripper"]:
             if key in observation:
                 img_tensor = observation[key]
                 input_observation[key] = img_tensor.to(self.device)
@@ -152,9 +152,9 @@ def create_sample_observation():
     # ... (create_sample_observation remains the same) ...
     return {
         "observation.state": np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]),  # 7-DOF joint positions
-        "observation.images.rgb": np.random.rand(3, 400, 640).astype(np.float32),  # RGB camera image
+        "observation.images.front": np.random.rand(3, 400, 640).astype(np.float32),  # Front camera image
         "observation.images.gripper": np.random.rand(3, 400, 640).astype(np.float32),  # Gripper camera image
-        "observation.images.depth": np.random.rand(3, 400, 640).astype(np.float32)   # Depth camera image
+        "observation.images.right": np.random.rand(3, 400, 640).astype(np.float32)   # Right camera image
     }
 
 def main():
