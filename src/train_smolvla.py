@@ -230,7 +230,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 policy.save_pretrained(checkpoint_dir)
                 preprocessor.save_pretrained(checkpoint_dir)
                 postprocessor.save_pretrained(checkpoint_dir)
-                torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer_state.pth")
+                #torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer_state.pth")
                 print(f"\nCheckpoint saved at step {step}")
                 
                 # Force garbage collection after checkpoint save
