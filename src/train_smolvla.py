@@ -177,8 +177,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        num_workers=8,
-        batch_size=12,
+        num_workers=4,
+        batch_size=6,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
