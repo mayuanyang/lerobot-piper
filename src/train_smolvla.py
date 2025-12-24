@@ -53,11 +53,6 @@ def get_augmentations():
                 type="ColorJitter",
                 kwargs={"contrast": (0.9, 1.1)},  # Reduced range to decrease memory usage
             ),
-            # "affine": ImageTransformConfig(
-            #     weight=1.0,
-            #     type="RandomAffine",
-            #     kwargs={"degrees": (-3.0, 3.0), "translate": (0.03, 0.03)},  # Reduced range to decrease memory usage
-            # ),
         }
     )
     
@@ -73,13 +68,7 @@ def apply_joint_augmentations(batch):
         key = "observation.state"
         if key in batch and isinstance(batch[key], torch.Tensor):
             value = batch[key]
-            # Generate per-joint random margin percentages (reduced to 0.01% max per joint)
-            max_margin_percentage = 0.05  # 0.01% (reduced from 0.05%)
-            # Generate random margin percentage for each joint independently
-            # Shape will be [1, 1, num_joints] to broadcast correctly with [batch, time, joints]
-            joint_margins = (torch.rand(1, 1, value.shape[-1]).to(value.device) - 0.5) * 2 * max_margin_percentage
-            # Apply margin-based noise (multiplicative to simulate proportional variations)
-            noise = value * joint_margins
+            noise = torch.randn_like(value) * 0.003  # ~0.17°C standard deviation
             batch[key] = value + noise
     return batch
 
@@ -105,6 +94,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     print('output_features:', output_features)
 
     cfg = SmolVLAConfig()
+    #cfg.chunk_size = 25
     
     if dataset_metadata.stats is None:
         raise ValueError("Dataset stats are required to initialize the policy.")
@@ -156,15 +146,15 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     frame_time = 1 / fps
     
     # Align with piper_smolvla.config chunk_size of 50
-    # Using 25 observation frames to balance with action frames
-    obs_temporal_window = [ -i * frame_time for i in range(25) ][::-1] # 25 frames
-    
+    # Using 10 observation frames to balance with action frames
+    obs_temporal_window = [ -i * frame_time for i in range(10) ][::-1] # 10 frames
+
     delta_timestamps = {
         "observation.images.gripper": obs_temporal_window,  
         "observation.images.right": obs_temporal_window,
         "observation.images.front": obs_temporal_window,
         "observation.state": obs_temporal_window,
-        "action": [i * frame_time for i in range(50)]  # Match chunk_size of 50
+        "action": [i * frame_time for i in range(50)] 
     }
 
     try:
@@ -177,8 +167,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        num_workers=4,
-        batch_size=6,
+        num_workers=2,
+        batch_size=20,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
@@ -191,18 +181,14 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         prog_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Training Step {step}")
         for batch_idx, batch in prog_bar:
             
-
-            # 2. Apply Joint Data Augmentation
-            batch = apply_joint_augmentations(batch)
-
-            # 4. Ensure task information is properly formatted for tokenizer
             # The tokenizer processor expects a "task" key in the batch
             if "task_description" in batch:
                 # Map task_description to task key for tokenizer processor
                 batch["task"] = batch["task_description"]
 
-            # 4. Preprocess (Normalize)
             batch = preprocessor(batch)
+            
+            batch = apply_joint_augmentations(batch)
 
             # 5. Move all tensor values in batch to device
             # Note: Some items may be strings or other non-tensor types that cannot be moved to device
