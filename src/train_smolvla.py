@@ -94,7 +94,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     print('output_features:', output_features)
 
     cfg = SmolVLAConfig()
-    #cfg.chunk_size = 25
+    cfg.n_obs_steps = 6
+    #cfg.chunk_size = 16
+    #cfg.n_action_steps = 16
     
     if dataset_metadata.stats is None:
         raise ValueError("Dataset stats are required to initialize the policy.")
@@ -160,7 +162,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     
     # Align with piper_smolvla.config chunk_size of 50
     # Using 10 observation frames to balance with action frames
-    obs_temporal_window = [ -i * frame_time for i in range(8) ][::-1] # 10 frames
+    obs_temporal_window = [ -i * frame_time for i in range(6) ][::-1] # 10 frames
 
     delta_timestamps = {
         "observation.images.gripper": obs_temporal_window,  
@@ -180,8 +182,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        num_workers=3,
-        batch_size=15,
+        num_workers=4,
+        batch_size=20,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
