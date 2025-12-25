@@ -8,7 +8,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetad
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
-from models.smooth_diffusion.custom_diffusion_config import CustomDiffusionConfig
+from src.models.smooth_diffusion.custom_diffusion_config import CustomDiffusionConfig
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy, SmolVLAConfig
 
@@ -19,7 +19,7 @@ from lerobot.datasets.transforms import ImageTransforms, ImageTransformsConfig, 
 # Import JointSmoothDiffusion instead of DiffusionPolicy
 # Ensure this path is reachable from your running directory
 try:
-    from models.smooth_diffusion.joint_smooth_diffusion import JointSmoothDiffusion
+    from src.models.smooth_diffusion.joint_smooth_diffusion import JointSmoothDiffusion
 except ImportError:
     # Fallback for checking script logic without the custom model
     print("WARNING: Custom JointSmoothDiffusion not found. Using standard DiffusionPolicy for syntax check.")
@@ -73,7 +73,7 @@ def apply_joint_augmentations(batch):
     return batch
 
 
-def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_from_checkpoint='ISdept/smolvla-piper'):
+def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_from_checkpoint=None):
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
 
@@ -134,7 +134,20 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         else:
             step = 0
     else:
-        raise NotImplemented
+        print("Starting fresh training from scratch")
+        # Initialize a new model from configuration
+        policy = SmolVLAPolicy(cfg)
+        policy.train()
+        policy.to(device)
+        
+        # Create new preprocessor and postprocessor
+        preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
+        
+        # Initialize optimizer
+        optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
+        
+        # Start from step 0
+        step = 0
 
     # Ensure preprocessors are on the correct device
     # (Some LeRobot versions keep them as modules)
@@ -147,7 +160,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     
     # Align with piper_smolvla.config chunk_size of 50
     # Using 10 observation frames to balance with action frames
-    obs_temporal_window = [ -i * frame_time for i in range(10) ][::-1] # 10 frames
+    obs_temporal_window = [ -i * frame_time for i in range(8) ][::-1] # 10 frames
 
     delta_timestamps = {
         "observation.images.gripper": obs_temporal_window,  
@@ -167,8 +180,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        num_workers=2,
-        batch_size=20,
+        num_workers=3,
+        batch_size=15,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
