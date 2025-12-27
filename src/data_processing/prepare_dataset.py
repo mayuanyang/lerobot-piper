@@ -77,18 +77,19 @@ def create_episodes_parquet_index(root_dir: Path, episode_index: int):
     pq.write_table(table, data_subdir / f"file-{episode_index:03d}.parquet")
 
 
-def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: dict, last_frames_to_chop: int):
+def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: dict, last_frames_to_chop: int, first_frames_to_chop: int = 0):
     
     
     num_joints = len(json_data["joint_names"])
     original_num_frames = len(json_data["frames"])
-    effective_num_frames = original_num_frames - last_frames_to_chop
+    effective_num_frames = original_num_frames - last_frames_to_chop - first_frames_to_chop
     
     if effective_num_frames <= 0:
         print(f"❌ ERROR: Chopping {last_frames_to_chop} frames from {original_num_frames} results in 0 or fewer frames. Skipping data generation.")
         return 0
 
-    joint_positions = [frame["joint_positions"] for frame in json_data["frames"]]
+    # Get joint positions starting from the first_frames_to_chop index
+    joint_positions = [frame["joint_positions"] for frame in json_data["frames"][first_frames_to_chop:]]
     
     lerobot_frames = []
     timestamp_base = 0.0
@@ -119,12 +120,13 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         global_index = episode_data.global_index_offset + i
         
         # Create frame data with observation images for each camera
+        # Adjust frame_index to account for skipped frames
         frame_data = {
             "observation.state": current_state_scaled,
             "action": action_diff_scaled,
             "timestamp": timestamp_base,
             "episode_index": episode_data.episode_index,
-            "frame_index": json_data["frames"][i]["frame_index"],  # 局部索引 (0, 1, 2, ...)
+            "frame_index": json_data["frames"][i + first_frames_to_chop]["frame_index"],  # 局部索引 (0, 1, 2, ...)
             "index": global_index,  # 全局索引 (0, 1, 2, ..., N)
             "next.done": is_done,
             "next.reward": 1.0 if is_done else 0.0,
@@ -166,8 +168,8 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     
     return effective_num_frames
 
-# Modified signature to accept last_frames_to_chop
-def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: dict, is_first_episode: bool = False, last_frames_to_chop: int = 0):
+# Modified signature to accept last_frames_to_chop and first_frames_to_chop
+def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: dict, is_first_episode: bool = False, last_frames_to_chop: int = 0, first_frames_to_chop: int = 0):
     
     
     # [File path definitions and checks remain the same...]
@@ -179,7 +181,7 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     
     # 🔴 CORE CHANGE 1: Use the effective number of frames
     original_num_frames = len(json_data["frames"])
-    effective_num_frames = original_num_frames - last_frames_to_chop
+    effective_num_frames = original_num_frames - last_frames_to_chop - first_frames_to_chop
     
     if effective_num_frames <= 0:
         print(f"❌ ERROR: Effective frame count is 0 or less ({effective_num_frames}). Skipping meta generation.")
@@ -304,14 +306,21 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     create_episodes_parquet_index(output_dir, episode_data.episode_index)
 
 
-def generate_video_files(output_dir: Path, episode_data: EpisodeData, json_data: dict, last_frames_to_chop: int = 0):
+def generate_video_files(output_dir: Path, episode_data: EpisodeData, json_data: dict, last_frames_to_chop: int = 0, first_frames_to_chop: int = 0):
     """
     Generate video files, properly handling frame chopping to match tabular data.
+    
+    Args:
+        output_dir (Path): Output directory for the dataset
+        episode_data (EpisodeData): Episode data containing camera information
+        json_data (dict): JSON data containing frame information
+        last_frames_to_chop (int): Number of frames to chop from the end
+        first_frames_to_chop (int): Number of frames to chop from the beginning
     """
     
     # Calculate effective number of frames
     original_num_frames = len(json_data["frames"])
-    effective_num_frames = original_num_frames - last_frames_to_chop
+    effective_num_frames = original_num_frames - last_frames_to_chop - first_frames_to_chop
     
     if effective_num_frames <= 0:
         print(f"❌ ERROR: Effective frame count is 0 or less ({effective_num_frames}). Skipping video generation.")
@@ -331,7 +340,11 @@ def generate_video_files(output_dir: Path, episode_data: EpisodeData, json_data:
         video_file_path = Path(camera_data.video_path)
         if video_file_path.exists() and video_file_path.suffix.lower() == '.mp4':
             # If it's a video file, we need to chop it to match the effective frame count
-            chop_video_to_frame_count(video_file_path, output_video_path, effective_num_frames, episode_data.fps)
+            # If first_frames_to_chop is specified, use the enhanced chop function
+            if first_frames_to_chop > 0:
+                chop_video_to_frame_count(video_file_path, output_video_path, effective_num_frames, episode_data.fps, first_frames_to_chop)
+            else:
+                chop_video_to_frame_count(video_file_path, output_video_path, effective_num_frames, episode_data.fps)
         elif video_file_path.exists():
             # For other file types, just copy
             shutil.copy(video_file_path, output_video_path)
@@ -339,16 +352,57 @@ def generate_video_files(output_dir: Path, episode_data: EpisodeData, json_data:
             print(f"⚠️ WARNING: Video file not found at {camera_data.video_path}. Skipping video copy.")
 
 
-def chop_video_to_frame_count(input_video_path: Path, output_video_path: Path, target_frame_count: int, fps: float):
+def chop_video_to_frame_count(input_video_path: Path, output_video_path: Path, target_frame_count: int, fps: float, first_num_frames: int = 0):
     """
-    Chop a video to contain exactly target_frame_count frames.
+    Chop a video to contain exactly target_frame_count frames, skipping first_num_frames if specified.
     """
     try:
-        # Use ffmpeg to extract only the required number of frames
+        # Use ffmpeg to extract only the required number of frames, skipping first_num_frames if needed
+        cmd = [
+            "ffmpeg",
+            "-i", str(input_video_path)
+        ]
+        
+        # If first_num_frames is specified, skip those frames
+        if first_num_frames > 0:
+            cmd.extend(["-vf", f"select=gte(n\\,{first_num_frames}),setpts=N/TB/{fps}"])
+        
+        cmd.extend([
+            "-vframes", str(target_frame_count),
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-y",
+            str(output_video_path)
+        ])
+        
+        import subprocess
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"⚠️ WARNING: Failed to chop video {input_video_path} to {target_frame_count} frames (skipping {first_num_frames} frames): {result.stderr}")
+            # Fallback: copy the original video
+            shutil.copy(input_video_path, output_video_path)
+    except Exception as e:
+        print(f"⚠️ WARNING: Error chopping video {input_video_path}: {e}")
+        # Fallback: copy the original video
+        shutil.copy(input_video_path, output_video_path)
+
+
+def chop_first_frames_from_video(input_video_path: Path, output_video_path: Path, first_num_frames: int, fps: float):
+    """
+    Chop the first first_num_frames from a video.
+    
+    Args:
+        input_video_path (Path): Path to the input video file
+        output_video_path (Path): Path where the output video will be saved
+        first_num_frames (int): Number of frames to chop from the beginning
+        fps (float): Frames per second of the video
+    """
+    try:
+        # Use ffmpeg to skip the first first_num_frames
         cmd = [
             "ffmpeg",
             "-i", str(input_video_path),
-            "-vframes", str(target_frame_count),
+            "-vf", f"select=gt(n\\,{first_num_frames}),setpts=N/TB/{fps}",
             "-c:v", "libx264",
             "-preset", "ultrafast",
             "-y",
@@ -358,11 +412,11 @@ def chop_video_to_frame_count(input_video_path: Path, output_video_path: Path, t
         import subprocess
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            print(f"⚠️ WARNING: Failed to chop video {input_video_path} to {target_frame_count} frames: {result.stderr}")
+            print(f"⚠️ WARNING: Failed to chop first {first_num_frames} frames from video {input_video_path}: {result.stderr}")
             # Fallback: copy the original video
             shutil.copy(input_video_path, output_video_path)
     except Exception as e:
-        print(f"⚠️ WARNING: Error chopping video {input_video_path}: {e}")
+        print(f"⚠️ WARNING: Error chopping first frames from video {input_video_path}: {e}")
         # Fallback: copy the original video
         shutil.copy(input_video_path, output_video_path)
 
@@ -647,11 +701,12 @@ def compute_and_save_dataset_stats(output_dir: Path):
         print(f"❌ ERROR: Failed to aggregate or save statistics: {e}")
 
 
-def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episode: bool = False, last_frames_to_chop: int = 10):
+def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episode: bool = False, last_frames_to_chop: int = 10, first_frames_to_chop: int = 15):
     """
     Main function to process one episode.
     
     last_frames_to_chop (int): The number of final frames to exclude from the dataset.
+    first_frames_to_chop (int): The number of initial frames to exclude from the dataset.
     """
     # Create directories
     os.makedirs(output_dir / "meta", exist_ok=True)
@@ -664,10 +719,10 @@ def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episod
     # Note: We assume generate_video_files either handles chopping internally 
     # (if source is a video) or is called BEFORE chopping the images/joints.
     # For now, we assume video files contain all frames and only the tabular data is chopped.
-    generate_video_files(output_dir, episode_data, json_data, last_frames_to_chop)
+    generate_video_files(output_dir, episode_data, json_data, last_frames_to_chop, first_frames_to_chop)
         
     # Pass the chop value to meta file generator
-    generate_meta_files(output_dir, episode_data, json_data, is_first_episode, last_frames_to_chop)   
+    generate_meta_files(output_dir, episode_data, json_data, is_first_episode, last_frames_to_chop, first_frames_to_chop)   
    
     # Pass the chop value to data file generator
-    return generate_data_files(output_dir, episode_data, json_data, last_frames_to_chop)
+    return generate_data_files(output_dir, episode_data, json_data, last_frames_to_chop, first_frames_to_chop)
