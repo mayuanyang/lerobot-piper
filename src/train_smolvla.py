@@ -90,9 +90,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     policy = SmolVLAPolicy.from_pretrained(model_id)
     cfg = policy.config
 
-    cfg.n_obs_steps = 6
-    cfg.chunk_size = 8
-    cfg.n_action_steps = 8
+    cfg.n_obs_steps = 2
+    cfg.chunk_size = 50
+    cfg.n_action_steps = 50
     
     if dataset_metadata.stats is None:
         raise ValueError("Dataset stats are required to initialize the policy.")
@@ -111,21 +111,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         
         preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
         
-        # Load Optimizer State
-        if not resume_from_checkpoint.startswith("http") and not resume_from_checkpoint.startswith("huggingface.co"):
-            checkpoint_path = Path(resume_from_checkpoint)
-            optimizer_state_path = checkpoint_path / "optimizer_state.pth"
-            if optimizer_state_path.exists():
-                optimizer.load_state_dict(torch.load(optimizer_state_path, map_location=device))
-                print(f"Optimizer state loaded.")
-            
-            # Extract step
-            if checkpoint_path.name.startswith("checkpoint-"):
-                step = int(checkpoint_path.name.split("-")[1])
-            else:
-                step = 0
-        else:
-            step = 0
+        step = 0
     else:
         print("Starting fresh training from scratch", cfg)
         # Initialize a new model from configuration
