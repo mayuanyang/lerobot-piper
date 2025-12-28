@@ -219,8 +219,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     # --- TRAINING LOOP ---
     print("Starting training loop...")
     done = False
+    epoch = 0
     while not done:
-        prog_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Training Step {step}")
+        epoch += 1
+        prog_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch}, Step {step}")
         for batch_idx, batch in prog_bar:
             
             # 1. Move to Device FIRST (Efficient)
@@ -245,7 +247,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             optimizer.zero_grad()
 
             if step % log_freq == 0:
-                prog_bar.set_postfix({"step": step, "loss": f"{loss.item():.3f}"})
+                # Get learning rate from optimizer
+                lr = optimizer.param_groups[0]['lr']
+                prog_bar.set_postfix({"step": step, "loss": f"{loss.item():.3f}", "lr": f"{lr:.2e}"})
             
             # 5. Save Checkpoint
             if step > 0 and step % checkpoint_freq == 0:
