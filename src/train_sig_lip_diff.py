@@ -10,7 +10,7 @@ from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy, SmolVLAConfig
 from lerobot.datasets.utils import dataset_to_policy_features
 from .models.smooth_diffusion.smooth_diffusion import SigLipDiffusionPolicy
-from .models.smooth_diffusion.smooth_diffusion_config import SigLipDiffusionConfig
+from .models.sig_lip_diffusion.sig_lip_diffusion_config import SigLipDiffusionConfig
 import json
 
 
