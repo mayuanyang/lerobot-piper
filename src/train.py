@@ -122,7 +122,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     
     obs = 2
     horizon = 16
-    n_action_steps = 16
+    n_action_steps = 8
 
     cfg = DiffusionConfig(
         input_features=input_features, 
