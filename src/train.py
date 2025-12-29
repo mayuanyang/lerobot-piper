@@ -7,20 +7,12 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetad
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
-from models.smooth_diffusion.custom_diffusion_config import CustomDiffusionConfig
+from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 from lerobot.policies.factory import make_pre_post_processors
 
 # 🟢 ADDED: Import torchvision for augmentation
 from torchvision.transforms import v2
 
-# Import JointSmoothDiffusion instead of DiffusionPolicy
-# Ensure this path is reachable from your running directory
-try:
-    from models.smooth_diffusion.joint_smooth_diffusion import JointSmoothDiffusion
-except ImportError:
-    # Fallback for checking script logic without the custom model
-    print("WARNING: Custom JointSmoothDiffusion not found. Using standard DiffusionPolicy for syntax check.")
-    from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy as JointSmoothDiffusion
 
 # Detect the best available device
 if torch.cuda.is_available():
@@ -122,7 +114,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     
     obs = 2
     horizon = 16
-    n_action_steps = 8
+    n_action_steps = 16
 
     cfg = DiffusionConfig(
         input_features=input_features, 
@@ -146,7 +138,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     # --- MODEL LOADING LOGIC ---
     if resume_from_checkpoint is not None:
         print(f"Resuming training from checkpoint: {resume_from_checkpoint}")
-        policy = JointSmoothDiffusion.from_pretrained(resume_from_checkpoint)
+        policy = DiffusionPolicy.from_pretrained(resume_from_checkpoint)
         policy.train()
         policy.to(device)
         
@@ -157,7 +149,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             print(f"Could not load preprocessors: {e}. Creating new ones.")
             preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
             
-        optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
+        optimizer = torch.optim.Adam(policy.parameters(), lr=2e-5)
         
         # Load Optimizer State
         if not resume_from_checkpoint.startswith("http") and not resume_from_checkpoint.startswith("huggingface.co"):
@@ -176,7 +168,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             step = 0
     else:
         # Initialize Fresh Policy
-        policy = JointSmoothDiffusion(cfg, velocity_loss_weight=1.0, acceleration_loss_weight=0.5, jerk_loss_weight=0.1)
+        policy = DiffusionPolicy(cfg)
         policy.train()
         policy.to(device)
         preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
@@ -214,7 +206,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=4,
-        batch_size=6,
+        batch_size=8,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
