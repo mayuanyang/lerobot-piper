@@ -146,10 +146,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
 
     dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, image_transforms=image_transforms, force_cache_sync=True, revision="main", tolerance_s=0.01)
 
+    batch_size = 8
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        num_workers=1,
-        batch_size=1,
+        num_workers=4,
+        batch_size=batch_size,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
@@ -163,11 +164,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         epoch += 1
         prog_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch}, Step {step}")
         for batch_idx, batch in prog_bar:
-            
-            # The tokenizer processor expects a "task" key in the batch
-            if "task_description" in batch:
-                # Map task_description to task key for tokenizer processor
-                batch["task"] = batch["task_description"]
+            batch["task"] = ["Pick and place the cube into the container"] * batch_size
 
             batch = preprocessor(batch)
             
