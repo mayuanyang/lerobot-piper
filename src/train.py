@@ -112,7 +112,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     print('input_features:', input_features)
     print('output_features:', output_features)
     
-    obs = 2
+    obs = 4
     horizon = 16
     n_action_steps = 16
 

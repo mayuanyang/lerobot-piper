@@ -99,18 +99,16 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     
     for i in range(effective_num_frames):
         # Determine the action for the current frame
-        current_state = joint_positions[i]
+        
         current_state_scaled = [pos / factor for pos in joint_positions[i]]
-        next_state = joint_positions[i + 1] if i + 1 < effective_num_frames else joint_positions[i]
-        #next_state_scaled = [pos / factor for pos in joint_positions[i + 1]] if i + 1 < effective_num_frames else [pos / factor for pos in joint_positions[i]]
+        next_state_scaled = [pos / factor for pos in joint_positions[i + 1]] if i + 1 < effective_num_frames else [pos / factor for pos in joint_positions[i]]
         
+        # # Compute element-wise difference between next_state and current_state
+        # action_diff = [next_pos - current_pos for next_pos, current_pos in zip(next_state, current_state)]
+        # action_diff_scaled = [diff / diff_factor for diff in action_diff]
         
-        # Compute element-wise difference between next_state and current_state
-        action_diff = [next_pos - current_pos for next_pos, current_pos in zip(next_state, current_state)]
-        action_diff_scaled = [diff / diff_factor for diff in action_diff]
-        
-        # Add small random noise to zero values
-        action_diff_scaled = [diff + np.random.uniform(-0.0001, 0.0001) if diff == 0.0 else diff for diff in action_diff_scaled]
+        # # Add small random noise to zero values
+        # action_diff_scaled = [diff + np.random.uniform(-0.0001, 0.0001) if diff == 0.0 else diff for diff in action_diff_scaled]
         
 
         is_done = (i == effective_num_frames - 1)
@@ -123,7 +121,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         # Adjust frame_index to account for skipped frames
         frame_data = {
             "observation.state": current_state_scaled,
-            "action": action_diff_scaled,
+            "action": next_state_scaled,
             "timestamp": timestamp_base,
             "episode_index": episode_data.episode_index,
             "frame_index": json_data["frames"][i + first_frames_to_chop]["frame_index"],  # 局部索引 (0, 1, 2, ...)
@@ -131,7 +129,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
             "next.done": is_done,
             "next.reward": 1.0 if is_done else 0.0,
             "task_index": 0,
-            "task_description": episode_data.task_description
+            #"task_description": episode_data.task_description
         }        
                 
         lerobot_frames.append(frame_data)
@@ -151,7 +149,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         "next.done": Value("bool"),
         "next.reward": Value("float32"),
         "task_index": Value("int64"),
-        "task_description": Value("string"),
+        #"task_description": Value("string"),
     }
 
     
@@ -215,10 +213,10 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
                     "shape": [num_joints],
                     "dtype": "float32"
                 },
-                "task_description": {  # 新增：任务字段定义
-                    "shape": [1],
-                    "dtype": "string"
-                }
+                # "task_description": {  # 新增：任务字段定义
+                #     "shape": [1],
+                #     "dtype": "string"
+                # }
             }
         }
 
@@ -283,7 +281,7 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         "dataset_to_index": dataset_to_index,
         "start_time": json_data["start_time"],
         "end_time": json_data["end_time"],
-        "task_description": episode_data.task_description
+        #"task_description": episode_data.task_description
         # [Video metadata for each camera remains the same...]
     }
     
