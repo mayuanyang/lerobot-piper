@@ -119,13 +119,17 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
     print('input_features:', input_features)
     print('output_features:', output_features)
+    
+    obs = 2
+    horizon = 24
+    n_action_steps = 16
 
     cfg = CustomDiffusionConfig(
         input_features=input_features, 
         output_features=output_features, 
-        n_obs_steps=2, 
-        horizon=24, 
-        n_action_steps=16, 
+        n_obs_steps=obs, 
+        horizon=horizon, 
+        n_action_steps=n_action_steps, 
         pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1", 
         use_group_norm=False,
         crop_shape=(400, 400),
@@ -189,14 +193,14 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     frame_time = 1 / fps
     
     # 0 to -9 is exactly 10 frames (matches n_obs_steps=10)
-    obs_temporal_window = [ -i * frame_time for i in range(10) ][::-1] # Reverse to get [-0.9, ... 0.0]
+    obs_temporal_window = [ -i * frame_time for i in range(obs) ][::-1] # Reverse to get [-0.9, ... 0.0]
     
     delta_timestamps = {
         "observation.images.gripper": obs_temporal_window,  
-        "observation.images.rgb": obs_temporal_window,
-        "observation.images.depth": obs_temporal_window,
+        "observation.images.front": obs_temporal_window,
+        "observation.images.right": obs_temporal_window,
         "observation.state": obs_temporal_window,
-        "action": [i * frame_time for i in range(24)]
+        "action": [i * frame_time for i in range(n_action_steps)]
     }
 
     try:
