@@ -121,7 +121,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     print('output_features:', output_features)
     
     obs = 2
-    horizon = 24
+    horizon = 16
     n_action_steps = 16
 
     cfg = CustomDiffusionConfig(
@@ -192,7 +192,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     fps = 10
     frame_time = 1 / fps
     
-    # 0 to -9 is exactly 10 frames (matches n_obs_steps=10)
+    # Create observation temporal window for n_obs_steps frames
     obs_temporal_window = [ -i * frame_time for i in range(obs) ][::-1] # Reverse to get [-0.9, ... 0.0]
     
     delta_timestamps = {
