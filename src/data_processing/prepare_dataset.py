@@ -124,7 +124,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
             "action": next_state_scaled,
             "timestamp": timestamp_base,
             "episode_index": episode_data.episode_index,
-            "frame_index": json_data["frames"][i + first_frames_to_chop]["frame_index"],  # 局部索引 (0, 1, 2, ...)
+            "frame_index": json_data["frames"][i + first_frames_to_chop]["frame_index"] - first_frames_to_chop,  # 局部索引 (0, 1, 2, ...)
             "index": global_index,  # 全局索引 (0, 1, 2, ..., N)
             "next.done": is_done,
             "next.reward": 1.0 if is_done else 0.0,

@@ -30,27 +30,15 @@ print(f"Using device: {device}")
 
 # 🟢 ADDED: Data Augmentation Setup
 def get_augmentations():
-    # Create ImageTransformsConfig with desired augmentations
-    cfg = ImageTransformsConfig(
-        enable=True,
-        max_num_transforms=2,  # Reduced from 3 to decrease memory usage
-        random_order=True,
-        tfs={
-            "brightness": ImageTransformConfig(
-                weight=1.0,
-                type="ColorJitter",
-                kwargs={"brightness": (0.9, 1.1)},  # Reduced range to decrease memory usage
-            ),
-            "contrast": ImageTransformConfig(
-                weight=1.0,
-                type="ColorJitter",
-                kwargs={"contrast": (0.9, 1.1)},  # Reduced range to decrease memory usage
-            ),
-        }
-    )
-    
-    # Create ImageTransforms object from config
-    return ImageTransforms(cfg)
+    # Basic augmentation for Diffusion Policy often includes:
+    # 1. Color Jitter (lighting invariance)
+    # 2. Small translations/rotations (position invariance)
+    return v2.Compose([
+        v2.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
+        # Using RandomAffine instead of Crop because we don't know your exact image dimensions 
+        # and don't want to accidentally crop out the gripper.
+        v2.RandomAffine(degrees=5, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+    ])
 
 
 # 🟢 ADDED: Helper to apply joint data augmentation
@@ -65,6 +53,15 @@ def apply_joint_augmentations(batch):
             batch[key] = value + noise
     return batch
 
+
+def random_drop_camera_views(batch, drop_prob=0.1):
+    """Randomly drop camera views in the batch with a given probability."""
+    camera_keys = [key for key in batch.keys() if key.startswith("observation.images.")]
+    for key in camera_keys:
+        if torch.rand(1).item() < drop_prob:
+            batch[key] = torch.zeros_like(batch[key])  # Replace with zeros
+            break # Drop only one camera view per batch
+    return batch
 
 def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-piper", push_to_hub=False, resume_from_checkpoint=True):
     output_directory = Path(output_dir)
@@ -91,8 +88,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     cfg = policy.config
 
     cfg.n_obs_steps = 2
-    cfg.chunk_size = 50
-    cfg.n_action_steps = 50
+    cfg.chunk_size = 16
+    cfg.n_action_steps = 16
     
     if dataset_metadata.stats is None:
         raise ValueError("Dataset stats are required to initialize the policy.")
@@ -107,7 +104,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         policy.train()
         policy.to(device)
 
-        optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
+        optimizer = torch.optim.Adam(policy.parameters(), lr=5e-5)
+        policy.config.chunk_size = cfg.chunk_size
+        policy.config.n_action_steps = cfg.n_action_steps
+        policy.config.n_obs_steps = cfg.n_obs_steps
         
         preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
         
@@ -146,7 +146,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
 
     dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, image_transforms=image_transforms, force_cache_sync=True, revision="main", tolerance_s=0.01)
 
-    batch_size = 8
+    batch_size = 36
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=4,
@@ -169,6 +169,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
             batch = preprocessor(batch)
             
             batch = apply_joint_augmentations(batch)
+            
+            batch = random_drop_camera_views(batch, drop_prob=0.2)
 
             # 5. Move all tensor values in batch to device
             # Note: Some items may be strings or other non-tensor types that cannot be moved to device

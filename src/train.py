@@ -12,6 +12,7 @@ from lerobot.policies.factory import make_pre_post_processors
 
 # 🟢 ADDED: Import torchvision for augmentation
 from torchvision.transforms import v2
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 
 # Detect the best available device
@@ -150,6 +151,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
             
         optimizer = torch.optim.Adam(policy.parameters(), lr=2e-5)
+        # Initialize learning rate scheduler
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
         
         # Load Optimizer State
         if not resume_from_checkpoint.startswith("http") and not resume_from_checkpoint.startswith("huggingface.co"):
@@ -174,6 +177,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
         step = 0
         optimizer = torch.optim.Adam(policy.parameters(), lr=3e-5)
+        # Initialize learning rate scheduler
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
 
     # Ensure preprocessors are on the correct device
     # (Some LeRobot versions keep them as modules)
@@ -241,6 +246,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
+            # Update learning rate scheduler
+            scheduler.step(loss)
 
             if step % log_freq == 0:
                 # Get learning rate from optimizer
