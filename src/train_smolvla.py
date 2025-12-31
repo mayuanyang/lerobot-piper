@@ -88,8 +88,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     cfg = policy.config
 
     cfg.n_obs_steps = 2
-    cfg.chunk_size = 16
-    cfg.n_action_steps = 16
+    cfg.chunk_size = 50
+    cfg.n_action_steps = 50
     
     if dataset_metadata.stats is None:
         raise ValueError("Dataset stats are required to initialize the policy.")
