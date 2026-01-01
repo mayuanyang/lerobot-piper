@@ -91,6 +91,18 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     cfg.chunk_size = 50
     cfg.n_action_steps = 50
     
+    # Update the configuration to use 7-dimensional state and action
+    # and 400x640 images
+    if "observation.state" in cfg.input_features:
+        cfg.input_features["observation.state"].shape = [7]
+    if "action" in cfg.output_features:
+        cfg.output_features["action"].shape = [7]
+        
+    # Update image shapes to 400x640
+    for img_key in ["observation.images.camera1", "observation.images.camera2", "observation.images.camera3"]:
+        if img_key in cfg.input_features:
+            cfg.input_features[img_key].shape = [3, 400, 640]
+    
     if dataset_metadata.stats is None:
         raise ValueError("Dataset stats are required to initialize the policy.")
 
@@ -104,7 +116,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         policy.train()
         policy.to(device)
 
-        optimizer = torch.optim.Adam(policy.parameters(), lr=5e-5)
+        optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.optimizer_lr)
         policy.config.chunk_size = cfg.chunk_size
         policy.config.n_action_steps = cfg.n_action_steps
         policy.config.n_obs_steps = cfg.n_obs_steps
@@ -115,15 +127,45 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     else:
         print("Starting fresh training from scratch", cfg)
         # Initialize a new model from configuration
-        policy = SmolVLAPolicy(cfg)
+        policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
+        policy.config.chunk_size = cfg.chunk_size
+        policy.config.n_action_steps = cfg.n_action_steps
+        policy.config.n_obs_steps = cfg.n_obs_steps
+        
         policy.train()
         policy.to(device)
-        optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
+        optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.optimizer_lr)
         # Create new preprocessor and postprocessor
         preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
                 
         # Start from step 0
         step = 0
+
+    # Create learning rate scheduler with warmup and cosine decay
+    from torch.optim.lr_scheduler import LambdaLR
+    
+    def cosine_decay_with_warmup(step):
+        """
+        Cosine decay with warmup learning rate scheduler
+        """
+        warmup_steps = cfg.scheduler_warmup_steps
+        decay_steps = cfg.scheduler_decay_steps
+        initial_lr = cfg.optimizer_lr
+        final_lr = cfg.scheduler_decay_lr
+        
+        if step < warmup_steps:
+            # Warmup phase: linearly increase learning rate
+            return step / warmup_steps
+        elif step < warmup_steps + decay_steps:
+            # Decay phase: cosine decay from initial_lr to final_lr
+            progress = (step - warmup_steps) / decay_steps
+            cosine_factor = (1 + torch.cos(torch.tensor(progress * 3.14159))) / 2
+            return (final_lr + (initial_lr - final_lr) * cosine_factor) / initial_lr
+        else:
+            # After decay: constant final learning rate
+            return final_lr / initial_lr
+    
+    scheduler = LambdaLR(optimizer, cosine_decay_with_warmup)
 
     # Ensure preprocessors are on the correct device
     # (Some LeRobot versions keep them as modules)
@@ -145,6 +187,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     }
 
     dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, image_transforms=image_transforms, force_cache_sync=True, revision="main", tolerance_s=0.01)
+    
 
     batch_size = 36
     dataloader = torch.utils.data.DataLoader(
@@ -166,6 +209,42 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         for batch_idx, batch in prog_bar:
             batch["task"] = ["Pick and place the cube into the container"] * batch_size
 
+            # 🟢 ADDED: Add frame_index to let the model know the position in the sequence
+            # The frame_index field from the dataset represents the local frame index within an episode
+            # if "frame_index" in batch:
+            #     batch["observation.sequence_index"] = batch["frame_index"].unsqueeze(-1)  # Add dimension to match expected shape
+
+            # Remap image feature names to match what the policy expects
+            feature_mapping = {
+                "observation.images.front": "observation.images.camera1",
+                "observation.images.right": "observation.images.camera2", 
+                "observation.images.gripper": "observation.images.camera3"
+            }
+            
+            # Create a new batch with remapped keys
+            remapped_batch = {}
+            for key, value in batch.items():
+                # Remap image feature keys
+                new_key = feature_mapping.get(key, key)
+                remapped_batch[new_key] = value
+            
+            batch = remapped_batch
+            
+            # Ensure observation.state has 7 dimensions as expected by our dataset
+            # The pretrained model might expect 6 dimensions, but our dataset has 7
+            if "observation.state" in batch:
+                state = batch["observation.state"]
+                if state.shape[-1] == 6:
+                    # If we somehow get 6-dimensional state, we need to handle it
+                    # But according to the user, the dataset provides 7-dimensional state
+                    print(f"Warning: observation.state has shape {state.shape}, expected 7 dimensions")
+                elif state.shape[-1] == 7:
+                    # This is what we expect - 7 dimensional state from the dataset
+                    pass
+                else:
+                    # Unexpected dimensionality
+                    print(f"Warning: observation.state has unexpected shape {state.shape}")
+            
             batch = preprocessor(batch)
             
             batch = apply_joint_augmentations(batch)
@@ -182,6 +261,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
             loss, _ = policy.forward(batch)
             loss.backward()
             optimizer.step()
+            scheduler.step()  # Update learning rate
             optimizer.zero_grad()
 
             if step % log_freq == 0:
