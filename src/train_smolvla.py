@@ -186,18 +186,97 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         "action": [i * frame_time for i in range(cfg.n_action_steps)] 
     }
 
-    dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, image_transforms=image_transforms, force_cache_sync=True, revision="main", tolerance_s=0.01)
+    # Load full dataset to determine episode indices
+    full_dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, image_transforms=image_transforms, force_cache_sync=True, revision="main", tolerance_s=0.01)
     
-
+    # Get unique episode indices
+    episode_indices = list(set(full_dataset.hf_dataset["episode_index"]))
+    episode_indices.sort()
+    
+    # Split episodes into training and validation sets (90% training, 10% validation)
+    num_val_episodes = max(1, int(len(episode_indices) * 0.1))
+    num_train_episodes = len(episode_indices) - num_val_episodes
+    
+    train_episode_indices = episode_indices[:num_train_episodes]
+    val_episode_indices = episode_indices[num_train_episodes:]
+    
+    print(f"Total episodes: {len(episode_indices)}")
+    print(f"Training episodes: {len(train_episode_indices)}")
+    print(f"Validation episodes: {len(val_episode_indices)}")
+    
+    # Create boolean masks for training and validation data
+    train_mask = [idx in train_episode_indices for idx in full_dataset.hf_dataset["episode_index"]]
+    val_mask = [idx in val_episode_indices for idx in full_dataset.hf_dataset["episode_index"]]
+    
+    # Create subsets for training and validation
+    from torch.utils.data import Subset
+    train_dataset = Subset(full_dataset, [i for i, mask in enumerate(train_mask) if mask])
+    val_dataset = Subset(full_dataset, [i for i, mask in enumerate(val_mask) if mask])
+    
     batch_size = 36
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
         num_workers=4,
         batch_size=batch_size,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
     )
+    
+    val_dataloader = torch.utils.data.DataLoader(
+        val_dataset,
+        num_workers=4,
+        batch_size=batch_size,
+        shuffle=False,
+        pin_memory=device.type != "cpu",
+        drop_last=True,
+    )
+
+    # Validation function
+    def validate_model():
+        policy.eval()
+        val_loss = 0.0
+        val_batches = 0
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(val_dataloader):
+                batch["task"] = ["Pick and place the cube into the container"] * batch_size
+
+                # Remap image feature names to match what the policy expects
+                feature_mapping = {
+                    "observation.images.front": "observation.images.camera1",
+                    "observation.images.right": "observation.images.camera2", 
+                    "observation.images.gripper": "observation.images.camera3"
+                }
+                
+                # Create a new batch with remapped keys
+                remapped_batch = {}
+                for key, value in batch.items():
+                    # Remap image feature keys
+                    new_key = feature_mapping.get(key, key)
+                    remapped_batch[new_key] = value
+                
+                batch = remapped_batch
+                
+                batch = preprocessor(batch)
+
+                # Move all tensor values in batch to device
+                for key, value in batch.items():
+                    if isinstance(value, torch.Tensor):
+                        batch[key] = value.to(device)
+
+                # Forward pass
+                loss, _ = policy.forward(batch)
+                val_loss += loss.item()
+                val_batches += 1
+                
+                # Limit validation to a reasonable number of batches to save time
+                if batch_idx >= 10:  # Validate on first 10 batches
+                    break
+        
+        policy.train()
+        avg_val_loss = val_loss / val_batches if val_batches > 0 else 0
+        return avg_val_loss
 
     # --- TRAINING LOOP ---
     print("Starting training loop...")
@@ -205,7 +284,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     epoch = 0
     while not done:
         epoch += 1
-        prog_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch}, Step {step}")
+        prog_bar = tqdm(enumerate(train_dataloader), total=len(train_dataloader), desc=f"Epoch {epoch}, Step {step}")
         for batch_idx, batch in prog_bar:
             batch["task"] = ["Pick and place the cube into the container"] * batch_size
 
@@ -270,6 +349,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
                 prog_bar.set_postfix({"step": step, "loss": f"{loss.item():.3f}", "lr": f"{lr:.2e}"})
                 # Explicitly delete variables to free up memory
                 del loss
+            
+            # Run validation every 100 steps
+            if step > 0 and step % 100 == 0:
+                print(f"\nRunning validation at step {step}...")
+                val_loss = validate_model()
+                print(f"Validation loss at step {step}: {val_loss:.4f}")
             
             # 7. Save Checkpoint
             if step > 0 and step % checkpoint_freq == 0:

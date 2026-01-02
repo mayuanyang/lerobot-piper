@@ -77,7 +77,43 @@ def create_episodes_parquet_index(root_dir: Path, episode_index: int):
     pq.write_table(table, data_subdir / f"file-{episode_index:03d}.parquet")
 
 
-def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: dict, last_frames_to_chop: int, first_frames_to_chop: int = 0):
+def compute_global_stats_for_episodes(episode_data_list, root_folder):
+    """
+    Compute global mean and std for joint positions across all episodes.
+    
+    Args:
+        episode_data_list: List of EpisodeData objects
+        root_folder: Root folder containing episode subfolders
+        
+    Returns:
+        tuple: (global_means, global_stds)
+    """
+    all_joint_positions = []
+    
+    for episode_data in episode_data_list:
+        # Load JSON data for this episode
+        json_path = Path(episode_data.joint_data_json_path)
+        with open(json_path, 'r') as f:
+            json_data = json.load(f)
+        
+        # Extract joint positions
+        joint_positions = [frame["joint_positions"] for frame in json_data["frames"]]
+        all_joint_positions.extend(joint_positions)
+    
+    if not all_joint_positions:
+        raise ValueError("No joint positions found in any episodes")
+    
+    # Compute global statistics
+    all_joint_positions = np.array(all_joint_positions)
+    global_means = np.mean(all_joint_positions, axis=0)
+    global_stds = np.std(all_joint_positions, axis=0)
+    # Avoid division by zero
+    global_stds = np.where(global_stds == 0, 1.0, global_stds)
+    
+    return global_means, global_stds
+
+
+def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: dict, last_frames_to_chop: int, first_frames_to_chop: int = 0, global_means=None, global_stds=None):
     
     
     num_joints = len(json_data["joint_names"])
@@ -91,24 +127,21 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     # Get joint positions starting from the first_frames_to_chop index
     joint_positions = [frame["joint_positions"] for frame in json_data["frames"][first_frames_to_chop:]]
     
+    # Use provided global statistics or compute per-episode statistics
+    if global_means is not None and global_stds is not None:
+        joint_means = np.array(global_means)
+        joint_stds = np.array(global_stds)
+    
     lerobot_frames = []
     timestamp_base = 0.0
     
-    factor = 100000
-    diff_factor = 10000
-    
     for i in range(effective_num_frames):
-        # Determine the action for the current frame
-        
-        current_state_scaled = [pos / factor for pos in joint_positions[i]]
-        next_state_scaled = [pos / factor for pos in joint_positions[i + 1]] if i + 1 < effective_num_frames else [pos / factor for pos in joint_positions[i]]
-        
-        # # Compute element-wise difference between next_state and current_state
-        # action_diff = [next_pos - current_pos for next_pos, current_pos in zip(next_state, current_state)]
-        # action_diff_scaled = [diff / diff_factor for diff in action_diff]
-        
-        # # Add small random noise to zero values
-        # action_diff_scaled = [diff + np.random.uniform(-0.0001, 0.0001) if diff == 0.0 else diff for diff in action_diff_scaled]
+        if global_means is None and global_stds is None:
+            current_state_scaled = [pos for pos in joint_positions[i]]
+            next_state_scaled = [pos for pos in joint_positions[i + 1]] if i + 1 < effective_num_frames else [pos for pos in joint_positions[i]]
+        else:    
+            current_state_scaled = [(pos - joint_means[j]) / joint_stds[j] for j, pos in enumerate(joint_positions[i])]
+            next_state_scaled = [(pos - joint_means[j]) / joint_stds[j] for j, pos in enumerate(joint_positions[i + 1])] if i + 1 < effective_num_frames else [(pos - joint_means[j]) / joint_stds[j] for j, pos in enumerate(joint_positions[i])]        
         
 
         is_done = (i == effective_num_frames - 1)
@@ -150,9 +183,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         "next.reward": Value("float32"),
         "task_index": Value("int64"),
         #"task_description": Value("string"),
-    }
-
-    
+    }    
         
     feature_config = Features(feature_config_dict)
     hf_dataset = hf_dataset.cast(feature_config)
@@ -699,12 +730,14 @@ def compute_and_save_dataset_stats(output_dir: Path):
         print(f"❌ ERROR: Failed to aggregate or save statistics: {e}")
 
 
-def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episode: bool = False, last_frames_to_chop: int = 10, first_frames_to_chop: int = 15):
+def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episode: bool = False, last_frames_to_chop: int = 10, first_frames_to_chop: int = 15, global_means=None, global_stds=None):
     """
     Main function to process one episode.
     
     last_frames_to_chop (int): The number of final frames to exclude from the dataset.
     first_frames_to_chop (int): The number of initial frames to exclude from the dataset.
+    global_means (array-like, optional): Global mean values for standardization.
+    global_stds (array-like, optional): Global standard deviation values for standardization.
     """
     # Create directories
     os.makedirs(output_dir / "meta", exist_ok=True)
@@ -722,5 +755,5 @@ def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episod
     # Pass the chop value to meta file generator
     generate_meta_files(output_dir, episode_data, json_data, is_first_episode, last_frames_to_chop, first_frames_to_chop)   
    
-    # Pass the chop value to data file generator
-    return generate_data_files(output_dir, episode_data, json_data, last_frames_to_chop, first_frames_to_chop)
+    # Pass the chop value and global statistics to data file generator
+    return generate_data_files(output_dir, episode_data, json_data, last_frames_to_chop, first_frames_to_chop, global_means, global_stds)
