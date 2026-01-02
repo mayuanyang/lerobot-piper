@@ -257,9 +257,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
                     remapped_batch[new_key] = value
                 
                 batch = remapped_batch
-                
-                # State and action is already normalized
-                #batch = preprocessor(batch)
+            
+                batch = preprocessor(batch)
 
                 # Move all tensor values in batch to device
                 for key, value in batch.items():
@@ -325,7 +324,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
                     # Unexpected dimensionality
                     print(f"Warning: observation.state has unexpected shape {state.shape}")
             
-            #batch = preprocessor(batch)
+            batch = preprocessor(batch)
             
             batch = apply_joint_augmentations(batch)
             
