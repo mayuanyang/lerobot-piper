@@ -325,21 +325,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
                     # Unexpected dimensionality
                     print(f"Warning: observation.state has unexpected shape {state.shape}")
             
-            # Store original state values for comparison
-            original_state = batch["observation.state"].clone() if "observation.state" in batch else None
-            
             batch = preprocessor(batch)
-            
-            # Check for double normalization by comparing before and after preprocessing
-            if original_state is not None and "observation.state" in batch:
-                processed_state = batch["observation.state"]
-                print(f"Original state mean: {original_state.mean().item():.6f}, std: {original_state.std().item():.6f}")
-                print(f"Processed state mean: {processed_state.mean().item():.6f}, std: {processed_state.std().item():.6f}")
-                # Check if normalization was applied (mean should be close to 0, std close to 1 for normalized data)
-                if torch.allclose(processed_state.mean(), torch.tensor(0.0), atol=0.1) and \
-                   torch.allclose(processed_state.std(), torch.tensor(1.0), atol=0.1):
-                    print("WARNING: State appears to be normalized. Check for double normalization.")
-            
+                        
             batch = apply_joint_augmentations(batch)
             
             batch = random_drop_camera_views(batch, drop_prob=0.2)
@@ -365,7 +352,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
                 del loss
             
             # Run validation every 100 steps
-            if step > 0 and step % 100 == 0:
+            if step > 0 and step % 500 == 0:
                 print(f"\nRunning validation at step {step}...")
                 val_loss = validate_model()
                 print(f"Validation loss at step {step}: {val_loss:.4f}")
