@@ -121,6 +121,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         policy.config.n_action_steps = cfg.n_action_steps
         policy.config.n_obs_steps = cfg.n_obs_steps
         
+        
         preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
         
         step = 0
@@ -131,6 +132,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         policy.config.chunk_size = cfg.chunk_size
         policy.config.n_action_steps = cfg.n_action_steps
         policy.config.n_obs_steps = cfg.n_obs_steps
+        
         
         policy.train()
         policy.to(device)
@@ -189,24 +191,22 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     # Load full dataset to determine episode indices
     full_dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, image_transforms=image_transforms, force_cache_sync=True, revision="main", tolerance_s=0.01)
     
-    # Get unique episode indices
-    episode_indices = list(set(full_dataset.hf_dataset["episode_index"]))
+    # Get unique episode indices (convert tensors to Python values)
+    episode_indices = list(set([int(idx.item()) if hasattr(idx, 'item') else int(idx) for idx in full_dataset.hf_dataset["episode_index"]]))
     episode_indices.sort()
     
-    # Split episodes into training and validation sets (90% training, 10% validation)
-    num_val_episodes = max(1, int(len(episode_indices) * 0.1))
-    num_train_episodes = len(episode_indices) - num_val_episodes
-    
-    train_episode_indices = episode_indices[:num_train_episodes]
-    val_episode_indices = episode_indices[num_train_episodes:]
+    # Split episodes based on episode_index: >= 150 for validation, < 150 for training
+    train_episode_indices = [idx for idx in episode_indices if idx < 150]
+    val_episode_indices = [idx for idx in episode_indices if idx >= 150]
     
     print(f"Total episodes: {len(episode_indices)}")
     print(f"Training episodes: {len(train_episode_indices)}")
     print(f"Validation episodes: {len(val_episode_indices)}")
     
     # Create boolean masks for training and validation data
-    train_mask = [idx in train_episode_indices for idx in full_dataset.hf_dataset["episode_index"]]
-    val_mask = [idx in val_episode_indices for idx in full_dataset.hf_dataset["episode_index"]]
+    dataset_episode_indices = [int(idx.item()) if hasattr(idx, 'item') else int(idx) for idx in full_dataset.hf_dataset["episode_index"]]
+    train_mask = [idx in train_episode_indices for idx in dataset_episode_indices]
+    val_mask = [idx in val_episode_indices for idx in dataset_episode_indices]
     
     # Create subsets for training and validation
     from torch.utils.data import Subset
@@ -257,9 +257,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
                     remapped_batch[new_key] = value
                 
                 batch = remapped_batch
-            
+                                
+                # State and action is already normalized
                 batch = preprocessor(batch)
-
+                
                 # Move all tensor values in batch to device
                 for key, value in batch.items():
                     if isinstance(value, torch.Tensor):
@@ -324,7 +325,20 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
                     # Unexpected dimensionality
                     print(f"Warning: observation.state has unexpected shape {state.shape}")
             
+            # Store original state values for comparison
+            original_state = batch["observation.state"].clone() if "observation.state" in batch else None
+            
             batch = preprocessor(batch)
+            
+            # Check for double normalization by comparing before and after preprocessing
+            if original_state is not None and "observation.state" in batch:
+                processed_state = batch["observation.state"]
+                print(f"Original state mean: {original_state.mean().item():.6f}, std: {original_state.std().item():.6f}")
+                print(f"Processed state mean: {processed_state.mean().item():.6f}, std: {processed_state.std().item():.6f}")
+                # Check if normalization was applied (mean should be close to 0, std close to 1 for normalized data)
+                if torch.allclose(processed_state.mean(), torch.tensor(0.0), atol=0.1) and \
+                   torch.allclose(processed_state.std(), torch.tensor(1.0), atol=0.1):
+                    print("WARNING: State appears to be normalized. Check for double normalization.")
             
             batch = apply_joint_augmentations(batch)
             
