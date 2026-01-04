@@ -30,14 +30,13 @@ print(f"Using device: {device}")
 
 # 🟢 ADDED: Data Augmentation Setup
 def get_augmentations():
-    # Basic augmentation for Diffusion Policy often includes:
-    # 1. Color Jitter (lighting invariance)
-    # 2. Small translations/rotations (position invariance)
     return v2.Compose([
-        v2.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
-        # Using RandomAffine instead of Crop because we don't know your exact image dimensions 
-        # and don't want to accidentally crop out the gripper.
-        v2.RandomAffine(degrees=5, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+        # 1. Color/Lighting is safe and helpful
+        v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        v2.RandomGrayscale(p=0.1),
+        # 2. Gaussian Blur helps with motion blur during fast moves
+        v2.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 2.0)),
+        # 3. DO NOT use Affine/Crop unless you transform the actions!
     ])
 
 
@@ -88,8 +87,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     cfg = policy.config
 
     cfg.n_obs_steps = 2
-    cfg.chunk_size = 50
-    cfg.n_action_steps = 50
+    cfg.chunk_size = 70
+    cfg.n_action_steps = 70
     
     # Update the configuration to use 7-dimensional state and action
     # and 400x640 images
@@ -128,7 +127,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     else:
         print("Starting fresh training from scratch", cfg)
         # Initialize a new model from configuration
-        policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
+        #policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
+        policy = SmolVLAPolicy(cfg)
         policy.config.chunk_size = cfg.chunk_size
         policy.config.n_action_steps = cfg.n_action_steps
         policy.config.n_obs_steps = cfg.n_obs_steps
@@ -329,7 +329,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
                         
             batch = apply_joint_augmentations(batch)
             
-            batch = random_drop_camera_views(batch, drop_prob=0.2)
+            batch = random_drop_camera_views(batch, drop_prob=0.8)
 
             # 5. Move all tensor values in batch to device
             # Note: Some items may be strings or other non-tensor types that cannot be moved to device

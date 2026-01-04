@@ -114,8 +114,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     print('output_features:', output_features)
     
     obs = 4
-    horizon = 16
-    n_action_steps = 16
+    horizon = 24
+    n_action_steps = 24
 
     cfg = DiffusionConfig(
         input_features=input_features, 
@@ -152,7 +152,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             
         optimizer = torch.optim.Adam(policy.parameters(), lr=2e-5)
         # Initialize learning rate scheduler
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
         
         # Load Optimizer State
         if not resume_from_checkpoint.startswith("http") and not resume_from_checkpoint.startswith("huggingface.co"):
@@ -176,9 +176,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         policy.to(device)
         preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
         step = 0
-        optimizer = torch.optim.Adam(policy.parameters(), lr=3e-5)
+        optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
         # Initialize learning rate scheduler
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=1000)
 
     # Ensure preprocessors are on the correct device
     # (Some LeRobot versions keep them as modules)
@@ -211,7 +211,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=4,
-        batch_size=8,
+        batch_size=12,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
