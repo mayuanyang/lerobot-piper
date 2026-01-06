@@ -83,6 +83,6 @@ class LongTaskDiffusionModel(DiffusionModel):
         velocity_loss = F.mse_loss(pred_dist, target_dist)
 
         # Total Loss
-        total_loss = loss + (0.5 * velocity_loss) 
+        total_loss = loss + (1 * velocity_loss) 
 
         return total_loss
