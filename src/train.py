@@ -6,8 +6,9 @@ from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
-from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
+from src.models.long_task_diffusion.long_task_diffusion_config import LongTaskDiffusionConfig
+from src.models.long_task_diffusion.long_task_diffusion_policy import LongTaskDiffusionPolicy
 from lerobot.policies.factory import make_pre_post_processors
 
 # 🟢 ADDED: Import torchvision for augmentation
@@ -37,42 +38,6 @@ def get_augmentations():
         v2.RandomAffine(degrees=5, translate=(0.05, 0.05), scale=(0.95, 1.05)),
     ])
 
-# 🟢 ADDED: Helper to apply augmentations to video batches
-def apply_augmentations(batch, transforms):
-    """Apply image augmentations with random selection"""
-    # Randomly decide whether to apply augmentation (50% chance)
-    if torch.rand(1).item() > 0.5:
-        for key, value in batch.items():
-            # strict check: must have "image" in name AND be a tensor
-            if "image" in key and isinstance(value, torch.Tensor):
-                
-                # Case 1: Standard Video Tensor (Batch, Time, Channel, Height, Width)
-                # This is what we expect for Diffusion Policy (ndim=5)
-                if value.ndim == 5:
-                    B, T, C, H, W = value.shape
-                    # Flatten Batch and Time dimensions so transforms can process them
-                    flat_imgs = value.view(B * T, C, H, W)
-                    
-                    # Apply transform
-                    aug_imgs = transforms(flat_imgs)
-                    
-                    # Reshape back to (B, T, C, H, W)
-                    batch[key] = aug_imgs.view(B, T, C, H, W)
-
-                # Case 2: Single Frame Tensor (Batch, Channel, Height, Width)
-                # (ndim=4) - Rare for your config, but good for safety
-                elif value.ndim == 4:
-                    batch[key] = transforms(value)
-
-                # Case 3: Metadata/Masks (ndim < 4)
-                # If the tensor is 2D or 3D (e.g. validity masks [B, T]), 
-                # we skip it. It cannot be color-jittered.
-                else:
-                    # Optional: Uncomment to see what key was skipped
-                    # print(f"Skipping augmentation for key '{key}' with shape {value.shape}")
-                    pass
-                    
-    return batch
 
 # 🟢 ADDED: Helper to apply joint data augmentation
 def apply_joint_augmentations(batch):
@@ -99,7 +64,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
     training_steps = 100000 
     log_freq = 10 # Reduced frequency to reduce console spam
-    checkpoint_freq = 1000 
+    checkpoint_freq = 1000
+    
+    image_transforms = get_augmentations()
 
     dataset_metadata = LeRobotDatasetMetadata(dataset_id, force_cache_sync=True, revision="main")
     features = dataset_to_policy_features(dataset_metadata.features)
@@ -113,19 +80,18 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     print('input_features:', input_features)
     print('output_features:', output_features)
     
-    obs = 4
+    obs = 24
     horizon = 24
-    n_action_steps = 24
+    n_action_steps = 12
+    
 
-    cfg = DiffusionConfig(
+    cfg = LongTaskDiffusionConfig(
         input_features=input_features, 
         output_features=output_features, 
         n_obs_steps=obs, 
         horizon=horizon, 
         n_action_steps=n_action_steps, 
-        pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1", 
-        use_group_norm=False,
-        crop_shape=(400, 400),
+        crop_shape=(320, 320),
         crop_is_random=True,
         use_separate_rgb_encoder_per_camera=True
     )
@@ -133,13 +99,15 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     if dataset_metadata.stats is None:
         raise ValueError("Dataset stats are required to initialize the policy.")
 
-    # Initialize Transforms
-    image_transforms = get_augmentations()
-
+    
     # --- MODEL LOADING LOGIC ---
     if resume_from_checkpoint is not None:
         print(f"Resuming training from checkpoint: {resume_from_checkpoint}")
-        policy = DiffusionPolicy.from_pretrained(resume_from_checkpoint)
+        # Try to load LongTaskDiffusionPolicy first, fallback to DiffusionPolicy
+        try:
+            policy = LongTaskDiffusionPolicy.from_pretrained(resume_from_checkpoint)
+        except:
+            policy = DiffusionPolicy.from_pretrained(resume_from_checkpoint)
         policy.train()
         policy.to(device)
         
@@ -171,7 +139,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             step = 0
     else:
         # Initialize Fresh Policy
-        policy = DiffusionPolicy(cfg)
+        policy = LongTaskDiffusionPolicy(cfg)
         policy.train()
         policy.to(device)
         preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
@@ -197,11 +165,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         "observation.images.front": obs_temporal_window,
         "observation.images.right": obs_temporal_window,
         "observation.state": obs_temporal_window,
-        "action": [i * frame_time for i in range(n_action_steps)]
+        "action": [i * frame_time for i in range(horizon)]
     }
 
     try:
-        dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, force_cache_sync=True, revision="main", tolerance_s=0.01)
+        dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, image_transforms=image_transforms, force_cache_sync=True, revision="main", tolerance_s=0.01)
     except Exception as e:
         print(f"Error loading remote dataset: {e}")
         local_dataset_path = "./src/output" 
@@ -211,7 +179,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=4,
-        batch_size=12,
+        batch_size=2,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
@@ -230,10 +198,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             for key in batch:
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].to(device, non_blocking=True)
-
-            # 2. Apply Image Augmentation (On GPU, before normalization)
-            # We usually augment raw images (0-255 or 0-1) before the preprocessor normalizes them using stats
-            batch = apply_augmentations(batch, image_transforms)
 
             # 3. Apply Joint Data Augmentation
             batch = apply_joint_augmentations(batch)
@@ -261,7 +225,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 policy.save_pretrained(checkpoint_dir)
                 preprocessor.save_pretrained(checkpoint_dir)
                 postprocessor.save_pretrained(checkpoint_dir)
-                torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer_state.pth")
+                #torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer_state.pth")
                 print(f"\nCheckpoint saved at step {step}")
                 
             step += 1

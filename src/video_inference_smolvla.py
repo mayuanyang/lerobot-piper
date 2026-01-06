@@ -78,73 +78,63 @@ class VideoInference:
         return frame_processed
 
 
-    def process_video(self, rgb_video_path: str, gripper_video_path: str, depth_video_path: str, 
+    def process_video(self, front_video_path: str, gripper_video_path: str, right_video_path: str, 
                         joint_states: deque) -> List[Dict[str, Any]]:
         
         print(f"Expected Image Size: {self.target_size}")
         print(f"Closed-loop mode: {self.closed_loop}")
 
         # Load videos (omitted boilerplate for brevity)
-        rgb_cap = self.load_video(rgb_video_path);
-        if rgb_cap is None: return []
+        front_cap = self.load_video(front_video_path);
+        if front_cap is None: return []
         gripper_cap = self.load_video(gripper_video_path);
-        if gripper_cap is None: rgb_cap.release(); return []
-        depth_cap = self.load_video(depth_video_path);
-        if depth_cap is None: rgb_cap.release(); gripper_cap.release(); return []
+        if gripper_cap is None: gripper_cap.release(); return []
+        right_cap = self.load_video(right_video_path);
+        if right_cap is None: right_cap.release(); gripper_cap.release(); return []
         
         # Initialize temporal buffers (Deques)
-        rgb_history = collections.deque(maxlen=HISTORY_LENGTH)
+        front_history = collections.deque(maxlen=HISTORY_LENGTH)
         gripper_history = collections.deque(maxlen=HISTORY_LENGTH)
-        depth_history = collections.deque(maxlen=HISTORY_LENGTH)
+        right_history = collections.deque(maxlen=HISTORY_LENGTH)
         state_history = collections.deque(maxlen=HISTORY_LENGTH)
         predicted_action = None  # Track the most recent predicted action for closed-loop
         
         results = []
         frame_count = 0
-        
-        state_scale = 100000.0
-        action_diff_scale = 10000.0
-        
+                
         try:
             print(f"Processing videos with {HISTORY_LENGTH}-step temporal window.")
             
             while True:
                 # Read frames from all videos
-                rgb_ret, rgb_frame = rgb_cap.read()
+                front_ret, front_frame = front_cap.read()
                 gripper_ret, gripper_frame = gripper_cap.read()
-                depth_ret, depth_frame = depth_cap.read()
+                right_ret, right_frame = right_cap.read()
                 
                 
-                if not (rgb_ret and gripper_ret and depth_ret):
+                if not (front_ret and gripper_ret and right_ret):
                     break
                 
                 # Preprocess frames (returns H, W, C)
-                processed_rgb_frame = self.preprocess_frame(rgb_frame)
+                processed_front_frame = self.preprocess_frame(front_frame)
                 processed_gripper_frame = self.preprocess_frame(gripper_frame)
-                processed_depth_frame = self.preprocess_frame(depth_frame)
+                processed_right_frame = self.preprocess_frame(right_frame)
                 
                 # --- Temporal Buffering ---
-                rgb_history.append(processed_rgb_frame)
+                front_history.append(processed_front_frame)
                 gripper_history.append(processed_gripper_frame)
-                depth_history.append(processed_depth_frame)
+                right_history.append(processed_right_frame)
                 
                 current_joint_state = joint_states.popleft()
-                # Divide every value in current_joint_state by 100000
-                current_joint_state = current_joint_state / state_scale
                 
-                # noise = np.random.uniform(-0.01, 0.01, size=current_joint_state.shape)
-
-                # # Add noise to current_joint_state
-                # current_joint_state = current_joint_state + noise
-
                 state_history.append(current_joint_state)
 
                                 
                 # --- Inference Check ---
-                if len(rgb_history) < HISTORY_LENGTH:
-                    print('No enough observation.state shape:', len(state_history), len(rgb_history), len(gripper_history), len(depth_history))
+                if len(right_history) < HISTORY_LENGTH:
+                    print('No enough observation.state shape:', len(state_history), len(front_history), len(gripper_history), len(right_history))
                     frame_count += 1
-                    cv2.imshow('RGB Video Input', rgb_frame)
+                    cv2.imshow('Front Video Input', front_frame)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         print("Processing stopped by user during buffering")
                         break
@@ -153,19 +143,20 @@ class VideoInference:
                 
                 # Stack the temporal history and prepare tensors in the correct format
                 # Expected format for diffusion policy: [B, T, C, H, W] where B=1 (batch size)
-                rgb_stacked = np.stack(rgb_history).astype(np.float32)  # [T, H, W, C]
-                rgb_tensor = torch.from_numpy(rgb_stacked).permute(0, 3, 1, 2).unsqueeze(0)  # [1, T, C, H, W]
+                front_stacked = np.stack(front_history).astype(np.float32)  # [T, H, W, C]
+                front_tensor = torch.from_numpy(front_stacked).permute(0, 3, 1, 2).unsqueeze(0)  # [1, T, C, H, W]
+                
+                right_stacked = np.stack(right_history).astype(np.float32)  # [T, H, W, C]
+                right_tensor = torch.from_numpy(right_stacked).permute(0, 3, 1, 2).unsqueeze(0)  # [1, T, C, H, W]  
                 
                 gripper_stacked = np.stack(gripper_history).astype(np.float32)  # [T, H, W, C]
                 gripper_tensor = torch.from_numpy(gripper_stacked).permute(0, 3, 1, 2).unsqueeze(0)  # [1, T, C, H, W]
                 
-                depth_stacked = np.stack(depth_history).astype(np.float32)  # [T, H, W, C]
-                depth_tensor = torch.from_numpy(depth_stacked).permute(0, 3, 1, 2).unsqueeze(0)  # [1, T, C, H, W]
 
                 observation = {
-                    "observation.images.rgb": rgb_tensor,
-                    "observation.images.gripper": gripper_tensor,
-                    "observation.images.depth": depth_tensor,
+                    "observation.images.camera1": front_tensor,
+                    "observation.images.camera2": right_tensor,
+                    "observation.images.camera3": gripper_tensor,
                 }
                 
                 
@@ -206,7 +197,7 @@ class VideoInference:
                         print(f"Warning: Unexpected action diff shape {predicted_action_diff.shape}, expected (7,)")
                     else:
                         # Apply the action diff to the current state to get the next state
-                        predicted_action = current_joint_state * state_scale + predicted_action_diff * action_diff_scale
+                        predicted_action = current_joint_state
                         print(f'Applied action diff to get next state: {predicted_action}')
                     
                     # Set the accumulated action back to the result
@@ -216,9 +207,9 @@ class VideoInference:
                 
                 
                 # Display and progress updates (omitted boilerplate for brevity)
-                cv2.imshow('RGB Video Input', rgb_frame)
+                cv2.imshow('Right Video Input', right_frame)
                 cv2.imshow('Gripper Video Input', gripper_frame)
-                cv2.imshow('Depth Video Input', depth_frame)
+                cv2.imshow('Depth Video Input', front_frame)  # Assuming front_frame is depth for demo
                 
                 if frame_count % 30 == 0:
                     print(f"Processed frame {frame_count}")
@@ -234,9 +225,9 @@ class VideoInference:
             traceback.print_exc()
         finally:
             # Clean up
-            rgb_cap.release()
+            front_cap.release()
             gripper_cap.release()
-            depth_cap.release()
+            right_cap.release()
             cv2.destroyAllWindows()
         
         print(f"Finished processing {frame_count} frames, with {len(results)} inference results")
@@ -301,15 +292,15 @@ def main(closed_loop=False):
     
     
     print("Processing video files")
-    rgb_video_path = "input/episode_001_rgb.mp4"
-    gripper_video_path = "input/episode_001_gripper.mp4"
-    depth_video_path = "input/episode_001_depth.mp4"
+    front_video_path = "input/camera_front_20260105_142956.mp4"
+    gripper_video_path = "input/camera_front_20260105_142956.mp4"
+    right_video_path = "input/camera_front_20260105_142956.mp4"
     
     joint_states = create_sample_joint_states()
     
     print('the length of joint_states', len(joint_states))
     
-    results = inference_engine.process_video(rgb_video_path, gripper_video_path, depth_video_path, joint_states)
+    results = inference_engine.process_video(front_video_path, gripper_video_path, right_video_path, joint_states)
     inference_engine.save_results(results, "temp/inference_results.json")
     print(f"Processed {len(results)} frames")
     
