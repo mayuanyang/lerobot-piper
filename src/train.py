@@ -80,9 +80,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     print('input_features:', input_features)
     print('output_features:', output_features)
     
-    obs = 24
-    horizon = 24
-    n_action_steps = 12
+    obs = 4
+    horizon = 16
+    n_action_steps = 8
     
 
     cfg = LongTaskDiffusionConfig(
@@ -179,7 +179,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=4,
-        batch_size=2,
+        batch_size=24,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,

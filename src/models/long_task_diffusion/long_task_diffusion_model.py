@@ -70,13 +70,14 @@ class LongTaskDiffusionModel(DiffusionModel):
             loss_steps = loss_steps * in_episode_bound.unsqueeze(-1)
 
         # 3. Temporal Weighting: Weight earlier steps in the horizon more
-        # Create a decay curve (e.g., exponential decay)
+        # Create a decay curve (e.g., exponential decay), action closer to the start of the horizon get higher weight
         weights = torch.exp(-0.1 * torch.arange(horizon, device=loss_steps.device))
         weights = weights / weights.sum() # Normalize
         loss = (loss_steps.mean(dim=-1) * weights).sum(dim=-1).mean()
 
         # 4. Velocity/Consistency Loss (The "Shortcut" Killer)
-        # Compare the change between adjacent actions in pred vs target
+        # Compare the change between adjacent actions in pred vs target, encouraging smooth transitions
+        # This helps prevent the model from taking shortcuts by making large jumps in action space
         pred_dist = pred[:, 1:, :] - pred[:, :-1, :]
         target_dist = target[:, 1:, :] - target[:, :-1, :]
         velocity_loss = F.mse_loss(pred_dist, target_dist)
