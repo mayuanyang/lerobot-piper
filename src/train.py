@@ -86,6 +86,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     
 
     cfg = LongTaskDiffusionConfig(
+        vision_backbone="resnet50",
+        pretrained_backbone_weights="imagenet",
         input_features=input_features, 
         output_features=output_features, 
         n_obs_steps=obs, 
