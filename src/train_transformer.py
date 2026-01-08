@@ -13,8 +13,8 @@ from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.factory import make_pre_post_processors
 
 # Import transformer-specific components
-from src.models.long_task_diffusion.long_task_transformer_config import LongTaskTransformerConfig
-from src.models.long_task_diffusion.long_task_transformer_policy import LongTaskTransformerPolicy
+from src.models.long_task_transformer.long_task_transformer_config import LongTaskTransformerConfig
+from src.models.long_task_transformer.long_task_transformer_policy import LongTaskTransformerPolicy
 
 # Import torchvision for augmentation
 from torchvision.transforms import v2

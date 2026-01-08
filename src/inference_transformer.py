@@ -12,7 +12,7 @@ from lerobot.configs.types import FeatureType
 from lerobot.policies.factory import load_pre_post_processors
 
 # Import transformer-specific components
-from src.models.long_task_diffusion.long_task_transformer_policy import LongTaskTransformerPolicy
+from src.models.long_task_transformer.long_task_transformer_policy import LongTaskTransformerPolicy
 
 
 # Detect the best available device
