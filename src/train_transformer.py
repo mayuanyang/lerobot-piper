@@ -95,19 +95,19 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         n_obs_steps=obs, 
         horizon=horizon, 
         n_action_steps=n_action_steps, 
-        crop_shape=(320, 320),
+        crop_shape=(84, 84),
         crop_is_random=True,
-        use_separate_rgb_encoder_per_camera=True,
+        use_separate_rgb_encoder_per_camera=False,
+        vision_backbone="resnet18",
+        pretrained_backbone_weights=None,
         state_dim=7,  # Adjust based on your robot's state dimension
         action_dim=7,  # Adjust based on your robot's action dimension
-        d_model=256,
-        nhead=8,
-        num_encoder_layers=6,
-        num_decoder_layers=6,
-        dim_feedforward=2048,
-        dropout=0.1,
-        resnet_model="resnet18",
-        pretrained_resnet=True
+        d_model=128,
+        nhead=4,
+        num_encoder_layers=4,
+        num_decoder_layers=4,
+        dim_feedforward=512,
+        dropout=0.1
     )
     
     if dataset_metadata.stats is None:

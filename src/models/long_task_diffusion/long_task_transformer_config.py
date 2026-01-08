@@ -17,6 +17,9 @@
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.configs.types import NormalizationMode
+from lerobot.optim.optimizers import AdamConfig
+from lerobot.optim.schedulers import CosineAnnealingLRConfig
 
 
 @PreTrainedConfig.register_subclass("long_task_transformer")
@@ -24,16 +27,27 @@ from lerobot.configs.policies import PreTrainedConfig
 class LongTaskTransformerConfig(PreTrainedConfig):
     """Long Task Transformer Configuration for long-horizon tasks with transformer-based architecture."""
     
-    # Input dimensions
-    n_obs_steps: int = 24
-    horizon: int = 24
-    n_action_steps: int = 12
-    
+    # Inputs / output structure.
+    n_obs_steps: int = 8
+    horizon: int = 16
+    n_action_steps: int = 8
+
+    normalization_mapping: dict[str, NormalizationMode] = field(
+        default_factory=lambda: {
+            "VISUAL": NormalizationMode.MEAN_STD,
+            "STATE": NormalizationMode.MIN_MAX,
+            "ACTION": NormalizationMode.MIN_MAX,
+        }
+    )
+
     # Image processing
-    image_features: dict = field(default_factory=dict)
-    crop_shape: tuple = (320, 320)
+    vision_backbone: str = "resnet18"
+    crop_shape: tuple = (84, 84)
     crop_is_random: bool = True
-    use_separate_rgb_encoder_per_camera: bool = True
+    pretrained_backbone_weights: str | None = None
+    use_group_norm: bool = True
+    spatial_softmax_num_keypoints: int = 32
+    use_separate_rgb_encoder_per_camera: bool = False
     
     # State processing
     state_dim: int = 7  # Default for 7-DOF arm
@@ -50,18 +64,22 @@ class LongTaskTransformerConfig(PreTrainedConfig):
     dropout: float = 0.1
     activation: str = "relu"
     
-    # ResNet encoder
-    resnet_model: str = "resnet18"
-    pretrained_resnet: bool = True
-    
     # Tokenization
     state_token_dim: int = 64
     
-    def validate_features(self) -> None:
-        if len(self.image_features) == 0 and not hasattr(self, 'state_dim'):
-            raise ValueError("You must provide at least one image or the state dimension.")
+    # Training presets
+    optimizer_lr: float = 1e-4
+    optimizer_betas: tuple = (0.95, 0.999)
+    optimizer_eps: float = 1e-8
+    optimizer_weight_decay: float = 1e-6
+    scheduler_name: str = "cosine"
+    scheduler_warmup_steps: int = 500
 
-        if self.crop_shape is not None and len(self.image_features) > 0:
+    def validate_features(self) -> None:
+        if len(self.image_features) == 0 and self.env_state_feature is None:
+            raise ValueError("You must provide at least one image or the environment state among the inputs.")
+
+        if self.crop_shape is not None:
             for key, image_ft in self.image_features.items():
                 if self.crop_shape[0] > image_ft.shape[1] or self.crop_shape[1] > image_ft.shape[2]:
                     raise ValueError(
@@ -69,3 +87,38 @@ class LongTaskTransformerConfig(PreTrainedConfig):
                         f"for `crop_shape` and {image_ft.shape} for "
                         f"`{key}`."
                     )
+
+        # Check that all input images have the same shape.
+        if len(self.image_features) > 0:
+            first_image_key, first_image_ft = next(iter(self.image_features.items()))
+            for key, image_ft in self.image_features.items():
+                if image_ft.shape != first_image_ft.shape:
+                    raise ValueError(
+                        f"`{key}` does not match `{first_image_key}`, but we expect all image shapes to match."
+                    )
+
+    def get_optimizer_preset(self) -> AdamConfig:
+        return AdamConfig(
+            lr=self.optimizer_lr,
+            betas=self.optimizer_betas,
+            eps=self.optimizer_eps,
+            weight_decay=self.optimizer_weight_decay,
+        )
+
+    def get_scheduler_preset(self) -> CosineAnnealingLRConfig:
+        return CosineAnnealingLRConfig(
+            name=self.scheduler_name,
+            num_warmup_steps=self.scheduler_warmup_steps,
+        )
+
+    @property
+    def observation_delta_indices(self) -> list:
+        return list(range(1 - self.n_obs_steps, 1))
+
+    @property
+    def action_delta_indices(self) -> list:
+        return list(range(1 - self.n_obs_steps, 1 - self.n_obs_steps + self.horizon))
+
+    @property
+    def reward_delta_indices(self) -> None:
+        return None

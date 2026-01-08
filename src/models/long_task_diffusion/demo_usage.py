@@ -29,8 +29,7 @@ def demo_model_creation():
         num_decoder_layers=2,   # Number of decoder layers
         dim_feedforward=256,    # Feedforward dimension
         dropout=0.1,            # Dropout rate
-        resnet_model="resnet18", # ResNet model for image encoding
-        pretrained_resnet=True   # Use pretrained ResNet weights
+        vision_backbone="resnet18"  # ResNet model for image encoding
     )
     print(f"   Created config with {config.n_obs_steps} observation steps and {config.horizon} horizon")
     

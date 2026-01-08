@@ -15,14 +15,14 @@ class ResNetImageEncoder(nn.Module):
         self.config = config
         
         # Initialize ResNet model
-        if config.resnet_model == "resnet18":
-            resnet = models.resnet18(pretrained=config.pretrained_resnet)
-        elif config.resnet_model == "resnet34":
-            resnet = models.resnet34(pretrained=config.pretrained_resnet)
-        elif config.resnet_model == "resnet50":
-            resnet = models.resnet50(pretrained=config.pretrained_resnet)
+        if config.vision_backbone == "resnet18":
+            resnet = models.resnet18(pretrained=config.pretrained_backbone_weights is not None)
+        elif config.vision_backbone == "resnet34":
+            resnet = models.resnet34(pretrained=config.pretrained_backbone_weights is not None)
+        elif config.vision_backbone == "resnet50":
+            resnet = models.resnet50(pretrained=config.pretrained_backbone_weights is not None)
         else:
-            raise ValueError(f"Unsupported ResNet model: {config.resnet_model}")
+            raise ValueError(f"Unsupported ResNet model: {config.vision_backbone}")
         
         # Remove the final classification layer
         self.resnet = nn.Sequential(*list(resnet.children())[:-1])
@@ -55,8 +55,8 @@ class StateTokenizer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.tokenizer = nn.Linear(config.state_dim, config.state_token_dim)
-        self.projection = nn.Linear(config.state_token_dim, config.d_model)
+        self.tokenizer = nn.Linear(config.state_dim, config.state_dim)  # Just project to d_model
+        self.projection = nn.Linear(config.state_dim, config.d_model)
         
     def forward(self, state: Tensor) -> Tensor:
         """
@@ -107,7 +107,7 @@ class LongTaskTransformerModel(nn.Module):
         self.config = config
         
         # Image encoders (one per camera if configured)
-        if config.image_features:
+        if len(config.image_features) > 0:
             self.image_encoders = nn.ModuleDict()
             for camera_key in config.image_features.keys():
                 self.image_encoders[camera_key] = ResNetImageEncoder(config)
@@ -124,7 +124,7 @@ class LongTaskTransformerModel(nn.Module):
             nhead=config.nhead,
             dim_feedforward=config.dim_feedforward,
             dropout=config.dropout,
-            activation=config.activation,
+            activation="relu",
             batch_first=True
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, config.num_encoder_layers)
@@ -135,7 +135,7 @@ class LongTaskTransformerModel(nn.Module):
             nhead=config.nhead,
             dim_feedforward=config.dim_feedforward,
             dropout=config.dropout,
-            activation=config.activation,
+            activation="relu",
             batch_first=True
         )
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, config.num_decoder_layers)
@@ -148,10 +148,7 @@ class LongTaskTransformerModel(nn.Module):
         
     def _prepare_image_features(self, batch: Dict[str, Tensor]) -> Tensor:
         """Extract and encode image features from batch."""
-        batch_size = batch[OBS_STATE].shape[0]
-        n_obs_steps = batch[OBS_STATE].shape[1]
-        
-        if not self.config.image_features:
+        if len(self.config.image_features) == 0:
             return None
             
         # Stack images from all cameras and time steps
@@ -207,6 +204,10 @@ class LongTaskTransformerModel(nn.Module):
         elif state_features is not None:
             context_tokens = state_features
         else:
+            # Fallback to just state features
+            context_tokens = state_features
+            
+        if context_tokens is None:
             raise ValueError("No valid input features found")
         
         # Add positional encoding

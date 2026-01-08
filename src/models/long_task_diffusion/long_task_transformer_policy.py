@@ -13,7 +13,7 @@ class LongTaskTransformerPolicy(nn.Module):
     and employs a transformer decoder to generate actions autoregressively.
     """
     
-    def __init__(self, config: LongTaskTransformerConfig, *args, **kwargs):
+    def __init__(self, config: LongTaskTransformerConfig):
         super().__init__()
         self.config = config
         
@@ -31,13 +31,8 @@ class LongTaskTransformerPolicy(nn.Module):
             tuple: (total_loss, None) where total_loss is computed by the transformer model
         """
         # Ensure batch is in the correct format
-        if self.config.image_features:
+        if len(self.config.image_features) > 0:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            # Stack image features if needed
-            if len(self.config.image_features) > 1:
-                image_keys = list(self.config.image_features.keys())
-                # Assuming images are already properly formatted in the batch
-                pass
         
         # Compute the loss using the transformer model
         loss = self.transformer.compute_loss(batch)
@@ -57,7 +52,7 @@ class LongTaskTransformerPolicy(nn.Module):
             actions: Tensor of predicted actions
         """
         # Ensure batch is in the correct format
-        if self.config.image_features:
+        if len(self.config.image_features) > 0:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             
         # Generate actions using the transformer model
