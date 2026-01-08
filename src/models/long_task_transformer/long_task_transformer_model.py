@@ -55,7 +55,6 @@ class StateTokenizer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.tokenizer = nn.Linear(config.state_dim, config.state_dim)  # Just project to d_model
         self.projection = nn.Linear(config.state_dim, config.d_model)
         
     def forward(self, state: Tensor) -> Tensor:
@@ -68,8 +67,7 @@ class StateTokenizer(nn.Module):
         Returns:
             tokens: Tensor of shape (batch_size, d_model)
         """
-        tokens = self.tokenizer(state)
-        tokens = self.projection(tokens)
+        tokens = self.projection(state)
         return tokens
 
 
@@ -204,17 +202,25 @@ class LongTaskTransformerModel(nn.Module):
         # Combine features
         if image_features is not None and state_features is not None:
             # Concatenate along feature dimension
-            context_tokens = torch.cat([image_features, state_features], dim=-1)
+            combined_features = torch.cat([image_features, state_features], dim=-1)
         elif image_features is not None:
-            context_tokens = image_features
+            combined_features = image_features
         elif state_features is not None:
-            context_tokens = state_features
+            combined_features = state_features
         else:
             # Fallback to just state features
-            context_tokens = state_features
+            combined_features = state_features
             
-        if context_tokens is None:
+        if combined_features is None:
             raise ValueError("No valid input features found")
+        
+        # Project combined features to d_model dimension if needed
+        if combined_features.shape[-1] != self.config.d_model:
+            if not hasattr(self, 'feature_projection'):
+                self.feature_projection = nn.Linear(combined_features.shape[-1], self.config.d_model)
+            context_tokens = self.feature_projection(combined_features)
+        else:
+            context_tokens = combined_features
         
         # Add positional encoding
         n_obs_steps = context_tokens.shape[1]
