@@ -148,6 +148,9 @@ class LongTaskTransformerModel(nn.Module):
         # Learnable tokens for action generation
         self.action_tokens = nn.Parameter(torch.randn(config.horizon, config.d_model))
         
+        # Initialize the feature projection layer as None
+        self.feature_projection = None
+        
     def _prepare_image_features(self, batch: Dict[str, Tensor]) -> Tensor:
         """Extract and encode image features from batch."""
         if len(self.config.image_features) == 0:

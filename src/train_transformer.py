@@ -151,6 +151,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         policy = LongTaskTransformerPolicy(cfg)
         policy.train()
         policy.to(device)
+        # Ensure all submodules are on the correct device
+        if hasattr(policy, 'transformer') and hasattr(policy.transformer, 'feature_projection'):
+            if policy.transformer.feature_projection is not None:
+                policy.transformer.feature_projection = policy.transformer.feature_projection.to(device)
         preprocessor, postprocessor = make_long_task_transformer_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
         step = 0
         optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
