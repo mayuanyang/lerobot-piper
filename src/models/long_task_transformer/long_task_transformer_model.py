@@ -219,8 +219,11 @@ class LongTaskTransformerModel(nn.Module):
         
         # Project combined features to d_model dimension if needed
         if combined_features.shape[-1] != self.config.d_model:
-            if not hasattr(self, 'feature_projection'):
-                self.feature_projection = nn.Linear(combined_features.shape[-1], self.config.d_model)
+            # Initialize feature projection layer if it doesn't exist or has wrong dimensions
+            if (self.feature_projection is None or 
+                self.feature_projection.in_features != combined_features.shape[-1] or
+                self.feature_projection.out_features != self.config.d_model):
+                self.feature_projection = nn.Linear(combined_features.shape[-1], self.config.d_model).to(combined_features.device)
             context_tokens = self.feature_projection(combined_features)
         else:
             context_tokens = combined_features
