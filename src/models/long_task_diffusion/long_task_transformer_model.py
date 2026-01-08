@@ -109,8 +109,12 @@ class LongTaskTransformerModel(nn.Module):
         # Image encoders (one per camera if configured)
         if len(config.image_features) > 0:
             self.image_encoders = nn.ModuleDict()
+            self.camera_key_map = {}  # Map sanitized keys to original keys
             for camera_key in config.image_features.keys():
-                self.image_encoders[camera_key] = ResNetImageEncoder(config)
+                # Sanitize the key by replacing dots with underscores
+                sanitized_key = camera_key.replace('.', '_')
+                self.image_encoders[sanitized_key] = ResNetImageEncoder(config)
+                self.camera_key_map[sanitized_key] = camera_key
         
         # State tokenizer
         self.state_tokenizer = StateTokenizer(config)
@@ -154,6 +158,8 @@ class LongTaskTransformerModel(nn.Module):
         # Stack images from all cameras and time steps
         image_tensors = []
         for camera_key in self.config.image_features.keys():
+            # Use sanitized key to access the encoder
+            sanitized_key = camera_key.replace('.', '_')
             if camera_key in batch:
                 # Shape: (batch_size, n_obs_steps, channels, height, width)
                 images = batch[camera_key]
@@ -161,7 +167,7 @@ class LongTaskTransformerModel(nn.Module):
                 # Reshape to process all images at once
                 images = images.view(-1, *images.shape[2:])
                 # Encode images
-                encoded_images = self.image_encoders[camera_key](images)
+                encoded_images = self.image_encoders[sanitized_key](images)
                 # Reshape back
                 encoded_images = encoded_images.view(batch_size, n_obs_steps, -1)
                 image_tensors.append(encoded_images)
