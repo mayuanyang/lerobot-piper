@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamConfig
-from lerobot.optim.schedulers import CosineAnnealingLRConfig
+from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 
 
 @PreTrainedConfig.register_subclass("long_task_transformer")
@@ -105,10 +105,12 @@ class LongTaskTransformerConfig(PreTrainedConfig):
             weight_decay=self.optimizer_weight_decay,
         )
 
-    def get_scheduler_preset(self) -> CosineAnnealingLRConfig:
-        return CosineAnnealingLRConfig(
-            name=self.scheduler_name,
+    def get_scheduler_preset(self) -> CosineDecayWithWarmupSchedulerConfig:
+        return CosineDecayWithWarmupSchedulerConfig(
             num_warmup_steps=self.scheduler_warmup_steps,
+            num_decay_steps=10000,  # Default value
+            peak_lr=self.optimizer_lr,
+            decay_lr=self.optimizer_lr * 0.1
         )
 
     @property
