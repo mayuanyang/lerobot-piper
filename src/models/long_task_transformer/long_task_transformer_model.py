@@ -117,6 +117,10 @@ class LongTaskTransformerModel(nn.Module):
         # State tokenizer
         self.state_tokenizer = StateTokenizer(config)
         
+        num_cameras = len(config.image_features)
+        combined_dim = (num_cameras + 1) * config.d_model 
+        self.feature_projection = nn.Linear(combined_dim, config.d_model)
+        
         # Positional encoding
         self.pos_encoding = nn.Parameter(torch.randn(config.n_obs_steps + config.horizon, config.d_model))
         
@@ -148,8 +152,7 @@ class LongTaskTransformerModel(nn.Module):
         # Learnable tokens for action generation
         self.action_tokens = nn.Parameter(torch.randn(config.horizon, config.d_model))
         
-        # Initialize the feature projection layer as None
-        self.feature_projection = None
+        
         
     def _prepare_image_features(self, batch: Dict[str, Tensor]) -> Tensor:
         """Extract and encode image features from batch."""
@@ -217,16 +220,8 @@ class LongTaskTransformerModel(nn.Module):
         if combined_features is None:
             raise ValueError("No valid input features found")
         
-        # Project combined features to d_model dimension if needed
-        if combined_features.shape[-1] != self.config.d_model:
-            # Initialize feature projection layer if it doesn't exist or has wrong dimensions
-            if (self.feature_projection is None or 
-                self.feature_projection.in_features != combined_features.shape[-1] or
-                self.feature_projection.out_features != self.config.d_model):
-                self.feature_projection = nn.Linear(combined_features.shape[-1], self.config.d_model).to(combined_features.device)
-            context_tokens = self.feature_projection(combined_features)
-        else:
-            context_tokens = combined_features
+        context_tokens = self.feature_projection(combined_features)
+        
         
         # Add positional encoding
         n_obs_steps = context_tokens.shape[1]
@@ -269,22 +264,30 @@ class LongTaskTransformerModel(nn.Module):
         return predicted_actions
     
     def compute_loss(self, batch: Dict[str, Tensor]) -> Tensor:
-        """
-        Compute the loss for training.
-        
-        Args:
-            batch: Dictionary containing the input batch data
-            
-        Returns:
-            loss: Scalar tensor with the computed loss
-        """
-        # Forward pass
         predicted_actions = self.forward(batch)
+        target = batch[ACTION]
+
+        # A. Element-wise loss
+        loss_steps = F.huber_loss(predicted_actions, target, reduction="none")
+
+        # B. Bring back the Padding Mask!
+        if self.config.do_mask_loss_for_padding:
+            mask = ~batch["action_is_pad"]
+            loss_steps = loss_steps * mask.unsqueeze(-1)
+
+        # C. Temporal Weighting (Prioritize immediate actions)
+        horizon = target.shape[1]
+        weights = torch.exp(-0.1 * torch.arange(horizon, device=target.device))
+        weights = weights / weights.sum()
         
-        # Get ground truth actions
-        ground_truth_actions = batch[ACTION]
-        
-        # Compute MSE loss
-        loss = F.mse_loss(predicted_actions, ground_truth_actions)
-        
-        return loss
+        # D. Gripper Weighting (The pick-and-place secret)
+        loss_steps[:, :, -1] *= 2.0 
+
+        main_loss = (loss_steps.mean(dim=-1) * weights).sum(dim=-1).mean()
+
+        # E. Velocity Loss (Prevents teleporting/shortcuts)
+        pred_dist = predicted_actions[:, 1:, :] - predicted_actions[:, :-1, :]
+        target_dist = target[:, 1:, :] - target[:, :-1, :]
+        velocity_loss = F.mse_loss(pred_dist, target_dist)
+
+        return main_loss + (0.1 * velocity_loss)

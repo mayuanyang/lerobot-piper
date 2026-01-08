@@ -100,7 +100,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         crop_is_random=True,
         use_separate_rgb_encoder_per_camera=False,
         vision_backbone="resnet18",
-        pretrained_backbone_weights=None,
+        pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
         state_dim=7,  # Adjust based on your robot's state dimension
         action_dim=7,  # Adjust based on your robot's action dimension
         d_model=128,
