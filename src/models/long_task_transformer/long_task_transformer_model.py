@@ -46,6 +46,7 @@ class ResNetImageEncoder(nn.Module):
         features = features.view(features.size(0), -1)
         # Project to transformer dimension
         features = self.projection(features)
+        print('features shape in ResNetImageEncoder:', features.shape)
         return features
 
 
@@ -68,6 +69,7 @@ class StateTokenizer(nn.Module):
             tokens: Tensor of shape (batch_size, d_model)
         """
         tokens = self.projection(state)
+        print('tokens shape in StateTokenizer:', tokens.shape)
         return tokens
 
 
@@ -90,6 +92,7 @@ class ActionHead(nn.Module):
             actions: Tensor of shape (batch_size, seq_len, action_dim)
         """
         actions = self.action_projection(decoder_output)
+        print('actions shape in ActionHead:', actions.shape)
         return actions
 
 
