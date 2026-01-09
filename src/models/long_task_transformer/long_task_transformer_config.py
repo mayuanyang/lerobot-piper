@@ -75,6 +75,9 @@ class LongTaskTransformerConfig(PreTrainedConfig):
     scheduler_name: str = "cosine"
     scheduler_warmup_steps: int = 500
 
+    # Loss computation
+    do_mask_loss_for_padding: bool = True
+
     def validate_features(self) -> None:
         if len(self.image_features) == 0 and self.env_state_feature is None:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")

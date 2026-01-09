@@ -83,6 +83,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     num_joints = len(json_data["joint_names"])
     original_num_frames = len(json_data["frames"])
     effective_num_frames = original_num_frames - last_frames_to_chop - first_frames_to_chop
+    delta_scale = 10  # Assuming joint positions are already in correct scale
     
     if effective_num_frames <= 0:
         print(f"❌ ERROR: Chopping {last_frames_to_chop} frames from {original_num_frames} results in 0 or fewer frames. Skipping data generation.")
@@ -97,6 +98,9 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     for i in range(effective_num_frames):
         current_state_scaled = [pos for pos in joint_positions[i]]
         next_state_scaled = [pos for pos in joint_positions[i + 1]] if i + 1 < effective_num_frames else [pos for pos in joint_positions[i]]
+        # Calculate delta as the difference between next state and current state
+        delta = [next_pos - current_pos for next_pos, current_pos in zip(next_state_scaled, current_state_scaled)]
+        delta = [d * delta_scale for d in delta]
 
         is_done = (i == effective_num_frames - 1)
         
@@ -108,7 +112,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         # Adjust frame_index to account for skipped frames
         frame_data = {
             "observation.state": current_state_scaled,
-            "action": next_state_scaled,
+            "action": delta,  # Use delta instead of next state as action
             "timestamp": timestamp_base,
             "episode_index": episode_data.episode_index,
             "frame_index": json_data["frames"][i + first_frames_to_chop]["frame_index"] - first_frames_to_chop,  # 局部索引 (0, 1, 2, ...)

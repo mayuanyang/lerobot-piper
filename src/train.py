@@ -81,13 +81,14 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     print('output_features:', output_features)
     
     obs = 4
-    horizon = 16
-    n_action_steps = 8
+    horizon = 8
+    n_action_steps = 4
     
 
     cfg = LongTaskDiffusionConfig(
         vision_backbone="resnet50",
-        pretrained_backbone_weights="imagenet",
+        pretrained_backbone_weights="ResNet50_Weights.IMAGENET1K_V2",
+        use_group_norm=False,
         input_features=input_features, 
         output_features=output_features, 
         n_obs_steps=obs, 
@@ -181,7 +182,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=4,
-        batch_size=24,
+        batch_size=6,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
