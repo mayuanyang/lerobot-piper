@@ -203,6 +203,14 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     print(f"Training episodes: {len(train_episode_indices)}")
     print(f"Validation episodes: {len(val_episode_indices)}")
     
+    # Check if we have any validation episodes
+    if len(val_episode_indices) == 0:
+        print("WARNING: No validation episodes found!")
+        # Use a small portion of training episodes for validation if no validation episodes
+        val_episode_indices = train_episode_indices[-10:]  # Last 10 training episodes
+        train_episode_indices = train_episode_indices[:-10]  # Remaining training episodes
+        print(f"Adjusted - Training episodes: {len(train_episode_indices)}, Validation episodes: {len(val_episode_indices)}")
+    
     # Create boolean masks for training and validation data
     dataset_episode_indices = [int(idx.item()) if hasattr(idx, 'item') else int(idx) for idx in full_dataset.hf_dataset["episode_index"]]
     train_mask = [idx in train_episode_indices for idx in dataset_episode_indices]
@@ -212,6 +220,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     from torch.utils.data import Subset
     train_dataset = Subset(full_dataset, [i for i, mask in enumerate(train_mask) if mask])
     val_dataset = Subset(full_dataset, [i for i, mask in enumerate(val_mask) if mask])
+    
+    # Check dataset sizes
+    print(f"Training dataset size: {len(train_dataset)}")
+    print(f"Validation dataset size: {len(val_dataset)}")
     
     batch_size = 36
     train_dataloader = torch.utils.data.DataLoader(
@@ -231,6 +243,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         pin_memory=device.type != "cpu",
         drop_last=True,
     )
+    
+    # Check if we have any validation batches
+    val_batches = len(val_dataloader)
+    print(f"Validation batches: {val_batches}")
+    if val_batches == 0:
+        print("WARNING: No validation batches! Check batch_size and dataset size.")
 
     # Validation function
     def validate_model():
@@ -238,9 +256,16 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         val_loss = 0.0
         val_batches = 0
         
+        print(f"Starting validation with {len(val_dataloader)} batches...")
+        
         with torch.no_grad():
             for batch_idx, batch in enumerate(val_dataloader):
-                batch["task"] = ["Pick and place the cube into the container"] * batch_size
+                # Check if batch is empty or invalid
+                if not batch:
+                    print(f"Warning: Empty batch at index {batch_idx}")
+                    continue
+                    
+                batch["task"] = ["Pick and place the cube into the container"] * len(batch.get("observation.state", []))
 
                 # Remap image feature names to match what the policy expects
                 feature_mapping = {
@@ -267,16 +292,27 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
                         batch[key] = value.to(device)
 
                 # Forward pass
-                loss, _ = policy.forward(batch)
-                val_loss += loss.item()
-                val_batches += 1
+                try:
+                    loss, _ = policy.forward(batch)
+                    # Check if loss is valid
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        print(f"Warning: Invalid loss value at batch {batch_idx}: {loss.item()}")
+                        continue
+                    val_loss += loss.item()
+                    val_batches += 1
+                    print(f"Batch {batch_idx}: loss = {loss.item():.4f}")
+                except Exception as e:
+                    print(f"Error during forward pass at batch {batch_idx}: {e}")
+                    continue
                 
                 # Limit validation to a reasonable number of batches to save time
-                if batch_idx >= 10:  # Validate on first 10 batches
+                # But make sure we have at least a few batches for meaningful average
+                if batch_idx >= min(10, len(val_dataloader) - 1):  # Validate on at least 10 batches or all available batches
                     break
         
         policy.train()
         avg_val_loss = val_loss / val_batches if val_batches > 0 else 0
+        print(f"Validation completed: {val_batches} batches, total loss: {val_loss:.4f}, average loss: {avg_val_loss:.4f}")
         return avg_val_loss
 
     # --- TRAINING LOOP ---

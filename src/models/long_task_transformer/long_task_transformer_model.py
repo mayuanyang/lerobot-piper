@@ -17,18 +17,24 @@ class ResNetImageEncoder(nn.Module):
         # Initialize ResNet model
         if config.vision_backbone == "resnet18":
             resnet = models.resnet18(pretrained=config.pretrained_backbone_weights is not None)
+            self.feature_dim = 512
         elif config.vision_backbone == "resnet34":
             resnet = models.resnet34(pretrained=config.pretrained_backbone_weights is not None)
+            self.feature_dim = 512
         elif config.vision_backbone == "resnet50":
             resnet = models.resnet50(pretrained=config.pretrained_backbone_weights is not None)
+            self.feature_dim = 2048
         else:
             raise ValueError(f"Unsupported ResNet model: {config.vision_backbone}")
         
-        # Remove the final classification layer
-        self.resnet = nn.Sequential(*list(resnet.children())[:-1])
+        # Remove the final classification layer and average pooling layer to preserve spatial features
+        self.resnet = nn.Sequential(*list(resnet.children())[:-2])
         
-        # Add a projection layer to match the transformer dimension
-        self.projection = nn.Linear(resnet.fc.in_features, config.d_model)
+        # Adaptive average pooling to ensure consistent spatial dimensions
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((7, 7))
+        
+        # Projection from flattened spatial features to transformer dimension
+        self.projection = nn.Linear(self.feature_dim * 7 * 7, config.d_model)
         
     def forward(self, images: Tensor) -> Tensor:
         """
@@ -40,13 +46,19 @@ class ResNetImageEncoder(nn.Module):
         Returns:
             features: Tensor of shape (batch_size, d_model)
         """
-        # Pass through ResNet
+        # Pass through ResNet (excluding final avgpool and fc layers)
         features = self.resnet(images)
+        print('features shape in ResNetImageEncoder:', features.shape)
+        
+        # Apply adaptive pooling to ensure consistent spatial dimensions
+        features = self.adaptive_pool(features)
+        
         # Flatten spatial dimensions
         features = features.view(features.size(0), -1)
+        
         # Project to transformer dimension
         features = self.projection(features)
-        print('features shape in ResNetImageEncoder:', features.shape)
+        print('features shape in projection:', features.shape)
         return features
 
 
@@ -248,8 +260,12 @@ class LongTaskTransformerModel(nn.Module):
         # Prepare context tokens from observations
         context_tokens = self._prepare_context_tokens(batch)
         
+        seq_len = context_tokens.shape[1]
+        causal_mask = torch.triu(torch.ones(seq_len, seq_len) * float('-inf'), diagonal=1)
+        causal_mask = causal_mask.to(context_tokens.device)
+        
         # Encode context
-        memory = self.transformer_encoder(context_tokens)
+        memory = self.transformer_encoder(context_tokens, mask=causal_mask)
         
         # Generate action queries if not provided
         if action_queries is None:
@@ -258,8 +274,12 @@ class LongTaskTransformerModel(nn.Module):
         # Add positional encoding to action queries
         action_queries = action_queries + self.pos_encoding[self.config.n_obs_steps:self.config.n_obs_steps + self.config.horizon].unsqueeze(0)
         
+        tgt_seq_len = action_queries.shape[1]
+        tgt_mask = torch.triu(torch.ones(tgt_seq_len, tgt_seq_len) * float('-inf'), diagonal=1)
+        tgt_mask = tgt_mask.to(action_queries.device)
+    
         # Decode actions
-        decoder_output = self.transformer_decoder(action_queries, memory)
+        decoder_output = self.transformer_decoder(action_queries, memory, tgt_mask=tgt_mask)
         
         # Generate actions
         predicted_actions = self.action_head(decoder_output)

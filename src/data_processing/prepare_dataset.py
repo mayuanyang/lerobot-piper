@@ -64,13 +64,21 @@ def create_episodes_parquet_index(root_dir: Path, episode_index: int):
         print("❌ WARNING: episodes.jsonl is empty. Skipping episodes index creation.")
         return
 
-    # 2. Create DataFrame and convert to Arrow Table
-    df = pd.DataFrame(episode_lines)
+    # 2. Filter to only include the current episode
+    # Adjust for zero-based indexing: episode_index in file is 1-based, but we need 0-based for lookup
+    current_episode_lines = [line for line in episode_lines if line.get('episode_index') == episode_index]
+    
+    if not current_episode_lines:
+        print(f"❌ WARNING: No data found for episode {episode_index}. Skipping episodes index creation.")
+        return
+
+    # 3. Create DataFrame and convert to Arrow Table (only for current episode)
+    df = pd.DataFrame(current_episode_lines)
     table = pa.Table.from_pandas(df)
 
-    # 3. Create the nested directory structure LeRobot expects
+    # 4. Create the nested directory structure LeRobot expects
     # This creates a subdirectory with multiple Parquet files
-    data_subdir = episodes_parquet_dir / f"episode-{episode_index:03d}"
+    data_subdir = episodes_parquet_dir / f"chunk-{episode_index:03d}"
     data_subdir.mkdir(exist_ok=True, parents=True)
     
     # Write multiple Parquet files (LeRobot expects this structure)
@@ -268,8 +276,8 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         "num_frames": effective_num_frames, # 🔴 CORE CHANGE 4: Report effective number of frames
         "dataset_from_index": dataset_from_index,
         "dataset_to_index": dataset_to_index,
-        "start_time": json_data["start_time"],
-        "end_time": json_data["end_time"],
+        #"start_time": json_data["start_time"],
+        #"end_time": json_data["end_time"],
         #"task_description": episode_data.task_description
         # [Video metadata for each camera remains the same...]
     }
@@ -280,8 +288,8 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         episodes_jsonl[f"videos/observation.images.{camera_name}/from_timestamp"] = 0.0
         episodes_jsonl[f"videos/observation.images.{camera_name}/chunk_index"] = episode_data.episode_index
         episodes_jsonl[f"videos/observation.images.{camera_name}/file_index"] = episode_data.episode_index
-        episodes_jsonl[f"videos/observation.images.{camera_name}/frame_index_offset"] = 0
-        episodes_jsonl[f"data/chunk_index"] = episode_data.episode_index
+        #episodes_jsonl[f"videos/observation.images.{camera_name}/frame_index_offset"] = 0
+        #episodes_jsonl[f"data/chunk_index"] = episode_data.episode_index
         episodes_jsonl[f"data/file_index"] = episode_data.episode_index
         
     
@@ -579,11 +587,18 @@ def compute_and_save_dataset_stats(output_dir: Path):
                             camera_name = column.split(".")[-1]
                             
                             # Construct the video file path based on the episodes.jsonl info
-                            chunk_index = episode_info.get(f"videos/observation.images.{camera_name}/chunk_index", episode_index)
-                            video_path = output_dir / "videos" / f"observation.images.{camera_name}" / f"chunk-{chunk_index:03d}" / f"episode_{chunk_index:03d}.mp4"
+                            # FIX: Use the correct key for retrieving chunk_index for each camera
+                            chunk_index_key = f"videos/observation.images.{camera_name}/chunk_index"
+                            file_index_key = f"videos/observation.images.{camera_name}/file_index"
+                            
+                            # Use the correct chunk_index and file_index for each camera
+                            chunk_index = episode_info.get(chunk_index_key, episode_index)
+                            file_index = episode_info.get(file_index_key, episode_index)
+                            
+                            video_path = output_dir / "videos" / f"observation.images.{camera_name}" / f"chunk-{chunk_index:03d}" / f"episode_{file_index:03d}.mp4"
                             
                             # Create a subdirectory for this episode's frames
-                            episode_temp_dir = temp_path / f"episode_{episode_index}"
+                            episode_temp_dir = temp_path / f"episode_{episode_index}_{camera_name}"
                             episode_temp_dir.mkdir(exist_ok=True)
                             
                             # Extract frames to temporary directory

@@ -84,3 +84,56 @@ When resuming training:
 3. **Monitor training progress**: When resuming, the step counter will continue from where it left off, so you can track progress accurately.
 
 4. **Keep checkpoints**: Don't delete checkpoint directories if you might want to resume training later.
+
+## Dataset Leakage Testing
+
+To ensure the quality of your training data, we provide a dataset leakage tester that checks for potential data contamination issues.
+
+### Running the Dataset Leakage Tester
+
+You can run the dataset leakage tester using the command line:
+
+```bash
+python src/data_processing/dataset_leakage_tester.py --dataset-root ./output
+```
+
+Or from within Python:
+
+```python
+from data_processing.dataset_leakage_tester import DatasetLeakageTester
+
+# Initialize the tester
+tester = DatasetLeakageTester("./output")
+
+# Run all tests
+results = tester.run_all_tests()
+
+# Print detailed report
+tester.print_report()
+```
+
+### What the Tester Checks
+
+The dataset leakage tester performs the following checks:
+
+1. **Episode Index Uniqueness**: Ensures all episode indices are unique
+2. **Frame Index Continuity**: Verifies frame indices are continuous within episodes
+3. **Global Index Overlaps**: Checks for overlaps in global indices between episodes
+4. **Duplicate Data**: Identifies duplicate observations or actions
+5. **Cross-Episode Contamination**: Ensures no contamination between episodes
+
+### Minimal Version
+
+For environments with dependency issues, we also provide a minimal version that checks the most critical issues:
+
+```bash
+python src/data_processing/minimal_dataset_leakage_tester.py --dataset-root ./output
+```
+
+### Using the Jupyter Notebook Demo
+
+We also provide a Jupyter notebook demo at `src/dataset_leakage_demo.ipynb` that shows how to use the tester interactively.
+
+```bash
+jupyter notebook src/dataset_leakage_demo.ipynb
+```
