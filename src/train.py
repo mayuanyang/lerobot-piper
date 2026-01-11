@@ -123,7 +123,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             
         optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
         # Initialize learning rate scheduler
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=200)
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=1000)
         
         # Load Optimizer State
         if not resume_from_checkpoint.startswith("http") and not resume_from_checkpoint.startswith("huggingface.co"):
