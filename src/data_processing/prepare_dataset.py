@@ -169,7 +169,7 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     
     # [File path definitions and checks remain the same...]
     data_path = "data/chunk-{episode_index:03d}/file-{episode_index:03d}.parquet"
-    video_path = "videos/{video_key}/chunk-{chunk_index:03d}/episode_{chunk_index:03d}.mp4"
+    video_path = "videos/{video_key}/chunk-{chunk_index:03d}/file-{chunk_index:03d}.mp4"
     info_json_path = output_dir / "meta" / "info.json"
     
     num_joints = len(json_data["joint_names"])
@@ -328,7 +328,7 @@ def generate_video_files(output_dir: Path, episode_data: EpisodeData, json_data:
         # Create the new directory structure for videos
         video_chunk_dir = output_dir / "videos" / cam_folder / f"chunk-{episode_data.episode_index:03d}"
         video_chunk_dir.mkdir(parents=True, exist_ok=True)
-        output_video_name = f"episode_{episode_data.episode_index:03d}.mp4"
+        output_video_name = f"file-{episode_data.episode_index:03d}.mp4"
         output_video_path = video_chunk_dir / output_video_name
     
         # Handle video processing based on source type
@@ -595,7 +595,7 @@ def compute_and_save_dataset_stats(output_dir: Path):
                             chunk_index = episode_info.get(chunk_index_key, episode_index)
                             file_index = episode_info.get(file_index_key, episode_index)
                             
-                            video_path = output_dir / "videos" / f"observation.images.{camera_name}" / f"chunk-{chunk_index:03d}" / f"episode_{file_index:03d}.mp4"
+                            video_path = output_dir / "videos" / f"observation.images.{camera_name}" / f"chunk-{chunk_index:03d}" / f"file-{file_index:03d}.mp4"
                             
                             # Create a subdirectory for this episode's frames
                             episode_temp_dir = temp_path / f"episode_{episode_index}_{camera_name}"
