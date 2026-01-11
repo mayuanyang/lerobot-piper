@@ -121,9 +121,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             print(f"Could not load preprocessors: {e}. Creating new ones.")
             preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
             
-        optimizer = torch.optim.Adam(policy.parameters(), lr=2e-5)
+        optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
         # Initialize learning rate scheduler
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=200)
         
         # Load Optimizer State
         if not resume_from_checkpoint.startswith("http") and not resume_from_checkpoint.startswith("huggingface.co"):

@@ -71,7 +71,7 @@ class LongTaskDiffusionModel(DiffusionModel):
 
         # 3. Temporal Weighting: Weight earlier steps in the horizon more
         # Create a decay curve (e.g., exponential decay), action closer to the start of the horizon get higher weight
-        weights = torch.exp(-0.1 * torch.arange(horizon, device=loss_steps.device))
+        weights = torch.exp(-0.2 * torch.arange(horizon, device=loss_steps.device))
         weights = weights / weights.sum() # Normalize
         loss = (loss_steps.mean(dim=-1) * weights).sum(dim=-1).mean()
 
