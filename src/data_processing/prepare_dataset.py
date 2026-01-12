@@ -11,11 +11,13 @@ import pyarrow.parquet as pq
 import cv2
 import traceback
 from datetime import datetime
-from .episode_data import EpisodeData
+from episode_data import EpisodeData
 import numpy as np
 from lerobot.datasets.compute_stats import compute_episode_stats, aggregate_stats
 from lerobot.datasets.utils import load_info, write_stats
 import tempfile
+from episode_data import EpisodeData, CameraData
+import re
 
 
 
@@ -43,7 +45,7 @@ def create_tasks_parquet(root_dir: Path, task_description: str):
     pq.write_table(table, tasks_parquet_path)
     
 
-def create_episodes_parquet_index(root_dir: Path, episode_index: int):
+def create_episodes_parquet(root_dir: Path):
     """
     Reads the data from episodes.jsonl and saves it as nested Parquet files
     in the format LeRobot expects.
@@ -64,25 +66,19 @@ def create_episodes_parquet_index(root_dir: Path, episode_index: int):
         print("❌ WARNING: episodes.jsonl is empty. Skipping episodes index creation.")
         return
 
-    # 2. Filter to only include the current episode
-    # Adjust for zero-based indexing: episode_index in file is 1-based, but we need 0-based for lookup
-    current_episode_lines = [line for line in episode_lines if line.get('episode_index') == episode_index]
     
-    if not current_episode_lines:
-        print(f"❌ WARNING: No data found for episode {episode_index}. Skipping episodes index creation.")
-        return
-
     # 3. Create DataFrame and convert to Arrow Table (only for current episode)
-    df = pd.DataFrame(current_episode_lines)
+    df = pd.DataFrame(episode_lines)
     table = pa.Table.from_pandas(df)
 
+  
     # 4. Create the nested directory structure LeRobot expects
     # This creates a subdirectory with multiple Parquet files
-    data_subdir = episodes_parquet_dir / f"chunk-{episode_index:03d}"
+    data_subdir = episodes_parquet_dir / f"chunk-000"
     data_subdir.mkdir(exist_ok=True, parents=True)
     
     # Write multiple Parquet files (LeRobot expects this structure)
-    pq.write_table(table, data_subdir / f"file-{episode_index:03d}.parquet")
+    pq.write_table(table, data_subdir / f"file-000.parquet")
 
 
 def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: dict, last_frames_to_chop: int, first_frames_to_chop: int = 0):
@@ -91,7 +87,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     num_joints = len(json_data["joint_names"])
     original_num_frames = len(json_data["frames"])
     effective_num_frames = original_num_frames - last_frames_to_chop - first_frames_to_chop
-    delta_scale = 10  # Assuming joint positions are already in correct scale
+    delta_scale = 100  # Assuming joint positions are already in correct scale
     
     if effective_num_frames <= 0:
         print(f"❌ ERROR: Chopping {last_frames_to_chop} frames from {original_num_frames} results in 0 or fewer frames. Skipping data generation.")
@@ -156,10 +152,24 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
 
 
     # Export to Parquet with new directory structure
-    chunk_dir = output_dir / "data" / f"chunk-{episode_data.episode_index:03d}"
+    chunk_dir = output_dir / "data" / f"chunk-000"
     chunk_dir.mkdir(parents=True, exist_ok=True)
-    parquet_path = chunk_dir / f"file-{episode_data.episode_index:03d}.parquet"
-    hf_dataset.to_parquet(parquet_path)
+    parquet_path = chunk_dir / f"file-000.parquet"
+    
+    # Check if parquet file already exists and append if it does
+    if parquet_path.exists():
+        # Read existing data
+        existing_dataset = pd.read_parquet(parquet_path)
+        # Concatenate new data with existing data
+        combined_df = pd.concat([existing_dataset, pd.DataFrame(lerobot_frames)], ignore_index=True)
+        # Convert back to dataset and cast features
+        combined_dataset = Dataset.from_pandas(combined_df)
+        combined_dataset = combined_dataset.cast(feature_config)
+        # Write combined data back to parquet
+        combined_dataset.to_parquet(parquet_path)
+    else:
+        # Write new data to parquet
+        hf_dataset.to_parquet(parquet_path)
     
     return effective_num_frames
 
@@ -276,21 +286,18 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         "num_frames": effective_num_frames, # 🔴 CORE CHANGE 4: Report effective number of frames
         "dataset_from_index": dataset_from_index,
         "dataset_to_index": dataset_to_index,
-        #"start_time": json_data["start_time"],
-        #"end_time": json_data["end_time"],
-        #"task_description": episode_data.task_description
-        # [Video metadata for each camera remains the same...]
     }
     
     # [Rest of episodes.jsonl writing and parquet index creation remains the same...]
     for camera_data in episode_data.cameras:
         camera_name = camera_data.camera
-        episodes_jsonl[f"videos/observation.images.{camera_name}/from_timestamp"] = 0.0
-        episodes_jsonl[f"videos/observation.images.{camera_name}/chunk_index"] = episode_data.episode_index
-        episodes_jsonl[f"videos/observation.images.{camera_name}/file_index"] = episode_data.episode_index
+        episodes_jsonl[f"videos/observation.images.{camera_name}/from_timestamp"] = dataset_from_index * (1.0 / episode_data.fps)
+        episodes_jsonl[f"videos/observation.images.{camera_name}/to_timestamp"] = dataset_to_index * (1.0 / episode_data.fps)
+        episodes_jsonl[f"videos/observation.images.{camera_name}/chunk_index"] = 0
+        episodes_jsonl[f"videos/observation.images.{camera_name}/file_index"] = 0
         #episodes_jsonl[f"videos/observation.images.{camera_name}/frame_index_offset"] = 0
         #episodes_jsonl[f"data/chunk_index"] = episode_data.episode_index
-        episodes_jsonl[f"data/file_index"] = episode_data.episode_index
+        episodes_jsonl[f"data/file_index"] = 0
         
     
     with open(output_dir / "meta" / "episodes.jsonl", "a") as f:
@@ -298,7 +305,7 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         
     if is_first_episode:
         create_tasks_parquet(output_dir, episode_data.task_description)
-    create_episodes_parquet_index(output_dir, episode_data.episode_index)
+    
 
 
 def generate_video_files(output_dir: Path, episode_data: EpisodeData, json_data: dict, last_frames_to_chop: int = 0, first_frames_to_chop: int = 0):
@@ -718,13 +725,400 @@ def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episod
     with open(episode_data.joint_data_json_path, 'r') as f:
         json_data = json.load(f)
 
-    # Note: We assume generate_video_files either handles chopping internally 
-    # (if source is a video) or is called BEFORE chopping the images/joints.
-    # For now, we assume video files contain all frames and only the tabular data is chopped.
+    # Pass the chop value to meta file generator
+    generate_meta_files(output_dir, episode_data, json_data, is_first_episode, last_frames_to_chop, first_frames_to_chop)
+    
     generate_video_files(output_dir, episode_data, json_data, last_frames_to_chop, first_frames_to_chop)
         
-    # Pass the chop value to meta file generator
-    generate_meta_files(output_dir, episode_data, json_data, is_first_episode, last_frames_to_chop, first_frames_to_chop)   
-   
+
     # Pass the chop value to data file generator
     return generate_data_files(output_dir, episode_data, json_data, last_frames_to_chop, first_frames_to_chop)
+
+def find_episode_folders(root_folder):
+    """Find all episode folders with naming convention episode1, episode2, etc."""
+    episode_folders = []
+    pattern = re.compile(r'^episode(\d+)$', re.IGNORECASE)
+    
+    for item in root_folder.iterdir():
+        if item.is_dir():
+            match = pattern.match(item.name)
+            if match:
+                episode_folders.append((item, int(match.group(1))))
+    
+    # Sort by episode number
+    episode_folders.sort(key=lambda x: x[1])
+    return episode_folders
+
+def find_json_and_videos(episode_folder):
+    """Find JSON file and video files in the episode folder."""
+    json_files = list(episode_folder.glob("*.json"))
+    if not json_files:
+        raise FileNotFoundError(f"No JSON file found in {episode_folder}")
+    if len(json_files) > 1:
+        print(f"Warning: Multiple JSON files found in {episode_folder}, using {json_files[0]}")
+    
+    json_path = json_files[0]
+    
+    # Find video files (assuming common video extensions)
+    video_extensions = ['.mp4', '.avi', '.mov', '.mkv']
+    video_files = []
+    for ext in video_extensions:
+        video_files.extend(episode_folder.glob(f"*{ext}"))
+    
+    return json_path, video_files
+
+def get_camera_name_from_video_path(video_path):
+    """Determine camera name based on video filename content."""
+    filename = video_path.stem.lower()
+    if 'front' in filename:
+        return 'front'
+    elif 'right' in filename:
+        return 'right'
+    elif 'gripper' in filename:
+        return 'gripper'
+    else:
+        # Fallback: use the last part of filename after underscore
+        return video_path.stem.split('_')[-1]
+      
+# def process_episode_folder(episode_folder, episode_idx, global_index_offset, last_frames_to_chop):
+#     """Process a single episode folder."""
+#     json_path, video_files = find_json_and_videos(episode_folder)
+    
+#     # Create CameraData objects from video files
+#     cameras_list = []
+#     for video_path in video_files:
+#         # Extract camera name from filename (you might want to customize this logic)
+#         camera_name = get_camera_name_from_video_path(video_path)
+#         cameras_list.append(CameraData(video_path=str(video_path), camera=camera_name))
+    
+#     episode_data = EpisodeData(
+#         joint_data_json_path=str(json_path), 
+#         episode_index=episode_idx, 
+#         fps=10, 
+#         global_index_offset=global_index_offset, 
+#         cameras=cameras_list,
+#         folder = episode_folder,
+#         task_description = "Pick up the cube and place it into the container."
+#     )
+    
+#     # Process the first episode differently to create initial files
+#     is_first_episode = (episode_idx == 1)
+#     num_of_frames = process_session(episode_data, OUTPUT_FOLDER, is_first_episode, last_frames_to_chop)
+#     episode_data.num_of_frames = num_of_frames
+#     return episode_data
+
+
+def combine_video_chunks_for_cameras(output_dir: Path, all_episodes_data: list, fps: float):
+    """
+    Combine all video chunks for each camera into one continuous video.
+    
+    Note: This function works with video chunks that have already been processed
+    with frame chopping (first_frames_to_chop and last_frames_to_chop), so the
+    combined video will only contain the frames that were kept after chopping.
+    
+    Args:
+        output_dir (Path): Output directory for the dataset
+        all_episodes_data (list): List of all EpisodeData objects
+        fps (float): Frames per second for the combined videos
+    """
+    print("Combining video chunks for all cameras...")
+    
+    # Group video chunks by camera
+    camera_chunks = {}
+    
+    # Collect all video chunks for each camera
+    for episode in all_episodes_data:
+        for camera_data in episode.cameras:
+            camera_name = camera_data.camera
+            # Source video path (these are already chopped videos)
+            src_video_path = output_dir / "videos" / f"observation.images.{camera_name}" / f"chunk-{episode.episode_index:03d}" / f"file-{episode.episode_index:03d}.mp4"
+            
+            if camera_name not in camera_chunks:
+                camera_chunks[camera_name] = []
+            
+            if src_video_path.exists():
+                camera_chunks[camera_name].append({
+                    'path': src_video_path,
+                    'episode_index': episode.episode_index
+                })
+            else:
+                print(f"⚠️ WARNING: Video chunk not found for camera {camera_name} in episode {episode.episode_index}")
+                print(f"    Expected path: {src_video_path}")
+    
+    print(f"Found cameras: {list(camera_chunks.keys())}")
+    
+        
+    # Combine chunks for each camera
+    for camera_name, chunks in camera_chunks.items():
+        if not chunks:
+            raise FileNotFoundError(f"No video chunks found for camera {camera_name}")
+            
+        print(f"Combining {len(chunks)} video chunks for camera {camera_name}...")
+        
+        # Create directory for the combined video
+        combined_video_dir = output_dir / "videos" / f"observation.images.{camera_name}" / "chunk-000-combined"
+        combined_video_dir.mkdir(parents=True, exist_ok=True)
+        combined_video_path = combined_video_dir / "file-000.mp4"
+        
+        # Check if we have any valid video chunks
+        valid_chunks = [chunk for chunk in chunks if chunk['path'].exists()]
+        if not valid_chunks:
+            raise FileNotFoundError(f"No valid video chunks for camera {camera_name}")
+            
+        # Validate that all chunks are valid video files
+        import subprocess
+        for chunk in valid_chunks:
+            # Check if the file is a valid video file using ffprobe
+            probe_cmd = [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=nw=1",
+                str(chunk['path'])
+            ]
+            try:
+                probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+                if probe_result.returncode != 0:
+                    print(f"⚠️ WARNING: Chunk {chunk['path']} is not a valid video file")
+                    print(f"    ffprobe stderr: {probe_result.stderr}")
+            except subprocess.TimeoutExpired:
+                print(f"⚠️ WARNING: Timeout checking validity of chunk {chunk['path']}")
+            except Exception as e:
+                print(f"⚠️ WARNING: Error checking validity of chunk {chunk['path']}: {e}")
+        
+        # Create a temporary file listing all video chunks with absolute paths
+        import tempfile
+        list_file_path = None
+        try:
+            # Create a fresh temporary file for each camera
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                list_file_path = f.name
+                for chunk in valid_chunks:
+                    # Use absolute path and escape special characters
+                    abs_path = chunk['path'].resolve()
+                    f.write(f"file '{abs_path}'\n")
+            
+            
+            # Use ffmpeg to concatenate videos
+            # Add -fflags +genpts to regenerate timestamps which can help with concatenation issues
+            cmd = [
+                "ffmpeg",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", list_file_path,
+                "-c", "copy",
+                "-fflags", "+genpts",
+                "-y",
+                str(combined_video_path)
+            ]
+            
+            print(f"Debug: Running ffmpeg command for camera {camera_name}: {' '.join(cmd)}")
+            
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"❌ ERROR: Failed to combine video chunks for camera {camera_name}: {result.stderr}")
+                # Also print stdout for additional debugging
+                if result.stdout:
+                    print(f"FFmpeg stdout: {result.stdout}")
+                continue
+                
+            print(f"✅ Successfully combined video chunks for camera {camera_name}")
+            
+            # Verify the output file was created and has reasonable size
+            if combined_video_path.exists():
+                file_size = combined_video_path.stat().st_size
+                print(f"✅ Verified output file for camera {camera_name}: {combined_video_path} ({file_size} bytes)")
+                if file_size < 1000:  # Less than 1KB, likely empty or corrupt
+                    print(f"⚠️ WARNING: Output file for camera {camera_name} is very small ({file_size} bytes), may be corrupt")
+            else:
+                print(f"❌ ERROR: Output file not found for camera {camera_name}: {combined_video_path}")
+                continue
+            
+            # Remove individual video chunks after successful combination
+            print(f"🗑️ Removing individual video chunks for camera {camera_name}...")
+            removed_count = 0
+            for chunk in valid_chunks:
+                try:
+                    if chunk['path'].exists():
+                        os.remove(chunk['path'])
+                        removed_count += 1
+                        # Also remove the parent directory if it's empty
+                        parent_dir = chunk['path'].parent
+                        try:
+                            parent_dir.rmdir()  # This will only remove if directory is empty
+                        except OSError:
+                            # Directory not empty or other error, which is fine
+                            pass
+                except Exception as e:
+                    print(f"⚠️ WARNING: Failed to remove chunk {chunk['path']}: {e}")
+            
+            print(f"🗑️ Removed {removed_count} individual video chunks for camera {camera_name}")
+            
+            # Rename the combined video directory to remove the -combined suffix
+            final_video_dir = output_dir / "videos" / f"observation.images.{camera_name}" / "chunk-000"
+            if combined_video_dir.exists():
+                # Remove the final directory if it already exists
+                if final_video_dir.exists():
+                    shutil.rmtree(final_video_dir)
+                # Rename the combined directory to the final name
+                combined_video_dir.rename(final_video_dir)
+                print(f"✅ Renamed {combined_video_dir} to {final_video_dir}")
+            
+        except Exception as e:
+            print(f"❌ ERROR: Exception occurred while combining video chunks for camera {camera_name}: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Clean up the temporary file
+            if list_file_path and os.path.exists(list_file_path):
+                try:
+                    os.unlink(list_file_path)
+                except Exception as e:
+                    print(f"⚠️ WARNING: Failed to clean up temporary file {list_file_path}: {e}")
+
+
+def update_metadata_for_aggregated_episode(output_dir: Path, all_episodes_data: list):
+    """
+    Update metadata files to reflect the single aggregated episode.
+    
+    Args:
+        output_dir (Path): Output directory for the dataset
+        all_episodes_data (list): List of all EpisodeData objects
+    """
+    print("Updating metadata for aggregated episode...")
+    
+    # Calculate total frames across all episodes
+    total_frames = sum(episode.num_of_frames for episode in all_episodes_data)
+    
+    # Update info.json
+    info_json_path = output_dir / "meta" / "info.json"
+    if info_json_path.exists():
+        with open(info_json_path, "r") as f:
+            info_json = json.load(f)
+        
+        # Update totals for single aggregated episode
+        info_json["total_episodes"] = len(all_episodes_data)
+        info_json["total_frames"] = total_frames
+        
+        with open(info_json_path, "w") as f:
+            json.dump(info_json, f, indent=2)
+        print("✅ Updated info.json for aggregated episode")
+
+
+def main():
+    print('Starting dataset preparation...')
+    # --- CONFIGURATION ---
+    ROOT_FOLDER = Path("data/piper_training_data/")  # Root folder containing episode subfolders
+    OUTPUT_FOLDER = Path("output/")  # Output folder for processed dataset
+    REPO_ID = "ISDept/piper_arm"  # Your desired Hugging Face repo ID
+    AGGREGATE_EPISODES = True  # New flag to control aggregation behavior
+    # ---------------------
+    
+    # Find all episode folders
+    episode_folders = find_episode_folders(ROOT_FOLDER)
+    
+    if not episode_folders:
+        print(f"No episode folders found in {ROOT_FOLDER}")
+        return
+    
+    print(f"Found {len(episode_folders)} episode folders")
+    
+    # First, collect all episode data without processing to compute global statistics
+    print("Collecting episode data for processing...")
+    all_episodes_data = []
+    
+    # Store episode-specific parameters
+    episode_params = {}
+    
+    global_index_offset = 0
+    
+    last_frames_to_chop = 5  # Default value
+    for episode_folder, episode_idx in episode_folders:    
+        
+        # Store parameters for this episode
+        episode_params[episode_idx] = {
+            'last_frames_to_chop': last_frames_to_chop
+        }
+        
+        try:
+            # Create episode data object (without processing yet)
+            json_path, video_files = find_json_and_videos(episode_folder)
+            
+            # Create CameraData objects from video files
+            cameras_list = []
+            for video_path in video_files:
+                # Extract camera name from filename
+                camera_name = get_camera_name_from_video_path(video_path)
+                cameras_list.append(CameraData(video_path=str(video_path), camera=camera_name))
+            
+            episode_data = EpisodeData(
+                joint_data_json_path=str(json_path), 
+                episode_index=episode_idx, 
+                fps=10, 
+                global_index_offset=0,  # Will be updated during processing
+                cameras=cameras_list,
+                folder = episode_folder,
+                task_description = "Pick up the cube and place it into the container.",
+                last_frames_to_chop = last_frames_to_chop
+            )
+            
+            all_episodes_data.append(episode_data)
+            
+        except Exception as e:
+            print(f"Error collecting data from episode {episode_idx}: {e}")
+            traceback.print_exc()
+            continue
+    
+    # Now process all episodes
+    print("Processing episodes...")
+    global_index_offset = 0
+    
+    # Sort episodes by index to ensure proper ordering
+    all_episodes_data.sort(key=lambda x: x.episode_index)
+    
+    for episode in all_episodes_data:
+        episode_folder = episode.folder
+        episode_idx = episode.episode_index
+        last_frames_to_chop = episode.last_frames_to_chop
+        
+        try:
+            # Update global index offset before processing
+            episode.global_index_offset = global_index_offset
+            
+            # Process the first episode differently to create initial files
+            is_first_episode = (episode_idx == min(e.episode_index for e in all_episodes_data))
+            num_of_frames = process_session(episode, OUTPUT_FOLDER, is_first_episode, last_frames_to_chop)
+            episode.num_of_frames = num_of_frames
+            
+            # Update global index offset for the next episode
+            global_index_offset += episode.num_of_frames
+            
+        except Exception as e:
+            print(f"Error processing episode {episode_idx}: {e}")
+            traceback.print_exc()
+            continue
+    
+    # Handle aggregation if requested
+    if AGGREGATE_EPISODES and all_episodes_data:
+        print("Aggregating all episodes into one giant episode...")
+        
+        # Combine all video chunks for each camera
+        fps = all_episodes_data[0].fps if all_episodes_data else 10
+        combine_video_chunks_for_cameras(OUTPUT_FOLDER, all_episodes_data, fps)
+                
+        # Update metadata for the single aggregated episode
+        update_metadata_for_aggregated_episode(OUTPUT_FOLDER, all_episodes_data)
+        
+        # Update total frames in info.json
+        update_total_frames_from_episodes(OUTPUT_FOLDER)
+        
+        create_episodes_parquet(OUTPUT_FOLDER)
+        
+        # Compute and save dataset statistics for the aggregated episode
+        compute_and_save_dataset_stats(OUTPUT_FOLDER)
+        
+        print("Dataset preparation with episode aggregation completed successfully!")
+    
+
+if __name__ == "__main__":
+    main()
