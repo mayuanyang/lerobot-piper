@@ -153,8 +153,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     cfg = policy.config
 
     cfg.n_obs_steps = 2
-    cfg.chunk_size = 70
-    cfg.n_action_steps = 70
+    cfg.chunk_size = 24
+    cfg.n_action_steps = 24
     
     # Update the configuration to use 7-dimensional state and action
     # and 400x640 images
