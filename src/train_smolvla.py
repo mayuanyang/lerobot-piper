@@ -193,11 +193,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     else:
         print("Starting fresh training from scratch", cfg)
         # Initialize a new model from configuration
-        #policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
-        policy = SmolVLAPolicy(cfg)
+        policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
+        #policy = SmolVLAPolicy(cfg)
         policy.config.chunk_size = cfg.chunk_size
         policy.config.n_action_steps = cfg.n_action_steps
         policy.config.n_obs_steps = cfg.n_obs_steps
+        policy.config.load_vlm_weights = True
         
         
         policy.train()
