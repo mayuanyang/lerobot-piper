@@ -260,8 +260,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     episode_indices.sort()
     
     # Split episodes based on episode_index: >= 200 for validation, < 200 for training
-    train_episode_indices = [idx for idx in episode_indices if idx < 200]
-    val_episode_indices = [idx for idx in episode_indices if idx >= 200]
+    num_of_training_episodes = 300
+    train_episode_indices = [idx for idx in episode_indices if idx < num_of_training_episodes]
+    val_episode_indices = [idx for idx in episode_indices if idx >= num_of_training_episodes]
     
     print(f"Total episodes: {len(episode_indices)}")
     print(f"Training episodes: {len(train_episode_indices)}")
