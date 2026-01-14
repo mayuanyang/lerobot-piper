@@ -44,25 +44,31 @@ def get_augmentations():
 
 # 🟢 ADDED: Helper to apply joint data augmentation
 def apply_joint_augmentations(batch):
-    """Apply margin-based augmentation to joint data (observation.state) with per-joint variations"""
-    # Randomly decide whether to apply augmentation (50% chance)
-    if torch.rand(1).item() > 0.5:
-        key = "observation.state"
-        if key in batch and isinstance(batch[key], torch.Tensor):
-            value = batch[key]
-            noise = torch.randn_like(value) * 0.003  # ~0.17°C standard deviation
-            batch[key] = value + noise
+    key = "observation.state"
+    if key not in batch:
+        return batch
+
+    q = batch[key]
+
+    # Per-timestep noise
+    noise = torch.randn_like(q) * 0.01  # ~0.6°
+    mask = (torch.rand_like(q) < 0.3).float()
+
+    batch[key] = q + noise * mask
     return batch
 
 
-def random_drop_camera_views(batch, drop_prob=0.1):
-    """Randomly drop camera views in the batch with a given probability."""
-    camera_keys = [key for key in batch.keys() if key.startswith("observation.images.")]
-    for key in camera_keys:
-        if torch.rand(1).item() < drop_prob:
-            batch[key] = torch.zeros_like(batch[key])  # Replace with zeros
-            break # Drop only one camera view per batch
+
+def random_drop_camera_views(batch, drop_prob=0.3):
+    camera_keys = [k for k in batch if k.startswith("observation.images.")]
+
+    for t in range(batch[camera_keys[0]].shape[1]):  # timestep dim
+        if torch.rand(1) < drop_prob:
+            key = camera_keys[torch.randint(len(camera_keys), (1,))]
+            batch[key][:, t] = 0
+
     return batch
+
 
 def validate_model(policy, val_dataloader, preprocessor):
     policy.eval()
@@ -363,7 +369,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
                         
             batch = apply_joint_augmentations(batch)
             
-            batch = random_drop_camera_views(batch, drop_prob=0.8)
+            batch = random_drop_camera_views(batch, drop_prob=0.3)
 
             # 5. Move all tensor values in batch to device
             # Note: Some items may be strings or other non-tensor types that cannot be moved to device

@@ -81,13 +81,17 @@ def create_episodes_parquet(root_dir: Path):
     pq.write_table(table, data_subdir / f"file-000.parquet")
 
 
-def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: dict, last_frames_to_chop: int, first_frames_to_chop: int = 0):
+def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: dict, last_frames_to_chop: int, first_frames_to_chop: int = 0, mode="diff"):
+    """
+    Generates the data files for a single episode.
+    """
     
     
     num_joints = len(json_data["joint_names"])
     original_num_frames = len(json_data["frames"])
     effective_num_frames = original_num_frames - last_frames_to_chop - first_frames_to_chop
     delta_scale = 100  # Assuming joint positions are already in correct scale
+    gripper_scale = 50  # Scale factor for gripper DOF if needed
     
     if effective_num_frames <= 0:
         print(f"❌ ERROR: Chopping {last_frames_to_chop} frames from {original_num_frames} results in 0 or fewer frames. Skipping data generation.")
@@ -102,9 +106,19 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     for i in range(effective_num_frames):
         current_state_scaled = [pos for pos in joint_positions[i]]
         next_state_scaled = [pos for pos in joint_positions[i + 1]] if i + 1 < effective_num_frames else [pos for pos in joint_positions[i]]
-        # Calculate delta as the difference between next state and current state
-        delta = [next_pos - current_pos for next_pos, current_pos in zip(next_state_scaled, current_state_scaled)]
-        delta = [d * delta_scale for d in delta]
+        
+        # Scale up the 7th DOF (index 6) by 50 times
+        if len(current_state_scaled) > 6:
+            current_state_scaled[6] *= gripper_scale
+        if len(next_state_scaled) > 6:
+            next_state_scaled[6] *= gripper_scale
+        
+        if mode == "diff":
+            delta = [next_pos - current_pos for next_pos, current_pos in zip(next_state_scaled, current_state_scaled)]
+            action = [d * delta_scale for d in delta]
+        else:
+            action = next_state_scaled
+            
 
         is_done = (i == effective_num_frames - 1)
         
@@ -116,7 +130,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         # Adjust frame_index to account for skipped frames
         frame_data = {
             "observation.state": current_state_scaled,
-            "action": delta,  # Use delta instead of next state as action
+            "action": action,  # Use delta instead of next state as action
             "timestamp": timestamp_base,
             "episode_index": episode_data.episode_index,
             "frame_index": json_data["frames"][i + first_frames_to_chop]["frame_index"] - first_frames_to_chop,  # 局部索引 (0, 1, 2, ...)
@@ -710,7 +724,7 @@ def compute_and_save_dataset_stats(output_dir: Path):
         print(f"❌ ERROR: Failed to aggregate or save statistics: {e}")
 
 
-def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episode: bool = False, last_frames_to_chop: int = 10, first_frames_to_chop: int = 15):
+def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episode: bool = False, last_frames_to_chop: int = 10, first_frames_to_chop: int = 15, mode="diff"):
     """
     Main function to process one episode.
     
@@ -732,7 +746,7 @@ def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episod
         
 
     # Pass the chop value to data file generator
-    return generate_data_files(output_dir, episode_data, json_data, last_frames_to_chop, first_frames_to_chop)
+    return generate_data_files(output_dir, episode_data, json_data, last_frames_to_chop, first_frames_to_chop, mode=mode)
 
 def find_episode_folders(root_folder):
     """Find all episode folders with naming convention episode1, episode2, etc."""
@@ -779,33 +793,6 @@ def get_camera_name_from_video_path(video_path):
     else:
         # Fallback: use the last part of filename after underscore
         return video_path.stem.split('_')[-1]
-      
-# def process_episode_folder(episode_folder, episode_idx, global_index_offset, last_frames_to_chop):
-#     """Process a single episode folder."""
-#     json_path, video_files = find_json_and_videos(episode_folder)
-    
-#     # Create CameraData objects from video files
-#     cameras_list = []
-#     for video_path in video_files:
-#         # Extract camera name from filename (you might want to customize this logic)
-#         camera_name = get_camera_name_from_video_path(video_path)
-#         cameras_list.append(CameraData(video_path=str(video_path), camera=camera_name))
-    
-#     episode_data = EpisodeData(
-#         joint_data_json_path=str(json_path), 
-#         episode_index=episode_idx, 
-#         fps=10, 
-#         global_index_offset=global_index_offset, 
-#         cameras=cameras_list,
-#         folder = episode_folder,
-#         task_description = "Pick up the cube and place it into the container."
-#     )
-    
-#     # Process the first episode differently to create initial files
-#     is_first_episode = (episode_idx == 1)
-#     num_of_frames = process_session(episode_data, OUTPUT_FOLDER, is_first_episode, last_frames_to_chop)
-#     episode_data.num_of_frames = num_of_frames
-#     return episode_data
 
 
 def combine_video_chunks_for_cameras(output_dir: Path, all_episodes_data: list, fps: float):
@@ -1012,6 +999,7 @@ def main():
     OUTPUT_FOLDER = Path("output/")  # Output folder for processed dataset
     REPO_ID = "ISDept/piper_arm"  # Your desired Hugging Face repo ID
     AGGREGATE_EPISODES = True  # New flag to control aggregation behavior
+    MODE = "full"  # Processing mode: "diff" or "full"
     # ---------------------
     
     # Find all episode folders
@@ -1087,7 +1075,7 @@ def main():
             
             # Process the first episode differently to create initial files
             is_first_episode = (episode_idx == min(e.episode_index for e in all_episodes_data))
-            num_of_frames = process_session(episode, OUTPUT_FOLDER, is_first_episode, last_frames_to_chop)
+            num_of_frames = process_session(episode, OUTPUT_FOLDER, is_first_episode, last_frames_to_chop, first_frames_to_chop=10, mode=MODE)
             episode.num_of_frames = num_of_frames
             
             # Update global index offset for the next episode
