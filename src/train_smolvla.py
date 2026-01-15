@@ -88,7 +88,7 @@ def validate_model(policy, val_dataloader, preprocessor):
 
             # Remap image feature names to match what the policy expects
             feature_mapping = {
-                "observation.images.front": "observation.images.camera1",
+                #"observation.images.front": "observation.images.camera1",
                 "observation.images.right": "observation.images.camera2", 
                 "observation.images.gripper": "observation.images.camera3"
             }
@@ -253,7 +253,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     delta_timestamps = {
         "observation.images.gripper": obs_temporal_window,  
         "observation.images.right": obs_temporal_window,
-        "observation.images.front": obs_temporal_window,
+        #"observation.images.front": obs_temporal_window,
         "observation.state": obs_temporal_window,
         "action": [i * frame_time for i in range(cfg.n_action_steps)] 
     }
@@ -336,7 +336,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
 
             # Remap image feature names to match what the policy expects
             feature_mapping = {
-                "observation.images.front": "observation.images.camera1",
+                #"observation.images.front": "observation.images.camera1",
                 "observation.images.right": "observation.images.camera2", 
                 "observation.images.gripper": "observation.images.camera3"
             }
