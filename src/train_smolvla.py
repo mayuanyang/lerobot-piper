@@ -31,15 +31,38 @@ else:
 print(f"Using device: {device}")
 
 # 🟢 ADDED: Data Augmentation Setup
-def get_augmentations():
+def get_rgb_augmentations():
     return v2.Compose([
-        # 1. Color/Lighting is safe and helpful
+        # 1. Color/Lighting is safe and helpful for RGB images
         v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
         v2.RandomGrayscale(p=0.1),
         # 2. Gaussian Blur helps with motion blur during fast moves
         v2.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 2.0)),
         # 3. DO NOT use Affine/Crop unless you transform the actions!
     ])
+
+def get_depth_augmentations():
+    return v2.Compose([
+        # Only apply transforms that make sense for depth images
+        # Gaussian Blur can help with noise in depth sensors
+        v2.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 2.0)),
+    ])
+
+# Custom transform wrapper to handle different image types
+class CameraSpecificTransforms:
+    def __init__(self):
+        self.rgb_transforms = get_rgb_augmentations()
+        self.depth_transforms = get_depth_augmentations()
+        
+    def __call__(self, batch):
+        # Apply transforms based on camera type
+        if "observation.images.gripper" in batch:
+            batch["observation.images.gripper"] = self.rgb_transforms(batch["observation.images.gripper"])
+            
+        if "observation.images.depth" in batch:
+            batch["observation.images.depth"] = self.depth_transforms(batch["observation.images.depth"])
+            
+        return batch
 
 
 # 🟢 ADDED: Helper to apply joint data augmentation
@@ -169,16 +192,20 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     if "action" in cfg.output_features:
         cfg.output_features["action"].shape = [7]
         
-    # Update image shapes to 400x640
-    for img_key in ["observation.images.camera1", "observation.images.camera2", "observation.images.camera3"]:
-        if img_key in cfg.input_features:
-            cfg.input_features[img_key].shape = [3, 400, 640]
+    # Update image shapes - RGB images get 3 channels, depth images get 1 channel
+    # Based on the feature mapping: depth -> camera1, gripper -> camera2
+    if "observation.images.camera1" in cfg.input_features:
+        # This is the depth camera (mapped from observation.images.depth)
+        cfg.input_features["observation.images.camera1"].shape = [1, 400, 640]
+    if "observation.images.camera2" in cfg.input_features:
+        # This is the gripper camera (mapped from observation.images.gripper)
+        cfg.input_features["observation.images.camera2"].shape = [3, 400, 640]
     
     if dataset_metadata.stats is None:
         raise ValueError("Dataset stats are required to initialize the policy.")
 
-    # Initialize Transforms
-    image_transforms = get_augmentations()
+    # Initialize Transforms - using camera-specific transforms
+    image_transforms = CameraSpecificTransforms()
 
     # --- MODEL LOADING LOGIC ---
     if resume_from_checkpoint:
