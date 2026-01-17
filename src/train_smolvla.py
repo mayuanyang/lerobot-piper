@@ -56,10 +56,13 @@ class CameraSpecificTransforms:
         
     def __call__(self, batch):
         # Apply transforms based on camera type
-        if "observation.images.gripper" in batch:
+        # Use batch.keys() to safely check for keys
+        batch_keys = batch.keys() if hasattr(batch, 'keys') else []
+        
+        if "observation.images.gripper" in batch_keys:
             batch["observation.images.gripper"] = self.rgb_transforms(batch["observation.images.gripper"])
             
-        if "observation.images.depth" in batch:
+        if "observation.images.depth" in batch_keys:
             batch["observation.images.depth"] = self.depth_transforms(batch["observation.images.depth"])
             
         return batch
@@ -293,7 +296,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     episode_indices.sort()
     
     # Split episodes based on episode_index: >= 200 for validation, < 200 for training
-    num_of_training_episodes = 20
+    num_of_training_episodes = 25
     train_episode_indices = [idx for idx in episode_indices if idx < num_of_training_episodes]
     val_episode_indices = [idx for idx in episode_indices if idx >= num_of_training_episodes]
     
