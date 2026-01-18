@@ -31,9 +31,8 @@ def create_tasks_parquet(root_dir: Path, task_description: str):
         
     # The task index (0) must match the 'task_index' used in episodes.jsonl
     task_data = {
-        'task_index': [0],
-        'task_title': [task_description],
-        'description': [f"Teleoperation dataset for the {task_description} task."]
+        '': [task_description],
+        'task_index': [0]
     }
     
     # Convert to Arrow Table and write Parquet file
@@ -251,11 +250,7 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
             channel = 3
             codec = "av1"
             pix_fmt = "yuv420p"
-            if camera_name.lower() == 'depth':
-                channel = 1
-                codec = "ffv1"
-                pix_fmt = "gray16le"
-            
+                        
             info_json["features"][feature_key] = {
                 "shape": [400, 640, channel],  # Adjust based on your actual video dimensions
                 "dtype": "video",
@@ -332,11 +327,11 @@ def generate_video_files(output_dir: Path, episode_data: EpisodeData, json_data:
         output_dir (Path): Output directory for the dataset
         episode_data (EpisodeData): Episode data containing camera information
         json_data (dict): JSON data containing frame information
-        last_frames_to_chop (int): Number of frames to chop from the end
-        first_frames_to_chop (int): Number of frames to chop from the beginning
+        last_frames_to_chop (int): Number of frames to chop from the end (global value)
+        first_frames_to_chop (int): Number of frames to chop from the beginning (global value, but overridden by camera-specific values)
     """
     
-    # Calculate effective number of frames
+    # Calculate effective number of frames using global values
     original_num_frames = len(json_data["frames"])
     effective_num_frames = original_num_frames - last_frames_to_chop - first_frames_to_chop
     
@@ -354,15 +349,25 @@ def generate_video_files(output_dir: Path, episode_data: EpisodeData, json_data:
         output_video_name = f"file-{episode_data.episode_index:03d}.mp4"
         output_video_path = video_chunk_dir / output_video_name
     
+        # Use camera-specific first_frames_to_chop if available, otherwise use global value
+        camera_first_frames_to_chop = getattr(camera_data, 'first_frames_to_chop', first_frames_to_chop)
+        
+        # Recalculate effective number of frames for this camera
+        camera_effective_num_frames = original_num_frames - last_frames_to_chop - camera_first_frames_to_chop
+        
+        if camera_effective_num_frames <= 0:
+            print(f"❌ ERROR: Effective frame count for camera {camera_name} is 0 or less ({camera_effective_num_frames}). Skipping video generation.")
+            continue
+    
         # Handle video processing based on source type
         video_file_path = Path(camera_data.video_path)
         if video_file_path.exists() and video_file_path.suffix.lower() == '.mp4':
             # If it's a video file, we need to chop it to match the effective frame count
             # If first_frames_to_chop is specified, use the enhanced chop function
-            if first_frames_to_chop > 0:
-                chop_video_to_frame_count(video_file_path, output_video_path, effective_num_frames, episode_data.fps, first_frames_to_chop)
+            if camera_first_frames_to_chop > 0:
+                chop_video_to_frame_count(video_file_path, output_video_path, camera_effective_num_frames, episode_data.fps, camera_first_frames_to_chop)
             else:
-                chop_video_to_frame_count(video_file_path, output_video_path, effective_num_frames, episode_data.fps)
+                chop_video_to_frame_count(video_file_path, output_video_path, camera_effective_num_frames, episode_data.fps)
         elif video_file_path.exists():
             # For other file types, just copy
             shutil.copy(video_file_path, output_video_path)
@@ -375,6 +380,25 @@ def chop_video_to_frame_count(input_video_path: Path, output_video_path: Path, t
     Chop a video to contain exactly target_frame_count frames, skipping first_num_frames if specified.
     """
     try:
+        # First, check if the input video has 1 channel (grayscale)
+        probe_cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=pix_fmt",
+            "-of", "csv=p=0",
+            str(input_video_path)
+        ]
+        
+        import subprocess
+        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+        is_grayscale = False
+        if probe_result.returncode == 0:
+            pixel_format = probe_result.stdout.strip()
+            # Common grayscale formats
+            grayscale_formats = ['gray', 'gray8', 'gray16le', 'gray16be']
+            is_grayscale = pixel_format in grayscale_formats
+        
         # Use ffmpeg to extract only the required number of frames, skipping first_num_frames if needed
         cmd = [
             "ffmpeg",
@@ -383,7 +407,14 @@ def chop_video_to_frame_count(input_video_path: Path, output_video_path: Path, t
         
         # If first_num_frames is specified, skip those frames
         if first_num_frames > 0:
-            cmd.extend(["-vf", f"select=gte(n\\,{first_num_frames}),setpts=N/TB/{fps}"])
+            if is_grayscale:
+                # For grayscale videos, convert to rgb during frame selection
+                cmd.extend(["-vf", f"select=gte(n\\,{first_num_frames}),setpts=N/TB/{fps},format=rgb24"])
+            else:
+                cmd.extend(["-vf", f"select=gte(n\\,{first_num_frames}),setpts=N/TB/{fps}"])
+        elif is_grayscale:
+            # For grayscale videos, convert to rgb
+            cmd.extend(["-vf", "format=rgb24"])
         
         cmd.extend([
             "-vframes", str(target_frame_count),
@@ -393,12 +424,27 @@ def chop_video_to_frame_count(input_video_path: Path, output_video_path: Path, t
             str(output_video_path)
         ])
         
-        import subprocess
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             print(f"⚠️ WARNING: Failed to chop video {input_video_path} to {target_frame_count} frames (skipping {first_num_frames} frames): {result.stderr}")
-            # Fallback: copy the original video
-            shutil.copy(input_video_path, output_video_path)
+            # Fallback: copy the original video (with conversion if needed)
+            if is_grayscale:
+                # Convert grayscale to rgb during copy
+                convert_cmd = [
+                    "ffmpeg",
+                    "-i", str(input_video_path),
+                    "-vf", "format=rgb24",
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-y",
+                    str(output_video_path)
+                ]
+                convert_result = subprocess.run(convert_cmd, capture_output=True, text=True)
+                if convert_result.returncode != 0:
+                    print(f"⚠️ WARNING: Failed to convert grayscale video {input_video_path}: {convert_result.stderr}")
+                    shutil.copy(input_video_path, output_video_path)
+            else:
+                shutil.copy(input_video_path, output_video_path)
     except Exception as e:
         print(f"⚠️ WARNING: Error chopping video {input_video_path}: {e}")
         # Fallback: copy the original video
@@ -416,23 +462,65 @@ def chop_first_frames_from_video(input_video_path: Path, output_video_path: Path
         fps (float): Frames per second of the video
     """
     try:
+        # First, check if the input video has 1 channel (grayscale)
+        probe_cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=pix_fmt",
+            "-of", "csv=p=0",
+            str(input_video_path)
+        ]
+        
+        import subprocess
+        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+        is_grayscale = False
+        if probe_result.returncode == 0:
+            pixel_format = probe_result.stdout.strip()
+            # Common grayscale formats
+            grayscale_formats = ['gray', 'gray8', 'gray16le', 'gray16be']
+            is_grayscale = pixel_format in grayscale_formats
+        
         # Use ffmpeg to skip the first first_num_frames
         cmd = [
             "ffmpeg",
-            "-i", str(input_video_path),
-            "-vf", f"select=gt(n\\,{first_num_frames}),setpts=N/TB/{fps}",
+            "-i", str(input_video_path)
+        ]
+        
+        if is_grayscale:
+            # For grayscale videos, convert to rgb during frame selection
+            cmd.extend(["-vf", f"select=gt(n\\,{first_num_frames}),setpts=N/TB/{fps},format=rgb24"])
+        else:
+            cmd.extend(["-vf", f"select=gt(n\\,{first_num_frames}),setpts=N/TB/{fps}"])
+        
+        cmd.extend([
             "-c:v", "libx264",
             "-preset", "ultrafast",
             "-y",
             str(output_video_path)
-        ]
+        ])
         
-        import subprocess
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             print(f"⚠️ WARNING: Failed to chop first {first_num_frames} frames from video {input_video_path}: {result.stderr}")
-            # Fallback: copy the original video
-            shutil.copy(input_video_path, output_video_path)
+            # Fallback: copy the original video (with conversion if needed)
+            if is_grayscale:
+                # Convert grayscale to rgb during copy
+                convert_cmd = [
+                    "ffmpeg",
+                    "-i", str(input_video_path),
+                    "-vf", "format=rgb24",
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-y",
+                    str(output_video_path)
+                ]
+                convert_result = subprocess.run(convert_cmd, capture_output=True, text=True)
+                if convert_result.returncode != 0:
+                    print(f"⚠️ WARNING: Failed to convert grayscale video {input_video_path}: {convert_result.stderr}")
+                    shutil.copy(input_video_path, output_video_path)
+            else:
+                shutil.copy(input_video_path, output_video_path)
     except Exception as e:
         print(f"⚠️ WARNING: Error chopping first frames from video {input_video_path}: {e}")
         # Fallback: copy the original video
@@ -542,7 +630,18 @@ def load_video_to_numpy(video_path: Path):
         ret, frame = cap.read()
         if not ret: 
             break
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+        # Check number of channels
+        if len(frame.shape) == 2:
+            # Grayscale image, convert to 3 channels by repeating
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+        elif frame.shape[2] == 1:
+            # Single channel image, convert to 3 channels by repeating
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+        else:
+            # Assume BGR format and convert to RGB
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
         frame = frame.astype(np.float32) / 255.0
         # Keep as HWC (Height, Width, Channels)
         frames.append(frame)
@@ -1144,7 +1243,14 @@ def main():
             for video_path in video_files:
                 # Extract camera name from filename
                 camera_name = get_camera_name_from_video_path(video_path)
-                cameras_list.append(CameraData(video_path=str(video_path), camera=camera_name))
+                # Set first_frames_to_chop based on camera type
+                first_frames_to_chop = 10  # Default value
+                if 'gripper' in camera_name.lower():
+                    if episode_idx == 1:
+                        first_frames_to_chop = 15  # First episode has extra lag
+                    else: 
+                        first_frames_to_chop = 10  # Gripper camera lags by 0.1 second (1 frame at 10fps)
+                cameras_list.append(CameraData(video_path=str(video_path), camera=camera_name, first_frames_to_chop=first_frames_to_chop))
             
             episode_data = EpisodeData(
                 joint_data_json_path=str(json_path), 

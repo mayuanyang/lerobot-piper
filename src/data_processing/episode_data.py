@@ -6,9 +6,10 @@ import json
 class CameraData:
     """A class to handle video data associated with an episode."""
     
-    def __init__(self, video_path: Path, camera: str):
+    def __init__(self, video_path: Path, camera: str, first_frames_to_chop: int = 0):
         self.video_path = video_path
         self.camera = camera
+        self.first_frames_to_chop = first_frames_to_chop
 
 class EpisodeData:
     """A class to handle inference with trained LeRobot policies."""
