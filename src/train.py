@@ -27,16 +27,41 @@ else:
 print(f"Using device: {device}")
 
 # 🟢 ADDED: Data Augmentation Setup
-def get_augmentations():
-    # Basic augmentation for Diffusion Policy often includes:
-    # 1. Color Jitter (lighting invariance)
-    # 2. Small translations/rotations (position invariance)
+def get_rgb_augmentations():
     return v2.Compose([
-        v2.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
-        # Using RandomAffine instead of Crop because we don't know your exact image dimensions 
-        # and don't want to accidentally crop out the gripper.
-        v2.RandomAffine(degrees=5, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+        # 1. Color/Lighting is safe and helpful for RGB images
+        v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        v2.RandomGrayscale(p=0.1),
+        # 2. Gaussian Blur helps with motion blur during fast moves
+        v2.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 2.0)),
+        # 3. DO NOT use Affine/Crop unless you transform the actions!
     ])
+
+def get_depth_augmentations():
+    return v2.Compose([
+        # Only apply transforms that make sense for depth images
+        # Gaussian Blur can help with noise in depth sensors
+        v2.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 2.0)),
+    ])
+
+# Custom transform wrapper to handle different image types
+class CameraSpecificTransforms:
+    def __init__(self):
+        self.rgb_transforms = get_rgb_augmentations()
+        self.depth_transforms = get_depth_augmentations()
+        
+    def __call__(self, batch):
+        # Apply transforms based on camera type
+        # Use batch.keys() to safely check for keys
+        batch_keys = batch.keys() if hasattr(batch, 'keys') else []
+        
+        if "observation.images.gripper" in batch_keys:
+            batch["observation.images.gripper"] = self.rgb_transforms(batch["observation.images.gripper"])
+            
+        if "observation.images.depth" in batch_keys:
+            batch["observation.images.depth"] = self.depth_transforms(batch["observation.images.depth"])
+            
+        return batch
 
 
 # 🟢 ADDED: Helper to apply joint data augmentation
@@ -58,6 +83,53 @@ def apply_joint_augmentations(batch):
     return batch
 
 
+def validate_model(policy, val_dataloader, preprocessor):
+    policy.eval()
+    val_loss = 0.0
+    val_batches = 0
+    
+    print(f"Starting validation with {len(val_dataloader)} batches...")
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(val_dataloader):
+            # Check if batch is empty or invalid
+            if not batch:
+                print(f"Warning: Empty batch at index {batch_idx}")
+                continue
+                
+            # Move all tensor values in batch to device
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor):
+                    batch[key] = value.to(device)
+
+            # Preprocess (Normalize)
+            batch = preprocessor(batch)
+
+            # Forward pass
+            try:
+                loss, _ = policy.forward(batch)
+                # Check if loss is valid
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"Warning: Invalid loss value at batch {batch_idx}: {loss.item()}")
+                    continue
+                val_loss += loss.item()
+                val_batches += 1
+                print(f"Batch {batch_idx}: loss = {loss.item():.4f}")
+            except Exception as e:
+                print(f"Error during forward pass at batch {batch_idx}: {e}")
+                continue
+            
+            # Limit validation to a reasonable number of batches to save time
+            # But make sure we have at least a few batches for meaningful average
+            if batch_idx >= min(10, len(val_dataloader) - 1):  # Validate on at least 10 batches or all available batches
+                break
+    
+    policy.train()
+    avg_val_loss = val_loss / val_batches if val_batches > 0 else 0
+    print(f"Validation completed: {val_batches} batches, total loss: {val_loss:.4f}, average loss: {avg_val_loss:.4f}")
+    return avg_val_loss
+
+
 def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_from_checkpoint=None):
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -66,7 +138,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     log_freq = 10 # Reduced frequency to reduce console spam
     checkpoint_freq = 1000
     
-    image_transforms = get_augmentations()
+    # Initialize Transforms - using camera-specific transforms
+    image_transforms = CameraSpecificTransforms()
 
     dataset_metadata = LeRobotDatasetMetadata(dataset_id, force_cache_sync=True, revision="main")
     features = dataset_to_policy_features(dataset_metadata.features)
@@ -98,6 +171,14 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         crop_is_random=True,
         use_separate_rgb_encoder_per_camera=True
     )
+    
+    # Update image shapes - RGB images get 3 channels, depth images get 1 channel
+    if "observation.images.gripper" in cfg.input_features:
+        # This is the gripper camera (RGB)
+        cfg.input_features["observation.images.gripper"].shape = [3, 400, 640]
+    if "observation.images.depth" in cfg.input_features:
+        # This is the depth camera (1 channel)
+        cfg.input_features["observation.images.depth"].shape = [1, 400, 640]
     
     if dataset_metadata.stats is None:
         raise ValueError("Dataset stats are required to initialize the policy.")
@@ -165,28 +246,70 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     
     delta_timestamps = {
         "observation.images.gripper": obs_temporal_window,  
-        "observation.images.front": obs_temporal_window,
-        "observation.images.right": obs_temporal_window,
+        "observation.images.depth": obs_temporal_window,
         "observation.state": obs_temporal_window,
         "action": [i * frame_time for i in range(horizon)]
     }
 
     try:
-        dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, image_transforms=image_transforms, force_cache_sync=True, revision="main", tolerance_s=0.01)
+        full_dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, image_transforms=image_transforms, force_cache_sync=True, revision="main", tolerance_s=0.01)
     except Exception as e:
         print(f"Error loading remote dataset: {e}")
         local_dataset_path = "./src/output" 
         print(f"Trying local dataset at {local_dataset_path}...")
-        dataset = LeRobotDataset(local_dataset_path, delta_timestamps=delta_timestamps, force_cache_sync=True, tolerance_s=0.01)
-
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
+        full_dataset = LeRobotDataset(local_dataset_path, delta_timestamps=delta_timestamps, force_cache_sync=True, tolerance_s=0.01)
+    
+    # Get unique episode indices (convert tensors to Python values)
+    episode_indices = list(set([int(idx.item()) if hasattr(idx, 'item') else int(idx) for idx in full_dataset.hf_dataset["episode_index"]]))
+    episode_indices.sort()
+    
+    # Split episodes based on episode_index: use last 20% for validation, first 80% for training
+    num_validation_episodes = max(1, len(episode_indices) // 5)  # 20% for validation
+    train_episode_indices = episode_indices[:-num_validation_episodes]
+    val_episode_indices = episode_indices[-num_validation_episodes:]
+    
+    print(f"Total episodes: {len(episode_indices)}")
+    print(f"Training episodes: {len(train_episode_indices)}")
+    print(f"Validation episodes: {len(val_episode_indices)}")
+    
+    # Create boolean masks for training and validation data
+    dataset_episode_indices = [int(idx.item()) if hasattr(idx, 'item') else int(idx) for idx in full_dataset.hf_dataset["episode_index"]]
+    train_mask = [idx in train_episode_indices for idx in dataset_episode_indices]
+    val_mask = [idx in val_episode_indices for idx in dataset_episode_indices]
+    
+    # Create subsets for training and validation
+    from torch.utils.data import Subset
+    train_dataset = Subset(full_dataset, [i for i, mask in enumerate(train_mask) if mask])
+    val_dataset = Subset(full_dataset, [i for i, mask in enumerate(val_mask) if mask])
+    
+    # Check dataset sizes
+    print(f"Training dataset size: {len(train_dataset)}")
+    print(f"Validation dataset size: {len(val_dataset)}")
+    
+    batch_size = 6
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
         num_workers=4,
-        batch_size=6,
+        batch_size=batch_size,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
     )
+    
+    val_dataloader = torch.utils.data.DataLoader(
+        val_dataset,
+        num_workers=4,
+        batch_size=batch_size,
+        shuffle=False,
+        pin_memory=device.type != "cpu",
+        drop_last=True,
+    )
+    
+    # Check if we have any validation batches
+    val_batches = len(val_dataloader)
+    print(f"Validation batches: {val_batches}")
+    if val_batches == 0:
+        print("WARNING: No validation batches! Check batch_size and dataset size.")
 
     # --- TRAINING LOOP ---
     print("Starting training loop...")
@@ -194,7 +317,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     epoch = 0
     while not done:
         epoch += 1
-        prog_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch}, Step {step}")
+        prog_bar = tqdm(enumerate(train_dataloader), total=len(train_dataloader), desc=f"Epoch {epoch}, Step {step}")
         for batch_idx, batch in prog_bar:
             
             # 1. Move to Device FIRST (Efficient)
@@ -220,6 +343,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 # Get learning rate from optimizer
                 lr = optimizer.param_groups[0]['lr']
                 prog_bar.set_postfix({"step": step, "loss": f"{loss.item():.3f}", "lr": f"{lr:.2e}"})
+            
+            # Run validation every 500 steps
+            if step > 0 and step % 500 == 0:
+                print(f"\nRunning validation at step {step}...")
+                val_loss = validate_model(policy, val_dataloader, preprocessor)
+                print(f"Validation loss at step {step}: {val_loss:.4f}")
             
             # 5. Save Checkpoint
             if step > 0 and step % checkpoint_freq == 0:

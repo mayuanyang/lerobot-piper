@@ -1,5 +1,7 @@
 import json
 import os
+import torch
+from torchvision.transforms import ToTensor
 import shutil
 import pandas as pd
 from datasets import Dataset, Features, Value, Sequence, List
@@ -196,7 +198,7 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     video_path = "videos/{video_key}/chunk-{chunk_index:03d}/file-{chunk_index:03d}.mp4"
     info_json_path = output_dir / "meta" / "info.json"
     
-    num_joints = len(json_data["joint_names"])
+    num_joints = 7
     
     # 🔴 CORE CHANGE 1: Use the effective number of frames
     original_num_frames = len(json_data["frames"])
@@ -531,188 +533,202 @@ def update_total_frames_from_episodes(output_dir: Path):
         print(f"❌ ERROR: Failed to update total frames: {e}")
 
 
-def compute_and_save_dataset_stats(output_dir: Path):
-    """
-    Compute dataset statistics for all episodes and save them to stats.json.
-    Optimized for single combined parquet file containing all episodes.
-    """
-    
-    # Load dataset info
-    try:
-        info = load_info(output_dir)
-        features = info["features"]
-        
-    except Exception as e:
-        print(f"❌ ERROR: Failed to load dataset info: {e}")
-        return
-    
-    # Load episodes data to get total frame count
-    episodes_jsonl_path = output_dir / "meta" / "episodes.jsonl"
-    if not episodes_jsonl_path.exists():
-        print(f"❌ WARNING: {episodes_jsonl_path} not found. Skipping stats computation.")
-        return
-    
-    # Read all episodes to calculate total frames
-    total_frames = 0
-    try:
-        with open(episodes_jsonl_path, 'r') as f:
-            for line in f:
-                if line.strip():
-                    episode_data = json.loads(line)
-                    total_frames += episode_data.get("num_frames", 0)
-    except Exception as e:
-        print(f"❌ ERROR: Failed to read episodes data: {e}")
-        return
-    
-    if total_frames == 0:
-        print("❌ WARNING: No frames found in episodes data. Skipping stats computation.")
-        return
-    
-    # Create a temporary directory for frame extraction
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
-        
-        # Load the single combined parquet file
-        combined_parquet_path = output_dir / "data" / f"chunk-000" / f"file-000.parquet"
-        if not combined_parquet_path.exists():
-            print(f"❌ ERROR: Combined parquet file not found: {combined_parquet_path}")
-            return
-            
-        try:
-            # Load combined parquet data
-            combined_dataset = pd.read_parquet(combined_parquet_path)
-        except Exception as e:
-            print(f"❌ ERROR: Failed to load combined parquet data: {e}")
-            return
-        
-        # Convert to the format expected by compute_episode_stats
-        dataset_dict = {}
-        
-        # Process each feature according to its type
-        # First, handle features that exist in the parquet file
-        for column in combined_dataset.columns:
-            if column in features:
-                if features[column]["dtype"] in ["image", "video"]:
-                    # For image/video features, we need to handle them specially
-                    # Extract camera name from the column name
-                    camera_name = column.split(".")[-1]
-                    
-                    # For simplicity in the combined case, we'll use the first episode's video paths
-                    # and duplicate frames as needed
-                    # In practice, this might need to be more sophisticated
-                    video_path = output_dir / "videos" / f"observation.images.{camera_name}" / f"chunk-000" / f"file-000.mp4"
-                    
-                    # Create a subdirectory for frames
-                    camera_temp_dir = temp_path / f"camera_{camera_name}"
-                    camera_temp_dir.mkdir(exist_ok=True)
-                    
-                    # Extract frames to temporary directory
-                    frame_paths = extract_video_frames_to_temp_dir(video_path, camera_temp_dir)
-                    
-                    # Adjust frame count to match dataset
-                    if len(frame_paths) < total_frames:
-                        # Pad with last frame if we have fewer frames
-                        frame_paths.extend([frame_paths[-1]] * (total_frames - len(frame_paths)))
-                    elif len(frame_paths) > total_frames:
-                        # Truncate if we have more frames
-                        frame_paths = frame_paths[:total_frames]
-                    
-                    dataset_dict[column] = [str(path) for path in frame_paths]
-                else:
-                    # Extract values and ensure they're in the right format
-                    column_data = combined_dataset[column].values
-                    
-                    # Handle fixed-size list data (common in parquet files)
-                    if len(column_data) > 0:
-                        # Check if we have array-like data that needs special handling
-                        first_element = column_data[0]
-                        # Use a very safe check to avoid boolean ambiguity errors
-                        is_array_like = False
-                        try:
-                            # Only check for __len__ if it's safe to do so
-                            if not isinstance(first_element, (str, bytes)):
-                                is_array_like = hasattr(first_element, '__len__')
-                        except:
-                            # If any check fails, assume it's not array-like
-                            is_array_like = False
-                        
-                        if is_array_like:
-                            # For fixed-size lists, convert to proper 2D numpy array
-                            try:
-                                # Convert to list first to handle pandas arrays properly
-                                if hasattr(column_data, 'tolist'):
-                                    temp_list = column_data.tolist()
-                                else:
-                                    temp_list = list(column_data)
-                                
-                                # Convert directly to numpy array with float32 dtype
-                                column_data = np.array(temp_list, dtype=np.float32)
-                            except Exception as e:
-                                print(f"Warning: Could not convert {column} data to 2D array: {e}")
-                                # Fallback to object array to prevent issues
-                                try:
-                                    column_data = np.array(temp_list, dtype=object)
-                                except:
-                                    # Last resort: keep original data
-                                    pass
-                        else:
-                            # For scalar data, ensure it's a proper numpy array
-                            if not isinstance(column_data, np.ndarray):
-                                try:
-                                    column_data = np.array(column_data)
-                                except:
-                                    pass  # Keep as-is
-                    
-                    dataset_dict[column] = column_data
-        
-        # Now handle features that don't exist in the parquet file but are defined in info.json
-        # This is particularly important for image/video features
-        for feature_name, feature_info in features.items():
-            if feature_name not in dataset_dict:
-                if feature_info["dtype"] in ["image", "video"]:
-                    # Handle image/video features that aren't in the parquet file
-                    # Extract camera name from the feature name
-                    camera_name = feature_name.split(".")[-1]
-                    
-                    # Use the video path for this camera
-                    video_path = output_dir / "videos" / f"observation.images.{camera_name}" / f"chunk-000" / f"file-000.mp4"
-                    
-                    # Create a subdirectory for frames
-                    camera_temp_dir = temp_path / f"camera_{camera_name}_missing"
-                    camera_temp_dir.mkdir(exist_ok=True)
-                    
-                    # Extract frames to temporary directory
-                    frame_paths = extract_video_frames_to_temp_dir(video_path, camera_temp_dir)
-                    
-                    # Adjust frame count to match dataset
-                    if len(frame_paths) < total_frames:
-                        # Pad with last frame if we have fewer frames
-                        frame_paths.extend([frame_paths[-1]] * (total_frames - len(frame_paths)))
-                    elif len(frame_paths) > total_frames:
-                        # Truncate if we have more frames
-                        frame_paths = frame_paths[:total_frames]
-                    
-                    dataset_dict[feature_name] = [str(path) for path in frame_paths]
-                else:
-                    # For non-image features that aren't in the parquet file, we can't really handle them
-                    # This would be an unusual case
-                    print(f"⚠️ WARNING: Feature {feature_name} defined in info.json but not found in parquet file and not an image/video feature. Skipping.")
-        
-        # Compute stats for the entire dataset at once
-        try:
-            # Note: We're using compute_episode_stats even though this is the entire dataset
-            # This is because the LeRobot framework expects this function interface
-            dataset_stats = compute_episode_stats(dataset_dict, features)
-            
-            # Save statistics to stats.json
-            write_stats(dataset_stats, output_dir)
-            
-        except Exception as e:
-            print(f"❌ ERROR: Exception while computing stats for combined dataset: {e}")
-            print("Full stacktrace:")
-            traceback.print_exc()
-            return
 
+def load_video_to_numpy(video_path: Path):
+    """Decodes video into (Frames, Height, Width, Channels) [0, 1]."""
+    cap = cv2.VideoCapture(str(video_path))
+    frames = []
+    while True:
+        ret, frame = cap.read()
+        if not ret: 
+            break
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = frame.astype(np.float32) / 255.0
+        # Keep as HWC (Height, Width, Channels)
+        frames.append(frame)
+    cap.release()
+    return np.stack(frames) if frames else None
+
+def compute_and_save_dataset_stats(output_dir: Path):
+    output_dir = Path(output_dir)
+    info = load_info(output_dir)
+    features = info["features"]
+    
+    numerical_dict = {}
+    numerical_features = {}
+    visual_results = {}
+    
+    # Read all parquet files
+    data_dir = output_dir / "data"
+    all_data_frames = []
+    
+    for chunk_dir in data_dir.glob("chunk-*"):
+        for parquet_file in chunk_dir.glob("*.parquet"):
+            df = pd.read_parquet(parquet_file)
+            all_data_frames.append(df)
+    
+    if not all_data_frames:
+        raise ValueError("No data files found for stats computation")
+    
+    combined_df = pd.concat(all_data_frames, ignore_index=True)
+    total_frames = len(combined_df)
+    
+    print(f"📊 Total frames in dataset: {total_frames}")
+
+    for f_name, f_info in features.items():
+        if f_info["dtype"] in ["image", "video"]:
+            print(f"\n🎥 Processing video feature: {f_name}")
+            
+            # Get shape info from features
+            shape = f_info["shape"]  # Should be [400, 640, channels]
+            height, width, channels = shape
+            is_depth = 'depth' in f_name.lower()
+            
+            # Find video files
+            video_dir = output_dir / "videos" / f_name
+            video_paths = []
+            
+            # Check all chunk directories
+            for chunk_dir in video_dir.glob("chunk-*"):
+                for video_file in chunk_dir.glob("*.mp4"):
+                    video_paths.append(video_file)
+            
+            if not video_paths:
+                print(f"  ⚠️ No video files found at {video_dir}")
+                continue
+            
+            print(f"  Found {len(video_paths)} video file(s)")
+            
+            # Load and combine all video data
+            all_frames_data = []
+            total_frames_loaded = 0
+            
+            for i, video_path in enumerate(video_paths):
+                print(f"  Loading video {i+1}/{len(video_paths)}: {video_path.name}")
+                data = load_video_to_numpy(video_path)
+                
+                if data is None:
+                    print(f"    ⚠️ Could not load video")
+                    continue
+                    
+                # Verify shape
+                if len(data.shape) != 4:
+                    print(f"    ⚠️ Unexpected shape: {data.shape}")
+                    continue
+                
+                # Check if data matches expected shape
+                _, h, w, c = data.shape
+                if h != height or w != width or c != channels:
+                    print(f"    ⚠️ Shape mismatch: Expected {height}x{width}x{channels}, got {h}x{w}x{c}")
+                    # Try to resize if needed
+                    if c != channels:
+                        if channels == 1 and c == 3:
+                            # Convert RGB to grayscale
+                            data = np.mean(data, axis=-1, keepdims=True)
+                        elif channels == 3 and c == 1:
+                            # Expand grayscale to RGB
+                            data = np.repeat(data, 3, axis=-1)
+                
+                all_frames_data.append(data)
+                total_frames_loaded += len(data)
+                print(f"    Loaded {len(data)} frames, shape: {data.shape}")
+            
+            if not all_frames_data:
+                print(f"  ⚠️ No video data loaded for {f_name}")
+                continue
+            
+            # Combine all video data
+            combined_data = np.concatenate(all_frames_data, axis=0)
+            print(f"  Total frames combined: {len(combined_data)}")
+            
+            # Verify final shape
+            if len(combined_data.shape) != 4:
+                print(f"  ⚠️ Combined data has wrong shape: {combined_data.shape}")
+                continue
+            
+            # Calculate statistics
+            print(f"  Calculating statistics...")
+            
+            # For RGB images (HWC format)
+            # For RGB images (Expected shape: [Frames, Height, Width, 3])
+            print('The shape of combined data is:', combined_data.shape)
+                        
+            # ... after combining data ...
+            print(f"  The shape of combined data is: {combined_data.shape}")
+            num_channels = combined_data.shape[-1]
+            
+            # --- CHANNEL DIFFERENCE DIAGNOSTIC (Safe for 1-channel) ---
+            if num_channels == 3:
+                channel_diff = np.abs(combined_data[..., 0] - combined_data[..., 2]).sum()
+                print(f"  Total pixel difference between Red and Blue: {channel_diff}")
+                if channel_diff == 0:
+                    print("  ⚠️ WARNING: All channels are identical (Grayscale-in-RGB)")
+            
+            # --- STATS CALCULATION ---
+            print(f"  Calculating statistics for {num_channels} channel(s)...")
+            means, stds, mins, maxs = [], [], [], []
+
+            for i in range(num_channels):
+                # Explicitly slice the channel to ensure independent math
+                channel_view = combined_data[..., i]
+                
+                means.append(float(np.mean(channel_view)))
+                stds.append(float(np.std(channel_view)))
+                mins.append(float(np.min(channel_view)))
+                maxs.append(float(np.max(channel_view)))
+
+            # --- LOGGING ---
+            if num_channels == 3:
+                print(f"  📊 RGB Stats - Mean: {means}, Std: {stds}")
+            else:
+                print(f"  📊 Depth/Grayscale Stats - Mean: {means[0]:.6f}, Std: {stds[0]:.6f}")
+
+            # --- LEROBOT FORMATTING ---
+            visual_results[f_name] = {
+                "min":  [[[m]] for m in mins],
+                "max":  [[[m]] for m in maxs],
+                "mean": [[[m]] for m in means],
+                "std":  [[[m]] for m in stds],
+            }
+            
+            
+            print(f"  ✅ Completed {f_name}")
+            
+        else:
+            # Numerical feature handling
+            if f_name in combined_df.columns:
+                val = combined_df[f_name].values
+                if len(val) > 0 and hasattr(val[0], '__len__'):
+                    numerical_dict[f_name] = np.stack(val.tolist())
+                else:
+                    numerical_dict[f_name] = val
+                numerical_features[f_name] = f_info
+
+    # Compute numerical stats
+    print("\n🧮 Computing numerical stats...")
+    final_stats = compute_episode_stats(numerical_dict, numerical_features)
+
+    # Merge visual stats
+    for f_name, stats_val in visual_results.items():
+        final_stats[f_name] = stats_val
+
+    # Save stats
+    write_stats(final_stats, output_dir)
+    stats_path = output_dir / 'meta' / 'stats.json'
+    print(f"\n✅ Stats saved to {stats_path}")
+    
+    # Print summary
+    print("\n📊 Stats Summary:")
+    for f_name in features:
+        if f_name in final_stats:
+            if f_name in visual_results:
+                print(f"  {f_name}: Video/Image stats computed")
+            else:
+                print(f"  {f_name}: Numerical stats computed")
+        else:
+            print(f"  ⚠️ {f_name}: No stats computed")
+    
+    return final_stats
 
 def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episode: bool = False, last_frames_to_chop: int = 10, first_frames_to_chop: int = 15, mode="diff"):
     """
