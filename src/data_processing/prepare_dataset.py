@@ -704,9 +704,110 @@ def compute_and_save_dataset_stats(output_dir: Path):
                     numerical_dict[f_name] = val
                 numerical_features[f_name] = f_info
 
-    # Compute numerical stats
-    print("\n🧮 Computing numerical stats...")
-    final_stats = compute_episode_stats(numerical_dict, numerical_features)
+    # Compute numerical stats manually without using compute_episode_stats
+    print("\n🧮 Computing numerical stats manually...")
+    final_stats = {}
+    
+    # Process each numerical feature
+    for f_name, data in numerical_dict.items():
+        f_info = numerical_features[f_name]
+        
+        # Convert to numpy array if not already
+        if not isinstance(data, np.ndarray):
+            data = np.array(data)
+        
+        # Skip boolean data types as they can't be used for numerical stats
+        if data.dtype == np.bool_:
+            print(f"  ⚠️ Skipping boolean feature '{f_name}' for numerical stats")
+            continue
+            
+        # Handle different data shapes
+        if data.ndim == 1:
+            # Single dimensional data (e.g., scalar values)
+            # Filter out non-numerical values
+            numeric_mask = np.isfinite(data) if np.issubdtype(data.dtype, np.number) else np.ones(len(data), dtype=bool)
+            filtered_data = data[numeric_mask] if np.issubdtype(data.dtype, np.number) else data.astype(float)
+            
+            if len(filtered_data) == 0:
+                print(f"  ⚠️ No valid numerical data for feature '{f_name}'")
+                continue
+                
+            final_stats[f_name] = {
+                "min": np.array([np.min(filtered_data)]),
+                "max": np.array([np.max(filtered_data)]),
+                "mean": np.array([np.mean(filtered_data)]),
+                "std": np.array([np.std(filtered_data)]),
+                "count": np.array([len(filtered_data)])
+            }
+        elif data.ndim == 2:
+            # Two dimensional data (e.g., vectors)
+            # Compute stats for each column/feature
+            num_features = data.shape[1]
+            min_vals = []
+            max_vals = []
+            mean_vals = []
+            std_vals = []
+            
+            for i in range(num_features):
+                column_data = data[:, i]
+                # Filter out non-numerical values
+                numeric_mask = np.isfinite(column_data) if np.issubdtype(column_data.dtype, np.number) else np.ones(len(column_data), dtype=bool)
+                filtered_column_data = column_data[numeric_mask] if np.issubdtype(column_data.dtype, np.number) else column_data.astype(float)
+                
+                if len(filtered_column_data) == 0:
+                    min_vals.append(0.0)
+                    max_vals.append(0.0)
+                    mean_vals.append(0.0)
+                    std_vals.append(0.0)
+                    continue
+                    
+                min_vals.append(np.min(filtered_column_data))
+                max_vals.append(np.max(filtered_column_data))
+                mean_vals.append(np.mean(filtered_column_data))
+                std_vals.append(np.std(filtered_column_data))
+            
+            final_stats[f_name] = {
+                "min": np.array(min_vals),
+                "max": np.array(max_vals),
+                "mean": np.array(mean_vals),
+                "std": np.array(std_vals),
+                "count": np.array([len(data)])
+            }
+        else:
+            # Higher dimensional data
+            # Flatten and compute stats
+            flattened_data = data.reshape(-1, data.shape[-1])
+            num_features = flattened_data.shape[1]
+            min_vals = []
+            max_vals = []
+            mean_vals = []
+            std_vals = []
+            
+            for i in range(num_features):
+                column_data = flattened_data[:, i]
+                # Filter out non-numerical values
+                numeric_mask = np.isfinite(column_data) if np.issubdtype(column_data.dtype, np.number) else np.ones(len(column_data), dtype=bool)
+                filtered_column_data = column_data[numeric_mask] if np.issubdtype(column_data.dtype, np.number) else column_data.astype(float)
+                
+                if len(filtered_column_data) == 0:
+                    min_vals.append(0.0)
+                    max_vals.append(0.0)
+                    mean_vals.append(0.0)
+                    std_vals.append(0.0)
+                    continue
+                    
+                min_vals.append(np.min(filtered_column_data))
+                max_vals.append(np.max(filtered_column_data))
+                mean_vals.append(np.mean(filtered_column_data))
+                std_vals.append(np.std(filtered_column_data))
+            
+            final_stats[f_name] = {
+                "min": np.array(min_vals),
+                "max": np.array(max_vals),
+                "mean": np.array(mean_vals),
+                "std": np.array(std_vals),
+                "count": np.array([len(flattened_data)])
+            }
 
     # Merge visual stats
     for f_name, stats_val in visual_results.items():
