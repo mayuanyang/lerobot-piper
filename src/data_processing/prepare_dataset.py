@@ -31,7 +31,7 @@ def create_tasks_parquet(root_dir: Path, task_description: str):
         
     # The task index (0) must match the 'task_index' used in episodes.jsonl
     task_data = {
-        '': [task_description],
+        'task': [task_description],
         'task_index': [0]
     }
     
