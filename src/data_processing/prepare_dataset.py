@@ -25,25 +25,22 @@ import re
 
 def create_tasks_parquet(root_dir: Path, task_description: str):
     """
-    Generates the required meta/tasks.parquet file for LeRobot.
-    This file defines the available tasks in the dataset (which is mandatory).
+    Write meta/tasks.parquet in the format LeRobot expects:
+    - DataFrame index = task string(s)
+    - Column 'task_index' = integer index 0..N-1
     """
-        
-    # The task index (0) must match the 'task_index' used in episodes.jsonl
-    task_data = {
-        'task': [task_description],
-        'task_index': [0]
-    }
-    
-    # Convert to Arrow Table and write Parquet file
-    df = pd.DataFrame(task_data)
-    table = pa.Table.from_pandas(df)
+    tasks = [task_description]
+
+    # Build DataFrame with task strings as index and task_index as column
+    df = pd.DataFrame({"task_index": list(range(len(tasks)))}, index=tasks)
+    df.index.name = None  # optional, but keeps index as pure strings
 
     tasks_dir = root_dir / "meta"
-    tasks_dir.mkdir(exist_ok=True, parents=True)
+    tasks_dir.mkdir(parents=True, exist_ok=True)
     tasks_parquet_path = tasks_dir / "tasks.parquet"
 
-    pq.write_table(table, tasks_parquet_path)
+    # Use pandas to_parquet so the index is preserved in a way pd.read_parquet will restore it
+    df.to_parquet(tasks_parquet_path)
     
 
 def create_episodes_parquet(root_dir: Path):
@@ -259,7 +256,7 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
                     "width",
                     "channel"
                 ],
-                "video_info": {
+                "info": {
                     "video.fps": round(episode_data.fps, 2),
                     "video.codec": codec,
                     "video.pix_fmt": pix_fmt,
@@ -1001,6 +998,76 @@ def get_camera_name_from_video_path(video_path):
         return video_path.stem.split('_')[-1]
 
 
+def pad_video_to_target_frames(video_path: Path, target_frames: int, fps: float) -> bool:
+    """
+    Pad a video with duplicated frames to reach the target frame count.
+    
+    Args:
+        video_path (Path): Path to the video file to pad
+        target_frames (int): Target number of frames
+        fps (float): Frames per second of the video
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        # First, get the current number of frames in the video
+        probe_cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-count_frames",
+            "-show_entries", "stream=nb_read_frames",
+            "-of", "default=nokey=1:noprint_wrappers=1",
+            str(video_path)
+        ]
+        
+        import subprocess
+        result = subprocess.run(probe_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"⚠️ WARNING: Error probing video {video_path}: {result.stderr}")
+            return False
+            
+        current_frames = int(result.stdout.strip())
+        frames_to_add = target_frames - current_frames
+        
+        if frames_to_add <= 0:
+            # No padding needed
+            return True
+            
+        print(f"  Padding video: current frames={current_frames}, target={target_frames}, adding {frames_to_add} frames")
+        
+        # Use ffmpeg to pad the video by duplicating the last frame
+        padded_video_path = video_path.with_suffix('.padded.mp4')
+        
+        # Calculate duration to add based on frames and fps
+        duration_to_add = frames_to_add / fps
+        
+        cmd = [
+            "ffmpeg",
+            "-i", str(video_path),
+            "-vf", f"tpad=stop_mode=clone:stop_duration={duration_to_add:.3f}",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-y",
+            str(padded_video_path)
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"⚠️ WARNING: Error padding video {video_path}: {result.stderr}")
+            return False
+            
+        # Replace the original video with the padded one
+        import os
+        os.replace(padded_video_path, video_path)
+        print(f"  ✅ Successfully padded video to {target_frames} frames")
+        return True
+    except Exception as e:
+        print(f"⚠️ WARNING: Exception while padding video {video_path}: {e}")
+        return False
+
+
 def combine_video_chunks_for_cameras(output_dir: Path, all_episodes_data: list, fps: float):
     """
     Combine all video chunks for each camera into one continuous video.
@@ -1197,7 +1264,61 @@ def update_metadata_for_aggregated_episode(output_dir: Path, all_episodes_data: 
             json.dump(info_json, f, indent=2)
         print("✅ Updated info.json for aggregated episode")
 
-
+def pad_videos(output_dir: Path):
+    """
+    Pad all videos in the dataset to reach the target frame count.
+    
+    Args:
+        output_dir (Path): Output directory for the dataset
+        target_frames (int): Target number of frames for each video 
+        fps (float): Frames per second of the videos
+    """    
+    # Pad all videos to match the target frame count from info.json
+    videos_dir = output_dir / "videos"
+    
+    # Check if videos directory exists
+    if not videos_dir.exists():
+        print(f"⚠️ Videos directory not found: {videos_dir}")
+        return
+    
+    info_json_path = output_dir / "meta" / "info.json"
+    if info_json_path.exists():
+        try:
+            with open(info_json_path, 'r') as f:
+                info_data = json.load(f)
+            target_frames = info_data.get("total_frames", 0)
+            fps = info_data.get("fps", 10)
+            video_fps = info_data.get("fps", fps)
+            
+            if target_frames > 0:
+                # Iterate through all camera directories
+                for camera_dir in videos_dir.iterdir():
+                    if camera_dir.is_dir() and camera_dir.name.startswith("observation.images."):
+                        print(f"Processing camera: {camera_dir.name}")
+                        video_paths = []
+                        
+                        # Check all chunk directories for this camera
+                        for chunk_dir in camera_dir.glob("chunk-*"):
+                            for video_file in chunk_dir.glob("*.mp4"):
+                                video_paths.append(video_file)
+                        
+                        # Pad all videos for this camera
+                        for p in video_paths:
+                            print(f"  Padding video to {target_frames} frames: {p}")
+                            if pad_video_to_target_frames(p, target_frames, video_fps):
+                                print(f"  ✅ Video padding completed for {p}")
+                            else:
+                                print(f"  ❌ Failed to pad video for {p}")
+            else:
+                print("⚠️ Target frame count is 0 or invalid. Skipping video padding.")
+        except Exception as e:
+            print(f"  ⚠️ Error reading info.json or padding videos: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print(f"⚠️ Info.json not found: {info_json_path}. Cannot determine target frame count.")
+    
+    
 def main():
     print('Starting dataset preparation...')
     # --- CONFIGURATION ---
@@ -1314,6 +1435,8 @@ def main():
         update_total_frames_from_episodes(OUTPUT_FOLDER)
         
         create_episodes_parquet(OUTPUT_FOLDER)
+        
+        pad_videos(OUTPUT_FOLDER)
         
         # Compute and save dataset statistics for the aggregated episode
         compute_and_save_dataset_stats(OUTPUT_FOLDER)
