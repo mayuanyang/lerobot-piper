@@ -42,10 +42,13 @@ class VisionEncoder(nn.Module):
         
         # Get feature dimensions (e.g., 512 for ResNet18)
         with torch.no_grad():
-            dummy_input = torch.zeros(1, 3, 224, 224)
-            feature_dim = self.backbone(dummy_input).shape[1]
+            dummy_input = torch.zeros(1, 3, 400, 640)
+            backbone_output = self.backbone(dummy_input)
+            feature_dim = backbone_output.shape[1]
+            height = backbone_output.shape[2]
+            width = backbone_output.shape[3]
         
-        self.spatial_softmax = SpatialSoftmax(height=7, width=7, num_channels=feature_dim)
+        self.spatial_softmax = SpatialSoftmax(height=height, width=width, num_channels=feature_dim)
         self.projection = nn.Linear(feature_dim * 2, config.d_model)
 
     def forward(self, x):

@@ -79,7 +79,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     print('output_features:', output_features)
     
     # Training parameters
-    obs = 8
+    obs = 2
     horizon = 16
     n_action_steps = 8
     
@@ -145,6 +145,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         policy = TransformerDiffusionPolicy(cfg)
         policy.train()
         policy.to(device)
+        
+        # Print total trainable parameters
+        total_params = sum(p.numel() for p in policy.model.parameters() if p.requires_grad)
+        print(f"Total trainable parameters: {total_params:,}")
         # Ensure all submodules are on the correct device
         if hasattr(policy, 'transformer') and hasattr(policy.transformer, 'feature_projection'):
             if policy.transformer.feature_projection is not None:
@@ -167,8 +171,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     
     delta_timestamps = {
         "observation.images.gripper": obs_temporal_window,  
-        "observation.images.front": obs_temporal_window,
-        "observation.images.right": obs_temporal_window,
+        "observation.images.depth": obs_temporal_window,
         "observation.state": obs_temporal_window,
         "action": [i * frame_time for i in range(horizon)]
     }
@@ -185,7 +188,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=4,
-        batch_size=8,
+        batch_size=32,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
