@@ -110,8 +110,6 @@ def validate_model(policy, val_dataloader, preprocessor):
                 print(f"Warning: Empty batch at index {batch_idx}")
                 continue
                 
-            batch["task"] = ["Pick and place the cube into the container"] * len(batch.get("observation.state", []))
-
             # Remap image feature names to match what the policy expects
             feature_mapping = {
                 #"observation.images.front": "observation.images.camera1",
@@ -181,28 +179,14 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     print('input_features:', input_features)
     print('output_features:', output_features)
 
-    policy = SmolVLAPolicy.from_pretrained(model_id)
-    cfg = policy.config
-
-    cfg.n_obs_steps = 2
-    cfg.chunk_size = 24
-    cfg.n_action_steps = 24
+    
+    n_obs_steps = 2
+    chunk_size = 24
+    n_action_steps = 24
     
     # Update the configuration to use 7-dimensional state and action
     # and 400x640 images
-    if "observation.state" in cfg.input_features:
-        cfg.input_features["observation.state"].shape = [7]
-    if "action" in cfg.output_features:
-        cfg.output_features["action"].shape = [7]
-        
-    # Update image shapes - RGB images get 3 channels, depth images get 1 channel
-    # Based on the feature mapping: depth -> camera1, gripper -> camera2
-    if "observation.images.camera1" in cfg.input_features:
-        # This is the depth camera (mapped from observation.images.depth)
-        cfg.input_features["observation.images.camera1"].shape = [1, 400, 640]
-    if "observation.images.camera2" in cfg.input_features:
-        # This is the gripper camera (mapped from observation.images.gripper)
-        cfg.input_features["observation.images.camera2"].shape = [3, 400, 640]
+    
     
     if dataset_metadata.stats is None:
         raise ValueError("Dataset stats are required to initialize the policy.")
@@ -217,29 +201,45 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         policy.train()
         policy.to(device)
 
-        optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.optimizer_lr)
-        policy.config.chunk_size = cfg.chunk_size
-        policy.config.n_action_steps = cfg.n_action_steps
-        policy.config.n_obs_steps = cfg.n_obs_steps
+        optimizer = torch.optim.Adam(policy.parameters(), lr=policy.config.optimizer_lr)
+        policy.config.chunk_size = chunk_size
+        policy.config.n_action_steps = n_action_steps
+        policy.config.n_obs_steps = n_obs_steps
         
         
         preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
         
         step = 0
     else:
-        print("Starting fresh training from scratch", cfg)
+        
         # Initialize a new model from configuration
         policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
+        
+        if "observation.state" in policy.config.input_features:
+            policy.config.input_features["observation.state"].shape = [7]
+        
+        if "action" in policy.config.output_features:
+            policy.config.output_features["action"].shape = [7]
+            
+        # Update image shapes - RGB images get 3 channels, depth images get 1 channel
+        # Based on the feature mapping: depth -> camera1, gripper -> camera2
+        if "observation.images.camera1" in policy.config.input_features:
+            # This is the depth camera (mapped from observation.images.depth)
+            policy.config.input_features["observation.images.camera1"].shape = [3, 400, 640]
+        if "observation.images.camera2" in policy.config.input_features:
+            # This is the gripper camera (mapped from observation.images.gripper)
+            policy.config.input_features["observation.images.camera2"].shape = [3, 400, 640]
+        
         #policy = SmolVLAPolicy(cfg)
-        policy.config.chunk_size = cfg.chunk_size
-        policy.config.n_action_steps = cfg.n_action_steps
-        policy.config.n_obs_steps = cfg.n_obs_steps
+        policy.config.chunk_size = chunk_size
+        policy.config.n_action_steps = n_action_steps
+        policy.config.n_obs_steps = n_obs_steps
         policy.config.load_vlm_weights = True
         
         
         policy.train()
         policy.to(device)
-        optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.optimizer_lr)
+        optimizer = torch.optim.Adam(policy.parameters(), lr=policy.config.optimizer_lr)
         # Create new preprocessor and postprocessor
         preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
                 
@@ -250,10 +250,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         """
         Cosine decay with warmup learning rate scheduler
         """
-        warmup_steps = cfg.scheduler_warmup_steps
-        decay_steps = cfg.scheduler_decay_steps
-        initial_lr = cfg.optimizer_lr
-        final_lr = cfg.scheduler_decay_lr
+        warmup_steps = policy.config.scheduler_warmup_steps
+        decay_steps = policy.config.scheduler_decay_steps
+        initial_lr = policy.config.optimizer_lr
+        final_lr = policy.config.scheduler_decay_lr
         
         if step < warmup_steps:
             # Warmup phase: linearly increase learning rate
@@ -278,14 +278,14 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     fps = 10
     frame_time = 1 / fps
     
-    obs_temporal_window = [ -i * frame_time for i in range(cfg.n_obs_steps) ][::-1]
+    obs_temporal_window = [ -i * frame_time for i in range(policy.config.n_obs_steps) ][::-1]
 
     delta_timestamps = {
         "observation.images.gripper": obs_temporal_window,  
         "observation.images.depth": obs_temporal_window,
         #"observation.images.front": obs_temporal_window,
         "observation.state": obs_temporal_window,
-        "action": [i * frame_time for i in range(cfg.n_action_steps)] 
+        "action": [i * frame_time for i in range(policy.config.n_action_steps)] 
     }
 
     # Load full dataset to determine episode indices
@@ -362,8 +362,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         epoch += 1
         prog_bar = tqdm(enumerate(train_dataloader), total=len(train_dataloader), desc=f"Epoch {epoch}, Step {step}")
         for batch_idx, batch in prog_bar:
-            batch["task"] = ["Pick and place the cube into the container"] * batch_size
-
+            
             # Remap image feature names to match what the policy expects
             feature_mapping = {
                 #"observation.images.front": "observation.images.camera1",
