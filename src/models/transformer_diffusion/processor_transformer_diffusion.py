@@ -18,7 +18,7 @@ from typing import Any
 
 import torch
 
-from .long_task_transformer_config import LongTaskTransformerConfig
+from .transformer_diffusion_config import TransformerDiffusionConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -32,8 +32,8 @@ from lerobot.processor.converters import policy_action_to_transition, transition
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 
-def make_long_task_transformer_pre_post_processors(
-    config: LongTaskTransformerConfig,
+def make_transformer_diffusion_pre_post_processors(
+    config: TransformerDiffusionConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],

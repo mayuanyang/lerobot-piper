@@ -1,16 +1,16 @@
-# Long Task Transformer Policy
+# Transformer Diffusion Policy
 
-This module implements a transformer-based policy for long-horizon robotic tasks. Unlike the diffusion-based approach, this model uses a transformer architecture with ResNet encoders for processing visual observations.
+This module implements a diffusion-based policy with transformer architecture for long-horizon robotic tasks. The model combines ResNet encoders for visual processing with a transformer-based diffusion approach for action generation.
 
 ## Architecture Overview
 
-The LongTaskTransformer model consists of:
+The TransformerDiffusion model consists of:
 
 1. **ResNet-based Image Encoders**: Process camera observations and convert them to feature embeddings
-2. **State Tokenizers**: Convert observation.state vectors to tokens
+2. **State Encoder**: Convert observation.state vectors to tokens
 3. **Transformer Encoder**: Processes the observation context (images + state)
-4. **Transformer Decoder**: Autoregressively generates action sequences
-5. **Action Head**: Converts decoder outputs to actionable robot commands
+4. **Diffusion Process**: Generates action sequences through a denoising process
+5. **Action Head**: Converts diffusion outputs to actionable robot commands
 
 ## Key Features
 
@@ -33,28 +33,22 @@ python src/train_transformer.py --output_dir ./outputs/transformer_model --datas
 python src/inference_transformer.py --model_path ./outputs/transformer_model
 ```
 
-### Demo
-
-```bash
-python src/models/long_task_transformer/demo_usage.py
-```
-
 ## Configuration
 
-The model can be configured through the `LongTaskTransformerConfig` class:
+The model can be configured through the `TransformerDiffusionConfig` class:
 
 ```python
-config = LongTaskTransformerConfig(
+config = TransformerDiffusionConfig(
     n_obs_steps=8,          # Number of observation steps
     horizon=16,             # Prediction horizon
     n_action_steps=8,       # Number of action steps to execute
     state_dim=7,            # Robot state dimension
     action_dim=7,           # Action dimension
-    d_model=128,            # Transformer model dimension
-    nhead=4,                # Number of attention heads
-    num_encoder_layers=4,   # Encoder layers
-    num_decoder_layers=4,   # Decoder layers
-    dim_feedforward=512,    # Feedforward dimension
+    d_model=256,            # Transformer model dimension
+    nhead=8,                # Number of attention heads
+    num_encoder_layers=6,   # Encoder layers
+    num_decoder_layers=6,   # Decoder layers
+    dim_feedforward=2048,   # Feedforward dimension
     dropout=0.1,            # Dropout rate
     vision_backbone="resnet18"  # Vision backbone
 )
@@ -62,6 +56,6 @@ config = LongTaskTransformerConfig(
 
 ## Model Components
 
-- `LongTaskTransformerConfig`: Configuration class defining model parameters
-- `LongTaskTransformerModel`: Core neural network implementation
-- `LongTaskTransformerPolicy`: High-level policy interface for training and inference
+- `TransformerDiffusionConfig`: Configuration class defining model parameters
+- `DiffusionTransformer`: Core neural network implementation
+- `TransformerDiffusionPolicy`: High-level policy interface for training and inference

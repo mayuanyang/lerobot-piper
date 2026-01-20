@@ -5,9 +5,9 @@ Demo script showcasing the usage of the LongTaskTransformer model.
 """
 
 import torch
-from src.models.long_task_transformer.long_task_transformer_config import LongTaskTransformerConfig
-from src.models.long_task_transformer.long_task_transformer_policy import LongTaskTransformerPolicy
-from src.models.long_task_transformer.long_task_transformer_model import LongTaskTransformerModel
+from models.transformer_diffusion.transformer_diffusion_config import LongTaskTransformerConfig
+from models.transformer_diffusion.transformer_diffusion_policy import LongTaskTransformerPolicy
+from models.transformer_diffusion.transformer_diffusion_model import LongTaskTransformerModel
 
 
 def demo_model_creation():

@@ -1,9 +1,3 @@
-#!/usr/bin/env python
-
-"""
-Training script specifically for the LongTaskTransformer model.
-"""
-
 from pathlib import Path
 import torch
 from tqdm import tqdm
@@ -13,9 +7,9 @@ from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.factory import make_pre_post_processors
 
 # Import transformer-specific components
-from src.models.long_task_transformer.long_task_transformer_config import LongTaskTransformerConfig
-from src.models.long_task_transformer.long_task_transformer_policy import LongTaskTransformerPolicy
-from src.models.long_task_transformer.processor_transformer import make_long_task_transformer_pre_post_processors
+from models.transformer_diffusion.transformer_diffusion_config import TransformerDiffusionConfig
+from models.transformer_diffusion.transformer_diffusion_policy import TransformerDiffusionPolicy
+from models.transformer_diffusion.processor_transformer_diffusion import make_transformer_diffusion_pre_post_processors
 
 # Import torchvision for augmentation
 from torchvision.transforms import v2
@@ -61,7 +55,7 @@ def apply_joint_augmentations(batch):
 
 
 def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_from_checkpoint=None):
-    """Train the LongTaskTransformer model."""
+    """Train the TransformerDiffusion model."""
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
 
@@ -90,7 +84,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     n_action_steps = 8
     
     # Create transformer configuration
-    cfg = LongTaskTransformerConfig(
+    cfg = TransformerDiffusionConfig(
         input_features=input_features, 
         output_features=output_features, 
         n_obs_steps=obs, 
@@ -117,7 +111,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     # Model loading logic
     if resume_from_checkpoint is not None:
         print(f"Resuming training from checkpoint: {resume_from_checkpoint}")
-        policy = LongTaskTransformerPolicy.from_pretrained(resume_from_checkpoint)
+        policy = TransformerDiffusionPolicy.from_pretrained(resume_from_checkpoint)
         policy.train()
         policy.to(device)
         
@@ -126,7 +120,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             preprocessor, postprocessor = load_pre_post_processors(resume_from_checkpoint)
         except Exception as e:
             print(f"Could not load preprocessors: {e}. Creating new ones.")
-            preprocessor, postprocessor = make_long_task_transformer_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
+            preprocessor, postprocessor = make_transformer_diffusion_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
             
         optimizer = torch.optim.Adam(policy.parameters(), lr=2e-5)
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
@@ -148,14 +142,14 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             step = 0
     else:
         # Initialize fresh policy
-        policy = LongTaskTransformerPolicy(cfg)
+        policy = TransformerDiffusionPolicy(cfg)
         policy.train()
         policy.to(device)
         # Ensure all submodules are on the correct device
         if hasattr(policy, 'transformer') and hasattr(policy.transformer, 'feature_projection'):
             if policy.transformer.feature_projection is not None:
                 policy.transformer.feature_projection = policy.transformer.feature_projection.to(device)
-        preprocessor, postprocessor = make_long_task_transformer_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
+        preprocessor, postprocessor = make_transformer_diffusion_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
         step = 0
         optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=1000)

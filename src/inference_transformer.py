@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 """
-Inference script specifically for the LongTaskTransformer model.
+Inference script specifically for the TransformerDiffusion model.
 """
 
 import torch
@@ -12,7 +12,7 @@ from lerobot.configs.types import FeatureType
 from lerobot.policies.factory import load_pre_post_processors
 
 # Import transformer-specific components
-from src.models.long_task_transformer.long_task_transformer_policy import LongTaskTransformerPolicy
+from models.transformer_diffusion.transformer_diffusion_policy import TransformerDiffusionPolicy
 
 
 # Detect the best available device
@@ -27,11 +27,11 @@ print(f"Using device: {device}")
 
 
 def run_inference(model_path, dataset_id="ISdept/piper_arm"):
-    """Run inference using the trained LongTaskTransformer model."""
+    """Run inference using the trained TransformerDiffusion model."""
     print(f"Loading model from: {model_path}")
     
     # Load the trained policy
-    policy = LongTaskTransformerPolicy.from_pretrained(model_path)
+    policy = TransformerDiffusionPolicy.from_pretrained(model_path)
     policy.eval()
     policy.to(device)
     
@@ -86,7 +86,7 @@ def run_inference_on_dataset(model_path, dataset_id="ISdept/piper_arm"):
     print(f"Loading model from: {model_path}")
     
     # Load the trained policy
-    policy = LongTaskTransformerPolicy.from_pretrained(model_path)
+    policy = TransformerDiffusionPolicy.from_pretrained(model_path)
     policy.eval()
     policy.to(device)
     
