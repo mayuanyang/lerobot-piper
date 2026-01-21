@@ -402,11 +402,11 @@ class DiffusionTransformer(nn.Module):
         # - If currently open (> 0.4), allow more flexibility but still encourage smooth transitions
         gripper_loss = 0.0
         
-        # Get predicted final actions by doing one denoising step with high timestep
-        # This gives us an approximation of the final predicted actions
-        high_timestep = torch.full_like(timesteps, self.noise_scheduler.config.num_train_timesteps - 1)
-        pred_final_actions = self.noise_scheduler.step(pred_noise, high_timestep, noisy_actions).pred_original_sample
-        pred_gripper_actions = pred_final_actions[:, :, -1]  # (B, Horizon)
+        # Compute denoised actions directly from predicted noise
+        # Formula: x_0 = (x_t - sqrt(1 - alpha_t) * epsilon) / sqrt(alpha_t)
+        alpha_t = self.noise_scheduler.alphas_cumprod[timesteps].view(-1, 1, 1)
+        pred_actions = (noisy_actions - torch.sqrt(1 - alpha_t) * pred_noise) / torch.sqrt(alpha_t)
+        pred_gripper_actions = pred_actions[:, :, -1]  # (B, Horizon)
         
         # For closed gripper, encourage predicted gripper values to be low (< 0.4)
         if is_currently_closed.any():
