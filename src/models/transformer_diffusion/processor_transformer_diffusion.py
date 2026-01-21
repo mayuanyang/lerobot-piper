@@ -32,36 +32,14 @@ from lerobot.processor.converters import policy_action_to_transition, transition
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 
-def make_transformer_diffusion_pre_post_processors(
+def make_pre_post_processors(
     config: TransformerDiffusionConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
-    """
-    Constructs pre-processor and post-processor pipelines for a long task transformer policy.
-
-    The pre-processing pipeline prepares the input data for the model by:
-    1. Renaming features.
-    2. Normalizing the input and output features based on dataset statistics.
-    3. Adding a batch dimension.
-    4. Moving the data to the specified device.
-
-    The post-processing pipeline handles the model's output by:
-    1. Moving the data to the CPU.
-    2. Unnormalizing the output features to their original scale.
-
-    Args:
-        config: The configuration object for the long task transformer policy,
-            containing feature definitions, normalization mappings, and device information.
-        dataset_stats: A dictionary of statistics used for normalization.
-            Defaults to None.
-
-    Returns:
-        A tuple containing the configured pre-processor and post-processor pipelines.
-    """
-
+    
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),

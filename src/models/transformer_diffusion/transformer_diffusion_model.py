@@ -5,6 +5,7 @@ import torchvision.models as models
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.optimization import get_scheduler
 from typing import Dict, Optional
+import math
 
 
 
@@ -32,6 +33,218 @@ class SpatialSoftmax(nn.Module):
         expected_y = torch.sum(probs * self.pos_y, dim=-1, keepdim=True)
         return torch.cat([expected_x, expected_y], dim=-1).view(batch_size, -1)
 
+
+class PositionalEncoding(nn.Module):
+    """Positional encoding for action sequences."""
+    def __init__(self, d_model, max_len=100):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))
+
+    def forward(self, x):
+        # x: (B, seq_len, d_model)
+        return x + self.pe[:, :x.size(1)]
+
+
+class DiffusionSinusoidalPosEmb(nn.Module):
+    """Sinusoidal positional embedding for diffusion timesteps."""
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = x[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
+
+
+class DiffusionConv1dBlock(nn.Module):
+    """Conv1d block with group normalization and Mish activation."""
+    def __init__(self, inp_channels, out_channels, kernel_size, n_groups=8):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv1d(inp_channels, out_channels, kernel_size, padding=kernel_size // 2),
+            nn.GroupNorm(n_groups, out_channels),
+            nn.Mish(),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class DiffusionConditionalResidualBlock1d(nn.Module):
+    """Residual block with FiLM conditioning."""
+    def __init__(self, in_channels, out_channels, cond_dim, kernel_size=3, n_groups=8, use_film_scale_modulation=False):
+        super().__init__()
+        self.use_film_scale_modulation = use_film_scale_modulation
+        self.out_channels = out_channels
+
+        self.conv1 = DiffusionConv1dBlock(in_channels, out_channels, kernel_size, n_groups=n_groups)
+
+        # FiLM modulation
+        film_layers = []
+        if use_film_scale_modulation:
+            film_layers.append(nn.Linear(cond_dim, out_channels * 2))
+        else:
+            film_layers.append(nn.Linear(cond_dim, out_channels))
+        film_layers.append(nn.Mish())
+        self.film = nn.Sequential(*film_layers)
+
+        self.conv2 = DiffusionConv1dBlock(out_channels, out_channels, kernel_size, n_groups=n_groups)
+
+        # For skip connection
+        self.skip_conv = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+
+    def forward(self, x, cond):
+        # x: (B, C, T)
+        # cond: (B, cond_dim)
+
+        # First conv
+        out = self.conv1(x)
+
+        # FiLM modulation
+        cond_out = self.film(cond)
+        if self.use_film_scale_modulation:
+            scale, bias = torch.chunk(cond_out, 2, dim=-1)
+            scale = scale.unsqueeze(-1)
+            bias = bias.unsqueeze(-1)
+            out = scale * out + bias
+        else:
+            cond_out = cond_out.unsqueeze(-1)
+            out = out + cond_out
+
+        # Second conv
+        out = self.conv2(out)
+
+        # Skip connection
+        x = self.skip_conv(x)
+        out = out + x
+        return out
+
+
+class DiffusionConditionalUnet1d(nn.Module):
+    """A 1D convolutional UNet with FiLM modulation for conditioning."""
+    def __init__(self, config, global_cond_dim):
+        super().__init__()
+        self.config = config
+
+        # Encoder for the diffusion timestep
+        self.diffusion_step_encoder = nn.Sequential(
+            DiffusionSinusoidalPosEmb(config.diffusion_step_embed_dim),
+            nn.Linear(config.diffusion_step_embed_dim, config.diffusion_step_embed_dim * 4),
+            nn.Mish(),
+            nn.Linear(config.diffusion_step_embed_dim * 4, config.diffusion_step_embed_dim),
+        )
+
+        # The FiLM conditioning dimension
+        cond_dim = config.diffusion_step_embed_dim + global_cond_dim
+
+        # In channels / out channels for each downsampling block in the Unet's encoder
+        # For the decoder, we just reverse these
+        in_out = [(config.action_dim, config.down_dims[0])] + list(
+            zip(config.down_dims[:-1], config.down_dims[1:])
+        )
+
+        # Unet encoder
+        common_res_block_kwargs = {
+            "cond_dim": cond_dim,
+            "kernel_size": config.kernel_size,
+            "n_groups": config.n_groups,
+            "use_film_scale_modulation": config.use_film_scale_modulation,
+        }
+        self.down_modules = nn.ModuleList([])
+        for ind, (dim_in, dim_out) in enumerate(in_out):
+            is_last = ind >= (len(in_out) - 1)
+            self.down_modules.append(
+                nn.ModuleList([
+                    DiffusionConditionalResidualBlock1d(dim_in, dim_out, **common_res_block_kwargs),
+                    DiffusionConditionalResidualBlock1d(dim_out, dim_out, **common_res_block_kwargs),
+                    # Downsample as long as it is not the last block
+                    nn.Conv1d(dim_out, dim_out, 3, 2, 1) if not is_last else nn.Identity(),
+                ])
+            )
+
+        # Processing in the middle of the auto-encoder
+        self.mid_modules = nn.ModuleList([
+            DiffusionConditionalResidualBlock1d(
+                config.down_dims[-1], config.down_dims[-1], **common_res_block_kwargs
+            ),
+            DiffusionConditionalResidualBlock1d(
+                config.down_dims[-1], config.down_dims[-1], **common_res_block_kwargs
+            ),
+        ])
+
+        # Unet decoder
+        self.up_modules = nn.ModuleList([])
+        for ind, (dim_out, dim_in) in enumerate(reversed(in_out[1:])):
+            is_last = ind >= (len(in_out) - 1)
+            self.up_modules.append(
+                nn.ModuleList([
+                    # dim_in * 2, because it takes the encoder's skip connection as well
+                    DiffusionConditionalResidualBlock1d(dim_in * 2, dim_out, **common_res_block_kwargs),
+                    DiffusionConditionalResidualBlock1d(dim_out, dim_out, **common_res_block_kwargs),
+                    # Upsample as long as it is not the last block
+                    nn.ConvTranspose1d(dim_out, dim_out, 4, 2, 1) if not is_last else nn.Identity(),
+                ])
+            )
+
+        self.final_conv = nn.Sequential(
+            DiffusionConv1dBlock(config.down_dims[0], config.down_dims[0], kernel_size=config.kernel_size),
+            nn.Conv1d(config.down_dims[0], config.action_dim, 1),
+        )
+
+    def forward(self, x, timestep, global_cond=None):
+        """
+        Args:
+            x: (B, T, input_dim) tensor for input to the Unet.
+            timestep: (B,) tensor of (timestep_we_are_denoising_from - 1).
+            global_cond: (B, global_cond_dim)
+        Returns:
+            (B, T, input_dim) diffusion model prediction.
+        """
+        # For 1D convolutions we'll need feature dimension first
+        x = x.permute(0, 2, 1)  # (B, input_dim, T)
+
+        timesteps_embed = self.diffusion_step_encoder(timestep)
+
+        # If there is a global conditioning feature, concatenate it to the timestep embedding
+        if global_cond is not None:
+            global_feature = torch.cat([timesteps_embed, global_cond], axis=-1)
+        else:
+            global_feature = timesteps_embed
+
+        # Run encoder, keeping track of skip features to pass to the decoder
+        encoder_skip_features = []
+        for resnet, resnet2, downsample in self.down_modules:
+            x = resnet(x, global_feature)
+            x = resnet2(x, global_feature)
+            encoder_skip_features.append(x)
+            x = downsample(x)
+
+        for mid_module in self.mid_modules:
+            x = mid_module(x, global_feature)
+
+        # Run decoder, using the skip features from the encoder
+        for resnet, resnet2, upsample in self.up_modules:
+            x = torch.cat((x, encoder_skip_features.pop()), dim=1)
+            x = resnet(x, global_feature)
+            x = resnet2(x, global_feature)
+            x = upsample(x)
+
+        x = self.final_conv(x)
+
+        x = x.permute(0, 2, 1)  # (B, T, input_dim)
+        return x
+
+
 class VisionEncoder(nn.Module):
     """Improved encoder with Spatial Softmax for 7-DOF precision."""
     def __init__(self, config):
@@ -57,8 +270,6 @@ class VisionEncoder(nn.Module):
         return self.projection(x)
 
 
-
-
 class DiffusionTransformer(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -74,11 +285,17 @@ class DiffusionTransformer(nn.Module):
         
         # 2. Observation Transformer (Temporal Fusion)
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.d_model, nhead=config.nhead, 
-            dim_feedforward=config.dim_feedforward, activation="gelu", 
-            batch_first=True, norm_first=True
+            d_model=config.d_model, 
+            nhead=config.nhead, 
+            dim_feedforward=config.dim_feedforward, 
+            activation="gelu", 
+            batch_first=True, 
+            norm_first=True
         )
         self.obs_transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.num_encoder_layers)
+        
+        # Positional encoding for observation tokens
+        self.obs_positional_encoding = PositionalEncoding(config.d_model, 100)  # 100 is max length
 
         # 3. Diffusion Components
         # We denoise the entire action horizon at once: (Horizon, Action_Dim)
@@ -96,16 +313,14 @@ class DiffusionTransformer(nn.Module):
             nn.Linear(128, config.d_model)
         )
 
-        # The Denoiser MLP (Predicts the noise added to actions)
-        # Input: Noisy Action + Time + Obs Context
-        input_dim = config.action_dim + config.d_model + config.d_model
-        self.denoiser = nn.Sequential(
-            nn.Linear(input_dim, 1024),
-            nn.GELU(),
-            nn.Linear(1024, 512),
-            nn.GELU(),
-            nn.Linear(512, config.action_dim)
-        )
+        # Positional encoding for action sequences
+        self.positional_encoding = PositionalEncoding(config.d_model, config.horizon)
+
+        # Action projection to model dimension
+        self.action_projection = nn.Linear(config.action_dim, config.d_model)
+
+        # The UNet Denoiser (Predicts the noise added to actions)
+        self.denoiser = DiffusionConditionalUnet1d(config, config.d_model)
 
     def get_condition(self, batch):
         """Processes images and states into a single global context vector."""
@@ -118,9 +333,14 @@ class DiffusionTransformer(nn.Module):
         
         tokens.append(self.state_encoder(batch["observation.state"]))
         
-        # Combine and pass through transformer
-        obs_features = torch.cat(tokens, dim=1) 
-        context = self.obs_transformer(obs_features)
+        # Combine tokens
+        obs_features = torch.cat(tokens, dim=1)  # (B, seq_len, d_model)
+        
+        # Apply positional encoding to observation tokens
+        obs_features_pos = self.obs_positional_encoding(obs_features)  # (B, seq_len, d_model)
+        
+        # Pass through transformer
+        context = self.obs_transformer(obs_features_pos)
         
         # Global Average Pool across temporal/modality dimension to get "Scene Context"
         return context.mean(dim=1) 
@@ -140,18 +360,21 @@ class DiffusionTransformer(nn.Module):
         # 3. Add noise to clean actions (Forward Diffusion)
         noisy_actions = self.noise_scheduler.add_noise(actions, noise, timesteps)
         
-        # 4. Predict the noise (Reverse Diffusion)
+        # 4. Project actions to model dimension and add positional encoding
+        noisy_actions_proj = self.action_projection(noisy_actions)  # (B, Horizon, d_model)
+        noisy_actions_pos = self.positional_encoding(noisy_actions_proj)  # (B, Horizon, d_model)
+        
+        # 5. Get time embedding
         time_emb = self.time_mlp(timesteps.unsqueeze(-1).float()) # (B, d_model)
         
-        # Reshape to treat horizon as part of the batch for the MLP denoiser
-        # (B, Horizon, Dim) -> (B*Horizon, Dim)
-        obs_cond_expanded = obs_cond.unsqueeze(1).expand(-1, self.config.horizon, -1)
-        time_emb_expanded = time_emb.unsqueeze(1).expand(-1, self.config.horizon, -1)
+        # 6. Expand embeddings to match horizon dimension
+        obs_cond_expanded = obs_cond.unsqueeze(1).expand(-1, self.config.horizon, -1)  # (B, Horizon, d_model)
+        time_emb_expanded = time_emb.unsqueeze(1).expand(-1, self.config.horizon, -1)  # (B, Horizon, d_model)
         
-        denoiser_input = torch.cat([noisy_actions, obs_cond_expanded, time_emb_expanded], dim=-1)
-        pred_noise = self.denoiser(denoiser_input)
+        # 7. Call UNet denoiser with separate arguments
+        pred_noise = self.denoiser(noisy_actions, timesteps, global_cond=obs_cond)
         
-        # 5. Loss: How well did we predict the added noise?
+        # 8. Loss: How well did we predict the added noise?
         loss = F.mse_loss(pred_noise, noise)
         return loss
 
@@ -167,15 +390,17 @@ class DiffusionTransformer(nn.Module):
         self.noise_scheduler.set_timesteps(self.config.num_inference_steps)
         
         for k in self.noise_scheduler.timesteps:
+            # Project actions to model dimension and add positional encoding
+            noisy_action_proj = self.action_projection(noisy_action)  # (B, Horizon, d_model)
+            noisy_action_pos = self.positional_encoding(noisy_action_proj)  # (B, Horizon, d_model)
+            
             # Prepare inputs
             time_emb = self.time_mlp(torch.tensor([k], device=self.device).float().unsqueeze(0)).expand(B, -1)
             obs_cond_expanded = obs_cond.unsqueeze(1).expand(-1, self.config.horizon, -1)
             time_emb_expanded = time_emb.unsqueeze(1).expand(-1, self.config.horizon, -1)
             
-            denoiser_input = torch.cat([noisy_action, obs_cond_expanded, time_emb_expanded], dim=-1)
-            
-            # Predict noise
-            noise_pred = self.denoiser(denoiser_input)
+            # Predict noise using UNet with separate arguments
+            noise_pred = self.denoiser(noisy_action, k.expand(B), global_cond=obs_cond)
             
             # Step back
             noisy_action = self.noise_scheduler.step(noise_pred, k, noisy_action).prev_sample

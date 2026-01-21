@@ -55,15 +55,15 @@ class TransformerDiffusionPolicy(PreTrainedPolicy):
     def select_action(self, batch: dict) -> torch.Tensor:
         """
         Selection logic for real-time inference on the Piper arm.
+        Returns only the first action with squeezed shape [1, 7].
         """
         self.model.eval()
         
         # Generate the full horizon of actions (e.g., 16 steps)
         predicted_actions = self.model(batch)
         
-        # We take 'n_action_steps' (usually 1, 4, or 8) 
-        # This reduces jitter by following the predicted trajectory
-        # instead of recalculating every single millisecond.
-        action_to_execute = predicted_actions[:, :self.config.n_action_steps, :]
+        # Return only the first action and squeeze to shape [1, 7]
+        first_action = predicted_actions[:, :1, :]  # Shape: [B, 1, 7]
+        squeezed_action = first_action.squeeze(1)   # Shape: [B, 7]
         
-        return action_to_execute
+        return squeezed_action

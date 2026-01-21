@@ -42,12 +42,8 @@ class TransformerDiffusionConfig(PreTrainedConfig):
 
     # Image processing
     vision_backbone: str = "resnet18"
-    crop_shape: tuple = (84, 84)
-    crop_is_random: bool = True
     pretrained_backbone_weights: str | None = None
-    use_group_norm: bool = True
-    spatial_softmax_num_keypoints: int = 32
-    use_separate_rgb_encoder_per_camera: bool = False
+        
     
     # State processing
     state_dim: int = 7  # Default for 7-DOF arm
@@ -59,14 +55,15 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     d_model: int = 256
     nhead: int = 8
     num_encoder_layers: int = 6
-    num_decoder_layers: int = 6
     dim_feedforward: int = 2048
-    dropout: float = 0.1
-    activation: str = "relu"
     
-    # Tokenization
-    state_token_dim: int = 64
-    
+    # UNet denoiser parameters
+    diffusion_step_embed_dim: int = 128
+    down_dims: tuple = (512, 1024, 2048)
+    kernel_size: int = 5
+    n_groups: int = 8
+    use_film_scale_modulation: bool = True
+        
     # Training presets
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple = (0.95, 0.999)
@@ -75,21 +72,11 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     scheduler_name: str = "cosine"
     scheduler_warmup_steps: int = 500
 
-    # Loss computation
-    do_mask_loss_for_padding: bool = True
-
+    
     def validate_features(self) -> None:
         if len(self.image_features) == 0 and self.env_state_feature is None:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
 
-        if self.crop_shape is not None:
-            for key, image_ft in self.image_features.items():
-                if self.crop_shape[0] > image_ft.shape[1] or self.crop_shape[1] > image_ft.shape[2]:
-                    raise ValueError(
-                        f"`crop_shape` should fit within the images shapes. Got {self.crop_shape} "
-                        f"for `crop_shape` and {image_ft.shape} for "
-                        f"`{key}`."
-                    )
 
         # Check that all input images have the same shape.
         if len(self.image_features) > 0:

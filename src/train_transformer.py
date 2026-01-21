@@ -9,7 +9,7 @@ from lerobot.policies.factory import make_pre_post_processors
 # Import transformer-specific components
 from models.transformer_diffusion.transformer_diffusion_config import TransformerDiffusionConfig
 from models.transformer_diffusion.transformer_diffusion_policy import TransformerDiffusionPolicy
-from models.transformer_diffusion.processor_transformer_diffusion import make_transformer_diffusion_pre_post_processors
+from models.transformer_diffusion.processor_transformer_diffusion import make_pre_post_processors
 
 # Import torchvision for augmentation
 from torchvision.transforms import v2
@@ -90,19 +90,19 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         n_obs_steps=obs, 
         horizon=horizon, 
         n_action_steps=n_action_steps, 
-        crop_shape=(84, 84),
-        crop_is_random=True,
-        use_separate_rgb_encoder_per_camera=False,
-        vision_backbone="resnet18",
-        pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
+        vision_backbone="resnet34",
+        pretrained_backbone_weights="ResNet34_Weights.IMAGENET1K_V1",
         state_dim=7,  # Adjust based on your robot's state dimension
         action_dim=7,  # Adjust based on your robot's action dimension
-        d_model=128,
-        nhead=4,
-        num_encoder_layers=4,
-        num_decoder_layers=4,
-        dim_feedforward=512,
-        dropout=0.1
+        d_model=512,
+        nhead=8,
+        num_encoder_layers=6,
+        dim_feedforward=1024,
+        diffusion_step_embed_dim=128,
+        down_dims=(512, 1024, 2048),
+        kernel_size=5,
+        n_groups=8,
+        use_film_scale_modulation=True
     )
     
     if dataset_metadata.stats is None:
@@ -120,7 +120,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             preprocessor, postprocessor = load_pre_post_processors(resume_from_checkpoint)
         except Exception as e:
             print(f"Could not load preprocessors: {e}. Creating new ones.")
-            preprocessor, postprocessor = make_transformer_diffusion_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
+            preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
             
         optimizer = torch.optim.Adam(policy.parameters(), lr=2e-5)
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
@@ -153,7 +153,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         if hasattr(policy, 'transformer') and hasattr(policy.transformer, 'feature_projection'):
             if policy.transformer.feature_projection is not None:
                 policy.transformer.feature_projection = policy.transformer.feature_projection.to(device)
-        preprocessor, postprocessor = make_transformer_diffusion_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
+        preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
         step = 0
         optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=1000)
