@@ -321,6 +321,9 @@ class DiffusionTransformer(nn.Module):
 
         # The UNet Denoiser (Predicts the noise added to actions)
         self.denoiser = DiffusionConditionalUnet1d(config, config.d_model)
+        
+        # Gripper state embedding
+        self.gripper_embed = nn.Embedding(2, config.d_model)  # 2 states: open/closed
 
     def get_condition(self, batch):
         """Processes images and states into a single global context vector."""
@@ -343,7 +346,19 @@ class DiffusionTransformer(nn.Module):
         context = self.obs_transformer(obs_features_pos)
         
         # Global Average Pool across temporal/modality dimension to get "Scene Context"
-        return context.mean(dim=1) 
+        scene_context = context.mean(dim=1)
+        
+        # Detect gripper state from current observation (last time step)
+        # Assuming gripper is the last dimension of state
+        current_state = batch["observation.state"][:, -1, :]  # (B, state_dim)
+        gripper_values = current_state[:, -1]  # (B,)
+        is_gripper_closed = (gripper_values < 0.4).long()  # (B,)
+        
+        # Embed gripper state and combine with scene context
+        gripper_embedding = self.gripper_embed(is_gripper_closed)  # (B, d_model)
+        combined_context = scene_context + gripper_embedding  # (B, d_model)
+        
+        return combined_context
 
     def compute_loss(self, batch):
         """Diffusion Training: Inject noise and learn to predict it."""
@@ -374,9 +389,38 @@ class DiffusionTransformer(nn.Module):
         # 7. Call UNet denoiser with separate arguments
         pred_noise = self.denoiser(noisy_actions, timesteps, global_cond=obs_cond)
         
-        # 8. Loss: How well did we predict the added noise?
-        loss = F.mse_loss(pred_noise, noise)
-        return loss
+        # 8. Basic noise prediction loss
+        noise_loss = F.mse_loss(pred_noise, noise)
+        
+        # 9. Gripper state consistency loss
+        # Encourage appropriate gripper behavior based on current state
+        current_gripper_state = batch["observation.state"][:, -1, -1]  # (B,)
+        is_currently_closed = current_gripper_state < 0.4  # (B,)
+        
+        # During training, we can encourage gripper consistency by:
+        # - If currently closed (< 0.4), encourage predicted actions to maintain low gripper values
+        # - If currently open (> 0.4), allow more flexibility but still encourage smooth transitions
+        gripper_loss = 0.0
+        
+        # Get predicted final actions by doing one denoising step with high timestep
+        # This gives us an approximation of the final predicted actions
+        high_timestep = torch.full_like(timesteps, self.noise_scheduler.config.num_train_timesteps - 1)
+        pred_final_actions = self.noise_scheduler.step(pred_noise, high_timestep, noisy_actions).pred_original_sample
+        pred_gripper_actions = pred_final_actions[:, :, -1]  # (B, Horizon)
+        
+        # For closed gripper, encourage predicted gripper values to be low (< 0.4)
+        if is_currently_closed.any():
+            closed_mask = is_currently_closed  # (B,)
+            closed_gripper_pred = pred_gripper_actions[closed_mask]  # (N, Horizon) where N is number of closed grippers
+            if closed_gripper_pred.numel() > 0:
+                # Encourage values below 0.3 for closed gripper (slightly below threshold)
+                target_closed = torch.full_like(closed_gripper_pred, 0.2)
+                gripper_loss = gripper_loss + F.mse_loss(closed_gripper_pred, target_closed)
+        
+        # 10. Combined loss
+        total_loss = noise_loss + 0.1 * gripper_loss
+        
+        return total_loss
 
     def forward(self, batch):
         """Inference: Start with pure noise and denoise into a smooth trajectory."""
