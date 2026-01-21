@@ -324,6 +324,10 @@ class DiffusionTransformer(nn.Module):
 
         # The UNet Denoiser (Predicts the noise added to actions)
         self.denoiser = DiffusionConditionalUnet1d(config, config.d_model)
+        
+        # Learnable weights for loss components
+        self.position_loss_weight = nn.Parameter(torch.tensor(1.0))
+        self.gripper_loss_weight = nn.Parameter(torch.tensor(5.0))  # Starting with your current value
 
 
     def get_condition(self, batch):
@@ -381,13 +385,18 @@ class DiffusionTransformer(nn.Module):
         # 5. Basic noise prediction loss
         noise_loss = F.mse_loss(pred_noise, noise)
         
-        # 6. Separate gripper loss (index 6) with higher weight
-        gripper_weight = 5.0  # Weight for gripper dimension
+        # 6. Separate losses with learnable weights
+        # Gripper loss (index 6) with learnable weight
         gripper_loss = F.mse_loss(pred_noise[..., 6], noise[..., 6])
-        weighted_gripper_loss = gripper_weight * gripper_loss
+        weighted_gripper_loss = self.gripper_loss_weight * gripper_loss
+        
+        # Position losses (indices 0-5) with learnable weight
+        position_loss = F.mse_loss(pred_noise[..., :6], noise[..., :6])
+        weighted_position_loss = self.position_loss_weight * position_loss
+    
         
         # 7. Combined loss
-        total_loss = noise_loss + weighted_gripper_loss
+        total_loss = noise_loss + weighted_gripper_loss + weighted_position_loss
 
         return total_loss
 
