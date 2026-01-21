@@ -375,26 +375,19 @@ class DiffusionTransformer(nn.Module):
         # 3. Add noise to clean actions (Forward Diffusion)
         noisy_actions = self.noise_scheduler.add_noise(actions, noise, timesteps)
         
-        # 4. Project actions to model dimension and add positional encoding
-        noisy_actions_proj = self.action_projection(noisy_actions)  # (B, Horizon, d_model)
-        noisy_actions_pos = self.positional_encoding(noisy_actions_proj)  # (B, Horizon, d_model)
-        
-        # 5. Get time embedding
-        time_emb = self.time_mlp(timesteps.unsqueeze(-1).float()) # (B, d_model)
-        
-        # 6. Expand embeddings to match horizon dimension
-        obs_cond_expanded = obs_cond.unsqueeze(1).expand(-1, self.config.horizon, -1)  # (B, Horizon, d_model)
-        time_emb_expanded = time_emb.unsqueeze(1).expand(-1, self.config.horizon, -1)  # (B, Horizon, d_model)
-        
-        # 7. Call UNet denoiser with separate arguments
+        # 4. Call UNet denoiser
         pred_noise = self.denoiser(noisy_actions, timesteps, global_cond=obs_cond)
         
-        # 8. Basic noise prediction loss
-        noise_loss = F.mse_loss(pred_noise, noise)       
+        # 5. Basic noise prediction loss
+        noise_loss = F.mse_loss(pred_noise, noise)
         
+        # 6. Separate gripper loss (index 6) with higher weight
+        gripper_weight = 5.0  # Weight for gripper dimension
+        gripper_loss = F.mse_loss(pred_noise[..., 6], noise[..., 6])
+        weighted_gripper_loss = gripper_weight * gripper_loss
         
-        # 10. Combined loss
-        total_loss = noise_loss
+        # 7. Combined loss
+        total_loss = noise_loss + weighted_gripper_loss
 
         return total_loss
 
@@ -410,16 +403,7 @@ class DiffusionTransformer(nn.Module):
         self.noise_scheduler.set_timesteps(self.config.num_inference_steps)
         
         for k in self.noise_scheduler.timesteps:
-            # Project actions to model dimension and add positional encoding
-            noisy_action_proj = self.action_projection(noisy_action)  # (B, Horizon, d_model)
-            noisy_action_pos = self.positional_encoding(noisy_action_proj)  # (B, Horizon, d_model)
-            
-            # Prepare inputs
-            time_emb = self.time_mlp(torch.tensor([k], device=self.device).float().unsqueeze(0)).expand(B, -1)
-            obs_cond_expanded = obs_cond.unsqueeze(1).expand(-1, self.config.horizon, -1)
-            time_emb_expanded = time_emb.unsqueeze(1).expand(-1, self.config.horizon, -1)
-            
-            # Predict noise using UNet with separate arguments
+            # Predict noise using UNet
             noise_pred = self.denoiser(noisy_action, k.expand(B), global_cond=obs_cond)
             
             # Step back
