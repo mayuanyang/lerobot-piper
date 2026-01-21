@@ -382,10 +382,7 @@ class DiffusionTransformer(nn.Module):
         # 4. Call UNet denoiser
         pred_noise = self.denoiser(noisy_actions, timesteps, global_cond=obs_cond)
         
-        # 5. Basic noise prediction loss
-        noise_loss = F.mse_loss(pred_noise, noise)
-        
-        # 6. Separate losses with learnable weights
+        # 5. Separate losses with learnable weights
         # Gripper loss (index 6) with learnable weight
         gripper_loss = F.mse_loss(pred_noise[..., 6], noise[..., 6])
         weighted_gripper_loss = self.gripper_loss_weight * gripper_loss
@@ -395,8 +392,8 @@ class DiffusionTransformer(nn.Module):
         weighted_position_loss = self.position_loss_weight * position_loss
     
         
-        # 7. Combined loss
-        total_loss = noise_loss + weighted_gripper_loss + weighted_position_loss
+        # 6. Combined loss (no longer including redundant noise_loss)
+        total_loss = weighted_gripper_loss + weighted_position_loss
 
         return total_loss
 
