@@ -281,7 +281,10 @@ class DiffusionTransformer(nn.Module):
             cam.replace('.', '_'): VisionEncoder(config) 
             for cam in config.image_features.keys()
         })
+        # Original state encoder for all 7 dimensions (including gripper as continuous)
         self.state_encoder = nn.Linear(config.state_dim, config.d_model)
+        # Additional embedding for categorical gripper state
+        self.gripper_embedding = nn.Embedding(2, config.d_model)  # 0: closed, 1: open
         
         # 2. Observation Transformer (Temporal Fusion)
         encoder_layer = nn.TransformerEncoderLayer(
@@ -332,7 +335,16 @@ class DiffusionTransformer(nn.Module):
             img = batch[cam_key.replace('_', '.')].flatten(0, 1)
             tokens.append(encoder(img).view(B, T_obs, -1))
         
+        # Original state encoding (all 7 dimensions including gripper as continuous)
         tokens.append(self.state_encoder(batch["observation.state"]))
+        
+        # Extract gripper value (7th dimension, index 6) and convert to categorical
+        gripper_values = batch["observation.state"][..., 6]  # (B, T_obs)
+        # Convert to categorical: 0 if < 0.4 (closed), 1 if >= 0.4 (open)
+        gripper_categorical = (gripper_values >= 0.4).long()  # (B, T_obs)
+        # Get embedding for categorical gripper state
+        gripper_embeddings = self.gripper_embedding(gripper_categorical)  # (B, T_obs, d_model)
+        tokens.append(gripper_embeddings)
         
         # Combine tokens
         obs_features = torch.cat(tokens, dim=1)  # (B, seq_len, d_model)
