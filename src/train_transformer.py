@@ -13,7 +13,7 @@ from models.transformer_diffusion.processor_transformer_diffusion import make_pr
 
 # Import torchvision for augmentation
 from torchvision.transforms import v2
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from transformers import get_cosine_schedule_with_warmup
 
 
 # Detect the best available device
@@ -30,27 +30,14 @@ print(f"Using device: {device}")
 # Data Augmentation Setup
 def get_augmentations():
     """Create data augmentations for training."""
-    return v2.Compose([
-        v2.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
-        v2.RandomAffine(degrees=5, translate=(0.05, 0.05), scale=(0.95, 1.05)),
-    ])
+    # Return identity transform (no augmentation)
+    return v2.Compose([])
 
 
 # Helper to apply joint data augmentation
 def apply_joint_augmentations(batch):
     """Apply random cropping to joint data (observation.state and action)"""
-    # Randomly decide whether to apply augmentation (50% chance)
-    if torch.rand(1).item() > 0.5:
-        for key in ["observation.state"]:
-            if key in batch and isinstance(batch[key], torch.Tensor):
-                value = batch[key]
-                # Generate a smaller random crop percentage (reduced to 0.05% max)
-                max_crop_percentage = 0.0005  # 0.05%
-                # Generate random crop percentage between [-max_crop_percentage, max_crop_percentage]
-                crop_percentage = (torch.rand(1).item() - 0.5) * 2 * max_crop_percentage
-                # Add independent Gaussian noise scaled by crop_percentage to each joint value
-                noise = value * crop_percentage
-                batch[key] = value + noise
+    # No augmentation applied
     return batch
 
 
@@ -123,7 +110,13 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
             
         optimizer = torch.optim.Adam(policy.parameters(), lr=2e-5)
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
+        # Cosine scheduler with warmup
+        warmup_steps = 1000
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer, 
+            num_warmup_steps=warmup_steps, 
+            num_training_steps=training_steps
+        )
         
         # Load optimizer state
         if not resume_from_checkpoint.startswith("http") and not resume_from_checkpoint.startswith("huggingface.co"):
@@ -156,7 +149,13 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
         step = 0
         optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=1000)
+        # Cosine scheduler with warmup
+        warmup_steps = 1000
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer, 
+            num_warmup_steps=warmup_steps, 
+            num_training_steps=training_steps
+        )
 
     # Ensure preprocessors are on the correct device
     if isinstance(preprocessor, torch.nn.Module):
@@ -217,16 +216,27 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             # Forward & Backward
             loss, _ = policy.forward(batch)
             loss.backward()
+            
+            # Calculate gradient norm for monitoring
+            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=float('inf'))
+            
             optimizer.step()
             optimizer.zero_grad()
             
-            # Update learning rate scheduler
-            scheduler.step(loss)
+            # Update learning rate scheduler (cosine scheduler steps every iteration)
+            scheduler.step()
 
             if step % log_freq == 0:
                 # Get learning rate from optimizer
                 lr = optimizer.param_groups[0]['lr']
-                prog_bar.set_postfix({"step": step, "loss": f"{loss.item():.3f}", "lr": f"{lr:.2e}"})
+                prog_bar.set_postfix({
+                    "step": step, 
+                    "loss": f"{loss.item():.3f}", 
+                    "lr": f"{lr:.2e}",
+                    "grad_norm": f"{grad_norm:.2f}",
+                    "pos_weight": f"{policy.model.position_loss_weight.item():.2f}",
+                    "grip_weight": f"{policy.model.gripper_loss_weight.item():.2f}"
+                })
             
             # Save checkpoint
             if step > 0 and step % checkpoint_freq == 0:
