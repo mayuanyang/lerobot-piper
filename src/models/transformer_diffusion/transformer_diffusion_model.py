@@ -291,6 +291,7 @@ class DiffusionTransformer(nn.Module):
             d_model=config.d_model, 
             nhead=config.nhead, 
             dim_feedforward=config.dim_feedforward, 
+            dropout=0.2,  # Added dropout for regularization
             activation="gelu", 
             batch_first=True, 
             norm_first=True

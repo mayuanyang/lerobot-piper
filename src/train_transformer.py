@@ -217,8 +217,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             loss, _ = policy.forward(batch)
             loss.backward()
             
-            # Calculate gradient norm for monitoring
-            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=float('inf'))
+            # Calculate gradient norm for monitoring and clip gradients
+            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
             
             optimizer.step()
             optimizer.zero_grad()
