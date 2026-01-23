@@ -16,9 +16,9 @@ class SpatialSoftmax(nn.Module):
     """
     def __init__(self, height, width, num_channels):
         super().__init__()
-        pos_x, pos_y = torch.meshgrid(
-            torch.linspace(-1, 1, width),
+        pos_y, pos_x = torch.meshgrid(
             torch.linspace(-1, 1, height),
+            torch.linspace(-1, 1, width),
             indexing="ij"
         )
         self.register_buffer("pos_x", pos_x.reshape(-1))
@@ -390,7 +390,10 @@ class DiffusionTransformer(nn.Module):
                 tokens.append(torch.zeros(B, T_obs, self.config.d_model, device=self.device))
         
         # Original state encoding (all 7 dimensions including gripper as continuous)
-        tokens.append(self.state_encoder(batch["observation.state"]))
+        state_encoded = self.state_encoder(batch["observation.state"])
+        # Apply positional encoding to state tokens
+        state_with_pos = self.state_positional_encoding(state_encoded)
+        tokens.append(state_with_pos)
         
         # Extract gripper value (7th dimension, index 6) and convert to categorical
         gripper_values = batch["observation.state"][..., 6]  # (B, T_obs)
