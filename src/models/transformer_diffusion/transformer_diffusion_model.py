@@ -85,6 +85,7 @@ class DiffusionConditionalResidualBlock1d(nn.Module):
     def __init__(self, in_channels, out_channels, cond_dim, kernel_size=3, n_groups=8, use_film_scale_modulation=False):
         super().__init__()
         self.use_film_scale_modulation = use_film_scale_modulation
+        self.in_channels = in_channels
         self.out_channels = out_channels
 
         self.conv1 = DiffusionConv1dBlock(in_channels, out_channels, kernel_size, n_groups=n_groups)
@@ -104,39 +105,45 @@ class DiffusionConditionalResidualBlock1d(nn.Module):
         self.skip_conv = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
     def forward(self, x, cond):
-        # x: (B, C, T)
-        # cond: (B, cond_dim)
+        """
+        x:    (B, C, T)
+        cond: (B, cond_dim, T)
+        """
+        assert x.shape[-1] == cond.shape[-1], "Cond and x must align in time"
 
-        # First conv
         out = self.conv1(x)
 
-        # FiLM modulation
-        cond_out = self.film(cond)
+        # Move cond to (B*T, cond_dim)
+        B, _, T = cond.shape
+        cond_flat = cond.permute(0, 2, 1).reshape(B * T, -1)
+
+        film_out = self.film(cond_flat)
+
         if self.use_film_scale_modulation:
-            scale, bias = torch.chunk(cond_out, 2, dim=-1)
-            scale = scale.unsqueeze(-1)
-            bias = bias.unsqueeze(-1)
+            scale, bias = torch.chunk(film_out, 2, dim=-1)
+            scale = scale.view(B, T, self.out_channels).permute(0, 2, 1)
+            bias  = bias.view(B, T, self.out_channels).permute(0, 2, 1)
             out = scale * out + bias
         else:
-            cond_out = cond_out.unsqueeze(-1)
-            out = out + cond_out
+            film_out = film_out.view(B, T, self.out_channels).permute(0, 2, 1)
+            out = out + film_out
 
-        # Second conv
         out = self.conv2(out)
+        return out + self.skip_conv(x)
 
-        # Skip connection
-        x = self.skip_conv(x)
-        out = out + x
-        return out
 
 
 class DiffusionConditionalUnet1d(nn.Module):
-    """A 1D convolutional UNet with FiLM modulation for conditioning."""
-    def __init__(self, config, global_cond_dim):
+    """
+    1D UNet with per-timestep FiLM conditioning.
+    Conditioning = diffusion timestep embedding + observation embedding (per time index).
+    """
+
+    def __init__(self, config, obs_cond_dim):
         super().__init__()
         self.config = config
 
-        # Encoder for the diffusion timestep
+        # ---- diffusion timestep encoder ----
         self.diffusion_step_encoder = nn.Sequential(
             DiffusionSinusoidalPosEmb(config.diffusion_step_embed_dim),
             nn.Linear(config.diffusion_step_embed_dim, config.diffusion_step_embed_dim * 4),
@@ -144,105 +151,129 @@ class DiffusionConditionalUnet1d(nn.Module):
             nn.Linear(config.diffusion_step_embed_dim * 4, config.diffusion_step_embed_dim),
         )
 
-        # The FiLM conditioning dimension
-        cond_dim = config.diffusion_step_embed_dim + global_cond_dim
+        # total conditioning dimension passed to FiLM
+        self.cond_dim = config.diffusion_step_embed_dim + obs_cond_dim
 
-        # In channels / out channels for each downsampling block in the Unet's encoder
-        # For the decoder, we just reverse these
+        # ---- UNet channel layout ----
         in_out = [(config.action_dim, config.down_dims[0])] + list(
             zip(config.down_dims[:-1], config.down_dims[1:])
         )
 
-        # Unet encoder
-        common_res_block_kwargs = {
-            "cond_dim": cond_dim,
-            "kernel_size": config.kernel_size,
-            "n_groups": config.n_groups,
-            "use_film_scale_modulation": config.use_film_scale_modulation,
-        }
-        self.down_modules = nn.ModuleList([])
-        for ind, (dim_in, dim_out) in enumerate(in_out):
-            is_last = ind >= (len(in_out) - 1)
-            self.down_modules.append(
-                nn.ModuleList([
-                    DiffusionConditionalResidualBlock1d(dim_in, dim_out, **common_res_block_kwargs),
-                    DiffusionConditionalResidualBlock1d(dim_out, dim_out, **common_res_block_kwargs),
-                    # Downsample as long as it is not the last block
-                    nn.Conv1d(dim_out, dim_out, 3, 2, 1) if not is_last else nn.Identity(),
-                ])
-            )
+        block_kwargs = dict(
+            cond_dim=self.cond_dim,
+            kernel_size=config.kernel_size,
+            n_groups=config.n_groups,
+            use_film_scale_modulation=config.use_film_scale_modulation,
+        )
 
-        # Processing in the middle of the auto-encoder
+        # ---- Encoder ----
+        self.down_modules = nn.ModuleList()
+        for i, (cin, cout) in enumerate(in_out):
+            is_last = i == len(in_out) - 1
+            self.down_modules.append(nn.ModuleList([
+                DiffusionConditionalResidualBlock1d(cin, cout, **block_kwargs),
+                DiffusionConditionalResidualBlock1d(cout, cout, **block_kwargs),
+                nn.Conv1d(cout, cout, 3, stride=2, padding=1) if not is_last else nn.Identity(),
+            ]))
+
+        # ---- Middle ----
         self.mid_modules = nn.ModuleList([
             DiffusionConditionalResidualBlock1d(
-                config.down_dims[-1], config.down_dims[-1], **common_res_block_kwargs
+                config.down_dims[-1], config.down_dims[-1], **block_kwargs
             ),
             DiffusionConditionalResidualBlock1d(
-                config.down_dims[-1], config.down_dims[-1], **common_res_block_kwargs
+                config.down_dims[-1], config.down_dims[-1], **block_kwargs
             ),
         ])
 
-        # Unet decoder
-        self.up_modules = nn.ModuleList([])
-        for ind, (dim_out, dim_in) in enumerate(reversed(in_out[1:])):
-            is_last = ind >= (len(in_out) - 1)
-            self.up_modules.append(
-                nn.ModuleList([
-                    # dim_in * 2, because it takes the encoder's skip connection as well
-                    DiffusionConditionalResidualBlock1d(dim_in * 2, dim_out, **common_res_block_kwargs),
-                    DiffusionConditionalResidualBlock1d(dim_out, dim_out, **common_res_block_kwargs),
-                    # Upsample as long as it is not the last block
-                    nn.ConvTranspose1d(dim_out, dim_out, 4, 2, 1) if not is_last else nn.Identity(),
-                ])
-            )
+        # ---- Decoder ----
+        # All decoder blocks concatenate with skip connections
+        decoder_pairs = [(cout, cin) for cin, cout in reversed(in_out[1:])]
+        self.up_modules = nn.ModuleList()
+        for cin, cout in decoder_pairs:
+            # All decoder blocks take concatenated input (cin * 2) -> cout
+            self.up_modules.append(nn.ModuleList([
+                DiffusionConditionalResidualBlock1d(cin * 2, cout, **block_kwargs),
+                DiffusionConditionalResidualBlock1d(cout, cout, **block_kwargs),
+                nn.ConvTranspose1d(cout, cout, 4, stride=2, padding=1),
+            ]))
 
+        # ---- Output ----
         self.final_conv = nn.Sequential(
-            DiffusionConv1dBlock(config.down_dims[0], config.down_dims[0], kernel_size=config.kernel_size),
+            DiffusionConv1dBlock(config.down_dims[0], config.down_dims[0], config.kernel_size),
             nn.Conv1d(config.down_dims[0], config.action_dim, 1),
         )
 
-    def forward(self, x, timestep, global_cond=None):
+    def forward(self, x, timestep, obs_cond):
         """
         Args:
-            x: (B, T, input_dim) tensor for input to the Unet.
-            timestep: (B,) tensor of (timestep_we_are_denoising_from - 1).
-            global_cond: (B, global_cond_dim)
+            x:        (B, T, action_dim)
+            timestep: (B,)
+            obs_cond: (B, T, obs_cond_dim)   per-timestep observation tokens
         Returns:
-            (B, T, input_dim) diffusion model prediction.
+            (B, T, action_dim)
         """
-        # For 1D convolutions we'll need feature dimension first
-        x = x.permute(0, 2, 1)  # (B, input_dim, T)
+        # ---- reshape to Conv1d ----
+        x = x.permute(0, 2, 1)               # (B, action_dim, T)
+        obs_cond = obs_cond.permute(0, 2, 1) # (B, obs_cond_dim, T)
 
-        timesteps_embed = self.diffusion_step_encoder(timestep)
+        B, _, T = x.shape
 
-        # If there is a global conditioning feature, concatenate it to the timestep embedding
-        if global_cond is not None:
-            global_feature = torch.cat([timesteps_embed, global_cond], axis=-1)
-        else:
-            global_feature = timesteps_embed
+        # ---- diffusion timestep embedding ----
+        t_emb = self.diffusion_step_encoder(timestep)     # (B, t_dim)
+        t_emb = t_emb.unsqueeze(-1).expand(-1, -1, T)     # (B, t_dim, T)
 
-        # Run encoder, keeping track of skip features to pass to the decoder
-        encoder_skip_features = []
-        for resnet, resnet2, downsample in self.down_modules:
-            x = resnet(x, global_feature)
-            x = resnet2(x, global_feature)
-            encoder_skip_features.append(x)
-            x = downsample(x)
+        # ---- full conditioning ----
+        cond = torch.cat([t_emb, obs_cond], dim=1)        # (B, cond_dim, T)
 
-        for mid_module in self.mid_modules:
-            x = mid_module(x, global_feature)
+        # ------------------------------------------------
+        # Encoder
+        # ------------------------------------------------
+        skips = []
+        conds = []
 
-        # Run decoder, using the skip features from the encoder
-        for resnet, resnet2, upsample in self.up_modules:
-            x = torch.cat((x, encoder_skip_features.pop()), dim=1)
-            x = resnet(x, global_feature)
-            x = resnet2(x, global_feature)
-            x = upsample(x)
+        for res1, res2, down in self.down_modules:
+            if cond.shape[-1] != x.shape[-1]:
+                cond = F.interpolate(cond, size=x.shape[-1], mode="nearest")
 
+            x = res1(x, cond)
+            x = res2(x, cond)
+
+            skips.append(x)
+            conds.append(cond)
+
+            x = down(x)
+
+        # ------------------------------------------------
+        # Middle
+        # ------------------------------------------------
+        if cond.shape[-1] != x.shape[-1]:
+            cond = F.interpolate(cond, size=x.shape[-1], mode="nearest")
+
+        for mid in self.mid_modules:
+            x = mid(x, cond)
+
+        # ------------------------------------------------
+        # Decoder
+        # ------------------------------------------------
+        for res1, res2, up in self.up_modules:
+            skip = skips.pop()
+            cond = conds.pop()
+
+            # Ensure x and skip have the same temporal dimension
+            if x.shape[-1] != skip.shape[-1]:
+                x = F.interpolate(x, size=skip.shape[-1], mode="nearest")
+
+            x = torch.cat([x, skip], dim=1)
+
+            x = res1(x, cond)
+            x = res2(x, cond)
+            x = up(x)
+
+        # ---- output ----
         x = self.final_conv(x)
+        return x.permute(0, 2, 1)
 
-        x = x.permute(0, 2, 1)  # (B, T, input_dim)
-        return x
 
 
 class VisionEncoder(nn.Module):
@@ -281,17 +312,30 @@ class DiffusionTransformer(nn.Module):
             cam.replace('.', '_'): VisionEncoder(config) 
             for cam in config.image_features.keys()
         })
-        # Original state encoder for all 7 dimensions (including gripper as continuous)
-        self.state_encoder = nn.Linear(config.state_dim, config.d_model)
+        # Enhanced state encoder for all 7 dimensions with deeper network
+        self.state_encoder = nn.Sequential(
+            nn.Linear(config.state_dim, config.d_model // 2),
+            nn.LayerNorm(config.d_model // 2),
+            nn.ReLU(),
+            nn.Linear(config.d_model // 2, config.d_model),
+            nn.LayerNorm(config.d_model),
+            nn.ReLU()
+        )
+        # Add positional encoding for state sequences
+        self.state_positional_encoding = PositionalEncoding(config.d_model, 100)
         # Additional embedding for categorical gripper state
         self.gripper_embedding = nn.Embedding(2, config.d_model)  # 0: closed, 1: open
+        
+        # Projection layer for concatenated observation features
+        num_obs_tokens = len(config.image_features) + 2  # cameras + state + gripper
+        self.obs_projection = nn.Linear(config.d_model * num_obs_tokens, config.d_model)
         
         # 2. Observation Transformer (Temporal Fusion)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=config.d_model, 
             nhead=config.nhead, 
             dim_feedforward=config.dim_feedforward, 
-            dropout=0.,  # Added dropout for regularization
+            dropout=0.1,  # Added dropout for regularization
             activation="gelu", 
             batch_first=True, 
             norm_first=True
@@ -326,9 +370,12 @@ class DiffusionTransformer(nn.Module):
         # The UNet Denoiser (Predicts the noise added to actions)
         self.denoiser = DiffusionConditionalUnet1d(config, config.d_model)
         
+        # Learnable parameter for number of inference steps
+        self.num_inference_steps = nn.Parameter(torch.tensor(100.0))
+
 
     def get_condition(self, batch):
-        """Processes images and states into a single global context vector."""
+        """Processes images and states into per-timestep observation tokens."""
         B, T_obs = batch["observation.state"].shape[:2]
         tokens = []
 
@@ -354,39 +401,49 @@ class DiffusionTransformer(nn.Module):
         tokens.append(gripper_embeddings)
         
         # Combine tokens
-        obs_features = torch.cat(tokens, dim=1)  # (B, seq_len, d_model)
+        obs_features = torch.cat(tokens, dim=-1)  # (B, T_obs, d_model * num_modalities)
+        
+        # Project to d_model
+        obs_features = self.obs_projection(obs_features)  # (B, T_obs, d_model)
         
         # Apply positional encoding to observation tokens
-        obs_features_pos = self.obs_positional_encoding(obs_features)  # (B, seq_len, d_model)
+        obs_features_pos = self.obs_positional_encoding(obs_features)  # (B, T_obs, d_model)
         
         # Pass through transformer
-        context = self.obs_transformer(obs_features_pos)
-        
-        # Global Average Pool across temporal/modality dimension to get "Scene Context"
-        scene_context = context.mean(dim=1)
+        context = self.obs_transformer(obs_features_pos)  # (B, T_obs, d_model)
 
-        return scene_context
+        return context
       
     def compute_loss(self, batch):
         """Diffusion Training: Inject noise and learn to predict it."""
         actions = batch["action"] # (B, Horizon, Action_Dim)
-        B = actions.shape[0]
+        B, T_act = actions.shape[:2]
         
         # 1. Get observation context
-        obs_cond = self.get_condition(batch) # (B, d_model)
+        obs_context = self.get_condition(batch) # (B, T_obs, d_model)
         
-        # 2. Sample noise and timesteps
+        # 2. Align observation timesteps with action timesteps
+        T_obs = obs_context.shape[1]
+        if T_obs != T_act:
+          obs_context = F.interpolate(
+              obs_context.permute(0, 2, 1),  # (B, d_model, T_obs)
+              size=T_act,
+              mode="linear",
+              align_corners=False
+          ).permute(0, 2, 1)  # (B, T_act, d_model)
+
+        
+        # 3. Sample noise and timesteps
         noise = torch.randn_like(actions)
         timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (B,), device=self.device).long()
         
-        # 3. Add noise to clean actions (Forward Diffusion)
+        # 4. Add noise to clean actions (Forward Diffusion)
         noisy_actions = self.noise_scheduler.add_noise(actions, noise, timesteps)
         
-        # 4. Call UNet denoiser
-        pred_noise = self.denoiser(noisy_actions, timesteps, global_cond=obs_cond)
+        # 5. Call UNet denoiser with per-timestep conditioning
+        pred_noise = self.denoiser(noisy_actions, timesteps, obs_context)
         
-        # 5. Separate losses with learnable weights
-        # Gripper loss (index 6) with learnable weight
+        # 6. Compute loss
         loss = F.mse_loss(pred_noise, noise)
 
         return loss
@@ -394,17 +451,31 @@ class DiffusionTransformer(nn.Module):
     def forward(self, batch):
         """Inference: Start with pure noise and denoise into a smooth trajectory."""
         B = batch["observation.state"].shape[0]
-        obs_cond = self.get_condition(batch)
+        T_act = self.config.horizon
+        
+        # Get observation context
+        obs_context = self.get_condition(batch)  # (B, T_obs, d_model)
+        
+        # Align observation timesteps with action timesteps
+        T_obs = obs_context.shape[1]
+        if T_obs != T_act:
+          obs_context = F.interpolate(
+              obs_context.permute(0, 2, 1),  # (B, d_model, T_obs)
+              size=T_act,
+              mode="linear",
+              align_corners=False
+          ).permute(0, 2, 1)  # (B, T_act, d_model)
         
         # Start from pure Gaussian noise
-        noisy_action = torch.randn((B, self.config.horizon, self.config.action_dim), device=self.device)
+        noisy_action = torch.randn((B, T_act, self.config.action_dim), device=self.device)
         
         # Iteratively denoise
-        self.noise_scheduler.set_timesteps(self.config.num_inference_steps)
+        self.noise_scheduler.set_timesteps(int(self.num_inference_steps.item()))
         
         for k in self.noise_scheduler.timesteps:
-            # Predict noise using UNet
-            noise_pred = self.denoiser(noisy_action, k.expand(B), global_cond=obs_cond)
+            # Predict noise using UNet with per-timestep conditioning
+            noise_pred = self.denoiser(noisy_action, k.expand(B), obs_context)
+
             
             # Step back
             noisy_action = self.noise_scheduler.step(noise_pred, k, noisy_action).prev_sample

@@ -125,11 +125,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         pretrained_backbone_weights="ResNet34_Weights.IMAGENET1K_V1",
         state_dim=7,  # Adjust based on your robot's state dimension
         action_dim=7,  # Adjust based on your robot's action dimension
-        d_model=256,
+        d_model=512,
         nhead=8,
-        num_encoder_layers=4,
+        num_encoder_layers=8,
         dim_feedforward=512,
-        diffusion_step_embed_dim=128,
+        diffusion_step_embed_dim=256,
         down_dims=(512, 1024, 2048),
         kernel_size=5,
         n_groups=8,
@@ -148,7 +148,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         
         preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
             
-        optimizer = torch.optim.Adam(policy.parameters(), lr=2e-5)
+        optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
         # Cosine scheduler with warmup
         warmup_steps = 1000
         scheduler = get_cosine_schedule_with_warmup(
@@ -226,7 +226,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=4,
-        batch_size=32,
+        batch_size=20,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
@@ -247,7 +247,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                     batch[key] = batch[key].to(device, non_blocking=True)
 
             # Apply joint data augmentation
-            batch = apply_joint_augmentations(batch)
+            #batch = apply_joint_augmentations(batch)
             
             # Apply camera dropout
             batch = apply_camera_dropout(batch)
