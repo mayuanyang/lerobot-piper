@@ -291,7 +291,7 @@ class DiffusionTransformer(nn.Module):
             d_model=config.d_model, 
             nhead=config.nhead, 
             dim_feedforward=config.dim_feedforward, 
-            dropout=0.2,  # Added dropout for regularization
+            dropout=0.,  # Added dropout for regularization
             activation="gelu", 
             batch_first=True, 
             norm_first=True
@@ -326,10 +326,6 @@ class DiffusionTransformer(nn.Module):
         # The UNet Denoiser (Predicts the noise added to actions)
         self.denoiser = DiffusionConditionalUnet1d(config, config.d_model)
         
-        # Learnable weights for loss components
-        self.position_loss_weight = nn.Parameter(torch.tensor(1.0))
-        self.gripper_loss_weight = nn.Parameter(torch.tensor(5.0))  # Starting with your current value
-
 
     def get_condition(self, batch):
         """Processes images and states into a single global context vector."""
@@ -337,8 +333,14 @@ class DiffusionTransformer(nn.Module):
         tokens = []
 
         for cam_key, encoder in self.image_encoders.items():
-            img = batch[cam_key.replace('_', '.')].flatten(0, 1)
-            tokens.append(encoder(img).view(B, T_obs, -1))
+            # Check if the camera data is present in the batch
+            batch_key = cam_key.replace('_', '.')
+            if batch_key in batch:
+                img = batch[batch_key].flatten(0, 1)
+                tokens.append(encoder(img).view(B, T_obs, -1))
+            else:
+                # If camera data is missing, create zero tokens
+                tokens.append(torch.zeros(B, T_obs, self.config.d_model, device=self.device))
         
         # Original state encoding (all 7 dimensions including gripper as continuous)
         tokens.append(self.state_encoder(batch["observation.state"]))
@@ -385,18 +387,9 @@ class DiffusionTransformer(nn.Module):
         
         # 5. Separate losses with learnable weights
         # Gripper loss (index 6) with learnable weight
-        gripper_loss = F.mse_loss(pred_noise[..., 6], noise[..., 6])
-        weighted_gripper_loss = self.gripper_loss_weight * gripper_loss
-        
-        # Position losses (indices 0-5) with learnable weight
-        position_loss = F.mse_loss(pred_noise[..., :6], noise[..., :6])
-        weighted_position_loss = self.position_loss_weight * position_loss
-    
-        
-        # 6. Combined loss (no longer including redundant noise_loss)
-        total_loss = weighted_gripper_loss + weighted_position_loss
+        loss = F.mse_loss(pred_noise, noise)
 
-        return total_loss
+        return loss
 
     def forward(self, batch):
         """Inference: Start with pure noise and denoise into a smooth trajectory."""

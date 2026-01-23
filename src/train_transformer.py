@@ -30,14 +30,58 @@ print(f"Using device: {device}")
 # Data Augmentation Setup
 def get_augmentations():
     """Create data augmentations for training."""
-    # Return identity transform (no augmentation)
-    return v2.Compose([])
+    # Return RGBD-friendly augmentations
+    return v2.Compose([
+        # Gentle color jittering for RGB channels
+        v2.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
+        # Mild geometric transforms to preserve physical consistency
+        v2.RandomAffine(degrees=5, translate=(0.02, 0.02), scale=(0.98, 1.02)),
+        # Randomly apply Gaussian noise with 30% probability
+        v2.RandomApply([v2.GaussianNoise()], p=0.3),
+    ])
 
 
 # Helper to apply joint data augmentation
 def apply_joint_augmentations(batch):
-    """Apply random cropping to joint data (observation.state and action)"""
-    # No augmentation applied
+    """Apply noise to joint data (observation.state and action)"""
+    # Apply augmentation with 50% probability
+    if torch.rand(1).item() > 0.5:
+        # Add small Gaussian noise to joint states
+        if "observation.state" in batch:
+            noise_scale = 0.01  # 1% of the typical joint range
+            noise = torch.randn_like(batch["observation.state"]) * noise_scale
+            batch["observation.state"] = batch["observation.state"] + noise
+            
+        # Add small Gaussian noise to actions
+        if "action" in batch:
+            noise_scale = 0.01  # 1% of the typical action range
+            noise = torch.randn_like(batch["action"]) * noise_scale
+            batch["action"] = batch["action"] + noise
+            
+    return batch
+
+
+# Helper to randomly drop one camera
+def apply_camera_dropout(batch, camera_keys=["observation.images.gripper", "observation.images.depth"], dropout_prob=0.2):
+    """Randomly drop one camera from the batch during training."""
+    # Only apply during training and with specified probability
+    if torch.rand(1).item() > dropout_prob:
+        return batch
+    
+    # If we only have one camera, don't drop it
+    if len(camera_keys) <= 1:
+        return batch
+    
+    # Randomly select one camera to drop
+    camera_to_drop = torch.randint(0, len(camera_keys), (1,)).item()
+    dropped_camera_key = camera_keys[camera_to_drop]
+    
+    # Remove the selected camera from the batch
+    if dropped_camera_key in batch:
+        del batch[dropped_camera_key]
+        # Uncomment the next line for debugging
+        # print(f"Dropped camera: {dropped_camera_key}")
+    
     return batch
 
 
@@ -81,10 +125,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         pretrained_backbone_weights="ResNet34_Weights.IMAGENET1K_V1",
         state_dim=7,  # Adjust based on your robot's state dimension
         action_dim=7,  # Adjust based on your robot's action dimension
-        d_model=512,
+        d_model=256,
         nhead=8,
-        num_encoder_layers=6,
-        dim_feedforward=1024,
+        num_encoder_layers=4,
+        dim_feedforward=512,
         diffusion_step_embed_dim=128,
         down_dims=(512, 1024, 2048),
         kernel_size=5,
@@ -102,12 +146,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         policy.train()
         policy.to(device)
         
-        try:
-            from lerobot.policies.factory import load_pre_post_processors
-            preprocessor, postprocessor = load_pre_post_processors(resume_from_checkpoint)
-        except Exception as e:
-            print(f"Could not load preprocessors: {e}. Creating new ones.")
-            preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
+        preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
             
         optimizer = torch.optim.Adam(policy.parameters(), lr=2e-5)
         # Cosine scheduler with warmup
@@ -148,7 +187,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 policy.transformer.feature_projection = policy.transformer.feature_projection.to(device)
         preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
         step = 0
-        optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
+        optimizer = torch.optim.Adam(policy.parameters(), lr=5e-5, weight_decay=1e-4)
         # Cosine scheduler with warmup
         warmup_steps = 1000
         scheduler = get_cosine_schedule_with_warmup(
@@ -209,6 +248,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
             # Apply joint data augmentation
             batch = apply_joint_augmentations(batch)
+            
+            # Apply camera dropout
+            batch = apply_camera_dropout(batch)
 
             # Preprocess (Normalize)
             batch = preprocessor(batch)
@@ -233,9 +275,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                     "step": step, 
                     "loss": f"{loss.item():.3f}", 
                     "lr": f"{lr:.2e}",
-                    "grad_norm": f"{grad_norm:.2f}",
-                    "pos_weight": f"{policy.model.position_loss_weight.item():.2f}",
-                    "grip_weight": f"{policy.model.gripper_loss_weight.item():.2f}"
+                    "grad_norm": f"{grad_norm:.2f}"
                 })
             
             # Save checkpoint
@@ -256,12 +296,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     policy.save_pretrained(output_directory)
     preprocessor.save_pretrained(output_directory)
     postprocessor.save_pretrained(output_directory)
-
-    if push_to_hub:
-        repo = 'ISdept/piper_arm_transformer'
-        policy.push_to_hub(repo)
-        preprocessor.push_to_hub(repo)
-        postprocessor.push_to_hub(repo)
 
 
 if __name__ == "__main__":
