@@ -9,6 +9,16 @@ The model includes SpatialSoftmax visualization capabilities to monitor vision e
 - Smooth tracking of object positions over time
 - Object-relative movement across camera views
 - Different camera signals (not identical outputs)
+- Multiple timesteps from the same observation window
+
+### Training Visualization Options:
+
+Visualizations are saved every N steps (default 100), showing all timesteps from the first item in each batch. This allows you to see how spatial features evolve over the observation window.
+
+To customize the visualization frequency:
+```python
+train(output_dir="./outputs", dataset_id="ISdept/piper_arm", visualize_every_n_batches=50)
+```
 
 To run standalone visualization:
 ```bash

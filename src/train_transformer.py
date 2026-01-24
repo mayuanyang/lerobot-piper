@@ -88,7 +88,7 @@ def apply_camera_dropout(batch, camera_keys=["observation.images.gripper", "obse
     return batch
 
 
-def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_from_checkpoint=None):
+def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_from_checkpoint=None, visualize_every_n_batches=100):
     """Train the TransformerDiffusion model."""
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -96,7 +96,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     training_steps = 100000 
     log_freq = 10
     checkpoint_freq = 1000
-    visualization_freq = 100  # Save visualizations every 100 steps
+    visualization_freq = visualize_every_n_batches  # Save visualizations every N steps
+    
+    # Counter for batch visualization
+    batch_counter = 0
     
     image_transforms = get_augmentations()
 
@@ -293,13 +296,17 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                     obs_context, spatial_outputs = policy.model.get_condition(batch)
                     policy.model.train()
                     
-                    # Update visualizer with spatial outputs
+                    # Update visualizer with spatial outputs (multiple timesteps from the same window)
                     for cam_key, spatial_data in spatial_outputs.items():
                         if spatial_data is not None:
                             img_tensor, spatial_coords = spatial_data
                             if img_tensor is not None and spatial_coords is not None:
-                                # Take the first timestep for visualization
-                                visualizer.update(cam_key, img_tensor[0], spatial_coords[0])
+                                # Visualize all timesteps from the first item in the batch
+                                # img_tensor shape: (B, T, C, H, W)
+                                # spatial_coords shape: (B, T, num_points*2)
+                                batch_idx = 0
+                                for t in range(img_tensor.shape[1]):  # Iterate through timesteps
+                                    visualizer.update(f"{cam_key}_t{t}", img_tensor[batch_idx, t], spatial_coords[batch_idx, t])
                     
                     # Save visualizations
                     visualizer.save_visualizations(step)
