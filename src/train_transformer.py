@@ -294,10 +294,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                     policy.model.train()
                     
                     # Update visualizer with spatial outputs
-                    for cam_key, (img_tensor, spatial_coords) in spatial_outputs.items():
-                        if img_tensor is not None and spatial_coords is not None:
-                            # Take the first timestep for visualization
-                            visualizer.update(cam_key, img_tensor[0], spatial_coords[0])
+                    for cam_key, spatial_data in spatial_outputs.items():
+                        if spatial_data is not None:
+                            img_tensor, spatial_coords = spatial_data
+                            if img_tensor is not None and spatial_coords is not None:
+                                # Take the first timestep for visualization
+                                visualizer.update(cam_key, img_tensor[0], spatial_coords[0])
                     
                     # Save visualizations
                     visualizer.save_visualizations(step)
