@@ -314,8 +314,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                                 # img_tensor shape: (B, T, C, H, W)
                                 # spatial_coords shape: (B, T, num_points*2)
                                 batch_idx = 0
+                                # Save each timestep with proper zero-padded numbering for correct sorting
                                 for t in range(img_tensor.shape[1]):  # Iterate through timesteps
-                                    visualizer.update(f"{cam_key}_t{t}", img_tensor[batch_idx, t], spatial_coords[batch_idx, t])
+                                    # Use zero-padded timestep numbering for proper sorting
+                                    padded_t = f"{t:03d}"  # e.g., 000, 001, 002, ...
+                                    visualizer.update(f"{cam_key}_t{padded_t}", img_tensor[batch_idx, t], spatial_coords[batch_idx, t])
                     
                     # Save visualizations with episode and frame index if available
                     visualizer.save_visualizations(step, episode=episode_index, frame=frame_index)
