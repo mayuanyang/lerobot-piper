@@ -11,6 +11,9 @@ from models.transformer_diffusion.transformer_diffusion_config import Transforme
 from models.transformer_diffusion.transformer_diffusion_policy import TransformerDiffusionPolicy
 from models.transformer_diffusion.processor_transformer_diffusion import make_pre_post_processors
 
+# Import visualization utilities
+from spatial_softmax_visualizer import SpatialSoftmaxVisualizer
+
 # Import torchvision for augmentation
 from torchvision.transforms import v2
 from transformers import get_cosine_schedule_with_warmup
@@ -93,6 +96,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     training_steps = 100000 
     log_freq = 10
     checkpoint_freq = 1000
+    visualization_freq = 100  # Save visualizations every 100 steps
     
     image_transforms = get_augmentations()
 
@@ -232,6 +236,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         drop_last=True,
     )
 
+    # Create visualizer
+    visualizer = SpatialSoftmaxVisualizer(output_dir / "spatial_softmax_visualizations")
+
     # Training loop
     print("Starting training loop...")
     done = False
@@ -277,6 +284,24 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                     "lr": f"{lr:.2e}",
                     "grad_norm": f"{grad_norm:.2f}"
                 })
+            
+            # Save visualizations
+            if step % visualization_freq == 0:
+                # Get spatial softmax outputs for visualization
+                with torch.no_grad():
+                    policy.model.eval()
+                    obs_context, spatial_outputs = policy.model.get_condition(batch)
+                    policy.model.train()
+                    
+                    # Update visualizer with spatial outputs
+                    for cam_key, (img_tensor, spatial_coords) in spatial_outputs.items():
+                        if img_tensor is not None and spatial_coords is not None:
+                            # Take the first timestep for visualization
+                            visualizer.update(cam_key, img_tensor[0], spatial_coords[0])
+                    
+                    # Save visualizations
+                    visualizer.save_visualizations(step)
+                    visualizer.reset_trajectories()
             
             # Save checkpoint
             if step > 0 and step % checkpoint_freq == 0:

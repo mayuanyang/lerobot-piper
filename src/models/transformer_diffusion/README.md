@@ -2,6 +2,19 @@
 
 This module implements a diffusion-based policy with transformer architecture for long-horizon robotic tasks. The model combines ResNet encoders for visual processing with a transformer-based diffusion approach for action generation.
 
+## Visualization
+
+The model includes SpatialSoftmax visualization capabilities to monitor vision encoder outputs during training and inference. Visualizations are saved to `spatial_softmax_visualizations` directory during training, showing:
+
+- Smooth tracking of object positions over time
+- Object-relative movement across camera views
+- Different camera signals (not identical outputs)
+
+To run standalone visualization:
+```bash
+python src/visualize_spatial_softmax.py
+```
+
 ## Architecture Overview
 
 The TransformerDiffusion model consists of:

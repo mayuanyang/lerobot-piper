@@ -297,8 +297,10 @@ class VisionEncoder(nn.Module):
 
     def forward(self, x):
         x = self.backbone(x)
-        x = self.spatial_softmax(x)
-        return self.projection(x)
+        spatial_coords = self.spatial_softmax(x)
+        projected = self.projection(spatial_coords)
+        # Return both the spatial coordinates and the projected features
+        return projected, spatial_coords
 
 
 class DiffusionTransformer(nn.Module):
@@ -323,11 +325,9 @@ class DiffusionTransformer(nn.Module):
         )
         # Add positional encoding for state sequences
         self.state_positional_encoding = PositionalEncoding(config.d_model, 100)
-        # Additional embedding for categorical gripper state
-        self.gripper_embedding = nn.Embedding(2, config.d_model)  # 0: closed, 1: open
-        
+                
         # Projection layer for concatenated observation features
-        num_obs_tokens = len(config.image_features) + 2  # cameras + state + gripper
+        num_obs_tokens = len(config.image_features) + 1  # cameras + state
         self.obs_projection = nn.Linear(config.d_model * num_obs_tokens, config.d_model)
         
         # 2. Observation Transformer (Temporal Fusion)
@@ -348,19 +348,13 @@ class DiffusionTransformer(nn.Module):
         # 3. Diffusion Components
         # We denoise the entire action horizon at once: (Horizon, Action_Dim)
         self.noise_scheduler = DDPMScheduler(
-            num_train_timesteps=100,
+            num_train_timesteps=50,
             beta_schedule='squaredcos_cap_v2',
             clip_sample=True,
             prediction_type='epsilon'
         )
 
-        # Time embedding for the diffusion step
-        self.time_mlp = nn.Sequential(
-            nn.Linear(1, 128),
-            nn.GELU(),
-            nn.Linear(128, config.d_model)
-        )
-
+        
         # Positional encoding for action sequences
         self.positional_encoding = PositionalEncoding(config.d_model, config.horizon)
 
@@ -371,7 +365,7 @@ class DiffusionTransformer(nn.Module):
         self.denoiser = DiffusionConditionalUnet1d(config, config.d_model)
         
         # Learnable parameter for number of inference steps
-        self.num_inference_steps = nn.Parameter(torch.tensor(100.0))
+        self.num_inference_steps = nn.Parameter(torch.tensor(50.0))
 
 
     def get_condition(self, batch):
@@ -379,29 +373,30 @@ class DiffusionTransformer(nn.Module):
         B, T_obs = batch["observation.state"].shape[:2]
         tokens = []
 
+        # Store spatial softmax outputs for visualization
+        spatial_outputs = {}
+
         for cam_key, encoder in self.image_encoders.items():
             # Check if the camera data is present in the batch
             batch_key = cam_key.replace('_', '.')
             if batch_key in batch:
                 img = batch[batch_key].flatten(0, 1)
-                tokens.append(encoder(img).view(B, T_obs, -1))
+                # Get both projected features and spatial coordinates
+                projected_features, spatial_coords = encoder(img)
+                tokens.append(projected_features.view(B, T_obs, -1))
+                # Store spatial coordinates for visualization
+                spatial_outputs[cam_key] = (img.view(B, T_obs, *img.shape[1:]), spatial_coords.view(B, T_obs, -1))
             else:
                 # If camera data is missing, create zero tokens
                 tokens.append(torch.zeros(B, T_obs, self.config.d_model, device=self.device))
+                spatial_outputs[cam_key] = None
         
         # Original state encoding (all 7 dimensions including gripper as continuous)
         state_encoded = self.state_encoder(batch["observation.state"])
         # Apply positional encoding to state tokens
         state_with_pos = self.state_positional_encoding(state_encoded)
         tokens.append(state_with_pos)
-        
-        # Extract gripper value (7th dimension, index 6) and convert to categorical
-        gripper_values = batch["observation.state"][..., 6]  # (B, T_obs)
-        # Convert to categorical: 0 if < 0.4 (closed), 1 if >= 0.4 (open)
-        gripper_categorical = (gripper_values >= 0.4).long()  # (B, T_obs)
-        # Get embedding for categorical gripper state
-        gripper_embeddings = self.gripper_embedding(gripper_categorical)  # (B, T_obs, d_model)
-        tokens.append(gripper_embeddings)
+
         
         # Combine tokens
         obs_features = torch.cat(tokens, dim=-1)  # (B, T_obs, d_model * num_modalities)
@@ -415,7 +410,8 @@ class DiffusionTransformer(nn.Module):
         # Pass through transformer
         context = self.obs_transformer(obs_features_pos)  # (B, T_obs, d_model)
 
-        return context
+        # Return context and spatial outputs for visualization
+        return context, spatial_outputs
       
     def compute_loss(self, batch):
         """Diffusion Training: Inject noise and learn to predict it."""
@@ -423,7 +419,7 @@ class DiffusionTransformer(nn.Module):
         B, T_act = actions.shape[:2]
         
         # 1. Get observation context
-        obs_context = self.get_condition(batch) # (B, T_obs, d_model)
+        obs_context, spatial_outputs = self.get_condition(batch) # (B, T_obs, d_model)
         
         # 2. Align observation timesteps with action timesteps
         T_obs = obs_context.shape[1]
@@ -457,7 +453,7 @@ class DiffusionTransformer(nn.Module):
         T_act = self.config.horizon
         
         # Get observation context
-        obs_context = self.get_condition(batch)  # (B, T_obs, d_model)
+        obs_context, spatial_outputs = self.get_condition(batch)  # (B, T_obs, d_model)
         
         # Align observation timesteps with action timesteps
         T_obs = obs_context.shape[1]
@@ -483,4 +479,5 @@ class DiffusionTransformer(nn.Module):
             # Step back
             noisy_action = self.noise_scheduler.step(noise_pred, k, noisy_action).prev_sample
             
-        return noisy_action
+        # Return both the actions and spatial outputs for visualization
+        return noisy_action, spatial_outputs

@@ -48,7 +48,7 @@ class TransformerDiffusionPolicy(PreTrainedPolicy):
         Useful for high-frequency control loops.
         """
         self.model.eval()
-        predicted_actions = self.model(batch)
+        predicted_actions, spatial_outputs = self.model(batch)
         return predicted_actions
     
     @torch.no_grad()
@@ -60,7 +60,7 @@ class TransformerDiffusionPolicy(PreTrainedPolicy):
         self.model.eval()
         
         # Generate the full horizon of actions (e.g., 16 steps)
-        predicted_actions = self.model(batch)
+        predicted_actions, spatial_outputs = self.model(batch)
         
         # Return only the first action and squeeze to shape [1, 7]
         first_action = predicted_actions[:, :1, :]  # Shape: [B, 1, 7]
