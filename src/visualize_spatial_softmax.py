@@ -86,7 +86,9 @@ def visualize_spatial_softmax_during_inference(
                 # Save visualizations every few steps
                 if (step_idx - start_idx) % 3 == 0:  # Save every 3rd step
                     global_step = episode_idx * num_steps_per_episode + (step_idx - start_idx)
-                    visualizer.save_visualizations(global_step, episode=episode_idx)
+                    # Try to get frame index if available
+                    frame_index = item.get("frame_index", step_idx) if isinstance(item, dict) else step_idx
+                    visualizer.save_visualizations(global_step, episode=episode_idx, frame=frame_index)
         
         # Save final visualizations for the episode
         global_step = (episode_idx + 1) * num_steps_per_episode

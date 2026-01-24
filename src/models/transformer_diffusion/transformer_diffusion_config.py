@@ -18,7 +18,7 @@ class TransformerDiffusionConfig(PreTrainedConfig):
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
-            "VISUAL": NormalizationMode.MEAN_STD,
+            "VISUAL": NormalizationMode.IDENTITY,
             "STATE": NormalizationMode.MIN_MAX,
             "ACTION": NormalizationMode.MIN_MAX,
         }

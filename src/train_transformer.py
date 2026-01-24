@@ -88,7 +88,7 @@ def apply_camera_dropout(batch, camera_keys=["observation.images.gripper", "obse
     return batch
 
 
-def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_from_checkpoint=None, visualize_every_n_batches=100):
+def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_from_checkpoint=None, visualize_every_n_batches=1000):
     """Train the TransformerDiffusion model."""
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -296,10 +296,14 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                     obs_context, spatial_outputs = policy.model.get_condition(batch)
                     policy.model.train()
                     
-                    # Try to get episode index from batch if available
+                    # Try to get episode index and frame index from batch if available
                     episode_index = None
                     if "episode_index" in batch:
                         episode_index = batch["episode_index"][0].item()  # Get first item in batch
+                    
+                    frame_index = None
+                    if "frame_index" in batch:
+                        frame_index = batch["frame_index"][0].item()  # Get first item in batch
                     
                     # Update visualizer with spatial outputs (multiple timesteps from the same window)
                     for cam_key, spatial_data in spatial_outputs.items():
@@ -313,8 +317,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                                 for t in range(img_tensor.shape[1]):  # Iterate through timesteps
                                     visualizer.update(f"{cam_key}_t{t}", img_tensor[batch_idx, t], spatial_coords[batch_idx, t])
                     
-                    # Save visualizations with episode index if available
-                    visualizer.save_visualizations(step, episode=episode_index)
+                    # Save visualizations with episode and frame index if available
+                    visualizer.save_visualizations(step, episode=episode_index, frame=frame_index)
                     visualizer.reset_trajectories()
             
             # Save checkpoint

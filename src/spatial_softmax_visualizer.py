@@ -85,13 +85,14 @@ class SpatialSoftmaxVisualizer:
             self.trajectories[camera_name] = []
         self.trajectories[camera_name].extend(pixel_coords)
         
-    def save_visualizations(self, step: int = 0, episode: int = None):
+    def save_visualizations(self, step: int = 0, episode: int = None, frame: int = None):
         """
         Save visualizations for all cameras.
         
         Args:
             step: Training/inference step number for naming
             episode: Episode index for naming (optional)
+            frame: Frame index for naming (optional)
         """
         for camera_name, image in self.images.items():
             # Create a copy of the image for drawing
@@ -117,17 +118,21 @@ class SpatialSoftmaxVisualizer:
             camera_dir = self.output_dir / camera_name
             camera_dir.mkdir(exist_ok=True)
             
-            # Include episode index in filename if provided
-            if episode is not None:
+            # Include episode and frame index in filename if provided
+            if episode is not None and frame is not None:
+                output_path = camera_dir / f"episode_{episode:03d}_frame_{frame:06d}_step_{step:06d}.png"
+            elif episode is not None:
                 output_path = camera_dir / f"episode_{episode:03d}_step_{step:06d}.png"
+            elif frame is not None:
+                output_path = camera_dir / f"frame_{frame:06d}_step_{step:06d}.png"
             else:
                 output_path = camera_dir / f"step_{step:06d}.png"
             cv2.imwrite(str(output_path), vis_image)
             
             # Also save a plot of the trajectory
-            self._save_trajectory_plot(camera_name, step, episode)
+            self._save_trajectory_plot(camera_name, step, episode, frame)
             
-    def _save_trajectory_plot(self, camera_name: str, step: int, episode: int = None):
+    def _save_trajectory_plot(self, camera_name: str, step: int, episode: int = None, frame: int = None):
         """Save a matplotlib plot of the trajectory."""
         if camera_name not in self.trajectories or len(self.trajectories[camera_name]) == 0:
             return
@@ -142,9 +147,13 @@ class SpatialSoftmaxVisualizer:
         plt.colorbar(label='Time')
         plt.scatter(x_coords[-1], y_coords[-1], c='red', s=100, marker='*', label='Latest')
         
-        # Include episode in title if provided
-        if episode is not None:
+        # Include episode and frame in title if provided
+        if episode is not None and frame is not None:
+            plt.title(f'{camera_name.capitalize()} Camera SpatialSoftmax Trajectory - Episode {episode}, Frame {frame}, Step {step}')
+        elif episode is not None:
             plt.title(f'{camera_name.capitalize()} Camera SpatialSoftmax Trajectory - Episode {episode}, Step {step}')
+        elif frame is not None:
+            plt.title(f'{camera_name.capitalize()} Camera SpatialSoftmax Trajectory - Frame {frame}, Step {step}')
         else:
             plt.title(f'{camera_name.capitalize()} Camera SpatialSoftmax Trajectory - Step {step}')
         plt.xlabel('X Pixel Coordinate')
@@ -153,9 +162,13 @@ class SpatialSoftmaxVisualizer:
         plt.grid(True, alpha=0.3)
         
         camera_dir = self.output_dir / camera_name
-        # Include episode in filename if provided
-        if episode is not None:
+        # Include episode and frame in filename if provided
+        if episode is not None and frame is not None:
+            plot_path = camera_dir / f"trajectory_episode_{episode:03d}_frame_{frame:06d}_step_{step:06d}.png"
+        elif episode is not None:
             plot_path = camera_dir / f"trajectory_episode_{episode:03d}_step_{step:06d}.png"
+        elif frame is not None:
+            plot_path = camera_dir / f"trajectory_frame_{frame:06d}_step_{step:06d}.png"
         else:
             plot_path = camera_dir / f"trajectory_step_{step:06d}.png"
         plt.savefig(str(plot_path), dpi=150, bbox_inches='tight')
