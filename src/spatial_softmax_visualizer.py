@@ -43,7 +43,8 @@ class SpatialSoftmaxVisualizer:
                 image_np = image.detach().cpu().numpy()
             
             # Handle different channel orders
-            if image_np.shape[0] in [1, 3]:  # (C, H, W)
+            # PyTorch typically uses (C, H, W) format
+            if len(image_np.shape) == 3 and image_np.shape[0] in [1, 3]:  # (C, H, W) format
                 image_np = np.transpose(image_np, (1, 2, 0))
             
             # Convert to uint8 if needed
@@ -118,6 +119,13 @@ class SpatialSoftmaxVisualizer:
             camera_dir = self.output_dir / camera_name
             camera_dir.mkdir(exist_ok=True)
             
+            # Convert BGR to RGB for proper color representation
+            # OpenCV uses BGR, but we want to save as RGB
+            if len(vis_image.shape) == 3 and vis_image.shape[2] == 3:
+                vis_image_rgb = cv2.cvtColor(vis_image, cv2.COLOR_BGR2RGB)
+            else:
+                vis_image_rgb = vis_image
+            
             # Include episode and frame index in filename if provided
             if episode is not None and frame is not None:
                 output_path = camera_dir / f"episode_{episode:03d}_frame_{frame:06d}_step_{step:06d}.png"
@@ -127,7 +135,7 @@ class SpatialSoftmaxVisualizer:
                 output_path = camera_dir / f"frame_{frame:06d}_step_{step:06d}.png"
             else:
                 output_path = camera_dir / f"step_{step:06d}.png"
-            cv2.imwrite(str(output_path), vis_image)
+            cv2.imwrite(str(output_path), vis_image_rgb)
             
             # Also save a plot of the trajectory
             self._save_trajectory_plot(camera_name, step, episode, frame)
