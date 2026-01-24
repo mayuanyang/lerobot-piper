@@ -1,6 +1,6 @@
 # Transformer Diffusion Policy
 
-This module implements a diffusion-based policy with transformer architecture for long-horizon robotic tasks. The model combines ResNet encoders for visual processing with a transformer-based diffusion approach for action generation.
+This module implements a diffusion-based policy with transformer architecture for long-horizon robotic tasks. The model combines ResNet encoders with K-point spatial softmax for visual processing and a transformer-based diffusion approach for action generation.
 
 ## Visualization
 
@@ -37,10 +37,16 @@ The TransformerDiffusion model consists of:
 
 ## Key Features
 
-- **Vision Processing**: Uses ResNet backbones (resnet18, resnet34, resnet50) for robust image feature extraction
+- **Vision Processing**: Uses ResNet backbones (resnet18, resnet34, resnet50) with K-point spatial softmax for robust image feature extraction
 - **State Tokenization**: Efficiently converts robot state vectors into transformer-compatible tokens
 - **Autoregressive Action Generation**: Generates action sequences step-by-step for long-horizon tasks
 - **Flexible Configuration**: Configurable transformer architecture parameters (layers, heads, dimensions)
+
+## K-Point Spatial Softmax
+
+The model uses a K-point spatial softmax mechanism that extracts multiple (x, y) coordinates from feature maps instead of a single point. This allows the model to track multiple objects or regions of interest simultaneously.
+
+Currently configured to use 2 points per camera, but can be easily adjusted to use more points by modifying the `num_points` parameter in the VisionEncoder.
 
 ## Usage
 

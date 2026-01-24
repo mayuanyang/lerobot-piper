@@ -296,6 +296,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                     obs_context, spatial_outputs = policy.model.get_condition(batch)
                     policy.model.train()
                     
+                    # Try to get episode index from batch if available
+                    episode_index = None
+                    if "episode_index" in batch:
+                        episode_index = batch["episode_index"][0].item()  # Get first item in batch
+                    
                     # Update visualizer with spatial outputs (multiple timesteps from the same window)
                     for cam_key, spatial_data in spatial_outputs.items():
                         if spatial_data is not None:
@@ -308,8 +313,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                                 for t in range(img_tensor.shape[1]):  # Iterate through timesteps
                                     visualizer.update(f"{cam_key}_t{t}", img_tensor[batch_idx, t], spatial_coords[batch_idx, t])
                     
-                    # Save visualizations
-                    visualizer.save_visualizations(step)
+                    # Save visualizations with episode index if available
+                    visualizer.save_visualizations(step, episode=episode_index)
                     visualizer.reset_trajectories()
             
             # Save checkpoint

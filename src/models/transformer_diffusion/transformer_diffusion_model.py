@@ -11,11 +11,27 @@ import math
 
 class SpatialSoftmax(nn.Module):
     """
-    Extracts 2D feature coordinates from feature maps.
-    Crucial for pick-and-place to identify 'where' objects are.
+    K-point Spatial Softmax that produces K (x, y) coordinates per image.
     """
-    def __init__(self, height, width, num_channels):
+    def __init__(self, height, width, in_channels, num_points=8, temperature=None):
+        """
+        Args:
+            height: Height of the feature map
+            width: Width of the feature map
+            in_channels: Number of input channels
+            num_points: Number of keypoints to extract
+            temperature: Temperature for softmax (None for no scaling)
+        """
         super().__init__()
+        self.height = height
+        self.width = width
+        self.num_points = num_points
+        self.temperature = temperature
+
+        # 1x1 conv to produce K attention maps
+        self.conv = nn.Conv2d(in_channels, num_points, kernel_size=1, bias=False)
+
+        # normalized pixel coordinate grid
         pos_y, pos_x = torch.meshgrid(
             torch.linspace(-1, 1, height),
             torch.linspace(-1, 1, width),
@@ -23,15 +39,31 @@ class SpatialSoftmax(nn.Module):
         )
         self.register_buffer("pos_x", pos_x.reshape(-1))
         self.register_buffer("pos_y", pos_y.reshape(-1))
-        self.num_channels = num_channels
 
-    def forward(self, feature_maps):
-        # feature_maps: (B, C, H, W)
-        batch_size = feature_maps.size(0)
-        probs = F.softmax(feature_maps.view(batch_size, self.num_channels, -1), dim=-1)
-        expected_x = torch.sum(probs * self.pos_x, dim=-1, keepdim=True)
-        expected_y = torch.sum(probs * self.pos_y, dim=-1, keepdim=True)
-        return torch.cat([expected_x, expected_y], dim=-1).view(batch_size, -1)
+    def forward(self, feature_map):
+        """
+        feature_map: (B, C, H, W)
+        returns:     (B, K*2) where K is num_points
+        """
+        B = feature_map.shape[0]
+
+        # attention logits: (B, K, H, W)
+        attn = self.conv(feature_map)
+        attn = attn.view(B, self.num_points, -1)
+
+        if self.temperature is not None:
+            attn = attn / self.temperature
+
+        # spatial softmax
+        attn = F.softmax(attn, dim=-1)
+
+        # expected coordinates
+        exp_x = torch.sum(attn * self.pos_x, dim=-1)
+        exp_y = torch.sum(attn * self.pos_y, dim=-1)
+
+        # Flatten coordinates: (B, K*2)
+        coords = torch.stack([exp_x, exp_y], dim=-1)  # (B, K, 2)
+        return coords.view(B, -1)  # (B, K*2)
 
 
 class PositionalEncoding(nn.Module):
@@ -292,8 +324,10 @@ class VisionEncoder(nn.Module):
             height = backbone_output.shape[2]
             width = backbone_output.shape[3]
         
-        self.spatial_softmax = SpatialSoftmax(height=height, width=width, num_channels=feature_dim)
-        self.projection = nn.Linear(feature_dim * 2, config.d_model)
+        # Use K-point spatial softmax with 2 points
+        self.spatial_softmax = SpatialSoftmax(height=height, width=width, in_channels=feature_dim, num_points=2)
+        # Update projection to match the new output size (2 points * 2 coordinates = 4)
+        self.projection = nn.Linear(2 * 2, config.d_model)
 
     def forward(self, x):
         x = self.backbone(x)

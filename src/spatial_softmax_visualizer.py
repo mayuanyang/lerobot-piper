@@ -85,12 +85,13 @@ class SpatialSoftmaxVisualizer:
             self.trajectories[camera_name] = []
         self.trajectories[camera_name].extend(pixel_coords)
         
-    def save_visualizations(self, step: int = 0):
+    def save_visualizations(self, step: int = 0, episode: int = None):
         """
         Save visualizations for all cameras.
         
         Args:
             step: Training/inference step number for naming
+            episode: Episode index for naming (optional)
         """
         for camera_name, image in self.images.items():
             # Create a copy of the image for drawing
@@ -115,13 +116,18 @@ class SpatialSoftmaxVisualizer:
             # Save image
             camera_dir = self.output_dir / camera_name
             camera_dir.mkdir(exist_ok=True)
-            output_path = camera_dir / f"step_{step:06d}.png"
+            
+            # Include episode index in filename if provided
+            if episode is not None:
+                output_path = camera_dir / f"episode_{episode:03d}_step_{step:06d}.png"
+            else:
+                output_path = camera_dir / f"step_{step:06d}.png"
             cv2.imwrite(str(output_path), vis_image)
             
             # Also save a plot of the trajectory
-            self._save_trajectory_plot(camera_name, step)
+            self._save_trajectory_plot(camera_name, step, episode)
             
-    def _save_trajectory_plot(self, camera_name: str, step: int):
+    def _save_trajectory_plot(self, camera_name: str, step: int, episode: int = None):
         """Save a matplotlib plot of the trajectory."""
         if camera_name not in self.trajectories or len(self.trajectories[camera_name]) == 0:
             return
@@ -136,14 +142,22 @@ class SpatialSoftmaxVisualizer:
         plt.colorbar(label='Time')
         plt.scatter(x_coords[-1], y_coords[-1], c='red', s=100, marker='*', label='Latest')
         
+        # Include episode in title if provided
+        if episode is not None:
+            plt.title(f'{camera_name.capitalize()} Camera SpatialSoftmax Trajectory - Episode {episode}, Step {step}')
+        else:
+            plt.title(f'{camera_name.capitalize()} Camera SpatialSoftmax Trajectory - Step {step}')
         plt.xlabel('X Pixel Coordinate')
         plt.ylabel('Y Pixel Coordinate')
-        plt.title(f'{camera_name.capitalize()} Camera SpatialSoftmax Trajectory - Step {step}')
         plt.legend()
         plt.grid(True, alpha=0.3)
         
         camera_dir = self.output_dir / camera_name
-        plot_path = camera_dir / f"trajectory_step_{step:06d}.png"
+        # Include episode in filename if provided
+        if episode is not None:
+            plot_path = camera_dir / f"trajectory_episode_{episode:03d}_step_{step:06d}.png"
+        else:
+            plot_path = camera_dir / f"trajectory_step_{step:06d}.png"
         plt.savefig(str(plot_path), dpi=150, bbox_inches='tight')
         plt.close()
         
