@@ -237,7 +237,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     )
 
     # Create visualizer
-    visualizer = SpatialSoftmaxVisualizer(output_dir / "spatial_softmax_visualizations")
+    visualizer = SpatialSoftmaxVisualizer(Path(output_dir) / "spatial_softmax_visualizations")
 
     # Training loop
     print("Starting training loop...")
