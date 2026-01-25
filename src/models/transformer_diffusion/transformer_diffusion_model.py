@@ -325,9 +325,10 @@ class VisionEncoder(nn.Module):
             width = backbone_output.shape[3]
         
         # Use K-point spatial softmax with 2 points
-        self.spatial_softmax = SpatialSoftmax(height=height, width=width, in_channels=feature_dim, num_points=2)
+        number_of_keypoints = 2
+        self.spatial_softmax = SpatialSoftmax(height=height, width=width, in_channels=feature_dim, num_points=number_of_keypoints)
         # Update projection to match the new output size (2 points * 2 coordinates = 4)
-        self.projection = nn.Linear(2 * 2, config.d_model)
+        self.projection = nn.Linear(number_of_keypoints * 2, config.d_model)
 
     def forward(self, x):
         x = self.backbone(x)

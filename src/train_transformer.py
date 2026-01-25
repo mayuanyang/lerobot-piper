@@ -117,8 +117,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     print('output_features:', output_features)
     
     # Training parameters
-    obs = 2
-    horizon = 16
+    obs = 4
+    horizon = 48
     n_action_steps = 8
     
     # Create transformer configuration
@@ -134,7 +134,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         action_dim=7,  # Adjust based on your robot's action dimension
         d_model=512,
         nhead=8,
-        num_encoder_layers=8,
+        num_encoder_layers=4,
         dim_feedforward=512,
         diffusion_step_embed_dim=256,
         down_dims=(512, 1024, 2048),

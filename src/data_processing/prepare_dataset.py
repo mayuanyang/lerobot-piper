@@ -1439,7 +1439,7 @@ def main():
         pad_videos(OUTPUT_FOLDER)
         
         # Compute and save dataset statistics for the aggregated episode
-        compute_and_save_dataset_stats(OUTPUT_FOLDER)
+        #compute_and_save_dataset_stats(OUTPUT_FOLDER)
         
         print("Dataset preparation with episode aggregation completed successfully!")
     
