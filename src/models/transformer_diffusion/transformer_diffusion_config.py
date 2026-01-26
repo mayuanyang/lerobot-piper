@@ -27,6 +27,8 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     # Image processing
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = None
+    # Input image size (height, width)
+    input_image_size: tuple[int, int] = (320, 320)
         
     
     # State processing
@@ -34,6 +36,9 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     
     # Action dimensions
     action_dim: int = 7  # Default for 7-DOF arm
+    
+    # Joint weights for loss computation (default: equal weights)
+    joint_weights: list[float] = field(default_factory=lambda: [1.0, 1.0, 1.0, 0.0, 0.8, 0.7, 1.0])
     
     # Transformer architecture
     d_model: int = 256

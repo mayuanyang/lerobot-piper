@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
+import torchvision.transforms as transforms
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.optimization import get_scheduler
 from typing import Dict, Optional
@@ -12,24 +13,38 @@ import math
 class SpatialSoftmax(nn.Module):
     """
     K-point Spatial Softmax that produces K (x, y) coordinates per image.
+    Includes temperature scaling and regularization to prevent collapse.
     """
-    def __init__(self, height, width, in_channels, num_points=8, temperature=None):
+    def __init__(self, height, width, in_channels, num_points=8, temperature=1.0, learnable_temperature=False):
         """
         Args:
             height: Height of the feature map
             width: Width of the feature map
             in_channels: Number of input channels
             num_points: Number of keypoints to extract
-            temperature: Temperature for softmax (None for no scaling)
+            temperature: Temperature for softmax (lower = sharper peaks)
+            learnable_temperature: Whether to make temperature a learnable parameter
         """
         super().__init__()
         self.height = height
         self.width = width
         self.num_points = num_points
-        self.temperature = temperature
+        
+        # Learnable temperature parameter to control sharpness
+        if learnable_temperature:
+            self.temperature = nn.Parameter(torch.ones(1) * temperature)
+        else:
+            self.temperature = temperature
 
         # 1x1 conv to produce K attention maps
         self.conv = nn.Conv2d(in_channels, num_points, kernel_size=1, bias=False)
+        
+        # Initialize weights to encourage diverse initial attention maps
+        # Use orthogonal initialization to encourage different feature maps
+        nn.init.orthogonal_(self.conv.weight)
+        # Scale weights to encourage sharper initial attention
+        with torch.no_grad():
+            self.conv.weight *= 2.0
 
         # normalized pixel coordinate grid
         pos_y, pos_x = torch.meshgrid(
@@ -312,13 +327,17 @@ class VisionEncoder(nn.Module):
     """Improved encoder with Spatial Softmax for 7-DOF precision."""
     def __init__(self, config):
         super().__init__()
+        # Add resize transform with configurable image size
+        self.resize_transform = transforms.Resize(config.input_image_size)
+        
         backbone = getattr(models, config.vision_backbone)(weights="DEFAULT" if config.pretrained_backbone_weights else None)
         # Remove fc and avgpool, keep spatial layers
         self.backbone = nn.Sequential(*list(backbone.children())[:-2])
         
         # Get feature dimensions (e.g., 512 for ResNet18)
+        # Update dummy input size to match configured image size
         with torch.no_grad():
-            dummy_input = torch.zeros(1, 3, 400, 640)
+            dummy_input = torch.zeros(1, 3, config.input_image_size[0], config.input_image_size[1])
             backbone_output = self.backbone(dummy_input)
             feature_dim = backbone_output.shape[1]
             height = backbone_output.shape[2]
@@ -326,11 +345,21 @@ class VisionEncoder(nn.Module):
         
         # Use K-point spatial softmax with 2 points
         number_of_keypoints = 2
-        self.spatial_softmax = SpatialSoftmax(height=height, width=width, in_channels=feature_dim, num_points=number_of_keypoints)
+        # Use lower temperature (sharper peaks) and learnable temperature to prevent collapse
+        self.spatial_softmax = SpatialSoftmax(
+            height=height, 
+            width=width, 
+            in_channels=feature_dim, 
+            num_points=number_of_keypoints,
+            temperature=0.1,  # Lower temperature for sharper peaks
+            learnable_temperature=True  # Allow temperature to adapt during training
+        )
         # Update projection to match the new output size (2 points * 2 coordinates = 4)
         self.projection = nn.Linear(number_of_keypoints * 2, config.d_model)
 
     def forward(self, x):
+        # Resize input images to configured size
+        x = self.resize_transform(x)
         x = self.backbone(x)
         spatial_coords = self.spatial_softmax(x)
         projected = self.projection(spatial_coords)
@@ -447,6 +476,36 @@ class DiffusionTransformer(nn.Module):
 
         # Return context and spatial outputs for visualization
         return context, spatial_outputs
+
+    def compute_spatial_regularization_loss(self, spatial_outputs):
+        """Compute regularization loss to prevent spatial softmax points from collapsing."""
+        reg_loss = 0.0
+        count = 0
+        
+        for cam_key, spatial_data in spatial_outputs.items():
+            if spatial_data is not None:
+                img_tensor, spatial_coords = spatial_data
+                if img_tensor is not None and spatial_coords is not None:
+                    # Reshape coordinates to (B, T, num_points, 2)
+                    B, T, coord_dim = spatial_coords.shape
+                    num_points = coord_dim // 2
+                    coords_reshaped = spatial_coords.view(B, T, num_points, 2)
+                    
+                    # Compute pairwise distances between points
+                    for i in range(num_points):
+                        for j in range(i + 1, num_points):
+                            # Euclidean distance between point i and point j
+                            diff = coords_reshaped[:, :, i, :] - coords_reshaped[:, :, j, :]
+                            distance = torch.norm(diff, dim=-1)  # (B, T)
+                            
+                            # Penalize small distances (encourage separation)
+                            # Use a margin-based loss: max(0, margin - distance)
+                            margin = 0.3  # Minimum distance in normalized coordinates [-1, 1]
+                            penalty = torch.clamp(margin - distance, min=0.0)
+                            reg_loss += penalty.mean()
+                            count += 1
+        
+        return reg_loss / count if count > 0 else reg_loss
       
     def compute_loss(self, batch):
         """Diffusion Training: Inject noise and learn to predict it."""
@@ -477,8 +536,27 @@ class DiffusionTransformer(nn.Module):
         # 5. Call UNet denoiser with per-timestep conditioning
         pred_noise = self.denoiser(noisy_actions, timesteps, obs_context)
         
-        # 6. Compute loss
-        loss = F.mse_loss(pred_noise, noise)
+        # 6. Compute both original and weighted losses
+        # Original MSE loss
+        original_loss = F.mse_loss(pred_noise, noise)
+        
+        # Weighted loss
+        # Get joint weights from config and expand to match the shape of noise/pred_noise
+        joint_weights = torch.tensor(self.config.joint_weights, device=self.device)
+        # Expand weights to match the shape: (B, T_act, action_dim)
+        expanded_weights = joint_weights.view(1, 1, -1).expand_as(noise)
+        
+        # Compute weighted MSE loss
+        squared_errors = (pred_noise - noise) ** 2
+        weighted_squared_errors = squared_errors * expanded_weights
+        weighted_loss = weighted_squared_errors.mean()
+        
+        # Spatial regularization loss to prevent point collapse
+        spatial_reg_loss = self.compute_spatial_regularization_loss(spatial_outputs)
+        
+        # Combined loss (original + weighted + spatial regularization)
+        # Use a small weight for the spatial regularization loss to avoid overpowering the main losses
+        loss = original_loss + weighted_loss + 0.1 * spatial_reg_loss
 
         return loss
 

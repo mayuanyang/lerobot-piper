@@ -48,6 +48,12 @@ The model uses a K-point spatial softmax mechanism that extracts multiple (x, y)
 
 Currently configured to use 2 points per camera, but can be easily adjusted to use more points by modifying the `num_points` parameter in the VisionEncoder.
 
+The SpatialSoftmax implementation includes several improvements to prevent the common issue of points collapsing to the center:
+- **Temperature scaling**: Uses a low initial temperature (0.1) with learnable parameters to encourage sharp attention peaks
+- **Orthogonal initialization**: Initializes the convolutional weights to encourage diverse attention maps
+- **Spatial regularization**: Adds a loss term during training to encourage separation between detected points
+- **Weight scaling**: Scales initial weights to promote sharper attention distributions
+
 ## Usage
 
 ### Training
@@ -73,6 +79,8 @@ config = TransformerDiffusionConfig(
     n_action_steps=8,       # Number of action steps to execute
     state_dim=7,            # Robot state dimension
     action_dim=7,           # Action dimension
+    joint_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],  # Weight for each joint in loss computation
+    input_image_size=(320, 320),  # Input image size (height, width)
     d_model=256,            # Transformer model dimension
     nhead=8,                # Number of attention heads
     num_encoder_layers=6,   # Encoder layers
@@ -82,6 +90,10 @@ config = TransformerDiffusionConfig(
     vision_backbone="resnet18"  # Vision backbone
 )
 ```
+
+## Weighted Loss
+
+The model supports weighted loss computation for different joints in addition to the original MSE loss. This is useful when certain joints are more important than others in your robotic task. The total loss is computed as the sum of the original MSE loss and the weighted MSE loss. You can adjust the `joint_weights` parameter in the configuration to assign different weights to each joint dimension. Higher weights will make the model focus more on accurately predicting those joint values during training.
 
 ## Model Components
 

@@ -88,7 +88,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     num_joints = len(json_data["joint_names"])
     original_num_frames = len(json_data["frames"])
     effective_num_frames = original_num_frames - last_frames_to_chop - first_frames_to_chop
-    delta_scale = 100  # Assuming joint positions are already in correct scale
+    delta_scale = 10  # Assuming joint positions are already in correct scale
     gripper_scale = 50  # Scale factor for gripper DOF if needed
     
     if effective_num_frames <= 0:
@@ -1326,7 +1326,7 @@ def main():
     OUTPUT_FOLDER = Path("output/")  # Output folder for processed dataset
     REPO_ID = "ISDept/piper_arm"  # Your desired Hugging Face repo ID
     AGGREGATE_EPISODES = True  # New flag to control aggregation behavior
-    MODE = "full"  # Processing mode: "diff" or "full"
+    MODE = "diff"  # Processing mode: "diff" or "full"
     # ---------------------
     
     # Find all episode folders

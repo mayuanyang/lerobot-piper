@@ -143,9 +143,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         use_film_scale_modulation=True
     )
     
-    if dataset_metadata.stats is None:
-        raise ValueError("Dataset stats are required to initialize the policy.")
-
+    
     # Model loading logic
     if resume_from_checkpoint is not None:
         print(f"Resuming training from checkpoint: {resume_from_checkpoint}")
@@ -268,6 +266,25 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             # Forward & Backward
             loss, _ = policy.forward(batch)
             loss.backward()
+            
+            # Print gradient information for vision encoders (for debugging)
+            if step % (log_freq * 10) == 0:  # Print every 10 log intervals
+                print(f"\n--- Gradient Analysis at Step {step} ---")
+                total_vision_grad = 0.0
+                total_vision_params = 0
+                for name, param in policy.model.named_parameters():
+                    if 'image_encoders' in name and param.grad is not None:
+                        grad_mean = param.grad.abs().mean().item()
+                        grad_max = param.grad.abs().max().item()
+                        param_count = param.numel()
+                        print(f"{name}: mean_grad={grad_mean:.6f}, max_grad={grad_max:.6f}, params={param_count}")
+                        total_vision_grad += grad_mean * param_count
+                        total_vision_params += param_count
+                
+                if total_vision_params > 0:
+                    avg_vision_grad = total_vision_grad / total_vision_params
+                    print(f"Average vision encoder gradient: {avg_vision_grad:.6f}")
+                print("--- End Gradient Analysis ---\n")
             
             # Calculate gradient norm for monitoring and clip gradients
             grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
