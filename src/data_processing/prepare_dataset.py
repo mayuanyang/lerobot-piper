@@ -88,8 +88,8 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     num_joints = len(json_data["joint_names"])
     original_num_frames = len(json_data["frames"])
     effective_num_frames = original_num_frames - last_frames_to_chop - first_frames_to_chop
-    delta_scale = 10  # Assuming joint positions are already in correct scale
-    gripper_scale = 50  # Scale factor for gripper DOF if needed
+    delta_scale = 40  # Assuming joint positions are already in correct scale
+    gripper_scale = 10  # Scale factor for gripper DOF if needed
     
     if effective_num_frames <= 0:
         print(f"❌ ERROR: Chopping {last_frames_to_chop} frames from {original_num_frames} results in 0 or fewer frames. Skipping data generation.")
@@ -671,6 +671,7 @@ def compute_and_save_dataset_stats(output_dir: Path):
     
     print(f"📊 Total frames in dataset: {total_frames}")
 
+    # Process visual features with simple fixed stats instead of loading all data
     for f_name, f_info in features.items():
         if f_info["dtype"] in ["image", "video"]:
             print(f"\n🎥 Processing video feature: {f_name}")
@@ -680,106 +681,21 @@ def compute_and_save_dataset_stats(output_dir: Path):
             height, width, channels = shape
             is_depth = 'depth' in f_name.lower()
             
-            # Find video files
-            video_dir = output_dir / "videos" / f_name
-            video_paths = []
-            
-            # Check all chunk directories
-            for chunk_dir in video_dir.glob("chunk-*"):
-                for video_file in chunk_dir.glob("*.mp4"):
-                    video_paths.append(video_file)
-            
-            if not video_paths:
-                print(f"  ⚠️ No video files found at {video_dir}")
-                continue
-            
-            print(f"  Found {len(video_paths)} video file(s)")
-            
-            # Load and combine all video data
-            all_frames_data = []
-            total_frames_loaded = 0
-            
-            for i, video_path in enumerate(video_paths):
-                print(f"  Loading video {i+1}/{len(video_paths)}: {video_path.name}")
-                data = load_video_to_numpy(video_path)
-                
-                if data is None:
-                    print(f"    ⚠️ Could not load video")
-                    continue
-                    
-                # Verify shape
-                if len(data.shape) != 4:
-                    print(f"    ⚠️ Unexpected shape: {data.shape}")
-                    continue
-                
-                # Check if data matches expected shape
-                _, h, w, c = data.shape
-                if h != height or w != width or c != channels:
-                    print(f"    ⚠️ Shape mismatch: Expected {height}x{width}x{channels}, got {h}x{w}x{c}")
-                    # Try to resize if needed
-                    if c != channels:
-                        if channels == 1 and c == 3:
-                            # Convert RGB to grayscale
-                            data = np.mean(data, axis=-1, keepdims=True)
-                        elif channels == 3 and c == 1:
-                            # Expand grayscale to RGB
-                            data = np.repeat(data, 3, axis=-1)
-                
-                all_frames_data.append(data)
-                total_frames_loaded += len(data)
-                print(f"    Loaded {len(data)} frames, shape: {data.shape}")
-            
-            if not all_frames_data:
-                print(f"  ⚠️ No video data loaded for {f_name}")
-                continue
-            
-            # Combine all video data
-            combined_data = np.concatenate(all_frames_data, axis=0)
-            print(f"  Total frames combined: {len(combined_data)}")
-            
-            # Verify final shape
-            if len(combined_data.shape) != 4:
-                print(f"  ⚠️ Combined data has wrong shape: {combined_data.shape}")
-                continue
-            
-            # Calculate statistics
-            print(f"  Calculating statistics...")
-            
-            # For RGB images (HWC format)
-            # For RGB images (Expected shape: [Frames, Height, Width, 3])
-            print('The shape of combined data is:', combined_data.shape)
-                        
-            # ... after combining data ...
-            print(f"  The shape of combined data is: {combined_data.shape}")
-            num_channels = combined_data.shape[-1]
-            
-            # --- CHANNEL DIFFERENCE DIAGNOSTIC (Safe for 1-channel) ---
-            if num_channels == 3:
-                channel_diff = np.abs(combined_data[..., 0] - combined_data[..., 2]).sum()
-                print(f"  Total pixel difference between Red and Blue: {channel_diff}")
-                if channel_diff == 0:
-                    print("  ⚠️ WARNING: All channels are identical (Grayscale-in-RGB)")
-            
-            # --- STATS CALCULATION ---
-            print(f"  Calculating statistics for {num_channels} channel(s)...")
-            means, stds, mins, maxs = [], [], [], []
+            # Use simple fixed statistics for RGB/RGBD data
+            # For RGB images, use min=0, max=1 (typical for normalized images)
+            # For depth images, also use min=0, max=1 (can be adjusted if needed)
+            if channels == 3:  # RGB
+                means = [0.5, 0.5, 0.5]  # Simple average values
+                stds = [0.5, 0.5, 0.5]   # Simple std values
+                mins = [0.0, 0.0, 0.0]   # Min values for RGB
+                maxs = [1.0, 1.0, 1.0]   # Max values for RGB
+            else:  # Grayscale or depth
+                means = [0.5]            # Simple average value
+                stds = [0.5]             # Simple std value
+                mins = [0.0]             # Min value
+                maxs = [1.0]             # Max value
 
-            for i in range(num_channels):
-                # Explicitly slice the channel to ensure independent math
-                channel_view = combined_data[..., i]
-                
-                means.append(float(np.mean(channel_view)))
-                stds.append(float(np.std(channel_view)))
-                mins.append(float(np.min(channel_view)))
-                maxs.append(float(np.max(channel_view)))
-
-            # --- LOGGING ---
-            if num_channels == 3:
-                print(f"  📊 RGB Stats - Mean: {means}, Std: {stds}")
-            else:
-                print(f"  📊 Depth/Grayscale Stats - Mean: {means[0]:.6f}, Std: {stds[0]:.6f}")
-
-            # --- LEROBOT FORMATTING ---
+            # Format for LeRobot
             visual_results[f_name] = {
                 "min":  [[[m]] for m in mins],
                 "max":  [[[m]] for m in maxs],
@@ -787,8 +703,7 @@ def compute_and_save_dataset_stats(output_dir: Path):
                 "std":  [[[m]] for m in stds],
             }
             
-            
-            print(f"  ✅ Completed {f_name}")
+            print(f"  ✅ Using fixed stats for {f_name} - Channels: {channels}")
             
         else:
             # Numerical feature handling
@@ -919,7 +834,7 @@ def compute_and_save_dataset_stats(output_dir: Path):
     for f_name in features:
         if f_name in final_stats:
             if f_name in visual_results:
-                print(f"  {f_name}: Video/Image stats computed")
+                print(f"  {f_name}: Fixed visual stats used (min=0, max=1)")
             else:
                 print(f"  {f_name}: Numerical stats computed")
         else:
@@ -1439,7 +1354,7 @@ def main():
         pad_videos(OUTPUT_FOLDER)
         
         # Compute and save dataset statistics for the aggregated episode
-        #compute_and_save_dataset_stats(OUTPUT_FOLDER)
+        compute_and_save_dataset_stats(OUTPUT_FOLDER)
         
         print("Dataset preparation with episode aggregation completed successfully!")
     

@@ -378,15 +378,9 @@ class DiffusionTransformer(nn.Module):
             cam.replace('.', '_'): VisionEncoder(config) 
             for cam in config.image_features.keys()
         })
-        # Enhanced state encoder for all 7 dimensions with deeper network
-        self.state_encoder = nn.Sequential(
-            nn.Linear(config.state_dim, config.d_model // 2),
-            nn.LayerNorm(config.d_model // 2),
-            nn.ReLU(),
-            nn.Linear(config.d_model // 2, config.d_model),
-            nn.LayerNorm(config.d_model),
-            nn.ReLU()
-        )
+                
+        self.state_encoder = nn.Linear(config.state_dim, config.d_model)
+        
         # Add positional encoding for state sequences
         self.state_positional_encoding = PositionalEncoding(config.d_model, 100)
                 
