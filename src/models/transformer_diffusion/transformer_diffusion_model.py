@@ -53,14 +53,12 @@ class SpatialSoftmax(nn.Module):
             self.nets = None
             self._out_c = self._in_c
         
-        self.temperature = nn.Parameter(torch.tensor(temperature)) if learnable_temperature else None
 
-        # Temperature scaling for sharper peaks
         if learnable_temperature:
-            self.temperature = nn.Parameter(torch.clamp(self.temperature, 0.1, 5.0))
-
+            self.temperature = nn.Parameter(torch.tensor(temperature))
         else:
             self.register_buffer('temperature', torch.tensor(temperature))
+
 
         # we could use torch.linspace directly but that seems to behave slightly differently than numpy
         # and causes a small degradation in pc_success of pre-trained models.
@@ -82,8 +80,14 @@ class SpatialSoftmax(nn.Module):
 
         # [B, K, H, W] -> [B * K, H * W] where K is number of keypoints
         features = features.reshape(-1, self._in_h * self._in_w)
+        
+        if isinstance(self.temperature, nn.Parameter):
+            temperature = self.temperature.clamp(0.1, 5.0)
+        else:
+            temperature = self.temperature
+        
         # Apply temperature scaling and 2d softmax normalization
-        attention = F.softmax(features / self.temperature, dim=-1)
+        attention = F.softmax(features / temperature, dim=-1)
         # [B * K, H * W] x [H * W, 2] -> [B * K, 2] for spatial coordinate mean in x and y dimensions
         expected_xy = attention @ self.pos_grid
         # reshape to [B, K, 2]
@@ -228,47 +232,27 @@ class DiffusionConditionalResidualBlock1d(nn.Module):
         return self.residual_activation(residual)
 
     def forward(self, x, cond):
-        """
-        x:    (B, C, T_x)
-        cond: (B, cond_dim, T_cond)
-        """
-        # Note: We no longer require T_x == T_cond, we'll handle mismatched dimensions
-        
-        out = self.conv1(x)
-
-        # Handle conditioning with potentially different temporal dimensions
         B, _, T_x = x.shape
         _, _, T_cond = cond.shape
-        
-        if T_cond == T_x:
-            # Same temporal dimensions - use standard conditioning
-            cond_proc = cond
-        elif T_cond == 1:
-            # Single time step conditioning - broadcast to all time steps
-            cond_proc = cond.expand(-1, -1, T_x)
-        else:
-            # Different temporal dimensions - use adaptive pooling to match
-            cond_proc = F.adaptive_avg_pool1d(cond, T_x)
+        assert T_cond == T_x, f"T_cond={T_cond}, T_x={T_x}, please align cond outside the block"
 
-        # Move cond to (B*T_x, cond_dim)
-        cond_flat = cond_proc.permute(0, 2, 1).reshape(B * T_x, -1)
+        out = self.conv1(x)
+        cond_flat = cond.permute(0, 2, 1).reshape(B * T_x, -1)
 
         film_out = self.film(cond_flat)
-
         if self.use_film_scale_modulation:
             scale, bias = torch.chunk(film_out, 2, dim=-1)
             scale = scale.view(B, T_x, self.out_channels).permute(0, 2, 1)
             bias  = bias.view(B, T_x, self.out_channels).permute(0, 2, 1)
-            # Remove tanh normalization to allow full range of scale and bias
             out = scale * out + bias
         else:
             film_out = film_out.view(B, T_x, self.out_channels).permute(0, 2, 1)
-            # Remove tanh normalization to allow full range of film outputs
             out = out + film_out
 
         out = self.conv2(out)
         residual = out + self.skip_conv(x)
         return self.residual_activation(residual)
+
 
 
 
@@ -379,15 +363,8 @@ class DiffusionConditionalUnet1d(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def forward(self, x, timestep, obs_cond):
-        """
-        Args:
-            x:        (B, T, action_dim)
-            timestep: (B,)
-            obs_cond: (B, T, obs_cond_dim)   per-timestep observation tokens
-        Returns:
-            (B, T, action_dim)
-        """
-        # ---- reshape to Conv1d ----
+        # x: (B, T, action_dim)
+        # obs_cond: (B, T, obs_cond_dim)
         x = x.permute(0, 2, 1)               # (B, action_dim, T)
         obs_cond = obs_cond.permute(0, 2, 1) # (B, obs_cond_dim, T)
 
@@ -397,42 +374,49 @@ class DiffusionConditionalUnet1d(nn.Module):
         t_emb = self.diffusion_step_encoder(timestep)     # (B, t_dim)
         t_emb = t_emb.unsqueeze(-1).expand(-1, -1, T)     # (B, t_dim, T)
 
-        # ---- full conditioning ----
-        cond = torch.cat([t_emb, obs_cond], dim=1)        # (B, cond_dim, T)
+        # ---- full conditioning at base resolution ----
+        base_cond = torch.cat([t_emb, obs_cond], dim=1)   # (B, cond_dim, T)
 
-        # ------------------------------------------------
-        # Encoder
-        # ------------------------------------------------
+        # ---------- build cond pyramid ----------
+        cond_pyramid = [base_cond]   # index 0 对应 encoder 第一层 / 最高分辨率
+        cur_T = T
+        # in_out: [(action_dim, d0), (d0,d1), (d1,d2), ...]
+        # 对应的 down_modules: 每次 stride=2，除了最后一层
+        for i in range(len(self.down_modules) - 1):
+            next_T = math.ceil(cur_T / 2)
+            cond_next = F.adaptive_avg_pool1d(base_cond, next_T)
+            cond_pyramid.append(cond_next)
+            cur_T = next_T
+
+        # ---------- Encoder ----------
         skips = []
-
-        for res1, res2, down in self.down_modules:
-            # The residual blocks now handle different temporal dimensions internally
-            x = res1(x, cond)
-            x = res2(x, cond)
-
+        for level, (res1, res2, down) in enumerate(self.down_modules):
+            cond_here = cond_pyramid[level]           # (B, cond_dim, T_x) 与当前 x 对齐
+            x = res1(x, cond_here)
+            x = res2(x, cond_here)
             skips.append(x)
-
             x = down(x)
 
-        # ------------------------------------------------
-        # Middle
-        # ------------------------------------------------
+        # 现在 x 的时间长度应该与 cond_pyramid[-1] 一致
+        cond_mid = cond_pyramid[-1]
         for mid in self.mid_modules:
-            x = mid(x, cond)
+            x = mid(x, cond_mid)
 
-        # ------------------------------------------------
-        # Decoder
-        # ------------------------------------------------
-        for res1, res2, up in self.up_modules:
+        # ---------- Decoder ----------
+        # 注意 decoder_pairs 是 reversed(in_out[1:])，up_modules 数量 = len(in_out) - 1
+        # 对应的 skip 层级是 len(self.down_modules) - 2, ..., 0
+        for idx, (res1, res2, up) in enumerate(self.up_modules):
             skip = skips.pop()
-            
             x = torch.cat([x, skip], dim=1)
 
-            x = res1(x, cond)
-            x = res2(x, cond)
+            # skip 对应的 encoder 层级
+            level = len(skips)   # 因为每 pop 一次，剩余 skips 数就是层级 index
+            cond_here = cond_pyramid[level]
+
+            x = res1(x, cond_here)
+            x = res2(x, cond_here)
             x = up(x)
 
-        # ---- output ----
         x = self.final_conv(x)
         return x.permute(0, 2, 1)
 
