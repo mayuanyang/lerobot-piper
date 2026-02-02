@@ -288,23 +288,55 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             loss, _ = policy.forward(batch)
             loss.backward()
             
-            # Print gradient information for vision encoders (for debugging)
+            # Print gradient information for vision encoders, state encoder, and UNet (for debugging)
             if step % (log_freq * 10) == 0:  # Print every 10 log intervals
                 print(f"\n--- Gradient Analysis at Step {step} ---")
+                
+                # Vision encoder gradients
                 total_vision_grad = 0.0
                 total_vision_params = 0
+                print("\n--- Vision Encoder Gradients ---")
                 for name, param in policy.model.named_parameters():
                     if 'image_encoders' in name and param.grad is not None:
                         grad_mean = param.grad.abs().mean().item()
-                        grad_max = param.grad.abs().max().item()
                         param_count = param.numel()
-                        print(f"{name}: mean_grad={grad_mean:.6f}, max_grad={grad_max:.6f}, params={param_count}")
                         total_vision_grad += grad_mean * param_count
                         total_vision_params += param_count
                 
                 if total_vision_params > 0:
                     avg_vision_grad = total_vision_grad / total_vision_params
                     print(f"Average vision encoder gradient: {avg_vision_grad:.6f}")
+                
+                # State encoder gradients
+                total_state_grad = 0.0
+                total_state_params = 0
+                print("\n--- State Encoder Gradients ---")
+                for name, param in policy.model.named_parameters():
+                    if 'state_encoder' in name and param.grad is not None:
+                        grad_mean = param.grad.abs().mean().item()
+                        param_count = param.numel()
+                        total_state_grad += grad_mean * param_count
+                        total_state_params += param_count
+                
+                if total_state_params > 0:
+                    avg_state_grad = total_state_grad / total_state_params
+                    print(f"Average state encoder gradient: {avg_state_grad:.6f}")
+                
+                # UNet gradients
+                total_unet_grad = 0.0
+                total_unet_params = 0
+                print("\n--- UNet Gradients ---")
+                for name, param in policy.model.named_parameters():
+                    if 'denoiser' in name and param.grad is not None:
+                        grad_mean = param.grad.abs().mean().item()
+                        param_count = param.numel()
+                        total_unet_grad += grad_mean * param_count
+                        total_unet_params += param_count
+                
+                if total_unet_params > 0:
+                    avg_unet_grad = total_unet_grad / total_unet_params
+                    print(f"Average UNet gradient: {avg_unet_grad:.6f}")
+                
                 print("--- End Gradient Analysis ---\n")
             
             # Calculate gradient norm for monitoring and clip gradients
