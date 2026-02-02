@@ -555,10 +555,15 @@ class DiffusionTransformer(nn.Module):
         # Positional encoding for observation tokens
         self.obs_positional_encoding = PositionalEncoding(config.d_model, 100)  # 100 is max length
 
+        # Token type embedding for weighted aggregation
+        self.token_type_emb = nn.Parameter(torch.zeros(num_obs_tokens, 1))  # (N_tok, 1)
+        # Initialize slightly differently
+        nn.init.uniform_(self.token_type_emb, -0.1, 0.1)
+
         # 3. Diffusion Components
         # We denoise the entire action horizon at once: (Horizon, Action_Dim)
         self.noise_scheduler = DDPMScheduler(
-            num_train_timesteps=20,  # Reduced from 50 to 20 for less noise
+            num_train_timesteps=100,  
             beta_schedule='scaled_linear',  # Less aggressive noise schedule
             beta_start=0.0001,  # Lower starting noise
             beta_end=0.02,      # Lower ending noise
@@ -581,52 +586,62 @@ class DiffusionTransformer(nn.Module):
 
 
     def get_condition(self, batch):
-        """Processes images and states into per-timestep observation tokens."""
         B, T_obs = batch["observation.state"].shape[:2]
-        tokens = []
-
-        # Store spatial softmax outputs for visualization
+        cam_tokens_per_timestep = []   # list of (B, T_obs, 2, d_model) for each camera
         spatial_outputs = {}
 
         for cam_key, encoder in self.image_encoders.items():
-            # Check if the camera data is present in the batch
             batch_key = cam_key.replace('_', '.')
             if batch_key in batch:
-                img = batch[batch_key].flatten(0, 1)
-                # Get the separate spatial and global projected features and spatial coordinates
-                (spatial_projected, global_projected), spatial_coords = encoder(img)
-                # Add both spatial and global features as separate tokens
-                tokens.append(spatial_projected.view(B, T_obs, -1))
-                tokens.append(global_projected.view(B, T_obs, -1))
-                # Store spatial coordinates for visualization
-                spatial_outputs[cam_key] = (img.view(B, T_obs, *img.shape[1:]), spatial_coords.view(B, T_obs, -1))
+                img = batch[batch_key].flatten(0, 1)      # (B*T_obs, C, H, W)
+                (spatial_proj, global_proj), spatial_coords = encoder(img)
+                # (B*T_obs, d_model) -> (B, T_obs, d_model)
+                spatial_proj = spatial_proj.view(B, T_obs, -1)
+                global_proj  = global_proj.view(B, T_obs, -1)
+                # 堆成两个 token: dim=2 是 token index（0=spatial,1=global）
+                cam_tokens = torch.stack([spatial_proj, global_proj], dim=2)  # (B, T_obs, 2, d_model)
+                cam_tokens_per_timestep.append(cam_tokens)
+
+                spatial_outputs[cam_key] = (
+                    img.view(B, T_obs, *img.shape[1:]),
+                    spatial_coords.view(B, T_obs, -1),
+                )
             else:
-                # If camera data is missing, create zero tokens for both spatial and global features
-                tokens.append(torch.zeros(B, T_obs, self.config.d_model, device=self.device))
-                tokens.append(torch.zeros(B, T_obs, self.config.d_model, device=self.device))
+                zeros = torch.zeros(B, T_obs, 2, self.config.d_model, device=self.device)
+                cam_tokens_per_timestep.append(zeros)
                 spatial_outputs[cam_key] = None
-        
-        # Original state encoding (all 7 dimensions including gripper as continuous)
-        state_encoded = self.state_encoder(batch["observation.state"])
-        # Apply positional encoding to state tokens
-        state_with_pos = self.state_positional_encoding(state_encoded)
-        tokens.append(state_with_pos)
 
-        
-        # Combine tokens
-        obs_features = torch.cat(tokens, dim=-1)  # (B, T_obs, d_model * num_modalities)
-        
-        # Project to d_model
-        obs_features = self.obs_projection(obs_features)  # (B, T_obs, d_model)
-        
-        # Apply positional encoding to observation tokens
-        obs_features_pos = self.obs_positional_encoding(obs_features)  # (B, T_obs, d_model)
-        
-        # Pass through transformer
-        context = self.obs_transformer(obs_features_pos)  # (B, T_obs, d_model)
+        # (B, T_obs, 2*#cams, d_model)
+        cam_tokens_all = torch.cat(cam_tokens_per_timestep, dim=2)
 
-        # Return context and spatial outputs for visualization
+        # state token: 先编码，再扩一维 token 轴
+        state_encoded = self.state_encoder(batch["observation.state"])   # (B, T_obs, d_model)
+        state_with_pos = self.state_positional_encoding(state_encoded)   # 也可以再额外加时间 PE
+        state_tokens = state_with_pos.unsqueeze(2)                        # (B, T_obs, 1, d_model)
+
+        # 拼成 (B, T_obs, N_tokens, d_model)
+        obs_tokens = torch.cat([cam_tokens_all, state_tokens], dim=2)
+
+        # 把 token 维展平到 seq_len 维度，让 Transformer 看到所有 token
+        B, T, N_tok, D = obs_tokens.shape
+        obs_tokens = obs_tokens.view(B, T * N_tok, D)   # (B, T*N_tokens, d_model)
+
+        # 对这个“长序列”加一次位置编码（可以是 1D PE）
+        obs_tokens = self.obs_positional_encoding(obs_tokens)   # (B, T*N_tokens, d_model)
+
+        # 过 Transformer
+        context = self.obs_transformer(obs_tokens)  # (B, T*N_tokens, d_model)
+
+        # 如果你想最后仍然得到“每个时间步 1 个 context 向量”去喂 UNet：
+        context = context.view(B, T, N_tok, D)                  # (B, T, N_tok, D)
+
+        # token_type_emb: (1, 1, N_tok, 1)
+        w = self.token_type_emb.view(1, 1, N_tok, 1)
+        attn = torch.softmax(w, dim=2)
+        context = (context * attn).sum(dim=2)                   # (B, T, D)
+
         return context, spatial_outputs
+
 
     
       
@@ -661,24 +676,8 @@ class DiffusionTransformer(nn.Module):
         
         # 6. Compute both original and weighted losses
         # Original MSE loss
-        original_loss = F.mse_loss(pred_noise, noise)
+        loss = F.mse_loss(pred_noise, noise)
         
-        # Weighted loss
-        # Get joint weights from config and expand to match the shape of noise/pred_noise
-        joint_weights = torch.tensor(self.config.joint_weights, device=self.device)
-        # Expand weights to match the shape: (B, T_act, action_dim)
-        expanded_weights = joint_weights.view(1, 1, -1).expand_as(noise)
-        
-        # Compute weighted MSE loss
-        squared_errors = (pred_noise - noise) ** 2
-        weighted_squared_errors = squared_errors * expanded_weights
-        weighted_loss = weighted_squared_errors.mean()
-        
-                
-        # Combined loss (original + weighted + spatial regularization)
-        # Use a small weight for the spatial regularization loss to avoid overpowering the main losses
-        loss = original_loss + weighted_loss
-
         return loss
 
     def forward(self, batch):

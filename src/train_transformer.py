@@ -117,8 +117,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     print('output_features:', output_features)
     
     # Training parameters
-    obs = 4
-    horizon = 48
+    obs = 2
+    horizon = 16
     n_action_steps = 8
     
     # Create transformer configuration
@@ -206,8 +206,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         # Higher learning rate for vision encoders to improve gradient flow
         # Standard learning rate for other components
         optimizer = torch.optim.Adam([
-            {'params': vision_params, 'lr': 5e-5},   # Higher LR for vision encoders
-            {'params': other_params, 'lr': 5e-5}     # Standard LR for other components
+            {'params': vision_params, 'lr': 1e-5},   # Higher LR for vision encoders
+            {'params': other_params, 'lr': 1e-4}     # Standard LR for other components
         ], weight_decay=1e-4)
         
         # Store parameter groups for dynamic adjustment
@@ -215,7 +215,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         other_param_group = optimizer.param_groups[1]
         
         # Cosine scheduler with warmup
-        warmup_steps = 1000
+        warmup_steps = 100
         scheduler = get_cosine_schedule_with_warmup(
             optimizer, 
             num_warmup_steps=warmup_steps, 
