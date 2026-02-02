@@ -1,5 +1,5 @@
 import torch
-import torch.nn as nn
+from torch import Tensor, nn
 import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.transforms as transforms
@@ -7,78 +7,90 @@ from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.optimization import get_scheduler
 from typing import Dict, Optional
 import math
+import numpy as np
+
+# Import the simple diffusion model
+from .simple_diffusion_model import SimpleDiffusionModel
 
 
 
 class SpatialSoftmax(nn.Module):
     """
-    K-point Spatial Softmax that produces K (x, y) coordinates per image.
-    Includes temperature scaling and regularization to prevent collapse.
+    Spatial Soft Argmax operation described in "Deep Spatial Autoencoders for Visuomotor Learning" by Finn et al.
+    (https://huggingface.co/papers/1509.06113). A minimal port of the robomimic implementation.
+
+    At a high level, this takes 2D feature maps (from a convnet/ViT) and returns the "center of mass"
+    of activations of each channel, i.e., keypoints in the image space for the policy to focus on.
+
+    Example: take feature maps of size (512x10x12). We generate a grid of normalized coordinates (10x12x2):
+    -----------------------------------------------------
+    | (-1., -1.)   | (-0.82, -1.)   | ... | (1., -1.)   |
+    | (-1., -0.78) | (-0.82, -0.78) | ... | (1., -0.78) |
+    | ...          | ...            | ... | ...         |
+    | (-1., 1.)    | (-0.82, 1.)    | ... | (1., 1.)    |
+    -----------------------------------------------------
+    This is achieved by applying channel-wise softmax over the activations (512x120) and computing the dot
+    product with the coordinates (120x2) to get expected points of maximal activation (512x2).
+
+    The example above results in 512 keypoints (corresponding to the 512 input channels). We can optionally
+    provide num_kp != None to control the number of keypoints. This is achieved by a first applying a learnable
+    linear mapping (in_channels, H, W) -> (num_kp, H, W).
     """
-    def __init__(self, height, width, in_channels, num_points=8, temperature=1.0, learnable_temperature=False):
+
+    def __init__(self, input_shape, num_kp=None, temperature=1.0, learnable_temperature=False):
         """
         Args:
-            height: Height of the feature map
-            width: Width of the feature map
-            in_channels: Number of input channels
-            num_points: Number of keypoints to extract
-            temperature: Temperature for softmax (lower = sharper peaks)
-            learnable_temperature: Whether to make temperature a learnable parameter
+            input_shape (list): (C, H, W) input feature map shape.
+            num_kp (int): number of keypoints in output. If None, output will have the same number of channels as input.
+            temperature (float): temperature for softmax. Lower values lead to sharper peaks.
+            learnable_temperature (bool): whether temperature should be learnable.
         """
         super().__init__()
-        self.height = height
-        self.width = width
-        self.num_points = num_points
-        
-        # Learnable temperature parameter to control sharpness
+
+        assert len(input_shape) == 3
+        self._in_c, self._in_h, self._in_w = input_shape
+
+        if num_kp is not None:
+            self.nets = torch.nn.Conv2d(self._in_c, num_kp, kernel_size=1)
+            self._out_c = num_kp
+        else:
+            self.nets = None
+            self._out_c = self._in_c
+
+        # Temperature scaling for sharper peaks
         if learnable_temperature:
             self.temperature = nn.Parameter(torch.ones(1) * temperature)
         else:
-            self.temperature = temperature
+            self.register_buffer('temperature', torch.tensor(temperature))
 
-        # 1x1 conv to produce K attention maps
-        self.conv = nn.Conv2d(in_channels, num_points, kernel_size=1, bias=False)
-        
-        # Initialize weights to encourage diverse initial attention maps
-        # Use orthogonal initialization to encourage different feature maps
-        nn.init.orthogonal_(self.conv.weight)
-        # Scale weights to encourage sharper initial attention
-        with torch.no_grad():
-            self.conv.weight *= 2.0
+        # we could use torch.linspace directly but that seems to behave slightly differently than numpy
+        # and causes a small degradation in pc_success of pre-trained models.
+        pos_x, pos_y = np.meshgrid(np.linspace(-1.0, 1.0, self._in_w), np.linspace(-1.0, 1.0, self._in_h))
+        pos_x = torch.from_numpy(pos_x.reshape(self._in_h * self._in_w, 1)).float()
+        pos_y = torch.from_numpy(pos_y.reshape(self._in_h * self._in_w, 1)).float()
+        # register as buffer so it's moved to the correct device.
+        self.register_buffer("pos_grid", torch.cat([pos_x, pos_y], dim=1))
 
-        # normalized pixel coordinate grid
-        pos_y, pos_x = torch.meshgrid(
-            torch.linspace(-1, 1, height),
-            torch.linspace(-1, 1, width),
-            indexing="ij"
-        )
-        self.register_buffer("pos_x", pos_x.reshape(-1))
-        self.register_buffer("pos_y", pos_y.reshape(-1))
-
-    def forward(self, feature_map):
+    def forward(self, features: Tensor) -> Tensor:
         """
-        feature_map: (B, C, H, W)
-        returns:     (B, K*2) where K is num_points
+        Args:
+            features: (B, C, H, W) input feature maps.
+        Returns:
+            (B, K, 2) image-space coordinates of keypoints.
         """
-        B = feature_map.shape[0]
+        if self.nets is not None:
+            features = self.nets(features)
 
-        # attention logits: (B, K, H, W)
-        attn = self.conv(feature_map)
-        attn = attn.view(B, self.num_points, -1)
+        # [B, K, H, W] -> [B * K, H * W] where K is number of keypoints
+        features = features.reshape(-1, self._in_h * self._in_w)
+        # Apply temperature scaling and 2d softmax normalization
+        attention = F.softmax(features / self.temperature, dim=-1)
+        # [B * K, H * W] x [H * W, 2] -> [B * K, 2] for spatial coordinate mean in x and y dimensions
+        expected_xy = attention @ self.pos_grid
+        # reshape to [B, K, 2]
+        feature_keypoints = expected_xy.view(-1, self._out_c, 2)
 
-        if self.temperature is not None:
-            attn = attn / self.temperature
-
-        # spatial softmax
-        attn = F.softmax(attn, dim=-1)
-
-        # expected coordinates
-        exp_x = torch.sum(attn * self.pos_x, dim=-1)
-        exp_y = torch.sum(attn * self.pos_y, dim=-1)
-
-        # Flatten coordinates: (B, K*2)
-        coords = torch.stack([exp_x, exp_y], dim=-1)  # (B, K, 2)
-        return coords.view(B, -1)  # (B, K*2)
+        return feature_keypoints
 
 
 class PositionalEncoding(nn.Module):
@@ -150,33 +162,121 @@ class DiffusionConditionalResidualBlock1d(nn.Module):
 
         # For skip connection
         self.skip_conv = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+        
+        # Activation after residual connection for better gradient flow
+        self.residual_activation = nn.Mish()
+        
+        # Initialize weights for stable training
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """Initialize weights for stable training."""
+        # Initialize the final conv layer of conv2 block to small values for stable residual connections
+        # This helps prevent gradient explosion while still allowing gradient flow
+        # Access the Conv1d layer (index 0) within the block, not the Mish activation (index 2)
+        nn.init.normal_(self.conv2.block[0].weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.conv2.block[0].bias)
+        
+        # Initialize FiLM modulation layers
+        for module in self.film:
+            if isinstance(module, nn.Linear):
+                # Xavier initialization for linear layers
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+        
+        # Initialize skip connection if it's a convolution
+        if isinstance(self.skip_conv, nn.Conv1d):
+            # Kaiming initialization for skip connection
+            nn.init.kaiming_normal_(self.skip_conv.weight, mode='fan_out', nonlinearity='relu')
+            if self.skip_conv.bias is not None:
+                nn.init.zeros_(self.skip_conv.bias)
 
-    def forward(self, x, cond):
-        """
-        x:    (B, C, T)
-        cond: (B, cond_dim, T)
-        """
-        assert x.shape[-1] == cond.shape[-1], "Cond and x must align in time"
-
+    def forward_with_cond(self, x, cond):
+        """Forward pass with conditioning, used for gradient checkpointing."""
         out = self.conv1(x)
 
-        # Move cond to (B*T, cond_dim)
-        B, _, T = cond.shape
-        cond_flat = cond.permute(0, 2, 1).reshape(B * T, -1)
+        # Handle conditioning with potentially different temporal dimensions
+        B, _, T_x = x.shape
+        _, _, T_cond = cond.shape
+        
+        if T_cond == T_x:
+            # Same temporal dimensions - use standard conditioning
+            cond_proc = cond
+        elif T_cond == 1:
+            # Single time step conditioning - broadcast to all time steps
+            cond_proc = cond.expand(-1, -1, T_x)
+        else:
+            # Different temporal dimensions - use adaptive pooling to match
+            cond_proc = F.adaptive_avg_pool1d(cond, T_x)
+
+        # Move cond to (B*T_x, cond_dim)
+        cond_flat = cond_proc.permute(0, 2, 1).reshape(B * T_x, -1)
 
         film_out = self.film(cond_flat)
 
         if self.use_film_scale_modulation:
             scale, bias = torch.chunk(film_out, 2, dim=-1)
-            scale = scale.view(B, T, self.out_channels).permute(0, 2, 1)
-            bias  = bias.view(B, T, self.out_channels).permute(0, 2, 1)
+            scale = scale.view(B, T_x, self.out_channels).permute(0, 2, 1)
+            bias  = bias.view(B, T_x, self.out_channels).permute(0, 2, 1)
+            # Add normalization to FiLM outputs to prevent gradient issues with large inputs
+            scale = torch.tanh(scale)  # Normalize scale to [-1, 1]
+            bias = torch.tanh(bias)    # Normalize bias to [-1, 1]
             out = scale * out + bias
         else:
-            film_out = film_out.view(B, T, self.out_channels).permute(0, 2, 1)
+            film_out = film_out.view(B, T_x, self.out_channels).permute(0, 2, 1)
+            # Add normalization to FiLM outputs to prevent gradient issues with large inputs
+            film_out = torch.tanh(film_out)  # Normalize to [-1, 1]
             out = out + film_out
 
         out = self.conv2(out)
-        return out + self.skip_conv(x)
+        residual = out + self.skip_conv(x)
+        return self.residual_activation(residual)
+
+    def forward(self, x, cond):
+        """
+        x:    (B, C, T_x)
+        cond: (B, cond_dim, T_cond)
+        """
+        # Note: We no longer require T_x == T_cond, we'll handle mismatched dimensions
+        
+        out = self.conv1(x)
+
+        # Handle conditioning with potentially different temporal dimensions
+        B, _, T_x = x.shape
+        _, _, T_cond = cond.shape
+        
+        if T_cond == T_x:
+            # Same temporal dimensions - use standard conditioning
+            cond_proc = cond
+        elif T_cond == 1:
+            # Single time step conditioning - broadcast to all time steps
+            cond_proc = cond.expand(-1, -1, T_x)
+        else:
+            # Different temporal dimensions - use adaptive pooling to match
+            cond_proc = F.adaptive_avg_pool1d(cond, T_x)
+
+        # Move cond to (B*T_x, cond_dim)
+        cond_flat = cond_proc.permute(0, 2, 1).reshape(B * T_x, -1)
+
+        film_out = self.film(cond_flat)
+
+        if self.use_film_scale_modulation:
+            scale, bias = torch.chunk(film_out, 2, dim=-1)
+            scale = scale.view(B, T_x, self.out_channels).permute(0, 2, 1)
+            bias  = bias.view(B, T_x, self.out_channels).permute(0, 2, 1)
+            # Add normalization to FiLM outputs to prevent gradient issues with large inputs
+            scale = torch.tanh(scale)  # Normalize scale to [-1, 1]
+            bias = torch.tanh(bias)    # Normalize bias to [-1, 1]
+            out = scale * out + bias
+        else:
+            film_out = film_out.view(B, T_x, self.out_channels).permute(0, 2, 1)
+            # Add normalization to FiLM outputs to prevent gradient issues with large inputs
+            film_out = torch.tanh(film_out)  # Normalize to [-1, 1]
+            out = out + film_out
+
+        out = self.conv2(out)
+        residual = out + self.skip_conv(x)
+        return self.residual_activation(residual)
 
 
 
@@ -217,11 +317,20 @@ class DiffusionConditionalUnet1d(nn.Module):
         self.down_modules = nn.ModuleList()
         for i, (cin, cout) in enumerate(in_out):
             is_last = i == len(in_out) - 1
-            self.down_modules.append(nn.ModuleList([
-                DiffusionConditionalResidualBlock1d(cin, cout, **block_kwargs),
-                DiffusionConditionalResidualBlock1d(cout, cout, **block_kwargs),
-                nn.Conv1d(cout, cout, 3, stride=2, padding=1) if not is_last else nn.Identity(),
-            ]))
+            if not is_last:
+                # Non-last layer: Two residual blocks + downsampling
+                self.down_modules.append(nn.ModuleList([
+                    DiffusionConditionalResidualBlock1d(cin, cout, **block_kwargs),
+                    DiffusionConditionalResidualBlock1d(cout, cout, **block_kwargs),
+                    nn.Conv1d(cout, cout, 3, stride=2, padding=1),  # Downsampling
+                ]))
+            else:
+                # Last layer: Two residual blocks only (no downsampling)
+                self.down_modules.append(nn.ModuleList([
+                    DiffusionConditionalResidualBlock1d(cin, cout, **block_kwargs),
+                    DiffusionConditionalResidualBlock1d(cout, cout, **block_kwargs),
+                    nn.Identity(),  # No downsampling
+                ]))
 
         # ---- Middle ----
         self.mid_modules = nn.ModuleList([
@@ -250,6 +359,32 @@ class DiffusionConditionalUnet1d(nn.Module):
             DiffusionConv1dBlock(config.down_dims[0], config.down_dims[0], config.kernel_size),
             nn.Conv1d(config.down_dims[0], config.action_dim, 1),
         )
+        
+        # Enable gradient checkpointing for memory efficiency
+        self.enable_gradient_checkpointing = True
+        
+        # Initialize weights for stable training
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """Initialize weights for stable training."""
+        # Initialize the final conv layer of final_conv block to small values
+        # This helps prevent gradient explosion while still allowing gradient flow
+        # Access the Conv1d layer (index 0) within the DiffusionConv1dBlock, not the Mish activation (index 2)
+        final_conv_block = self.final_conv[-1]  # This is the DiffusionConv1dBlock
+        if hasattr(final_conv_block, 'block'):
+            # Access the Conv1d layer within the block (index 0)
+            conv_layer = final_conv_block.block[0]
+            if hasattr(conv_layer, 'weight') and hasattr(conv_layer, 'bias'):
+                nn.init.normal_(conv_layer.weight, mean=0.0, std=0.01)
+                nn.init.zeros_(conv_layer.bias)
+        
+        # Initialize diffusion timestep encoder
+        for module in self.diffusion_step_encoder:
+            if isinstance(module, nn.Linear):
+                # Xavier initialization for linear layers
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
 
     def forward(self, x, timestep, obs_cond):
         """
@@ -277,26 +412,19 @@ class DiffusionConditionalUnet1d(nn.Module):
         # Encoder
         # ------------------------------------------------
         skips = []
-        conds = []
 
         for res1, res2, down in self.down_modules:
-            if cond.shape[-1] != x.shape[-1]:
-                cond = F.interpolate(cond, size=x.shape[-1], mode="nearest")
-
+            # The residual blocks now handle different temporal dimensions internally
             x = res1(x, cond)
             x = res2(x, cond)
 
             skips.append(x)
-            conds.append(cond)
 
             x = down(x)
 
         # ------------------------------------------------
         # Middle
         # ------------------------------------------------
-        if cond.shape[-1] != x.shape[-1]:
-            cond = F.interpolate(cond, size=x.shape[-1], mode="nearest")
-
         for mid in self.mid_modules:
             x = mid(x, cond)
 
@@ -305,12 +433,7 @@ class DiffusionConditionalUnet1d(nn.Module):
         # ------------------------------------------------
         for res1, res2, up in self.up_modules:
             skip = skips.pop()
-            cond = conds.pop()
-
-            # Ensure x and skip have the same temporal dimension
-            if x.shape[-1] != skip.shape[-1]:
-                x = F.interpolate(x, size=skip.shape[-1], mode="nearest")
-
+            
             x = torch.cat([x, skip], dim=1)
 
             x = res1(x, cond)
@@ -332,39 +455,83 @@ class VisionEncoder(nn.Module):
         
         backbone = getattr(models, config.vision_backbone)(weights="DEFAULT" if config.pretrained_backbone_weights else None)
         # Remove fc and avgpool, keep spatial layers
-        self.backbone = nn.Sequential(*list(backbone.children())[:-2])
+        backbone_children = list(backbone.children())
+        self.backbone_features = nn.Sequential(*backbone_children[:-2])
+        
+        # Enable gradient checkpointing for memory efficiency
+        if hasattr(self.backbone_features, 'gradient_checkpointing'):
+            self.backbone_features.gradient_checkpointing = True
         
         # Get feature dimensions (e.g., 512 for ResNet18)
         # Update dummy input size to match configured image size
         with torch.no_grad():
             dummy_input = torch.zeros(1, 3, config.input_image_size[0], config.input_image_size[1])
-            backbone_output = self.backbone(dummy_input)
+            backbone_output = self.backbone_features(dummy_input)
             feature_dim = backbone_output.shape[1]
             height = backbone_output.shape[2]
             width = backbone_output.shape[3]
         
         # Use K-point spatial softmax with 2 points
-        number_of_keypoints = 2
-        # Use lower temperature (sharper peaks) and learnable temperature to prevent collapse
+        number_of_keypoints = 64
+        # Use moderate temperature and learnable temperature to prevent collapse
+        # Higher temperature (closer to 1.0) provides smoother gradients
         self.spatial_softmax = SpatialSoftmax(
-            height=height, 
-            width=width, 
-            in_channels=feature_dim, 
-            num_points=number_of_keypoints,
-            temperature=0.1,  # Lower temperature for sharper peaks
+            input_shape=(feature_dim, height, width),
+            num_kp=number_of_keypoints,
+            temperature=1.0,  # Moderate temperature for better gradients
             learnable_temperature=True  # Allow temperature to adapt during training
         )
+        
+        # Add adaptive feature normalization
+        self.feature_norm = nn.InstanceNorm2d(feature_dim, affine=True)
+        
+        # Add dropout for regularization
+        self.dropout = nn.Dropout(0.1)
+        
         # Update projection to match the new output size (2 points * 2 coordinates = 4)
-        self.projection = nn.Linear(number_of_keypoints * 2, config.d_model)
+        # Add batch normalization for better gradient flow
+        self.projection = nn.Sequential(
+            nn.Linear(number_of_keypoints * 2, config.d_model),
+            nn.LayerNorm(config.d_model),
+            nn.GELU(),
+            nn.Dropout(0.1)
+        )
 
     def forward(self, x):
         # Resize input images to configured size
         x = self.resize_transform(x)
-        x = self.backbone(x)
+        x = self.backbone_features(x)
+        # Apply adaptive normalization to features
+        x = self.feature_norm(x)
         spatial_coords = self.spatial_softmax(x)
-        projected = self.projection(spatial_coords)
+        # Flatten the spatial coordinates for the projection layer
+        # From (B, K, 2) to (B, K * 2)
+        spatial_coords_flat = spatial_coords.view(spatial_coords.size(0), -1)
+        projected = self.projection(spatial_coords_flat)
         # Return both the spatial coordinates and the projected features
         return projected, spatial_coords
+    
+    def get_feature_statistics(self, x):
+        """Get statistics about the features for debugging purposes."""
+        x = self.resize_transform(x)
+        x = self.backbone_features(x)
+        x = self.feature_norm(x)
+        
+        # Compute statistics
+        stats = {
+            'mean': x.mean().item(),
+            'std': x.std().item(),
+            'min': x.min().item(),
+            'max': x.max().item(),
+            'shape': x.shape
+        }
+        
+        # Get spatial softmax output
+        spatial_coords = self.spatial_softmax(x)
+        stats['spatial_coords_mean'] = spatial_coords.mean().item()
+        stats['spatial_coords_std'] = spatial_coords.std().item()
+        
+        return stats
 
 
 class DiffusionTransformer(nn.Module):
@@ -406,8 +573,10 @@ class DiffusionTransformer(nn.Module):
         # 3. Diffusion Components
         # We denoise the entire action horizon at once: (Horizon, Action_Dim)
         self.noise_scheduler = DDPMScheduler(
-            num_train_timesteps=50,
-            beta_schedule='squaredcos_cap_v2',
+            num_train_timesteps=20,  # Reduced from 50 to 20 for less noise
+            beta_schedule='scaled_linear',  # Less aggressive noise schedule
+            beta_start=0.0001,  # Lower starting noise
+            beta_end=0.02,      # Lower ending noise
             clip_sample=True,
             prediction_type='epsilon'
         )
@@ -423,7 +592,7 @@ class DiffusionTransformer(nn.Module):
         self.denoiser = DiffusionConditionalUnet1d(config, config.d_model)
         
         # Learnable parameter for number of inference steps
-        self.num_inference_steps = nn.Parameter(torch.tensor(50.0))
+        self.num_inference_steps = nn.Parameter(torch.tensor(20.0))  # Match training steps
 
 
     def get_condition(self, batch):
@@ -512,12 +681,12 @@ class DiffusionTransformer(nn.Module):
         # 2. Align observation timesteps with action timesteps
         T_obs = obs_context.shape[1]
         if T_obs != T_act:
-          obs_context = F.interpolate(
-              obs_context.permute(0, 2, 1),  # (B, d_model, T_obs)
-              size=T_act,
-              mode="linear",
-              align_corners=False
-          ).permute(0, 2, 1)  # (B, T_act, d_model)
+            # Use nearest neighbor interpolation to avoid introducing artifacts
+            obs_context = F.interpolate(
+                obs_context.permute(0, 2, 1),  # (B, d_model, T_obs)
+                size=T_act,
+                mode="nearest"
+            ).permute(0, 2, 1)  # (B, T_act, d_model)
 
         
         # 3. Sample noise and timesteps
@@ -565,12 +734,12 @@ class DiffusionTransformer(nn.Module):
         # Align observation timesteps with action timesteps
         T_obs = obs_context.shape[1]
         if T_obs != T_act:
-          obs_context = F.interpolate(
-              obs_context.permute(0, 2, 1),  # (B, d_model, T_obs)
-              size=T_act,
-              mode="linear",
-              align_corners=False
-          ).permute(0, 2, 1)  # (B, T_act, d_model)
+            # Use nearest neighbor interpolation to avoid introducing artifacts
+            obs_context = F.interpolate(
+                obs_context.permute(0, 2, 1),  # (B, d_model, T_obs)
+                size=T_act,
+                mode="nearest"
+            ).permute(0, 2, 1)  # (B, T_act, d_model)
         
         # Start from pure Gaussian noise
         noisy_action = torch.randn((B, T_act, self.config.action_dim), device=self.device)

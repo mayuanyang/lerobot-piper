@@ -128,8 +128,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         n_obs_steps=obs, 
         horizon=horizon, 
         n_action_steps=n_action_steps, 
-        vision_backbone="resnet34",
-        pretrained_backbone_weights="ResNet34_Weights.IMAGENET1K_V1",
+        vision_backbone="resnet18",
+        pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
         state_dim=7,  # Adjust based on your robot's state dimension
         action_dim=7,  # Adjust based on your robot's action dimension
         d_model=512,
@@ -192,7 +192,28 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 policy.transformer.feature_projection = policy.transformer.feature_projection.to(device)
         preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
         step = 0
-        optimizer = torch.optim.Adam(policy.parameters(), lr=5e-5, weight_decay=1e-4)
+        
+        # Implement differential learning rates for better gradient flow
+        vision_params = []
+        other_params = []
+        
+        for name, param in policy.named_parameters():
+            if 'image_encoders' in name:
+                vision_params.append(param)
+            else:
+                other_params.append(param)
+        
+        # Higher learning rate for vision encoders to improve gradient flow
+        # Standard learning rate for other components
+        optimizer = torch.optim.Adam([
+            {'params': vision_params, 'lr': 5e-5},   # Higher LR for vision encoders
+            {'params': other_params, 'lr': 5e-5}     # Standard LR for other components
+        ], weight_decay=1e-4)
+        
+        # Store parameter groups for dynamic adjustment
+        vision_param_group = optimizer.param_groups[0]
+        other_param_group = optimizer.param_groups[1]
+        
         # Cosine scheduler with warmup
         warmup_steps = 1000
         scheduler = get_cosine_schedule_with_warmup(
@@ -221,12 +242,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
     # Load dataset
     try:
-        dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, image_transforms=image_transforms, force_cache_sync=True, revision="main", tolerance_s=0.01)
+        dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, image_transforms=image_transforms, force_cache_sync=True, revision="main", tolerance_s=0.005)  # Tighter timestamp alignment
     except Exception as e:
         print(f"Error loading remote dataset: {e}")
         local_dataset_path = "./src/output" 
         print(f"Trying local dataset at {local_dataset_path}...")
-        dataset = LeRobotDataset(local_dataset_path, delta_timestamps=delta_timestamps, force_cache_sync=True, tolerance_s=0.01)
+        dataset = LeRobotDataset(local_dataset_path, delta_timestamps=delta_timestamps, force_cache_sync=True, tolerance_s=0.005)  # Tighter timestamp alignment
 
     dataloader = torch.utils.data.DataLoader(
         dataset,

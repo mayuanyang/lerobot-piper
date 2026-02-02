@@ -38,7 +38,7 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     action_dim: int = 7  # Default for 7-DOF arm
     
     # Joint weights for loss computation (default: equal weights)
-    joint_weights: list[float] = field(default_factory=lambda: [1.0, 1.0, 1.0, 0.0, 0.8, 0.7, 1.0])
+    joint_weights: list[float] = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
     
     # Transformer architecture
     d_model: int = 256
