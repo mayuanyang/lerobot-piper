@@ -9,10 +9,6 @@ from typing import Dict, Optional
 import math
 import numpy as np
 
-# Import the simple diffusion model
-from .simple_diffusion_model import SimpleDiffusionModel
-
-
 
 class SpatialSoftmax(nn.Module):
     """
