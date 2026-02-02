@@ -439,7 +439,7 @@ class DiffusionConditionalUnet1d(nn.Module):
 
 
 class VisionEncoder(nn.Module):
-    """Improved encoder with Spatial Softmax for 7-DOF precision."""
+    """Improved encoder with Spatial Softmax and Global Features for 7-DOF precision."""
     def __init__(self, config):
         super().__init__()
         # Add resize transform with configurable image size
@@ -480,10 +480,20 @@ class VisionEncoder(nn.Module):
         # Add dropout for regularization
         self.dropout = nn.Dropout(0.1)
         
-        # Update projection to match the new output size (2 points * 2 coordinates = 4)
-        # Add batch normalization for better gradient flow
-        self.projection = nn.Sequential(
+        # Global feature extractor - adaptive average pooling to fixed size
+        self.global_pool = nn.AdaptiveAvgPool2d((4, 4))  # Reduce to 4x4 spatial features
+        
+        # Projection for spatial features
+        self.spatial_projection = nn.Sequential(
             nn.Linear(number_of_keypoints * 2, config.d_model),
+            nn.LayerNorm(config.d_model),
+            nn.GELU(),
+            nn.Dropout(0.1)
+        )
+        
+        # Projection for global features
+        self.global_projection = nn.Sequential(
+            nn.Linear(feature_dim * 4 * 4, config.d_model),
             nn.LayerNorm(config.d_model),
             nn.GELU(),
             nn.Dropout(0.1)
@@ -495,13 +505,22 @@ class VisionEncoder(nn.Module):
         x = self.backbone_features(x)
         # Apply adaptive normalization to features
         x = self.feature_norm(x)
+        
+        # Extract spatial features using spatial softmax
         spatial_coords = self.spatial_softmax(x)
         # Flatten the spatial coordinates for the projection layer
         # From (B, K, 2) to (B, K * 2)
         spatial_coords_flat = spatial_coords.view(spatial_coords.size(0), -1)
-        projected = self.projection(spatial_coords_flat)
-        # Return both the spatial coordinates and the projected features
-        return projected, spatial_coords
+        spatial_projected = self.spatial_projection(spatial_coords_flat)
+        
+        # Extract global features using adaptive pooling
+        global_features = self.global_pool(x)
+        # Flatten global features
+        global_features_flat = global_features.view(global_features.size(0), -1)
+        global_projected = self.global_projection(global_features_flat)
+        
+        # Return both projected features separately and spatial coordinates (for visualization)
+        return (spatial_projected, global_projected), spatial_coords
     
     def get_feature_statistics(self, x):
         """Get statistics about the features for debugging purposes."""
@@ -544,7 +563,8 @@ class DiffusionTransformer(nn.Module):
         self.state_positional_encoding = PositionalEncoding(config.d_model, 100)
                 
         # Projection layer for concatenated observation features
-        num_obs_tokens = len(config.image_features) + 1  # cameras + state
+        # Now we have 2 tokens per camera (spatial + global) plus 1 for state
+        num_obs_tokens = len(config.image_features) * 2 + 1  # (cameras * 2) + state
         self.obs_projection = nn.Linear(config.d_model * num_obs_tokens, config.d_model)
         
         # 2. Observation Transformer (Temporal Fusion)
@@ -601,12 +621,15 @@ class DiffusionTransformer(nn.Module):
             if batch_key in batch:
                 img = batch[batch_key].flatten(0, 1)
                 # Get both projected features and spatial coordinates
-                projected_features, spatial_coords = encoder(img)
-                tokens.append(projected_features.view(B, T_obs, -1))
+                (spatial_projected, global_projected), spatial_coords = encoder(img)
+                # Add both spatial and global features as separate tokens
+                tokens.append(spatial_projected.view(B, T_obs, -1))
+                tokens.append(global_projected.view(B, T_obs, -1))
                 # Store spatial coordinates for visualization
                 spatial_outputs[cam_key] = (img.view(B, T_obs, *img.shape[1:]), spatial_coords.view(B, T_obs, -1))
             else:
-                # If camera data is missing, create zero tokens
+                # If camera data is missing, create zero tokens for both spatial and global features
+                tokens.append(torch.zeros(B, T_obs, self.config.d_model, device=self.device))
                 tokens.append(torch.zeros(B, T_obs, self.config.d_model, device=self.device))
                 spatial_outputs[cam_key] = None
         
