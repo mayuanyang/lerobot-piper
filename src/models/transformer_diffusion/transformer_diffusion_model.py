@@ -52,10 +52,13 @@ class SpatialSoftmax(nn.Module):
         else:
             self.nets = None
             self._out_c = self._in_c
+        
+        self.temperature = nn.Parameter(torch.tensor(temperature)) if learnable_temperature else None
 
         # Temperature scaling for sharper peaks
         if learnable_temperature:
-            self.temperature = nn.Parameter(torch.ones(1) * temperature)
+            self.temperature = nn.Parameter(torch.clamp(self.temperature, 0.1, 5.0))
+
         else:
             self.register_buffer('temperature', torch.tensor(temperature))
 
@@ -214,14 +217,10 @@ class DiffusionConditionalResidualBlock1d(nn.Module):
             scale, bias = torch.chunk(film_out, 2, dim=-1)
             scale = scale.view(B, T_x, self.out_channels).permute(0, 2, 1)
             bias  = bias.view(B, T_x, self.out_channels).permute(0, 2, 1)
-            # Add normalization to FiLM outputs to prevent gradient issues with large inputs
-            scale = torch.tanh(scale)  # Normalize scale to [-1, 1]
-            bias = torch.tanh(bias)    # Normalize bias to [-1, 1]
+            # Remove tanh normalization to allow full range of scale and bias
             out = scale * out + bias
         else:
             film_out = film_out.view(B, T_x, self.out_channels).permute(0, 2, 1)
-            # Add normalization to FiLM outputs to prevent gradient issues with large inputs
-            film_out = torch.tanh(film_out)  # Normalize to [-1, 1]
             out = out + film_out
 
         out = self.conv2(out)
@@ -260,14 +259,11 @@ class DiffusionConditionalResidualBlock1d(nn.Module):
             scale, bias = torch.chunk(film_out, 2, dim=-1)
             scale = scale.view(B, T_x, self.out_channels).permute(0, 2, 1)
             bias  = bias.view(B, T_x, self.out_channels).permute(0, 2, 1)
-            # Add normalization to FiLM outputs to prevent gradient issues with large inputs
-            scale = torch.tanh(scale)  # Normalize scale to [-1, 1]
-            bias = torch.tanh(bias)    # Normalize bias to [-1, 1]
+            # Remove tanh normalization to allow full range of scale and bias
             out = scale * out + bias
         else:
             film_out = film_out.view(B, T_x, self.out_channels).permute(0, 2, 1)
-            # Add normalization to FiLM outputs to prevent gradient issues with large inputs
-            film_out = torch.tanh(film_out)  # Normalize to [-1, 1]
+            # Remove tanh normalization to allow full range of film outputs
             out = out + film_out
 
         out = self.conv2(out)
@@ -636,35 +632,7 @@ class DiffusionTransformer(nn.Module):
         # Return context and spatial outputs for visualization
         return context, spatial_outputs
 
-    def compute_spatial_regularization_loss(self, spatial_outputs):
-        """Compute regularization loss to prevent spatial softmax points from collapsing."""
-        reg_loss = 0.0
-        count = 0
-        
-        for cam_key, spatial_data in spatial_outputs.items():
-            if spatial_data is not None:
-                img_tensor, spatial_coords = spatial_data
-                if img_tensor is not None and spatial_coords is not None:
-                    # Reshape coordinates to (B, T, num_points, 2)
-                    B, T, coord_dim = spatial_coords.shape
-                    num_points = coord_dim // 2
-                    coords_reshaped = spatial_coords.view(B, T, num_points, 2)
-                    
-                    # Compute pairwise distances between points
-                    for i in range(num_points):
-                        for j in range(i + 1, num_points):
-                            # Euclidean distance between point i and point j
-                            diff = coords_reshaped[:, :, i, :] - coords_reshaped[:, :, j, :]
-                            distance = torch.norm(diff, dim=-1)  # (B, T)
-                            
-                            # Penalize small distances (encourage separation)
-                            # Use a margin-based loss: max(0, margin - distance)
-                            margin = 0.3  # Minimum distance in normalized coordinates [-1, 1]
-                            penalty = torch.clamp(margin - distance, min=0.0)
-                            reg_loss += penalty.mean()
-                            count += 1
-        
-        return reg_loss / count if count > 0 else reg_loss
+    
       
     def compute_loss(self, batch):
         """Diffusion Training: Inject noise and learn to predict it."""
@@ -710,12 +678,10 @@ class DiffusionTransformer(nn.Module):
         weighted_squared_errors = squared_errors * expanded_weights
         weighted_loss = weighted_squared_errors.mean()
         
-        # Spatial regularization loss to prevent point collapse
-        spatial_reg_loss = self.compute_spatial_regularization_loss(spatial_outputs)
-        
+                
         # Combined loss (original + weighted + spatial regularization)
         # Use a small weight for the spatial regularization loss to avoid overpowering the main losses
-        loss = original_loss + weighted_loss + 0.1 * spatial_reg_loss
+        loss = original_loss + weighted_loss
 
         return loss
 

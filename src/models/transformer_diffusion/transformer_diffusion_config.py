@@ -38,7 +38,7 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     action_dim: int = 7  # Default for 7-DOF arm
     
     # Joint weights for loss computation (default: equal weights)
-    joint_weights: list[float] = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+    joint_weights: list[float] = field(default_factory=lambda: [1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0])
     
     # Transformer architecture
     d_model: int = 256
@@ -51,7 +51,7 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     down_dims: tuple = (512, 1024, 2048)
     kernel_size: int = 5
     n_groups: int = 8
-    use_film_scale_modulation: bool = True
+    use_film_scale_modulation: bool = False
         
     # Training presets
     optimizer_lr: float = 1e-4
