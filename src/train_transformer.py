@@ -147,11 +147,13 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     # Model loading logic
     if resume_from_checkpoint is not None:
         print(f"Resuming training from checkpoint: {resume_from_checkpoint}")
+        # Load policy with its original configuration
         policy = TransformerDiffusionPolicy.from_pretrained(resume_from_checkpoint)
         policy.train()
         policy.to(device)
         
-        preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
+        # Use the policy's configuration for creating processors
+        preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
             
         optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
         # Cosine scheduler with warmup
@@ -340,7 +342,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 print("--- End Gradient Analysis ---\n")
             
             # Calculate gradient norm for monitoring and clip gradients
-            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=5.0)
             
             optimizer.step()
             optimizer.zero_grad()
