@@ -94,7 +94,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     output_directory.mkdir(parents=True, exist_ok=True)
 
     training_steps = 100000 
-    log_freq = 10
+    progress_update_freq = 200  # Single frequency for all progress updates
     checkpoint_freq = 1000
     visualization_freq = visualize_every_n_batches  # Save visualizations every N steps
     
@@ -267,11 +267,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     print("Starting training loop...")
     done = False
     epoch = 0
+    prog_bar = tqdm(total=training_steps, desc="Training Progress", initial=step)
     while not done:
         epoch += 1
-        prog_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch}, Step {step}")
-        for batch_idx, batch in prog_bar:
-            
+        for batch_idx, batch in enumerate(dataloader):
             # Move to device
             for key in batch:
                 if isinstance(batch[key], torch.Tensor):
@@ -291,7 +290,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             loss.backward()
             
             # Print gradient information for vision encoders, state encoder, and UNet (for debugging)
-            if step % (log_freq * 10) == 0:  # Print every 10 log intervals
+            if step % progress_update_freq == 0:  # Print every 10 progress update intervals
                 print(f"\n--- Gradient Analysis at Step {step} ---")
                 
                 # Vision encoder gradients
@@ -350,11 +349,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             # Update learning rate scheduler (cosine scheduler steps every iteration)
             scheduler.step()
 
-            if step % log_freq == 0:
+            if step % progress_update_freq == 0:
                 # Get learning rate from optimizer
                 lr = optimizer.param_groups[0]['lr']
+                prog_bar.set_description(f"Epoch {epoch}, Step {step}")
                 prog_bar.set_postfix({
-                    "step": step, 
                     "loss": f"{loss.item():.3f}", 
                     "lr": f"{lr:.2e}",
                     "grad_norm": f"{grad_norm:.2f}"
@@ -406,9 +405,16 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 print(f"\nCheckpoint saved at step {step}")
                 
             step += 1
+            # Update progress bar less frequently to reduce Colab verbosity
+            if step % progress_update_freq == 0 or step >= training_steps:
+                prog_bar.update(progress_update_freq)
+                prog_bar.set_description(f"Epoch {epoch}, Step {step}")
+            
             if step >= training_steps:
                 done = True
+                prog_bar.close()
                 break
+    prog_bar.close()
 
     # Final save
     policy.save_pretrained(output_directory)
