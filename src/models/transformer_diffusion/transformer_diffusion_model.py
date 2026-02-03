@@ -177,15 +177,24 @@ class DiffusionConditionalResidualBlock1d(nn.Module):
         # Initialize the final conv layer of conv2 block to small values for stable residual connections
         # This helps prevent gradient explosion while still allowing gradient flow
         # Access the Conv1d layer (index 0) within the block, not the Mish activation (index 2)
-        nn.init.normal_(self.conv2.block[0].weight, mean=0.0, std=0.01)
+        nn.init.normal_(self.conv2.block[0].weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.conv2.block[0].bias)
         
         # Initialize FiLM modulation layers
         for module in self.film:
             if isinstance(module, nn.Linear):
-                # Xavier initialization for linear layers
                 nn.init.xavier_uniform_(module.weight)
-                nn.init.zeros_(module.bias)
+                
+                # Calculate where the split happens
+                # Output dim is out_channels * 2 (Scale | Bias)
+                # We want Scale to be 1, Bias to be 0
+                if module.out_features == self.out_channels * 2:
+                    # Concatenate them to match the output layout [Scale, Bias]
+                    nn.init.constant_(module.bias, 0) # clear first
+                    # Set the first half (Scale) to 1.0
+                    module.bias.data[:self.out_channels].fill_(1.0) 
+                    # Set the second half (Bias) to 0.0
+                    module.bias.data[self.out_channels:].fill_(0.0)
         
         # Initialize skip connection if it's a convolution
         if isinstance(self.skip_conv, nn.Conv1d):
@@ -352,7 +361,7 @@ class DiffusionConditionalUnet1d(nn.Module):
             # Access the Conv1d layer within the block (index 0)
             conv_layer = final_conv_block.block[0]
             if hasattr(conv_layer, 'weight') and hasattr(conv_layer, 'bias'):
-                nn.init.normal_(conv_layer.weight, mean=0.0, std=0.01)
+                nn.init.normal_(conv_layer.weight, mean=0.0, std=0.02)
                 nn.init.zeros_(conv_layer.bias)
         
         # Initialize diffusion timestep encoder
@@ -458,6 +467,8 @@ class VisionEncoder(nn.Module):
             learnable_temperature=True  # Allow temperature to adapt during training
         )
         
+        self.spatial_norm = nn.GroupNorm(32, feature_dim) # GroupNorm is safer than BN for small batches
+        
         # Add dropout for regularization
         self.dropout = nn.Dropout(0.1)
         
@@ -484,6 +495,8 @@ class VisionEncoder(nn.Module):
         # Resize input images to configured size
         x = self.resize_transform(x)
         x = self.backbone_features(x)
+        
+        x = self.spatial_norm(x)
         
         # Extract spatial features using spatial softmax
         spatial_coords = self.spatial_softmax(x)
@@ -539,15 +552,12 @@ class DiffusionTransformer(nn.Module):
         # Positional encoding for observation tokens
         self.obs_positional_encoding = PositionalEncoding(config.d_model, 100)  # 100 is max length
 
-        # Token type embedding for weighted aggregation
-        self.token_type_emb = nn.Parameter(torch.zeros(num_obs_tokens, 1))  # (N_tok, 1)
-        # Initialize slightly differently
-        nn.init.uniform_(self.token_type_emb, -0.1, 0.1)
-
+        
         # 3. Diffusion Components
         # We denoise the entire action horizon at once: (Horizon, Action_Dim)
+        training_steps = 100
         self.noise_scheduler = DDPMScheduler(
-            num_train_timesteps=100,  
+            num_train_timesteps=training_steps,  
             beta_schedule='scaled_linear',  # Less aggressive noise schedule
             beta_start=0.0001,  # Lower starting noise
             beta_end=0.02,      # Lower ending noise
@@ -566,7 +576,13 @@ class DiffusionTransformer(nn.Module):
         self.denoiser = DiffusionConditionalUnet1d(config, config.d_model)
         
         # Learnable parameter for number of inference steps
-        self.num_inference_steps = nn.Parameter(torch.tensor(20.0))  # Match training steps
+        self.num_inference_steps = nn.Parameter(torch.tensor(training_steps * 1.0))  # Match training steps
+        
+        self.fusion_projection = nn.Sequential(
+            nn.Linear(config.d_model * num_obs_tokens, config.d_model),
+            nn.Mish(), # Mish helps gradient flow better than ReLU
+            nn.Linear(config.d_model, config.d_model)
+        )
 
 
     def get_condition(self, batch):
@@ -616,13 +632,12 @@ class DiffusionTransformer(nn.Module):
         # 过 Transformer
         context = self.obs_transformer(obs_tokens)  # (B, T*N_tokens, d_model)
 
-        # 如果你想最后仍然得到“每个时间步 1 个 context 向量”去喂 UNet：
-        context = context.view(B, T, N_tok, D)                  # (B, T, N_tok, D)
-
-        # token_type_emb: (1, 1, N_tok, 1)
-        w = self.token_type_emb.view(1, 1, N_tok, 1)
-        attn = torch.softmax(w, dim=2)
-        context = (context * attn).sum(dim=2)                   # (B, T, D)
+        # Instead of summing, we concatenate all token features per timestep
+        context_flat = context.view(B, T, N_tok * D) # (B, T, N_tok * D)
+        
+        # Project down to d_model size. This allows the MLP to decide 
+        # how to mix spatial/global/state dynamically per sample.
+        context = self.fusion_projection(context_flat) # (B, T, D)
 
         return context, spatial_outputs
 
@@ -644,7 +659,7 @@ class DiffusionTransformer(nn.Module):
             obs_context = F.interpolate(
                 obs_context.permute(0, 2, 1),  # (B, d_model, T_obs)
                 size=T_act,
-                mode="nearest"
+                mode="linear"
             ).permute(0, 2, 1)  # (B, T_act, d_model)
 
         
