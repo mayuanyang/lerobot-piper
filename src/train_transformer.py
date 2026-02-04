@@ -280,7 +280,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             #batch = apply_joint_augmentations(batch)
             
             # Apply camera dropout
-            batch = apply_camera_dropout(batch)
+            #batch = apply_camera_dropout(batch)
 
             # Preprocess (Normalize)
             batch = preprocessor(batch)
