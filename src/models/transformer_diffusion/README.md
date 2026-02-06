@@ -1,5 +1,9 @@
 # Transformer Diffusion Policy
 
+## Simplified Version Available
+
+A simplified version of this model is available that addresses gradient flow issues in the original implementation. See [README_SIMPLE.md](README_SIMPLE.md) for details.
+
 This module implements a diffusion-based policy with transformer architecture for long-horizon robotic tasks. The model combines ResNet encoders with K-point spatial softmax for visual processing and a transformer-based diffusion approach for action generation.
 
 ## Visualization

@@ -908,6 +908,8 @@ def get_camera_name_from_video_path(video_path):
         return 'right'
     elif 'gripper' in filename:
         return 'gripper'
+    elif 'front' in filename:
+        return 'front'
     else:
         # Fallback: use the last part of filename after underscore
         return video_path.stem.split('_')[-1]
@@ -1241,7 +1243,7 @@ def main():
     OUTPUT_FOLDER = Path("output/")  # Output folder for processed dataset
     REPO_ID = "ISDept/piper_arm"  # Your desired Hugging Face repo ID
     AGGREGATE_EPISODES = True  # New flag to control aggregation behavior
-    MODE = "diff"  # Processing mode: "diff" or "full"
+    MODE = "full"  # Processing mode: "diff" or "full"
     # ---------------------
     
     # Find all episode folders
@@ -1283,7 +1285,7 @@ def main():
                 first_frames_to_chop = 10  # Default value
                 if 'gripper' in camera_name.lower():
                     if episode_idx == 1:
-                        first_frames_to_chop = 15  # First episode has extra lag
+                        first_frames_to_chop = 12  # First episode has extra lag
                     else: 
                         first_frames_to_chop = 10  # Gripper camera lags by 0.1 second (1 frame at 10fps)
                 cameras_list.append(CameraData(video_path=str(video_path), camera=camera_name, first_frames_to_chop=first_frames_to_chop))

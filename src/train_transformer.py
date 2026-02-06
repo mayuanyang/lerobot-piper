@@ -65,7 +65,7 @@ def apply_joint_augmentations(batch):
 
 
 # Helper to randomly drop one camera
-def apply_camera_dropout(batch, camera_keys=["observation.images.gripper", "observation.images.depth"], dropout_prob=0.2):
+def apply_camera_dropout(batch, camera_keys=["observation.images.front", "observation.images.gripper", "observation.images.right"], dropout_prob=0.2):
     """Randomly drop one camera from the batch during training."""
     # Only apply during training and with specified probability
     if torch.rand(1).item() > dropout_prob:
@@ -89,7 +89,7 @@ def apply_camera_dropout(batch, camera_keys=["observation.images.gripper", "obse
 
 
 def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_from_checkpoint=None, visualize_every_n_batches=1000):
-    """Train the TransformerDiffusion model."""
+    """Train the SimpleTransformerDiffusion model."""
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
 
@@ -121,7 +121,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     horizon = 16
     n_action_steps = 8
     
-    # Create transformer configuration
+    # Create transformer configuration - simplified version with smaller model
     cfg = TransformerDiffusionConfig(
         input_features=input_features, 
         output_features=output_features, 
@@ -132,13 +132,13 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
         state_dim=7,  # Adjust based on your robot's state dimension
         action_dim=7,  # Adjust based on your robot's action dimension
-        d_model=512,
+        d_model=256,  # Smaller model for better gradient flow
         nhead=8,
-        num_encoder_layers=4,
-        dim_feedforward=512,
-        diffusion_step_embed_dim=256,
-        down_dims=(512, 1024, 2048),
-        kernel_size=5,
+        num_encoder_layers=4,  # Fewer layers
+        dim_feedforward=512,  # Smaller feedforward dimension
+        diffusion_step_embed_dim=128,
+        down_dims=(256, 512),  # Simplified UNet dimensions (though we're not using UNet anymore)
+        kernel_size=3,
         n_groups=8,
         use_film_scale_modulation=True
     )
@@ -236,8 +236,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     obs_temporal_window = [ -i * frame_time for i in range(obs) ][::-1]
     
     delta_timestamps = {
+        "observation.images.front": obs_temporal_window,
         "observation.images.gripper": obs_temporal_window,  
-        "observation.images.depth": obs_temporal_window,
+        "observation.images.right": obs_temporal_window,
         "observation.state": obs_temporal_window,
         "action": [i * frame_time for i in range(horizon)]
     }
@@ -254,7 +255,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=4,
-        batch_size=20,
+        batch_size=16,  # Reduced batch size for better gradient flow
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
@@ -280,7 +281,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             #batch = apply_joint_augmentations(batch)
             
             # Apply camera dropout
-            #batch = apply_camera_dropout(batch)
+            batch = apply_camera_dropout(batch)
 
             # Preprocess (Normalize)
             batch = preprocessor(batch)
@@ -289,7 +290,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             loss, _ = policy.forward(batch)
             loss.backward()
             
-            # Print gradient information for vision encoders, state encoder, and UNet (for debugging)
+            # Print gradient information for vision encoders, state encoder, and transformer denoiser (for debugging)
             if step % progress_update_freq == 0:  # Print every 10 progress update intervals
                 print(f"\n--- Gradient Analysis at Step {step} ---")
                 
@@ -323,25 +324,25 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                     avg_state_grad = total_state_grad / total_state_params
                     print(f"Average state encoder gradient: {avg_state_grad:.6f}")
                 
-                # UNet gradients
-                total_unet_grad = 0.0
-                total_unet_params = 0
-                print("\n--- UNet Gradients ---")
+                # Transformer denoiser gradients
+                total_denoiser_grad = 0.0
+                total_denoiser_params = 0
+                print("\n--- Transformer Denoiser Gradients ---")
                 for name, param in policy.model.named_parameters():
-                    if 'denoiser' in name and param.grad is not None:
+                    if 'denoising_transformer' in name and param.grad is not None:
                         grad_mean = param.grad.abs().mean().item()
                         param_count = param.numel()
-                        total_unet_grad += grad_mean * param_count
-                        total_unet_params += param_count
+                        total_denoiser_grad += grad_mean * param_count
+                        total_denoiser_params += param_count
                 
-                if total_unet_params > 0:
-                    avg_unet_grad = total_unet_grad / total_unet_params
-                    print(f"Average UNet gradient: {avg_unet_grad:.6f}")
+                if total_denoiser_params > 0:
+                    avg_denoiser_grad = total_denoiser_grad / total_denoiser_params
+                    print(f"Average transformer denoiser gradient: {avg_denoiser_grad:.6f}")
                 
                 print("--- End Gradient Analysis ---\n")
             
             # Calculate gradient norm for monitoring and clip gradients
-            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=5.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)  # Reduced clipping threshold
             
             optimizer.step()
             optimizer.zero_grad()

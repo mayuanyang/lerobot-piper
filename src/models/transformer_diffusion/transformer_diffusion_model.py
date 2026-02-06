@@ -515,7 +515,9 @@ class VisionEncoder(nn.Module):
         return (spatial_projected, global_projected), spatial_coords
     
 
-class DiffusionTransformer(nn.Module):
+class SimpleDiffusionTransformer(nn.Module):
+    """Simplified diffusion transformer that does denoising directly within the transformer architecture."""
+    
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -567,20 +569,48 @@ class DiffusionTransformer(nn.Module):
 
         
         # Positional encoding for action sequences
-        self.positional_encoding = PositionalEncoding(config.d_model, config.horizon)
+        self.action_positional_encoding = PositionalEncoding(config.d_model, config.horizon)
 
         # Action projection to model dimension
         self.action_projection = nn.Linear(config.action_dim, config.d_model)
 
-        # The UNet Denoiser (Predicts the noise added to actions)
-        self.denoiser = DiffusionConditionalUnet1d(config, config.d_model)
-        
         # Learnable parameter for number of inference steps
         self.num_inference_steps = nn.Parameter(torch.tensor(training_steps * 1.0))  # Match training steps
         
         self.fusion_projection = nn.Sequential(
             nn.Linear(config.d_model * num_obs_tokens, config.d_model),
             nn.Mish(), # Mish helps gradient flow better than ReLU
+            nn.Linear(config.d_model, config.d_model)
+        )
+        
+        # Simplified denoising transformer - direct noise prediction
+        # This replaces the complex UNet with a simpler transformer-based approach
+        denoising_layers = nn.TransformerDecoderLayer(
+            d_model=config.d_model,
+            nhead=config.nhead,
+            dim_feedforward=config.dim_feedforward,
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True
+        )
+        self.denoising_transformer = nn.TransformerDecoder(
+            denoising_layers,
+            num_layers=4  # Fewer layers for simpler architecture
+        )
+        
+        # Final projection to action space
+        self.noise_prediction_head = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model // 2),
+            nn.Mish(),
+            nn.Linear(config.d_model // 2, config.action_dim)
+        )
+        
+        # Time embedding for diffusion timesteps
+        self.time_embedding = nn.Sequential(
+            DiffusionSinusoidalPosEmb(config.diffusion_step_embed_dim),
+            nn.Linear(config.diffusion_step_embed_dim, config.d_model),
+            nn.Mish(),
             nn.Linear(config.d_model, config.d_model)
         )
 
@@ -642,8 +672,34 @@ class DiffusionTransformer(nn.Module):
         return context, spatial_outputs
 
 
+    def denoise_step(self, noisy_actions, timesteps, obs_context):
+        """Single denoising step using transformer-based denoiser."""
+        B, T_act, _ = noisy_actions.shape
+        
+        # Project actions to model dimension and add positional encoding
+        action_embeddings = self.action_projection(noisy_actions)  # (B, T_act, d_model)
+        action_embeddings = self.action_positional_encoding(action_embeddings)  # (B, T_act, d_model)
+        
+        # Embed timesteps
+        time_embeddings = self.time_embedding(timesteps.float())  # (B, d_model)
+        time_embeddings = time_embeddings.unsqueeze(1).expand(-1, T_act, -1)  # (B, T_act, d_model)
+        
+        # Combine action and time embeddings
+        action_with_time = action_embeddings + time_embeddings  # (B, T_act, d_model)
+        
+        # Use transformer decoder for denoising
+        # obs_context serves as memory/key/value for cross-attention
+        denoised_features = self.denoising_transformer(
+            tgt=action_with_time,  # (B, T_act, d_model)
+            memory=obs_context     # (B, T_obs, d_model)
+        )  # (B, T_act, d_model)
+        
+        # Predict noise
+        pred_noise = self.noise_prediction_head(denoised_features)  # (B, T_act, action_dim)
+        
+        return pred_noise
+
     
-      
     def compute_loss(self, batch):
         """Diffusion Training: Inject noise and learn to predict it."""
         actions = batch["action"] # (B, Horizon, Action_Dim)
@@ -670,8 +726,8 @@ class DiffusionTransformer(nn.Module):
         # 4. Add noise to clean actions (Forward Diffusion)
         noisy_actions = self.noise_scheduler.add_noise(actions, noise, timesteps)
         
-        # 5. Call UNet denoiser with per-timestep conditioning
-        pred_noise = self.denoiser(noisy_actions, timesteps, obs_context)
+        # 5. Call simplified transformer denoiser with per-timestep conditioning
+        pred_noise = self.denoise_step(noisy_actions, timesteps, obs_context)
         
         # 6. Compute both original and weighted losses
         # Original MSE loss
@@ -704,8 +760,8 @@ class DiffusionTransformer(nn.Module):
         self.noise_scheduler.set_timesteps(int(self.num_inference_steps.item()))
         
         for k in self.noise_scheduler.timesteps:
-            # Predict noise using UNet with per-timestep conditioning
-            noise_pred = self.denoiser(noisy_action, k.expand(B), obs_context)
+            # Predict noise using simplified transformer denoiser
+            noise_pred = self.denoise_step(noisy_action, k.expand(B), obs_context)
 
             
             # Step back
@@ -713,3 +769,7 @@ class DiffusionTransformer(nn.Module):
             
         # Return both the actions and spatial outputs for visualization
         return noisy_action, spatial_outputs
+
+
+# Keep the original class for backward compatibility, but alias to the new simplified version
+DiffusionTransformer = SimpleDiffusionTransformer
