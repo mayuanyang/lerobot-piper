@@ -69,31 +69,29 @@ class SpatialSoftmax(nn.Module):
         self.register_buffer("pos_grid", torch.cat([pos_x, pos_y], dim=1))
 
     def forward(self, features: Tensor) -> Tensor:
-        """
-        Args:
-            features: (B, C, H, W) input feature maps.
-        Returns:
-            (B, K, 2) image-space coordinates of keypoints.
-        """
+        # 1. Standard Spatial Softmax to get (B, K, 2) coordinates
         if self.nets is not None:
-            features = self.nets(features)
-
-        # [B, K, H, W] -> [B * K, H * W] where K is number of keypoints
-        features = features.reshape(-1, self._in_h * self._in_w)
-        
-        if isinstance(self.temperature, nn.Parameter):
-            temperature = self.temperature.clamp(0.1, 5.0)
+            kp_heatmap = self.nets(features)
         else:
-            temperature = self.temperature
-        
-        # Apply temperature scaling and 2d softmax normalization
-        attention = F.softmax(features / temperature, dim=-1)
-        # [B * K, H * W] x [H * W, 2] -> [B * K, 2] for spatial coordinate mean in x and y dimensions
-        expected_xy = attention @ self.pos_grid
-        # reshape to [B, K, 2]
-        feature_keypoints = expected_xy.view(-1, self._out_c, 2)
+            kp_heatmap = features
 
-        return feature_keypoints
+        B, K, H, W = kp_heatmap.shape
+        # Flatten and softmax
+        heatmap_flat = F.softmax(kp_heatmap.view(B, K, -1) / self.temperature, dim=-1)
+        expected_xy = heatmap_flat @ self.pos_grid  # (B, K, 2)
+        
+        # 2. Feature Sampling: Extract local features at these coordinates
+        # grid_sample expects coordinates in [-1, 1], which expected_xy already is
+        # We need to reshape expected_xy to (B, K, 1, 2) for grid_sample
+        grid = expected_xy.unsqueeze(2) 
+        
+        # Sample from the original high-dim features (B, C, H, W)
+        # This gives us (B, C, K, 1) -> features at each keypoint
+        local_features = F.grid_sample(features, grid, align_corners=True)
+        local_features = local_features.squeeze(-1).permute(0, 2, 1) # (B, K, C)
+        
+        # 3. Combine: Return both the coordinates and the sampled features
+        return expected_xy, local_features
 
 
 class PositionalEncoding(nn.Module):
@@ -189,27 +187,22 @@ class VisionEncoder(nn.Module):
         )
 
     def forward(self, x):
-        # Resize input images to configured size
         x = self.resize_transform(x)
-        x = self.backbone_features(x)
+        features = self.backbone_features(x)
         
-        x = self.spatial_norm(x)
+        # Extract Coords (B, K, 2) and Features (B, K, C)
+        coords, local_feats = self.spatial_softmax(features)
         
-        # Extract spatial features using spatial softmax
-        spatial_coords = self.spatial_softmax(x)
-        # Flatten the spatial coordinates for the projection layer
-        # From (B, K, 2) to (B, K * 2)
-        spatial_coords_flat = spatial_coords.view(spatial_coords.size(0), -1)
-        spatial_projected = self.spatial_projection(spatial_coords_flat)
+        # Spatial Tokens: (B, K, d_model)
+        spatial_combined = torch.cat([local_feats, coords], dim=-1)
+        spatial_tokens = self.spatial_projection(spatial_combined)
         
-        # Extract global features using adaptive pooling
-        global_features = self.global_pool(x)
-        # Flatten global features (squeeze the spatial dimensions)
-        global_features_flat = global_features.view(global_features.size(0), -1)
-        global_projected = self.global_projection(global_features_flat)
+        # Global Token: (B, 1, d_model)
+        global_pool = self.global_pool(features).view(features.size(0), -1)
+        global_token = self.global_projection(global_pool).unsqueeze(1)
         
-        # Return both projected features separately and spatial coordinates (for visualization)
-        return (spatial_projected, global_projected), spatial_coords
+        # We return the tokens for the model AND coords for you
+        return spatial_tokens, global_token, coords
     
 
 class SimpleDiffusionTransformer(nn.Module):
@@ -314,59 +307,38 @@ class SimpleDiffusionTransformer(nn.Module):
 
     def get_condition(self, batch):
         B, T_obs = batch["observation.state"].shape[:2]
-        cam_tokens_per_timestep = []   # list of (B, T_obs, 2, d_model) for each camera
-        spatial_outputs = {}
+        all_obs_tokens = [] 
+        spatial_coords_dict = {} # To store coords for drawing
 
         for cam_key, encoder in self.image_encoders.items():
             batch_key = cam_key.replace('_', '.')
             if batch_key in batch:
-                img = batch[batch_key].flatten(0, 1)      # (B*T_obs, C, H, W)
-                (spatial_proj, global_proj), spatial_coords = encoder(img)
-                # (B*T_obs, d_model) -> (B, T_obs, d_model)
-                spatial_proj = spatial_proj.view(B, T_obs, -1)
-                global_proj  = global_proj.view(B, T_obs, -1)
-                # 堆成两个 token: dim=2 是 token index（0=spatial,1=global）
-                cam_tokens = torch.stack([spatial_proj, global_proj], dim=2)  # (B, T_obs, 2, d_model)
-                cam_tokens_per_timestep.append(cam_tokens)
+                img = batch[batch_key].flatten(0, 1)
+                
+                # Unpack the three outputs
+                s_tokens, g_token, coords = encoder(img)
+                
+                # Store coords: Reshape from (B*T_obs, K, 2) -> (B, T_obs, K, 2)
+                spatial_coords_dict[cam_key] = coords.view(B, T_obs, -1, 2)
+                
+                # Prepare tokens for Transformer
+                all_obs_tokens.append(s_tokens.view(B, T_obs, -1, self.config.d_model))
+                all_obs_tokens.append(g_token.view(B, T_obs, 1, self.config.d_model))
 
-                spatial_outputs[cam_key] = (
-                    img.view(B, T_obs, *img.shape[1:]),
-                    spatial_coords.view(B, T_obs, -1),
-                )
-            else:
-                zeros = torch.zeros(B, T_obs, 2, self.config.d_model, device=self.device)
-                cam_tokens_per_timestep.append(zeros)
-                spatial_outputs[cam_key] = None
-
-        # (B, T_obs, 2*#cams, d_model)
-        cam_tokens_all = torch.cat(cam_tokens_per_timestep, dim=2)
-
-        # state token: 先编码，再扩一维 token 轴
-        state_encoded = self.state_encoder(batch["observation.state"])   # (B, T_obs, d_model)
-        state_with_pos = self.state_positional_encoding(state_encoded)   # 也可以再额外加时间 PE
-        state_tokens = state_with_pos.unsqueeze(2)                        # (B, T_obs, 1, d_model)
-
-        # 拼成 (B, T_obs, N_tokens, d_model)
-        obs_tokens = torch.cat([cam_tokens_all, state_tokens], dim=2)
-
-        # 把 token 维展平到 seq_len 维度，让 Transformer 看到所有 token
-        B, T, N_tok, D = obs_tokens.shape
-        obs_tokens = obs_tokens.view(B, T * N_tok, D)   # (B, T*N_tokens, d_model)
-
-        # 对这个“长序列”加一次位置编码（可以是 1D PE）
-        obs_tokens = self.obs_positional_encoding(obs_tokens)   # (B, T*N_tokens, d_model)
-
-        # 过 Transformer
-        context = self.obs_transformer(obs_tokens)  # (B, T*N_tokens, d_model)
-
-        # Instead of summing, we concatenate all token features per timestep
-        context_flat = context.view(B, T, N_tok * D) # (B, T, N_tok * D)
+        # Combine all camera and state tokens
+        cam_tokens_all = torch.cat(all_obs_tokens, dim=2)
+        state_tokens = self.state_encoder(batch["observation.state"]).unsqueeze(2)
         
-        # Project down to d_model size. This allows the MLP to decide 
-        # how to mix spatial/global/state dynamically per sample.
-        context = self.fusion_projection(context_flat) # (B, T, D)
+        obs_tokens = torch.cat([cam_tokens_all, state_tokens], dim=2)
+        B, T, N, D = obs_tokens.shape
+        
+        # Flatten time and token dimensions for the Encoder
+        obs_tokens_flat = obs_tokens.view(B, T * N, D)
+        obs_tokens_flat = self.obs_positional_encoding(obs_tokens_flat)
+        
+        context = self.obs_transformer(obs_tokens_flat)
 
-        return context, spatial_outputs
+        return context, spatial_coords_dict
 
 
     def denoise_step(self, noisy_actions, timesteps, obs_context):
