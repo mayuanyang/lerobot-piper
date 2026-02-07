@@ -379,16 +379,19 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                         frame_index = batch["frame_index"][0].item()  # Get first item in batch
                     
                     # Update visualizer with spatial outputs for all three cameras
-                    for cam_key, spatial_data in spatial_outputs.items():
-                        if spatial_data is not None:
-                            img_tensor, spatial_coords = spatial_data
-                            if img_tensor is not None and spatial_coords is not None:
+                    for cam_key, spatial_coords in spatial_outputs.items():
+                        if spatial_coords is not None:
+                            # Get the corresponding image tensor from the batch
+                            # Convert cam_key back to batch key format
+                            batch_key = cam_key.replace('_', '.')
+                            if batch_key in batch:
+                                img_tensor = batch[batch_key]
                                 # Visualize all timesteps from the first item in the batch
                                 # img_tensor shape: (B, T, C, H, W)
-                                # spatial_coords shape: (B, T, num_points*2)
+                                # spatial_coords shape: (B, T, K, 2)
                                 batch_idx = 0
                                 # Save each timestep with proper zero-padded numbering for correct sorting
-                                for t in range(img_tensor.shape[1]):  # Iterate through timesteps
+                                for t in range(min(img_tensor.shape[1], spatial_coords.shape[1])):  # Iterate through timesteps
                                     # Use zero-padded timestep numbering for proper sorting
                                     padded_t = f"{t:03d}"  # e.g., 000, 001, 002, ...
                                     visualizer.update(f"{cam_key}_t{padded_t}", img_tensor[batch_idx, t], spatial_coords[batch_idx, t])
