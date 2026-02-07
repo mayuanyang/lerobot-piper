@@ -223,7 +223,7 @@ class SimpleDiffusionTransformer(nn.Module):
         self.state_encoder = nn.Linear(config.state_dim, config.d_model)
         
         # Add positional encoding for state sequences
-        self.state_positional_encoding = PositionalEncoding(config.d_model, 100)
+        self.state_positional_encoding = PositionalEncoding(config.d_model, 200)  # Increased to handle longer sequences
                 
         # Projection layer for concatenated observation features
         # Now we have 2 tokens per camera (spatial + global) plus 1 for state
@@ -243,7 +243,7 @@ class SimpleDiffusionTransformer(nn.Module):
         self.obs_transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.num_encoder_layers)
         
         # Positional encoding for observation tokens
-        self.obs_positional_encoding = PositionalEncoding(config.d_model, 100)  # 100 is max length
+        self.obs_positional_encoding = PositionalEncoding(config.d_model, 200)  # Increased to handle longer sequences
 
         
         # 3. Diffusion Components
