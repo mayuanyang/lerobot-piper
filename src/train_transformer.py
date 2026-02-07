@@ -394,7 +394,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                                 for t in range(min(img_tensor.shape[1], spatial_coords.shape[1])):  # Iterate through timesteps
                                     # Use zero-padded timestep numbering for proper sorting
                                     padded_t = f"{t:03d}"  # e.g., 000, 001, 002, ...
-                                    visualizer.update(f"{cam_key}_t{padded_t}", img_tensor[batch_idx, t], spatial_coords[batch_idx, t])
+                                    # Flatten coordinates to match visualizer expectations: (K, 2) -> (K*2,)
+                                    flattened_coords = spatial_coords[batch_idx, t].flatten()
+                                    visualizer.update(f"{cam_key}_t{padded_t}", img_tensor[batch_idx, t], flattened_coords)
                     
                     # Save visualizations with episode and frame index if available
                     visualizer.save_visualizations(step, episode=episode_index, frame=frame_index)
