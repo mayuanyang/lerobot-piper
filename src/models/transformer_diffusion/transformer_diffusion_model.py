@@ -171,8 +171,9 @@ class VisionEncoder(nn.Module):
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))  # Reduce to 1x1 spatial features
         
         # Projection for spatial features
+        # Updated to handle concatenated local features and coordinates
         self.spatial_projection = nn.Sequential(
-            nn.Linear(number_of_keypoints * 2, config.d_model),
+            nn.Linear(feature_dim + 2, config.d_model),
             nn.LayerNorm(config.d_model),
             nn.GELU(),
             nn.Dropout(0.1)
