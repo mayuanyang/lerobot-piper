@@ -128,309 +128,6 @@ class DiffusionSinusoidalPosEmb(nn.Module):
         return emb
 
 
-class DiffusionConv1dBlock(nn.Module):
-    """Conv1d block with group normalization and Mish activation."""
-    def __init__(self, inp_channels, out_channels, kernel_size, n_groups=8):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv1d(inp_channels, out_channels, kernel_size, padding=kernel_size // 2),
-            nn.GroupNorm(n_groups, out_channels),
-            nn.Mish(),
-        )
-
-    def forward(self, x):
-        return self.block(x)
-
-
-class DiffusionConditionalResidualBlock1d(nn.Module):
-    """Residual block with FiLM conditioning."""
-    def __init__(self, in_channels, out_channels, cond_dim, kernel_size=3, n_groups=8, use_film_scale_modulation=False):
-        super().__init__()
-        self.use_film_scale_modulation = use_film_scale_modulation
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-
-        self.conv1 = DiffusionConv1dBlock(in_channels, out_channels, kernel_size, n_groups=n_groups)
-
-        # FiLM modulation
-        film_layers = []
-        if use_film_scale_modulation:
-            film_layers.append(nn.Linear(cond_dim, out_channels * 2))
-        else:
-            film_layers.append(nn.Linear(cond_dim, out_channels))
-        film_layers.append(nn.Mish())
-        self.film = nn.Sequential(*film_layers)
-
-        self.conv2 = DiffusionConv1dBlock(out_channels, out_channels, kernel_size, n_groups=n_groups)
-
-        # For skip connection
-        self.skip_conv = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
-        
-        # Activation after residual connection for better gradient flow
-        self.residual_activation = nn.Mish()
-        
-        # Initialize weights for stable training
-        self._initialize_weights()
-    
-    def _initialize_weights(self):
-        """Initialize weights for stable training."""
-        # Initialize the final conv layer of conv2 block to small values for stable residual connections
-        # This helps prevent gradient explosion while still allowing gradient flow
-        # Access the Conv1d layer (index 0) within the block, not the Mish activation (index 2)
-        nn.init.normal_(self.conv2.block[0].weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.conv2.block[0].bias)
-        
-        # Initialize FiLM modulation layers
-        for module in self.film:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                
-                # Calculate where the split happens
-                # Output dim is out_channels * 2 (Scale | Bias)
-                # We want Scale to be 1, Bias to be 0
-                if module.out_features == self.out_channels * 2:
-                    # Concatenate them to match the output layout [Scale, Bias]
-                    nn.init.constant_(module.bias, 0) # clear first
-                    # Set the first half (Scale) to 1.0
-                    module.bias.data[:self.out_channels].fill_(1.0) 
-                    # Set the second half (Bias) to 0.0
-                    module.bias.data[self.out_channels:].fill_(0.0)
-        
-        # Initialize skip connection if it's a convolution
-        if isinstance(self.skip_conv, nn.Conv1d):
-            # Kaiming initialization for skip connection
-            nn.init.kaiming_normal_(self.skip_conv.weight, mode='fan_out', nonlinearity='relu')
-            if self.skip_conv.bias is not None:
-                nn.init.zeros_(self.skip_conv.bias)
-
-    def forward_with_cond(self, x, cond):
-        """Forward pass with conditioning, used for gradient checkpointing."""
-        out = self.conv1(x)
-
-        # Handle conditioning with potentially different temporal dimensions
-        B, _, T_x = x.shape
-        _, _, T_cond = cond.shape
-        
-        if T_cond == T_x:
-            # Same temporal dimensions - use standard conditioning
-            cond_proc = cond
-        elif T_cond == 1:
-            # Single time step conditioning - broadcast to all time steps
-            cond_proc = cond.expand(-1, -1, T_x)
-        else:
-            # Different temporal dimensions - use adaptive pooling to match
-            cond_proc = F.adaptive_avg_pool1d(cond, T_x)
-
-        # Move cond to (B*T_x, cond_dim)
-        cond_flat = cond_proc.permute(0, 2, 1).reshape(B * T_x, -1)
-
-        film_out = self.film(cond_flat)
-
-        if self.use_film_scale_modulation:
-            scale, bias = torch.chunk(film_out, 2, dim=-1)
-            scale = scale.view(B, T_x, self.out_channels).permute(0, 2, 1)
-            bias  = bias.view(B, T_x, self.out_channels).permute(0, 2, 1)
-            # Remove tanh normalization to allow full range of scale and bias
-            out = scale * out + bias
-        else:
-            film_out = film_out.view(B, T_x, self.out_channels).permute(0, 2, 1)
-            out = out + film_out
-
-        out = self.conv2(out)
-        residual = out + self.skip_conv(x)
-        return self.residual_activation(residual)
-
-    def forward(self, x, cond):
-        B, _, T_x = x.shape
-        _, _, T_cond = cond.shape
-        assert T_cond == T_x, f"T_cond={T_cond}, T_x={T_x}, please align cond outside the block"
-
-        out = self.conv1(x)
-        cond_flat = cond.permute(0, 2, 1).reshape(B * T_x, -1)
-
-        film_out = self.film(cond_flat)
-        if self.use_film_scale_modulation:
-            scale, bias = torch.chunk(film_out, 2, dim=-1)
-            scale = scale.view(B, T_x, self.out_channels).permute(0, 2, 1)
-            bias  = bias.view(B, T_x, self.out_channels).permute(0, 2, 1)
-            out = scale * out + bias
-        else:
-            film_out = film_out.view(B, T_x, self.out_channels).permute(0, 2, 1)
-            out = out + film_out
-
-        out = self.conv2(out)
-        residual = out + self.skip_conv(x)
-        return self.residual_activation(residual)
-
-
-
-
-class DiffusionConditionalUnet1d(nn.Module):
-    """
-    1D UNet with per-timestep FiLM conditioning.
-    Conditioning = diffusion timestep embedding + observation embedding (per time index).
-    """
-
-    def __init__(self, config, obs_cond_dim):
-        super().__init__()
-        self.config = config
-
-        # ---- diffusion timestep encoder ----
-        self.diffusion_step_encoder = nn.Sequential(
-            DiffusionSinusoidalPosEmb(config.diffusion_step_embed_dim),
-            nn.Linear(config.diffusion_step_embed_dim, config.diffusion_step_embed_dim * 4),
-            nn.Mish(),
-            nn.Linear(config.diffusion_step_embed_dim * 4, config.diffusion_step_embed_dim),
-        )
-
-        # total conditioning dimension passed to FiLM
-        self.cond_dim = config.diffusion_step_embed_dim + obs_cond_dim
-
-        # ---- UNet channel layout ----
-        in_out = [(config.action_dim, config.down_dims[0])] + list(
-            zip(config.down_dims[:-1], config.down_dims[1:])
-        )
-
-        block_kwargs = dict(
-            cond_dim=self.cond_dim,
-            kernel_size=config.kernel_size,
-            n_groups=config.n_groups,
-            use_film_scale_modulation=config.use_film_scale_modulation,
-        )
-
-        # ---- Encoder ----
-        self.down_modules = nn.ModuleList()
-        for i, (cin, cout) in enumerate(in_out):
-            is_last = i == len(in_out) - 1
-            if not is_last:
-                # Non-last layer: Two residual blocks + downsampling
-                self.down_modules.append(nn.ModuleList([
-                    DiffusionConditionalResidualBlock1d(cin, cout, **block_kwargs),
-                    DiffusionConditionalResidualBlock1d(cout, cout, **block_kwargs),
-                    nn.Conv1d(cout, cout, 3, stride=2, padding=1),  # Downsampling
-                ]))
-            else:
-                # Last layer: Two residual blocks only (no downsampling)
-                self.down_modules.append(nn.ModuleList([
-                    DiffusionConditionalResidualBlock1d(cin, cout, **block_kwargs),
-                    DiffusionConditionalResidualBlock1d(cout, cout, **block_kwargs),
-                    nn.Identity(),  # No downsampling
-                ]))
-
-        # ---- Middle ----
-        self.mid_modules = nn.ModuleList([
-            DiffusionConditionalResidualBlock1d(
-                config.down_dims[-1], config.down_dims[-1], **block_kwargs
-            ),
-            DiffusionConditionalResidualBlock1d(
-                config.down_dims[-1], config.down_dims[-1], **block_kwargs
-            ),
-        ])
-
-        # ---- Decoder ----
-        # All decoder blocks concatenate with skip connections
-        decoder_pairs = [(cout, cin) for cin, cout in reversed(in_out[1:])]
-        self.up_modules = nn.ModuleList()
-        for cin, cout in decoder_pairs:
-            # All decoder blocks take concatenated input (cin * 2) -> cout
-            self.up_modules.append(nn.ModuleList([
-                DiffusionConditionalResidualBlock1d(cin * 2, cout, **block_kwargs),
-                DiffusionConditionalResidualBlock1d(cout, cout, **block_kwargs),
-                nn.ConvTranspose1d(cout, cout, 4, stride=2, padding=1),
-            ]))
-
-        # ---- Output ----
-        self.final_conv = nn.Sequential(
-            DiffusionConv1dBlock(config.down_dims[0], config.down_dims[0], config.kernel_size),
-            nn.Conv1d(config.down_dims[0], config.action_dim, 1),
-        )
-        
-        # Enable gradient checkpointing for memory efficiency
-        self.enable_gradient_checkpointing = True
-        
-        # Initialize weights for stable training
-        self._initialize_weights()
-    
-    def _initialize_weights(self):
-        """Initialize weights for stable training."""
-        # Initialize the final conv layer of final_conv block to small values
-        # This helps prevent gradient explosion while still allowing gradient flow
-        # Access the Conv1d layer (index 0) within the DiffusionConv1dBlock, not the Mish activation (index 2)
-        final_conv_block = self.final_conv[-1]  # This is the DiffusionConv1dBlock
-        if hasattr(final_conv_block, 'block'):
-            # Access the Conv1d layer within the block (index 0)
-            conv_layer = final_conv_block.block[0]
-            if hasattr(conv_layer, 'weight') and hasattr(conv_layer, 'bias'):
-                nn.init.normal_(conv_layer.weight, mean=0.0, std=0.02)
-                nn.init.zeros_(conv_layer.bias)
-        
-        # Initialize diffusion timestep encoder
-        for module in self.diffusion_step_encoder:
-            if isinstance(module, nn.Linear):
-                # Xavier initialization for linear layers
-                nn.init.xavier_uniform_(module.weight)
-                nn.init.zeros_(module.bias)
-
-    def forward(self, x, timestep, obs_cond):
-        # x: (B, T, action_dim)
-        # obs_cond: (B, T, obs_cond_dim)
-        x = x.permute(0, 2, 1)               # (B, action_dim, T)
-        obs_cond = obs_cond.permute(0, 2, 1) # (B, obs_cond_dim, T)
-
-        B, _, T = x.shape
-
-        # ---- diffusion timestep embedding ----
-        t_emb = self.diffusion_step_encoder(timestep)     # (B, t_dim)
-        t_emb = t_emb.unsqueeze(-1).expand(-1, -1, T)     # (B, t_dim, T)
-
-        # ---- full conditioning at base resolution ----
-        base_cond = torch.cat([t_emb, obs_cond], dim=1)   # (B, cond_dim, T)
-
-        # ---------- build cond pyramid ----------
-        cond_pyramid = [base_cond]   # index 0 对应 encoder 第一层 / 最高分辨率
-        cur_T = T
-        # in_out: [(action_dim, d0), (d0,d1), (d1,d2), ...]
-        # 对应的 down_modules: 每次 stride=2，除了最后一层
-        for i in range(len(self.down_modules) - 1):
-            next_T = math.ceil(cur_T / 2)
-            cond_next = F.adaptive_avg_pool1d(base_cond, next_T)
-            cond_pyramid.append(cond_next)
-            cur_T = next_T
-
-        # ---------- Encoder ----------
-        skips = []
-        for level, (res1, res2, down) in enumerate(self.down_modules):
-            cond_here = cond_pyramid[level]           # (B, cond_dim, T_x) 与当前 x 对齐
-            x = res1(x, cond_here)
-            x = res2(x, cond_here)
-            skips.append(x)
-            x = down(x)
-
-        # 现在 x 的时间长度应该与 cond_pyramid[-1] 一致
-        cond_mid = cond_pyramid[-1]
-        for mid in self.mid_modules:
-            x = mid(x, cond_mid)
-
-        # ---------- Decoder ----------
-        # 注意 decoder_pairs 是 reversed(in_out[1:])，up_modules 数量 = len(in_out) - 1
-        # 对应的 skip 层级是 len(self.down_modules) - 2, ..., 0
-        for idx, (res1, res2, up) in enumerate(self.up_modules):
-            skip = skips.pop()
-            x = torch.cat([x, skip], dim=1)
-
-            # skip 对应的 encoder 层级
-            level = len(skips)   # 因为每 pop 一次，剩余 skips 数就是层级 index
-            cond_here = cond_pyramid[level]
-
-            x = res1(x, cond_here)
-            x = res2(x, cond_here)
-            x = up(x)
-
-        x = self.final_conv(x)
-        return x.permute(0, 2, 1)
-
-
-
 class VisionEncoder(nn.Module):
     """Improved encoder with separate Spatial Softmax and Global Features for 7-DOF precision."""
     def __init__(self, config):
@@ -596,7 +293,7 @@ class SimpleDiffusionTransformer(nn.Module):
         )
         self.denoising_transformer = nn.TransformerDecoder(
             denoising_layers,
-            num_layers=4  # Fewer layers for simpler architecture
+            num_layers=config.num_decoder_layers  # Configurable number of layers
         )
         
         # Final projection to action space
@@ -684,6 +381,8 @@ class SimpleDiffusionTransformer(nn.Module):
         time_embeddings = self.time_embedding(timesteps.float())  # (B, d_model)
         time_embeddings = time_embeddings.unsqueeze(1).expand(-1, T_act, -1)  # (B, T_act, d_model)
         
+        extended_memory = torch.cat([time_embeddings, obs_context], dim=1)
+        
         # Combine action and time embeddings
         action_with_time = action_embeddings + time_embeddings  # (B, T_act, d_model)
         
@@ -691,7 +390,7 @@ class SimpleDiffusionTransformer(nn.Module):
         # obs_context serves as memory/key/value for cross-attention
         denoised_features = self.denoising_transformer(
             tgt=action_with_time,  # (B, T_act, d_model)
-            memory=obs_context     # (B, T_obs, d_model)
+            memory=extended_memory     # (B, T_obs, d_model)
         )  # (B, T_act, d_model)
         
         # Predict noise
@@ -707,18 +406,7 @@ class SimpleDiffusionTransformer(nn.Module):
         
         # 1. Get observation context
         obs_context, spatial_outputs = self.get_condition(batch) # (B, T_obs, d_model)
-        
-        # 2. Align observation timesteps with action timesteps
-        T_obs = obs_context.shape[1]
-        if T_obs != T_act:
-            # Use nearest neighbor interpolation to avoid introducing artifacts
-            obs_context = F.interpolate(
-                obs_context.permute(0, 2, 1),  # (B, d_model, T_obs)
-                size=T_act,
-                mode="linear"
-            ).permute(0, 2, 1)  # (B, T_act, d_model)
-
-        
+                
         # 3. Sample noise and timesteps
         noise = torch.randn_like(actions)
         timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (B,), device=self.device).long()
@@ -743,16 +431,7 @@ class SimpleDiffusionTransformer(nn.Module):
         # Get observation context
         obs_context, spatial_outputs = self.get_condition(batch)  # (B, T_obs, d_model)
         
-        # Align observation timesteps with action timesteps
-        T_obs = obs_context.shape[1]
-        if T_obs != T_act:
-            # Use nearest neighbor interpolation to avoid introducing artifacts
-            obs_context = F.interpolate(
-                obs_context.permute(0, 2, 1),  # (B, d_model, T_obs)
-                size=T_act,
-                mode="nearest"
-            ).permute(0, 2, 1)  # (B, T_act, d_model)
-        
+                
         # Start from pure Gaussian noise
         noisy_action = torch.randn((B, T_act, self.config.action_dim), device=self.device)
         

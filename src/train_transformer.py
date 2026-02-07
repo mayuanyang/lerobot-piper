@@ -135,6 +135,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         d_model=256,  # Smaller model for better gradient flow
         nhead=8,
         num_encoder_layers=4,  # Fewer layers
+        num_decoder_layers=6,  # Configurable denoising transformer layers
         dim_feedforward=512,  # Smaller feedforward dimension
         diffusion_step_embed_dim=128,
         down_dims=(256, 512),  # Simplified UNet dimensions (though we're not using UNet anymore)
@@ -377,7 +378,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                     if "frame_index" in batch:
                         frame_index = batch["frame_index"][0].item()  # Get first item in batch
                     
-                    # Update visualizer with spatial outputs (multiple timesteps from the same window)
+                    # Update visualizer with spatial outputs for all three cameras
                     for cam_key, spatial_data in spatial_outputs.items():
                         if spatial_data is not None:
                             img_tensor, spatial_coords = spatial_data

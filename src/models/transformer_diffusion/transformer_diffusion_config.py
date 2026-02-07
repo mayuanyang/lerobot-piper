@@ -19,8 +19,8 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.IDENTITY,
-            "STATE": NormalizationMode.IDENTITY,
-            "ACTION": NormalizationMode.IDENTITY,
+            "STATE": NormalizationMode.MIN_MAX,
+            "ACTION": NormalizationMode.MIN_MAX,
         }
     )
 
@@ -41,6 +41,7 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     d_model: int = 256
     nhead: int = 8
     num_encoder_layers: int = 6
+    num_decoder_layers: int = 6
     dim_feedforward: int = 2048
     
     # UNet denoiser parameters

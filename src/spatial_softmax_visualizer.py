@@ -110,10 +110,12 @@ class SpatialSoftmaxVisualizer:
                             (0, 255, 0),  # Green line
                             2)
                     
-                # Draw points
+                # Draw points with numbers
                 for i, (x, y) in enumerate(points):
                     color = (0, 0, 255) if i == len(points) - 1 else (255, 0, 0)  # Red for latest, blue for others
                     cv2.circle(vis_image, (x, y), 5, color, -1)
+                    # Add number label
+                    cv2.putText(vis_image, str(i), (x + 10, y + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
                     
             # Save image
             camera_dir = self.output_dir / camera_name
@@ -151,9 +153,14 @@ class SpatialSoftmaxVisualizer:
         
         plt.figure(figsize=(10, 8))
         plt.plot(x_coords, y_coords, 'b-', linewidth=1, alpha=0.7, label='Trajectory')
-        plt.scatter(x_coords, y_coords, c=range(len(x_coords)), cmap='viridis', s=30)
-        plt.colorbar(label='Time')
+        scatter = plt.scatter(x_coords, y_coords, c=range(len(x_coords)), cmap='viridis', s=30)
+        plt.colorbar(scatter, label='Time')
         plt.scatter(x_coords[-1], y_coords[-1], c='red', s=100, marker='*', label='Latest')
+        
+        # Add numbers to each point
+        for i, (x, y) in enumerate(zip(x_coords, y_coords)):
+            plt.annotate(str(i), (x, y), xytext=(5, 5), textcoords='offset points', 
+                        fontsize=8, alpha=0.7)
         
         # Include episode and frame in title if provided
         if episode is not None and frame is not None:
