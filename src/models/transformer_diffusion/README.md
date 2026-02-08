@@ -50,13 +50,22 @@ The TransformerDiffusion model consists of:
 
 The model uses a K-point spatial softmax mechanism that extracts multiple (x, y) coordinates from feature maps instead of a single point. This allows the model to track multiple objects or regions of interest simultaneously.
 
-Currently configured to use 2 points per camera, but can be easily adjusted to use more points by modifying the `num_points` parameter in the VisionEncoder.
+Currently configured to use 16 points per camera, but can be easily adjusted to use more points by modifying the `num_points` parameter in the VisionEncoder.
 
 The SpatialSoftmax implementation includes several improvements to prevent the common issue of points collapsing to the center:
 - **Temperature scaling**: Uses a low initial temperature (0.1) with learnable parameters to encourage sharp attention peaks
 - **Orthogonal initialization**: Initializes the convolutional weights to encourage diverse attention maps
 - **Spatial regularization**: Adds a loss term during training to encourage separation between detected points
 - **Weight scaling**: Scales initial weights to promote sharper attention distributions
+
+## Object-Guided Spatial Softmax
+
+The enhanced version includes an object-guided spatial softmax that dedicates specific keypoints to different objects of interest:
+- **Gripper**: 6 keypoints dedicated to tracking the robotic gripper
+- **Object**: 5 keypoints dedicated to tracking the object being manipulated
+- **Container**: 5 keypoints dedicated to tracking the target container
+
+This object-guided approach improves the model's ability to focus on relevant regions and maintain consistent tracking of important objects throughout the manipulation task.
 
 ## Usage
 

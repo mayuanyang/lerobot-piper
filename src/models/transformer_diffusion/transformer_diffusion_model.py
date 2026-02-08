@@ -31,22 +31,42 @@ class SpatialSoftmax(nn.Module):
     The example above results in 512 keypoints (corresponding to the 512 input channels). We can optionally
     provide num_kp != None to control the number of keypoints. This is achieved by a first applying a learnable
     linear mapping (in_channels, H, W) -> (num_kp, H, W).
+    
+    Enhanced version supports guided spatial softmax for specific objects (gripper, object, container).
     """
 
-    def __init__(self, input_shape, num_kp=None, temperature=1.0, learnable_temperature=False):
+    def __init__(self, input_shape, num_kp=None, temperature=1.0, learnable_temperature=False, 
+                 object_guided=False, gripper_kp=6, object_kp=5, container_kp=5):
         """
         Args:
             input_shape (list): (C, H, W) input feature map shape.
             num_kp (int): number of keypoints in output. If None, output will have the same number of channels as input.
             temperature (float): temperature for softmax. Lower values lead to sharper peaks.
             learnable_temperature (bool): whether temperature should be learnable.
+            object_guided (bool): whether to use object-guided spatial softmax.
+            gripper_kp (int): number of keypoints for gripper.
+            object_kp (int): number of keypoints for object.
+            container_kp (int): number of keypoints for container.
         """
         super().__init__()
 
         assert len(input_shape) == 3
         self._in_c, self._in_h, self._in_w = input_shape
+        self.object_guided = object_guided
 
-        if num_kp is not None:
+        if object_guided:
+            # Create separate convolution layers for each object type
+            self.gripper_kp = gripper_kp
+            self.object_kp = object_kp
+            self.container_kp = container_kp
+            total_kp = gripper_kp + object_kp + container_kp
+            
+            # Separate conv layers for each object type
+            self.gripper_net = torch.nn.Conv2d(self._in_c, gripper_kp, kernel_size=1)
+            self.object_net = torch.nn.Conv2d(self._in_c, object_kp, kernel_size=1)
+            self.container_net = torch.nn.Conv2d(self._in_c, container_kp, kernel_size=1)
+            self._out_c = total_kp
+        elif num_kp is not None:
             self.nets = torch.nn.Conv2d(self._in_c, num_kp, kernel_size=1)
             self._out_c = num_kp
         else:
@@ -68,19 +88,52 @@ class SpatialSoftmax(nn.Module):
         # register as buffer so it's moved to the correct device.
         self.register_buffer("pos_grid", torch.cat([pos_x, pos_y], dim=1))
 
-    def forward(self, features: Tensor) -> Tensor:
-        # 1. Standard Spatial Softmax to get (B, K, 2) coordinates
-        if self.nets is not None:
+    def forward(self, features: Tensor, gripper_mask=None, object_mask=None, container_mask=None) -> Tensor:
+        """
+        Forward pass with optional object-guided masking.
+        
+        Args:
+            features (Tensor): Input feature maps.
+            gripper_mask (Tensor, optional): Mask for gripper region.
+            object_mask (Tensor, optional): Mask for object region.
+            container_mask (Tensor, optional): Mask for container region.
+        """
+        B, C, H, W = features.shape
+        
+        if self.object_guided:
+            # Apply object-guided spatial softmax
+            gripper_heatmap = self.gripper_net(features)
+            object_heatmap = self.object_net(features)
+            container_heatmap = self.container_net(features)
+            
+            # Apply masks if provided
+            if gripper_mask is not None:
+                # Expand mask to match heatmap dimensions
+                gripper_mask = F.interpolate(gripper_mask, size=(H, W), mode='nearest')
+                gripper_heatmap = gripper_heatmap * gripper_mask
+            
+            if object_mask is not None:
+                # Expand mask to match heatmap dimensions
+                object_mask = F.interpolate(object_mask, size=(H, W), mode='nearest')
+                object_heatmap = object_heatmap * object_mask
+                
+            if container_mask is not None:
+                # Expand mask to match heatmap dimensions
+                container_mask = F.interpolate(container_mask, size=(H, W), mode='nearest')
+                container_heatmap = container_heatmap * container_mask
+            
+            # Concatenate all heatmaps
+            kp_heatmap = torch.cat([gripper_heatmap, object_heatmap, container_heatmap], dim=1)
+        elif self.nets is not None:
             kp_heatmap = self.nets(features)
         else:
             kp_heatmap = features
 
-        B, K, H, W = kp_heatmap.shape
         # Flatten and softmax
-        heatmap_flat = F.softmax(kp_heatmap.view(B, K, -1) / self.temperature, dim=-1)
+        heatmap_flat = F.softmax(kp_heatmap.view(B, kp_heatmap.shape[1], -1) / self.temperature, dim=-1)
         expected_xy = heatmap_flat @ self.pos_grid  # (B, K, 2)
         
-        # 2. Feature Sampling: Extract local features at these coordinates
+        # Feature Sampling: Extract local features at these coordinates
         # grid_sample expects coordinates in [-1, 1], which expected_xy already is
         # We need to reshape expected_xy to (B, K, 1, 2) for grid_sample
         grid = expected_xy.unsqueeze(2) 
@@ -90,7 +143,7 @@ class SpatialSoftmax(nn.Module):
         local_features = F.grid_sample(features, grid, align_corners=True)
         local_features = local_features.squeeze(-1).permute(0, 2, 1) # (B, K, C)
         
-        # 3. Combine: Return both the coordinates and the sampled features
+        # Return both the coordinates and the sampled features
         return expected_xy, local_features
 
 
@@ -151,14 +204,14 @@ class VisionEncoder(nn.Module):
             height = backbone_output.shape[2]
             width = backbone_output.shape[3]
         
-        # Use K-point spatial softmax with 2 points
-        number_of_keypoints = 16
-        # Use moderate temperature and learnable temperature to prevent collapse
-        # Higher temperature (closer to 1.0) provides smoother gradients
+        # Use object-guided spatial softmax with dedicated keypoints for each object
         self.spatial_softmax = SpatialSoftmax(
             input_shape=(feature_dim, height, width),
-            num_kp=number_of_keypoints,
-            temperature=1.0,  # Moderate temperature for better gradients
+            object_guided=True,  # Enable object-guided spatial softmax
+            gripper_kp=6,        # 6 keypoints for gripper
+            object_kp=5,         # 5 keypoints for object
+            container_kp=5,      # 5 keypoints for container
+            temperature=1.0,     # Moderate temperature for better gradients
             learnable_temperature=True  # Allow temperature to adapt during training
         )
         
@@ -187,12 +240,12 @@ class VisionEncoder(nn.Module):
             nn.Dropout(0.1)
         )
 
-    def forward(self, x):
+    def forward(self, x, gripper_mask=None, object_mask=None, container_mask=None):
         x = self.resize_transform(x)
         features = self.backbone_features(x)
         
-        # Extract Coords (B, K, 2) and Features (B, K, C)
-        coords, local_feats = self.spatial_softmax(features)
+        # Extract Coords (B, K, 2) and Features (B, K, C) with optional object masks
+        coords, local_feats = self.spatial_softmax(features, gripper_mask, object_mask, container_mask)
         
         # Spatial Tokens: (B, K, d_model)
         spatial_combined = torch.cat([local_feats, coords], dim=-1)
@@ -316,8 +369,21 @@ class SimpleDiffusionTransformer(nn.Module):
             if batch_key in batch:
                 img = batch[batch_key].flatten(0, 1)
                 
-                # Unpack the three outputs
-                s_tokens, g_token, coords = encoder(img)
+                # Get object masks if available in the batch
+                gripper_mask = batch.get(f"{batch_key}_gripper_mask")
+                object_mask = batch.get(f"{batch_key}_object_mask")
+                container_mask = batch.get(f"{batch_key}_container_mask")
+                
+                # Flatten masks if they exist
+                if gripper_mask is not None:
+                    gripper_mask = gripper_mask.flatten(0, 1)
+                if object_mask is not None:
+                    object_mask = object_mask.flatten(0, 1)
+                if container_mask is not None:
+                    container_mask = container_mask.flatten(0, 1)
+                
+                # Unpack the three outputs with optional object masks
+                s_tokens, g_token, coords = encoder(img, gripper_mask, object_mask, container_mask)
                 
                 # Store coords: Reshape from (B*T_obs, K, 2) -> (B, T_obs, K, 2)
                 spatial_coords_dict[cam_key] = coords.view(B, T_obs, -1, 2)
