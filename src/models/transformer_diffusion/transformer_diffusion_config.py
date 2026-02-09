@@ -12,7 +12,7 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     """Long Task Transformer Configuration for long-horizon tasks with transformer-based architecture."""
     
     # Inputs / output structure.
-    n_obs_steps: int = 8
+    n_obs_steps: int = 2
     horizon: int = 16
     n_action_steps: int = 8
 
@@ -42,14 +42,14 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     nhead: int = 8
     num_encoder_layers: int = 6
     num_decoder_layers: int = 6
-    dim_feedforward: int = 2048
+    dim_feedforward: int = 512
     
     # UNet denoiser parameters
     diffusion_step_embed_dim: int = 128
-    down_dims: tuple = (512, 1024, 2048)
-    kernel_size: int = 5
+    down_dims: tuple = (256, 512)
+    kernel_size: int = 3
     n_groups: int = 8
-    use_film_scale_modulation: bool = False
+    use_film_scale_modulation: bool = True
         
     # Training presets
     optimizer_lr: float = 1e-4
