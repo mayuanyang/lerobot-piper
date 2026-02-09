@@ -146,7 +146,18 @@ class SpatialSoftmax(nn.Module):
         # Return both the coordinates and the sampled features
         return expected_xy, local_features
 
-
+class ResidualLinear(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.GELU(),
+            nn.Linear(dim, dim)
+        )
+    def forward(self, x):
+        return x + self.net(x) # Basic skip connection
+      
 class PositionalEncoding(nn.Module):
     """Positional encoding for action sequences."""
     def __init__(self, d_model, max_len=100):
@@ -227,9 +238,7 @@ class VisionEncoder(nn.Module):
         # Updated to handle concatenated local features and coordinates
         self.spatial_projection = nn.Sequential(
             nn.Linear(feature_dim + 2, config.d_model),
-            nn.LayerNorm(config.d_model),
-            nn.GELU(),
-            nn.Dropout(0.1)
+            ResidualLinear(config.d_model) # Stabilizes the feature transformation
         )
         
         # Projection for global features
