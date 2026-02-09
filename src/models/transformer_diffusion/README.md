@@ -67,6 +67,24 @@ The enhanced version includes an object-guided spatial softmax that dedicates sp
 
 This object-guided approach improves the model's ability to focus on relevant regions and maintain consistent tracking of important objects throughout the manipulation task.
 
+## Residual Connections
+
+The model incorporates residual connections throughout the architecture to improve gradient flow and training stability:
+- **Observation Transformer**: Residual connections in the observation context processing
+- **Vision Encoder**: Residual connections in spatial and global feature projections
+- **Denoising Transformer**: Residual connections in the action denoising process
+
+These residual connections help mitigate the vanishing gradient problem and enable deeper networks to be trained effectively.
+
+## Device Inference
+
+The model automatically infers the device from its parameters, allowing seamless operation across different hardware configurations:
+- **Automatic Device Detection**: The model detects whether it's running on CPU or GPU based on its parameters
+- **Consistent Device Usage**: All tensors and operations use the same device as the model parameters
+- **No Hardcoded Device References**: Eliminates issues with hardcoded device assignments
+
+This approach ensures that when the outer network moves the model to a specific device (CPU/GPU), all internal components automatically use the same device without manual configuration.
+
 ## Usage
 
 ### Training

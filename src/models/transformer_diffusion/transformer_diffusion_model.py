@@ -274,7 +274,7 @@ class SimpleDiffusionTransformer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Device will be inferred from the model's device when needed
 
         # 1. Vision & State Encoding (The "Conditioner")
         self.image_encoders = nn.ModuleDict({
@@ -457,9 +457,12 @@ class SimpleDiffusionTransformer(nn.Module):
         # 1. Get observation context
         obs_context, spatial_outputs = self.get_condition(batch) # (B, T_obs, d_model)
                 
+        # Infer device from model parameters
+        device = next(self.parameters()).device
+        
         # 3. Sample noise and timesteps
-        noise = torch.randn_like(actions)
-        timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (B,), device=self.device).long()
+        noise = torch.randn_like(actions, device=device)
+        timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (B,), device=device).long()
         
         # 4. Add noise to clean actions (Forward Diffusion)
         noisy_actions = self.noise_scheduler.add_noise(actions, noise, timesteps)
@@ -481,16 +484,18 @@ class SimpleDiffusionTransformer(nn.Module):
         # Get observation context
         obs_context, spatial_outputs = self.get_condition(batch)  # (B, T_obs, d_model)
         
+        # Infer device from model parameters
+        device = next(self.parameters()).device
                 
         # Start from pure Gaussian noise
-        noisy_action = torch.randn((B, T_act, self.config.action_dim), device=self.device)
+        noisy_action = torch.randn((B, T_act, self.config.action_dim), device=device)
         
         # Iteratively denoise
         self.noise_scheduler.set_timesteps(int(self.num_inference_steps.item()))
         
         for k in self.noise_scheduler.timesteps:
             # Predict noise using simplified transformer denoiser
-            noise_pred = self.denoise_step(noisy_action, k.expand(B), obs_context)
+            noise_pred = self.denoise_step(noisy_action, k.expand(B).to(device), obs_context)
 
             
             # Step back
