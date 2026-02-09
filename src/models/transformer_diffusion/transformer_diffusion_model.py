@@ -432,6 +432,8 @@ class SimpleDiffusionTransformer(nn.Module):
             memory=extended_memory     # (B, T_obs, d_model)
         )  # (B, T_act, d_model)
         
+        denoised_features = denoised_features + action_embeddings
+        
         # Predict noise
         pred_noise = self.noise_prediction_head(denoised_features)  # (B, T_act, action_dim)
         
