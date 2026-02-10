@@ -40,12 +40,17 @@ class CameraSpecificTransforms:
     def __init__(self):
         self.rgb_transforms = get_rgb_augmentations()
         
-    def __call__(self, batch):
-        # Apply transforms to all camera images
-        camera_keys = [k for k in batch.keys() if k.startswith("observation.images.")]
-        for key in camera_keys:
-            batch[key] = self.rgb_transforms(batch[key])
-        return batch
+    def __call__(self, data):
+        # Handle both batch dictionaries and individual tensors
+        if isinstance(data, dict):
+            # This is a batch dictionary
+            camera_keys = [k for k in data.keys() if k.startswith("observation.images.")]
+            for key in camera_keys:
+                data[key] = self.rgb_transforms(data[key])
+            return data
+        else:
+            # This is a single tensor (individual image)
+            return self.rgb_transforms(data)
 
 
 # Helper to apply joint data augmentation
