@@ -1,12 +1,13 @@
 from typing import Any, Dict
 import torch
-from lerobot.processor import BaseProcessorStep
+from lerobot.processor import ProcessorStep, ProcessorStepRegistry
 
 
-class RemoveFourthJointProcessorStep(BaseProcessorStep):
+@ProcessorStepRegistry.register("remove_fourth_joint_processor")
+class RemoveFourthJointProcessorStep(ProcessorStep):
     """Processor step to remove the 4th joint (index 3) from observation.state and action tensors."""
     
-    def __init__(self):
+    def __init__(self, **kwargs):
         super().__init__()
     
     def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
