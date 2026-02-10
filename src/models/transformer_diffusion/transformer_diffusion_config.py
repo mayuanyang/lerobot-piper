@@ -46,7 +46,6 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     
     # UNet denoiser parameters
     diffusion_step_embed_dim: int = 128
-    down_dims: tuple = (256, 512)
     kernel_size: int = 3
     n_groups: int = 8
     use_film_scale_modulation: bool = True

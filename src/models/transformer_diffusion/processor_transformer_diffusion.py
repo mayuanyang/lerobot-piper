@@ -15,6 +15,7 @@ from lerobot.processor import (
 
 # Import from local module
 from .grid_overlay_processor import GridOverlayProcessorStep
+from .remove_fourth_joint_processor import RemoveFourthJointProcessorStep
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
@@ -32,6 +33,7 @@ def make_pre_post_processors(
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
+        RemoveFourthJointProcessorStep(),  # Remove 4th joint before normalization
     ]
     
     # Add grid overlay processor step if requested

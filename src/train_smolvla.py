@@ -207,7 +207,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         policy.config.n_obs_steps = n_obs_steps
         
         
+        # Add RemoveFourthJointProcessorStep to the preprocessor pipeline
         preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
+        
+        # Insert RemoveFourthJointProcessorStep at the beginning of the pipeline
+        from models.transformer_diffusion.remove_fourth_joint_processor import RemoveFourthJointProcessorStep
+        preprocessor.steps.insert(0, RemoveFourthJointProcessorStep())
         
         step = 0
     else:
@@ -216,10 +221,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
         
         if "observation.state" in policy.config.input_features:
-            policy.config.input_features["observation.state"].shape = [7]
+            policy.config.input_features["observation.state"].shape = [6]  # 7 joints minus the 4th joint which is always 0
         
         if "action" in policy.config.output_features:
-            policy.config.output_features["action"].shape = [7]
+            policy.config.output_features["action"].shape = [6]  # 7 joints minus the 4th joint which is always 0
             
         # Update image shapes - All RGB images get 3 channels
         # Based on the feature mapping: front -> camera1, gripper -> camera2, right -> camera3
@@ -249,15 +254,16 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         policy.train()
         policy.to(device)
         optimizer = torch.optim.Adam(policy.parameters(), lr=policy.config.optimizer_lr)
-        # Create new preprocessor and postprocessor
-        preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
+        # Add RemoveFourthJointProcessorStep to the preprocessor pipeline
+        from models.transformer_diffusion.remove_fourth_joint_processor import RemoveFourthJointProcessorStep
+        preprocessor.steps.insert(0, RemoveFourthJointProcessorStep())
         
         # Add grid overlay processor step to the preprocessor pipeline
         if hasattr(preprocessor, 'steps'):
             # Insert grid overlay step after the rename step but before normalization
             grid_step = GridOverlayProcessorStep(grid_cell_size=48, camera_names=["camera1", "camera3"])
             # Find the position to insert the grid step (after rename, before normalization)
-            insert_pos = 1  # Default position
+            insert_pos = 2  # Default position (after RemoveFourthJointProcessorStep and Rename)
             for i, step in enumerate(preprocessor.steps):
                 if hasattr(step, '__class__') and 'Normalizer' in step.__class__.__name__:
                     insert_pos = i
@@ -397,17 +403,16 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
             
             batch = remapped_batch
             
-            # Ensure observation.state has 7 dimensions as expected by our dataset
-            # The pretrained model might expect 6 dimensions, but our dataset has 7
+            # Ensure observation.state has 6 dimensions after removing 4th joint
+            # The dataset originally has 7-dimensional state, but we remove the 4th joint (index 3)
             if "observation.state" in batch:
                 state = batch["observation.state"]
                 if state.shape[-1] == 6:
-                    # If we somehow get 6-dimensional state, we need to handle it
-                    # But according to the user, the dataset provides 7-dimensional state
-                    print(f"Warning: observation.state has shape {state.shape}, expected 7 dimensions")
-                elif state.shape[-1] == 7:
-                    # This is what we expect - 7 dimensional state from the dataset
+                    # This is what we expect after removing the 4th joint
                     pass
+                elif state.shape[-1] == 7:
+                    # This is the original 7-dimensional state from the dataset
+                    print(f"Warning: observation.state still has 7 dimensions, expected 6 after removing 4th joint")
                 else:
                     # Unexpected dimensionality
                     print(f"Warning: observation.state has unexpected shape {state.shape}")
