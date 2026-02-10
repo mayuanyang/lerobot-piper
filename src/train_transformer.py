@@ -154,7 +154,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         policy.to(device)
         
         # Use the policy's configuration for creating processors
-        preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy.config, 
+            dataset_stats=dataset_metadata.stats, 
+            add_grid_overlay=True,
+            grid_overlay_cameras=["front", "right"]  # Front and right cameras (original names)
+        )
             
         optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
         # Cosine scheduler with warmup
@@ -193,7 +198,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         if hasattr(policy, 'transformer') and hasattr(policy.transformer, 'feature_projection'):
             if policy.transformer.feature_projection is not None:
                 policy.transformer.feature_projection = policy.transformer.feature_projection.to(device)
-        preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
+        preprocessor, postprocessor = make_pre_post_processors(
+            cfg, 
+            dataset_stats=dataset_metadata.stats, 
+            add_grid_overlay=True,
+            grid_overlay_cameras=["front", "right"]  # Front and right cameras (original names)
+        )
         step = 0
         
         # Implement differential learning rates for better gradient flow

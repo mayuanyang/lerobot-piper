@@ -5,20 +5,15 @@ import torch
 from tqdm import tqdm
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.factory import make_pre_post_processors
-from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy, SmolVLAConfig
+from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.datasets.utils import dataset_to_policy_features
-import json
 from torch.optim.lr_scheduler import LambdaLR
 
 
 # 🟢 ADDED: Import torchvision for augmentation
 from torchvision.transforms import v2
-from lerobot.datasets.transforms import ImageTransforms, ImageTransformsConfig, ImageTransformConfig
 from torch.utils.data import Subset
-
-
 
 # Detect the best available device
 if torch.cuda.is_available():
@@ -29,6 +24,84 @@ else:
     device = torch.device("cpu")
 
 print(f"Using device: {device}")
+
+# Function to draw a grid overlay on images
+def draw_grid_overlay(image_tensor, grid_cell_size=48):
+    """
+    Draw a grid overlay on the image tensor.
+    
+    Args:
+        image_tensor: Tensor of shape (C, H, W) or (T, C, H, W) or (B, T, C, H, W)
+        grid_cell_size: Size of each grid cell in pixels (default 48)
+    
+    Returns:
+        Image tensor with grid overlay
+    """
+    import torch
+    
+    # Handle different tensor shapes
+    original_shape = image_tensor.shape
+    if len(original_shape) == 5:  # (B, T, C, H, W)
+        batch_size, time_steps, channels, height, width = original_shape
+        # Reshape to process all images at once
+        image_flat = image_tensor.view(-1, channels, height, width)
+    elif len(original_shape) == 4:  # (T, C, H, W)
+        time_steps, channels, height, width = original_shape
+        image_flat = image_tensor
+    elif len(original_shape) == 3:  # (C, H, W)
+        channels, height, width = original_shape
+        image_flat = image_tensor.unsqueeze(0)  # Add batch dimension
+    else:
+        return image_tensor  # Unsupported shape
+    
+    # Draw grid on each image in the batch
+    batch_size_flat = image_flat.shape[0]
+    for i in range(batch_size_flat):
+        # Get image dimensions
+        _, h, w = image_flat[i].shape
+        
+        # Draw vertical lines
+        for x in range(0, w, grid_cell_size):
+            # Draw a thin line (2 pixels wide) in red color (channel 0)
+            start_x = max(0, x - 1)
+            end_x = min(w, x + 1)
+            image_flat[i, 0, :, start_x:end_x] = 1.0  # Red channel
+            image_flat[i, 1, :, start_x:end_x] = 0.0  # Green channel
+            image_flat[i, 2, :, start_x:end_x] = 0.0  # Blue channel
+        
+        # Draw horizontal lines
+        for y in range(0, h, grid_cell_size):
+            # Draw a thin line (2 pixels wide) in red color (channel 0)
+            start_y = max(0, y - 1)
+            end_y = min(h, y + 1)
+            image_flat[i, 0, start_y:end_y, :] = 1.0  # Red channel
+            image_flat[i, 1, start_y:end_y, :] = 0.0  # Green channel
+            image_flat[i, 2, start_y:end_y, :] = 0.0  # Blue channel
+    
+    # Reshape back to original shape
+    if len(original_shape) == 5:
+        image_tensor = image_flat.view(batch_size, time_steps, channels, height, width)
+    elif len(original_shape) == 4:
+        image_tensor = image_flat
+    elif len(original_shape) == 3:
+        image_tensor = image_flat.squeeze(0)
+    
+    return image_tensor
+
+# Custom processor step for adding grid overlay
+class GridOverlayProcessorStep:
+    def __init__(self, grid_cell_size=48):
+        self.grid_cell_size = grid_cell_size
+    
+    def __call__(self, batch):
+        # Apply grid overlay only to front and right cameras (camera1 and camera3)
+        # Skip gripper camera (camera2)
+        camera_keys = [k for k in batch.keys() if k.startswith("observation.images.")]
+        for key in camera_keys:
+            # Only apply grid to camera1 (front) and camera3 (right)
+            if ("camera1" in key or "camera3" in key) and isinstance(batch[key], torch.Tensor):
+                batch[key] = draw_grid_overlay(batch[key], self.grid_cell_size)
+        return batch
 
 # 🟢 ADDED: Data Augmentation Setup
 def get_rgb_augmentations():
@@ -41,32 +114,22 @@ def get_rgb_augmentations():
         # 3. DO NOT use Affine/Crop unless you transform the actions!
     ])
 
-def get_depth_augmentations():
-    return v2.Compose([
-        # Only apply transforms that make sense for depth images
-        # Gaussian Blur can help with noise in depth sensors
-        v2.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 2.0)),
-    ])
-
 # Custom transform wrapper to handle different image types
 class CameraSpecificTransforms:
     def __init__(self):
         self.rgb_transforms = get_rgb_augmentations()
-        self.depth_transforms = get_depth_augmentations()
         
     def __call__(self, batch):
         # Apply transforms based on camera type
         # Use batch.keys() to safely check for keys
         batch_keys = batch.keys() if hasattr(batch, 'keys') else []
         
-        if "observation.images.gripper" in batch_keys:
-            batch["observation.images.gripper"] = self.rgb_transforms(batch["observation.images.gripper"])
-            
-        if "observation.images.depth" in batch_keys:
-            batch["observation.images.depth"] = self.depth_transforms(batch["observation.images.depth"])
+        # Apply RGB transforms to all camera images
+        camera_keys = [k for k in batch_keys if k.startswith("observation.images.")]
+        for key in camera_keys:
+            batch[key] = self.rgb_transforms(batch[key])
             
         return batch
-
 
 # 🟢 ADDED: Helper to apply joint data augmentation
 def apply_joint_augmentations(batch):
@@ -83,18 +146,30 @@ def apply_joint_augmentations(batch):
     batch[key] = q + noise * mask
     return batch
 
-
-
 def random_drop_camera_views(batch, drop_prob=0.3):
-    camera_keys = [k for k in batch if k.startswith("observation.images.")]
+    """Randomly drop one camera from the batch during training."""
+    # Only apply during training and with specified probability
+    if torch.rand(1).item() > drop_prob:
+        return batch
 
-    for t in range(batch[camera_keys[0]].shape[1]):  # timestep dim
-        if torch.rand(1) < drop_prob:
-            key = camera_keys[torch.randint(len(camera_keys), (1,))]
-            batch[key][:, t] = 0
+    # Get camera keys
+    camera_keys = [k for k in batch if k.startswith("observation.images.")]
+    
+    # If we only have one camera, don't drop it
+    if len(camera_keys) <= 1:
+        return batch
+
+    # Randomly select one camera to drop
+    camera_to_drop = torch.randint(0, len(camera_keys), (1,)).item()
+    dropped_camera_key = camera_keys[camera_to_drop]
+
+    # Remove the selected camera from the batch
+    if dropped_camera_key in batch:
+        del batch[dropped_camera_key]
+        # Uncomment the next line for debugging
+        # print(f"Dropped camera: {dropped_camera_key}")
 
     return batch
-
 
 def validate_model(policy, val_dataloader, preprocessor):
     policy.eval()
@@ -112,9 +187,9 @@ def validate_model(policy, val_dataloader, preprocessor):
                 
             # Remap image feature names to match what the policy expects
             feature_mapping = {
-                #"observation.images.front": "observation.images.camera1",
-                "observation.images.depth": "observation.images.camera1", 
-                "observation.images.gripper": "observation.images.camera2"
+                "observation.images.front": "observation.images.camera1",
+                "observation.images.gripper": "observation.images.camera2",
+                "observation.images.right": "observation.images.camera3"
             }
             
             # Create a new batch with remapped keys
@@ -184,8 +259,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     chunk_size = 24
     n_action_steps = 24
     
-    # Update the configuration to use 7-dimensional state and action
-    # and 400x640 images
     
     
     if dataset_metadata.stats is None:
@@ -221,16 +294,25 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         if "action" in policy.config.output_features:
             policy.config.output_features["action"].shape = [7]
             
-        # Update image shapes - RGB images get 3 channels, depth images get 1 channel
-        # Based on the feature mapping: depth -> camera1, gripper -> camera2
+        # Update image shapes - All RGB images get 3 channels
+        # Based on the feature mapping: front -> camera1, gripper -> camera2, right -> camera3
         if "observation.images.camera1" in policy.config.input_features:
-            # This is the depth camera (mapped from observation.images.depth)
+            # This is the front camera (mapped from observation.images.front)
             policy.config.input_features["observation.images.camera1"].shape = [3, 400, 640]
         if "observation.images.camera2" in policy.config.input_features:
             # This is the gripper camera (mapped from observation.images.gripper)
             policy.config.input_features["observation.images.camera2"].shape = [3, 400, 640]
+        if "observation.images.camera3" in policy.config.input_features:
+            # This is the right camera (mapped from observation.images.right)
+            policy.config.input_features["observation.images.camera3"].shape = [3, 400, 640]
         
-        #policy = SmolVLAPolicy(cfg)
+        # Update normalization mapping to match command line arguments
+        if hasattr(policy.config, 'normalization_mapping'):
+            policy.config.normalization_mapping = {
+                "VISUAL": "IDENTITY",
+                "STATE": "MEAN_STD",
+                "ACTION": "MEAN_STD"
+            }
         policy.config.chunk_size = chunk_size
         policy.config.n_action_steps = n_action_steps
         policy.config.n_obs_steps = n_obs_steps
@@ -242,6 +324,18 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         optimizer = torch.optim.Adam(policy.parameters(), lr=policy.config.optimizer_lr)
         # Create new preprocessor and postprocessor
         preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
+        
+        # Add grid overlay processor step to the preprocessor pipeline
+        if hasattr(preprocessor, 'steps'):
+            # Insert grid overlay step after the rename step but before normalization
+            grid_step = GridOverlayProcessorStep(grid_cell_size=48, camera_names=["camera1", "camera3"])
+            # Find the position to insert the grid step (after rename, before normalization)
+            insert_pos = 1  # Default position
+            for i, step in enumerate(preprocessor.steps):
+                if hasattr(step, '__class__') and 'Normalizer' in step.__class__.__name__:
+                    insert_pos = i
+                    break
+            preprocessor.steps.insert(insert_pos, grid_step)
                 
         # Start from step 0
         step = 0
@@ -281,9 +375,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     obs_temporal_window = [ -i * frame_time for i in range(policy.config.n_obs_steps) ][::-1]
 
     delta_timestamps = {
+        "observation.images.front": obs_temporal_window,
         "observation.images.gripper": obs_temporal_window,  
-        "observation.images.depth": obs_temporal_window,
-        #"observation.images.front": obs_temporal_window,
+        "observation.images.right": obs_temporal_window,
         "observation.state": obs_temporal_window,
         "action": [i * frame_time for i in range(policy.config.n_action_steps)] 
     }
@@ -351,9 +445,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     if val_batches == 0:
         print("WARNING: No validation batches! Check batch_size and dataset size.")
 
-    # Validation function
-    
-
     # --- TRAINING LOOP ---
     print("Starting training loop...")
     done = False
@@ -365,9 +456,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
             
             # Remap image feature names to match what the policy expects
             feature_mapping = {
-                #"observation.images.front": "observation.images.camera1",
-                "observation.images.depth": "observation.images.camera1", 
-                "observation.images.gripper": "observation.images.camera2"
+                "observation.images.front": "observation.images.camera1",
+                "observation.images.gripper": "observation.images.camera2",
+                "observation.images.right": "observation.images.camera3"
             }
             
             # Create a new batch with remapped keys
