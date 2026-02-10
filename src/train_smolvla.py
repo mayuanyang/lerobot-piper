@@ -130,6 +130,7 @@ def save_camera_frames(batch, step, output_dir, prefix="before_grid"):
     frames_dir = Path(output_dir) / "saved_frames"
     frames_dir.mkdir(exist_ok=True)
     
+    saved_count = 0
     # Save frames for each camera
     for key, value in batch.items():
         if key.startswith("observation.images.") and isinstance(value, torch.Tensor):
@@ -150,7 +151,10 @@ def save_camera_frames(batch, step, output_dir, prefix="before_grid"):
                 camera_name = key.replace("observation.images.", "")
                 filename = frames_dir / f"step_{step:06d}_{prefix}_{camera_name}.png"
                 img.save(filename)
-                print(f"Saved frame: {filename}")
+                saved_count += 1
+    
+    if saved_count > 0:
+        print(f"Saved {saved_count} camera frames for step {step} ({prefix})")
 
 
 def validate_model(policy, val_dataloader, preprocessor):
@@ -415,7 +419,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
             batch = remap_batch_features(batch)
             
             # Save frames before grid overlay for visualization (every 100 steps)
-            if step > 0 and step % frame_save_freq == 0:
+            if step % frame_save_freq == 0:
                 save_camera_frames(batch, step, output_directory, prefix="before_grid")
             
             # Ensure observation.state has 7 dimensions
@@ -427,7 +431,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
             batch = preprocessor(batch)
             
             # Save frames after grid overlay for visualization (every 100 steps)
-            if step > 0 and step % frame_save_freq == 0:
+            if step % frame_save_freq == 0:
                 save_camera_frames(batch, step, output_directory, prefix="after_grid")
             
             batch = apply_joint_augmentations(batch)
