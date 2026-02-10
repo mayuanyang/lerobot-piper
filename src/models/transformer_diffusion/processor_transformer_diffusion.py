@@ -36,7 +36,7 @@ def make_pre_post_processors(
     
     # Add grid overlay processor step if requested
     if add_grid_overlay:
-        input_steps.append(GridOverlayProcessorStep(grid_cell_size=48, camera_names=grid_overlay_cameras))
+        input_steps.append(GridOverlayProcessorStep(grid_cell_size=40, camera_names=grid_overlay_cameras))
     
     input_steps.extend([
         DeviceProcessorStep(device=config.device),
