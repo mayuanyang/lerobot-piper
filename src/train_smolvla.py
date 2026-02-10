@@ -302,13 +302,17 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     
     obs_temporal_window = [ -i * frame_time for i in range(policy.config.n_obs_steps) ][::-1]
 
-    delta_timestamps = {
-        "observation.images.front": obs_temporal_window,
-        "observation.images.gripper": obs_temporal_window,  
-        "observation.images.right": obs_temporal_window,
-        "observation.state": obs_temporal_window,
-        "action": [i * frame_time for i in range(policy.config.n_action_steps)] 
-    }
+    # Dynamically build delta_timestamps based on available features in the dataset
+    delta_timestamps = {}
+    
+    # Add camera features that exist in the dataset
+    for feature_name in dataset_metadata.features.keys():
+        if feature_name.startswith("observation.images."):
+            delta_timestamps[feature_name] = obs_temporal_window
+    
+    # Add state and action features
+    delta_timestamps["observation.state"] = obs_temporal_window
+    delta_timestamps["action"] = [i * frame_time for i in range(policy.config.n_action_steps)]
 
     # Load full dataset to determine episode indices
     full_dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, image_transforms=image_transforms, force_cache_sync=True, revision="main", tolerance_s=0.01)
