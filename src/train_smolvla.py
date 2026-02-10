@@ -134,18 +134,57 @@ def save_camera_frames(batch, step, output_dir, prefix="before_grid"):
     # Save frames for each camera
     for key, value in batch.items():
         if key.startswith("observation.images.") and isinstance(value, torch.Tensor):
-            # Take the first frame from the batch (shape: [batch_size, channels, height, width])
-            first_frame = value[0]  # Shape: [channels, height, width]
+            # Handle different tensor shapes
+            if len(value.shape) == 4:  # Batched format [batch_size, channels, height, width]
+                first_frame = value[0]  # Shape: [channels, height, width]
+            elif len(value.shape) == 3:  # Single image format [channels, height, width]
+                first_frame = value
+            else:
+                # Unsupported tensor shape, skip this key
+                continue
             
-            # Convert to PIL Image (need to permute from CHW to HWC and scale to 0-255)
-            if first_frame.shape[0] == 3:  # RGB image
-                # Permute from (C, H, W) to (H, W, C) and convert to uint8
-                img_tensor = first_frame.permute(1, 2, 0)  # Shape: [height, width, channels]
-                img_tensor = torch.clamp(img_tensor, 0, 1)  # Ensure values are in [0, 1]
+            # Handle different image formats
+            if len(first_frame.shape) == 3:  # Multi-channel image (CHW format)
+                channels, height, width = first_frame.shape
+                
+                # Convert to PIL Image (need to permute from CHW to HWC and scale to 0-255)
+                if channels == 3:  # RGB image
+                    # Permute from (C, H, W) to (H, W, C) and convert to uint8
+                    img_tensor = first_frame.permute(1, 2, 0)  # Shape: [height, width, channels]
+                    img_tensor = torch.clamp(img_tensor, 0, 1)  # Ensure values are in [0, 1]
+                    img_tensor = (img_tensor * 255).byte()  # Scale to [0, 255] and convert to uint8
+                    
+                    # Convert to PIL Image
+                    img = torchvision.transforms.ToPILImage()(img_tensor.permute(2, 0, 1))  # Back to CHW for ToPILImage
+                    
+                    # Save image
+                    camera_name = key.replace("observation.images.", "")
+                    filename = frames_dir / f"step_{step:06d}_{prefix}_{camera_name}.png"
+                    img.save(filename)
+                    saved_count += 1
+                elif channels == 1:  # Grayscale image
+                    # Squeeze the channel dimension and convert to PIL Image
+                    img_tensor = first_frame.squeeze(0)  # Shape: [height, width]
+                    img_tensor = torch.clamp(img_tensor, 0, 1)  # Ensure values are in [0, 1]
+                    img_tensor = (img_tensor * 255).byte()  # Scale to [0, 255] and convert to uint8
+                    
+                    # Convert to PIL Image
+                    img = torchvision.transforms.ToPILImage()(img_tensor)
+                    
+                    # Save image
+                    camera_name = key.replace("observation.images.", "")
+                    filename = frames_dir / f"step_{step:06d}_{prefix}_{camera_name}.png"
+                    img.save(filename)
+                    saved_count += 1
+            elif len(first_frame.shape) == 2:  # Grayscale image (HW format)
+                height, width = first_frame.shape
+                
+                # Convert to PIL Image
+                img_tensor = torch.clamp(first_frame, 0, 1)  # Ensure values are in [0, 1]
                 img_tensor = (img_tensor * 255).byte()  # Scale to [0, 255] and convert to uint8
                 
                 # Convert to PIL Image
-                img = torchvision.transforms.ToPILImage()(img_tensor.permute(2, 0, 1))  # Back to CHW for ToPILImage
+                img = torchvision.transforms.ToPILImage()(img_tensor)
                 
                 # Save image
                 camera_name = key.replace("observation.images.", "")
@@ -153,6 +192,7 @@ def save_camera_frames(batch, step, output_dir, prefix="before_grid"):
                 img.save(filename)
                 saved_count += 1
     
+    # Only print a message if frames were saved
     if saved_count > 0:
         print(f"Saved {saved_count} camera frames for step {step} ({prefix})")
 
