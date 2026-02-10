@@ -11,8 +11,8 @@ from lerobot.datasets.utils import dataset_to_policy_features
 from torch.optim.lr_scheduler import LambdaLR
 from lerobot.processor import ProcessorStepRegistry
 
-# Get the GridOverlayProcessorStep from the registry
-GridOverlayProcessorStep = ProcessorStepRegistry.get("grid_overlay_processor")
+# Import GridOverlayProcessorStep directly from the module
+from models.transformer_diffusion.grid_overlay_processor import GridOverlayProcessorStep
 
 
 # 🟢 ADDED: Import torchvision for augmentation
