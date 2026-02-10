@@ -256,7 +256,35 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         optimizer = torch.optim.Adam(policy.parameters(), lr=policy.config.optimizer_lr)
         # Add RemoveFourthJointProcessorStep to the preprocessor pipeline
         from models.transformer_diffusion.remove_fourth_joint_processor import RemoveFourthJointProcessorStep
+        
+        # Modify dataset_stats to remove the 4th joint from observation.state and action stats
+        modified_stats = None
+        if dataset_metadata.stats is not None:
+            modified_stats = {}
+            for key, stats_dict in dataset_metadata.stats.items():
+                if key in ["observation.state", "action"] and stats_dict is not None:
+                    # Remove the 4th joint (index 3) from stats
+                    modified_stats[key] = {}
+                    for stat_key, stat_value in stats_dict.items():
+                        if isinstance(stat_value, (list, tuple)) and len(stat_value) == 7:
+                            # Remove the 4th element (index 3) from 7-element arrays
+                            modified_stats[key][stat_key] = list(stat_value[:3]) + list(stat_value[4:])
+                        elif isinstance(stat_value, torch.Tensor) and stat_value.dim() == 1 and stat_value.shape[0] == 7:
+                            # Remove the 4th element (index 3) from 7-element tensors
+                            modified_stats[key][stat_key] = torch.cat([stat_value[:3], stat_value[4:]], dim=0)
+                        else:
+                            # Keep other values as-is
+                            modified_stats[key][stat_key] = stat_value
+                else:
+                    # Keep other features as-is
+                    modified_stats[key] = stats_dict
+        
         preprocessor.steps.insert(0, RemoveFourthJointProcessorStep())
+        
+        # Update the normalizer step with modified stats
+        for step in preprocessor.steps:
+            if hasattr(step, 'stats') and step.stats is not None:
+                step.stats = modified_stats
         
         # Add grid overlay processor step to the preprocessor pipeline
         if hasattr(preprocessor, 'steps'):

@@ -29,6 +29,27 @@ def make_pre_post_processors(
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
+    # Create a copy of dataset_stats and modify it to remove the 4th joint
+    modified_stats = None
+    if dataset_stats is not None:
+        modified_stats = {}
+        for key, stats_dict in dataset_stats.items():
+            if key in ["observation.state", "action"] and stats_dict is not None:
+                # Remove the 4th joint (index 3) from stats
+                modified_stats[key] = {}
+                for stat_key, stat_value in stats_dict.items():
+                    if isinstance(stat_value, (list, tuple)) and len(stat_value) == 7:
+                        # Remove the 4th element (index 3) from 7-element arrays
+                        modified_stats[key][stat_key] = list(stat_value[:3]) + list(stat_value[4:])
+                    elif isinstance(stat_value, torch.Tensor) and stat_value.dim() == 1 and stat_value.shape[0] == 7:
+                        # Remove the 4th element (index 3) from 7-element tensors
+                        modified_stats[key][stat_key] = torch.cat([stat_value[:3], stat_value[4:]], dim=0)
+                    else:
+                        # Keep other values as-is
+                        modified_stats[key][stat_key] = stat_value
+            else:
+                # Keep other features as-is
+                modified_stats[key] = stats_dict
     
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
@@ -45,7 +66,7 @@ def make_pre_post_processors(
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
-            stats=dataset_stats,
+            stats=modified_stats,  # Use modified stats
         ),
     ])
     

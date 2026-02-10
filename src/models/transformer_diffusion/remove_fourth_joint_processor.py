@@ -11,6 +11,25 @@ class RemoveFourthJointProcessorStep(ProcessorStep):
     def __init__(self, **kwargs):
         super().__init__()
     
+    def _remove_fourth_joint_from_stats(self, stats_dict):
+        """Remove the 4th joint (index 3) from statistics arrays."""
+        if stats_dict is None:
+            return stats_dict
+            
+        # Create a copy of the stats dictionary
+        new_stats = {}
+        for key, value in stats_dict.items():
+            if isinstance(value, (list, tuple)) and len(value) == 7:
+                # Remove the 4th element (index 3) from 7-element arrays
+                new_stats[key] = list(value[:3]) + list(value[4:])
+            elif isinstance(value, torch.Tensor) and value.dim() == 1 and value.shape[0] == 7:
+                # Remove the 4th element (index 3) from 7-element tensors
+                new_stats[key] = torch.cat([value[:3], value[4:]], dim=0)
+            else:
+                # Keep other values as-is
+                new_stats[key] = value
+        return new_stats
+    
     def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Remove the 4th joint (index 3) from observation.state and action tensors."""
         # Process observation.state if it exists
@@ -53,7 +72,29 @@ class RemoveFourthJointProcessorStep(ProcessorStep):
     
     def transform_features(self, features):
         """Update feature shapes to reflect the removal of the 4th joint."""
-        # This step changes the dimensionality of state and action features
-        # For simplicity, we'll return the features as-is and let the runtime handle shape mismatches
-        # In a production environment, you might want to update the feature metadata properly
-        return features
+        # Create a copy of features to avoid modifying the original
+        transformed_features = features.copy()
+        
+        # Update observation.state shape if it exists
+        if "observation.state" in transformed_features:
+            feature = transformed_features["observation.state"]
+            if hasattr(feature, 'shape') and len(feature.shape) > 0:
+                # Reduce the last dimension by 1 (from 7 to 6)
+                if feature.shape[-1] == 7:
+                    new_shape = list(feature.shape)
+                    new_shape[-1] = 6
+                    # Update the shape attribute
+                    feature.shape = tuple(new_shape)
+        
+        # Update action shape if it exists
+        if "action" in transformed_features:
+            feature = transformed_features["action"]
+            if hasattr(feature, 'shape') and len(feature.shape) > 0:
+                # Reduce the last dimension by 1 (from 7 to 6)
+                if feature.shape[-1] == 7:
+                    new_shape = list(feature.shape)
+                    new_shape[-1] = 6
+                    # Update the shape attribute
+                    feature.shape = tuple(new_shape)
+        
+        return transformed_features
