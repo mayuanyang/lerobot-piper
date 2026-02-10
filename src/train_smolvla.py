@@ -250,6 +250,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         policy.to(device)
         optimizer = torch.optim.Adam(policy.parameters(), lr=policy.config.optimizer_lr)
         
+        # Create preprocessor and postprocessor
+        preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
+        
         # Add grid overlay processor step to the preprocessor pipeline
         if hasattr(preprocessor, 'steps'):
             # Insert grid overlay step after the rename step but before normalization
