@@ -13,6 +13,7 @@ from torchvision.transforms import v2
 from torch.utils.data import Subset
 import random
 import torchvision
+from models.transformer_diffusion.grid_overlay_processor import GridOverlayProcessorStep
 
 
 # Detect the best available device
@@ -131,31 +132,31 @@ def save_camera_frames(batch, step, output_dir, prefix="before_grid"):
     frames_dir.mkdir(exist_ok=True)
     
     saved_count = 0
-    # Save frames for each camera
-    for key, value in batch.items():
-        if key.startswith("observation.images.") and isinstance(value, torch.Tensor):
-            # Handle different tensor shapes
-            if len(value.shape) == 4:  # Batched format [batch_size, channels, height, width]
-                first_frame = value[0]  # Shape: [channels, height, width]
-            elif len(value.shape) == 3:  # Single image format [channels, height, width]
-                first_frame = value
+    # Save frames only for specific camera keys
+    target_keys = ['observation.images.camera1', 'observation.images.camera2', 'observation.images.camera3']
+    
+    for key in target_keys:
+        if key in batch and isinstance(batch[key], torch.Tensor):
+            value = batch[key]
+            # Handle 5D tensor format [B, T, C, H, W]
+            if len(value.shape) == 5:  # Batched format [batch_size, time_steps, channels, height, width]
+                # Extract first frame from batch and first time step: value[0, 0, :, :, :]
+                first_frame = value[0, 0]  # Shape: [channels, height, width]
             else:
                 # Unsupported tensor shape, skip this key
                 continue
             
-            # Handle different image formats
+            # Handle different image formats (should be 3D: CHW)
             if len(first_frame.shape) == 3:  # Multi-channel image (CHW format)
                 channels, height, width = first_frame.shape
                 
                 # Convert to PIL Image (need to permute from CHW to HWC and scale to 0-255)
                 if channels == 3:  # RGB image
-                    # Permute from (C, H, W) to (H, W, C) and convert to uint8
-                    img_tensor = first_frame.permute(1, 2, 0)  # Shape: [height, width, channels]
-                    img_tensor = torch.clamp(img_tensor, 0, 1)  # Ensure values are in [0, 1]
-                    img_tensor = (img_tensor * 255).byte()  # Scale to [0, 255] and convert to uint8
+                    # Ensure the tensor is in the correct range [0, 1]
+                    img_tensor = torch.clamp(first_frame, 0, 1)
                     
-                    # Convert to PIL Image
-                    img = torchvision.transforms.ToPILImage()(img_tensor.permute(2, 0, 1))  # Back to CHW for ToPILImage
+                    # Convert to PIL Image directly (ToPILImage handles the conversion)
+                    img = torchvision.transforms.ToPILImage()(img_tensor)
                     
                     # Save image
                     camera_name = key.replace("observation.images.", "")
@@ -166,7 +167,6 @@ def save_camera_frames(batch, step, output_dir, prefix="before_grid"):
                     # Squeeze the channel dimension and convert to PIL Image
                     img_tensor = first_frame.squeeze(0)  # Shape: [height, width]
                     img_tensor = torch.clamp(img_tensor, 0, 1)  # Ensure values are in [0, 1]
-                    img_tensor = (img_tensor * 255).byte()  # Scale to [0, 255] and convert to uint8
                     
                     # Convert to PIL Image
                     img = torchvision.transforms.ToPILImage()(img_tensor)
@@ -181,7 +181,6 @@ def save_camera_frames(batch, step, output_dir, prefix="before_grid"):
                 
                 # Convert to PIL Image
                 img_tensor = torch.clamp(first_frame, 0, 1)  # Ensure values are in [0, 1]
-                img_tensor = (img_tensor * 255).byte()  # Scale to [0, 255] and convert to uint8
                 
                 # Convert to PIL Image
                 img = torchvision.transforms.ToPILImage()(img_tensor)
@@ -253,7 +252,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     training_steps = 100000 
     log_freq = 10
     checkpoint_freq = 1000 
-    frame_save_freq = 100  # Save frames every 100 steps
+    frame_save_freq = 5000  # Save frames every 100 steps
 
     dataset_metadata = LeRobotDatasetMetadata(dataset_id, force_cache_sync=True, revision="main")
     features = dataset_to_policy_features(dataset_metadata.features)
@@ -268,8 +267,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     print('output_features:', output_features)
 
     n_obs_steps = 2
-    chunk_size = 24
-    n_action_steps = 24
+    chunk_size = 16
+    n_action_steps = 16
     
     if dataset_metadata.stats is None:
         raise ValueError("Dataset stats are required to initialize the policy.")
@@ -330,8 +329,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         # Add grid overlay processor step to the preprocessor pipeline
         if hasattr(preprocessor, 'steps'):
             # Insert grid overlay step after the rename step but before normalization
-            from models.transformer_diffusion.grid_overlay_processor import GridOverlayProcessorStep
-            grid_step = GridOverlayProcessorStep(grid_cell_size=48, camera_names=["camera1", "camera3"])
+            
+            grid_step = GridOverlayProcessorStep(grid_cell_size=40, camera_names=["camera1", "camera3"])
             # Find the position to insert the grid step (after rename, before normalization)
             insert_pos = 1  # Default position (after Rename)
             for i, step in enumerate(preprocessor.steps):
@@ -396,7 +395,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     
     # Split episodes: 90% for training, 10% for validation
     num_episodes = len(episode_indices)
-    num_train_episodes = int(0.9 * num_episodes)
+    num_train_episodes = int(0.95 * num_episodes)
     
     # Shuffle episodes for random split
     shuffled_indices = episode_indices.copy()
