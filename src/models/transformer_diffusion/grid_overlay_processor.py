@@ -1,4 +1,6 @@
 import torch
+from lerobot.processor import ProcessorStep, ProcessorStepRegistry
+from lerobot.configs.types import PipelineFeatureType, PolicyFeature
 
 def draw_grid_overlay(image_tensor, grid_cell_size=48):
     """
@@ -60,17 +62,24 @@ def draw_grid_overlay(image_tensor, grid_cell_size=48):
     
     return image_tensor
 
-class GridOverlayProcessorStep:
+@ProcessorStepRegistry.register("grid_overlay_processor")
+class GridOverlayProcessorStep(ProcessorStep):
     def __init__(self, grid_cell_size=48, camera_names=None):
         self.grid_cell_size = grid_cell_size
         # Default to front and right cameras if not specified
         self.camera_names = camera_names or ["camera1", "camera3"]
     
-    def __call__(self, batch):
+    def __call__(self, transition):
         # Apply grid overlay only to specified cameras
-        camera_keys = [k for k in batch.keys() if k.startswith("observation.images.")]
-        for key in camera_keys:
-            # Check if any of the specified camera names are in the key
-            if any(cam_name in key for cam_name in self.camera_names) and isinstance(batch[key], torch.Tensor):
-                batch[key] = draw_grid_overlay(batch[key], self.grid_cell_size)
-        return batch
+        observation = transition.get("observation", {})
+        if observation:
+            camera_keys = [k for k in observation.keys() if k.startswith("images.")]
+            for key in camera_keys:
+                # Check if any of the specified camera names are in the key
+                if any(cam_name in key for cam_name in self.camera_names) and isinstance(observation[key], torch.Tensor):
+                    observation[key] = draw_grid_overlay(observation[key], self.grid_cell_size)
+        return transition
+    
+    def transform_features(self, features):
+        # This step doesn't change the features, so return them as-is
+        return features
