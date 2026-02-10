@@ -38,12 +38,27 @@ def make_pre_post_processors(
                 # Remove the 4th joint (index 3) from stats
                 modified_stats[key] = {}
                 for stat_key, stat_value in stats_dict.items():
+                    # Handle different types of stats values
                     if isinstance(stat_value, (list, tuple)) and len(stat_value) == 7:
                         # Remove the 4th element (index 3) from 7-element arrays
                         modified_stats[key][stat_key] = list(stat_value[:3]) + list(stat_value[4:])
                     elif isinstance(stat_value, torch.Tensor) and stat_value.dim() == 1 and stat_value.shape[0] == 7:
                         # Remove the 4th element (index 3) from 7-element tensors
                         modified_stats[key][stat_key] = torch.cat([stat_value[:3], stat_value[4:]], dim=0)
+                    elif hasattr(stat_value, 'shape') and len(stat_value.shape) >= 1 and stat_value.shape[-1] == 7:
+                        # Handle multi-dimensional tensors where the last dimension is 7
+                        if len(stat_value.shape) == 1:
+                            # 1D tensor case (already handled above, but adding for completeness)
+                            modified_stats[key][stat_key] = torch.cat([stat_value[:3], stat_value[4:]], dim=0)
+                        else:
+                            # Multi-dimensional tensor case - remove 4th element from last dimension
+                            modified_stats[key][stat_key] = torch.cat([stat_value[..., :3], stat_value[..., 4:]], dim=-1)
+                    elif isinstance(stat_value, (list, tuple)):
+                        # Handle list/tuple with different length
+                        modified_stats[key][stat_key] = stat_value
+                    elif isinstance(stat_value, torch.Tensor):
+                        # Handle tensor with different shape
+                        modified_stats[key][stat_key] = stat_value
                     else:
                         # Keep other values as-is
                         modified_stats[key][stat_key] = stat_value
