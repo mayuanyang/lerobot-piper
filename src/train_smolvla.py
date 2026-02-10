@@ -13,7 +13,6 @@ from torchvision.transforms import v2
 from torch.utils.data import Subset
 import random
 import torchvision
-from models.transformer_diffusion.grid_overlay_processor import GridOverlayProcessorStep
 
 
 # Detect the best available device
@@ -94,20 +93,18 @@ def random_drop_camera_views(batch, drop_prob=0.3):
 
 def create_feature_mapping(batch_keys):
     """Create a mapping from dataset camera names to policy camera names."""
+    # Fixed camera name mapping
+    camera_mapping = {
+        'observation.images.front': 'observation.images.camera1',
+        'observation.images.gripper': 'observation.images.camera2',
+        'observation.images.right': 'observation.images.camera3'
+    }
+    
+    # Create feature mapping based on available keys in the batch
     feature_mapping = {}
-    
-    # Policy expects: camera1, camera2, camera3
-    policy_camera_names = ["camera1", "camera2", "camera3"]
-    dataset_camera_prefix = "observation.images."
-    
-    # Get available camera features from the batch
-    available_cameras = [key for key in batch_keys if key.startswith(dataset_camera_prefix) and not key.endswith("_is_pad")]
-    
-    # Map available cameras to policy camera names in order
-    for i, camera_key in enumerate(available_cameras):
-        if i < len(policy_camera_names):
-            policy_camera_key = dataset_camera_prefix + policy_camera_names[i]
-            feature_mapping[camera_key] = policy_camera_key
+    for dataset_key, policy_key in camera_mapping.items():
+        if dataset_key in batch_keys:
+            feature_mapping[dataset_key] = policy_key
             
     return feature_mapping
 
@@ -329,7 +326,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         # Add grid overlay processor step to the preprocessor pipeline
         if hasattr(preprocessor, 'steps'):
             # Insert grid overlay step after the rename step but before normalization
-            
+            from models.transformer_diffusion.grid_overlay_processor import GridOverlayProcessorStep
             grid_step = GridOverlayProcessorStep(grid_cell_size=40, camera_names=["camera1", "camera3"])
             # Find the position to insert the grid step (after rename, before normalization)
             insert_pos = 1  # Default position (after Rename)
