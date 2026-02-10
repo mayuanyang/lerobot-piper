@@ -72,7 +72,7 @@ def make_pre_post_processors(
     
     output_steps = [
         UnnormalizerProcessorStep(
-            features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
+            features=config.output_features, norm_map=config.normalization_mapping, stats=modified_stats
         ),
         DeviceProcessorStep(device="cpu"),
     ]
