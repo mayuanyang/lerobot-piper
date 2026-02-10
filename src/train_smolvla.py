@@ -9,15 +9,11 @@ from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.datasets.utils import dataset_to_policy_features
 from torch.optim.lr_scheduler import LambdaLR
-from lerobot.processor import ProcessorStepRegistry
-
-# Import GridOverlayProcessorStep directly from the module
-from models.transformer_diffusion.grid_overlay_processor import GridOverlayProcessorStep
-
-
-# 🟢 ADDED: Import torchvision for augmentation
 from torchvision.transforms import v2
 from torch.utils.data import Subset
+import random
+import torchvision
+
 
 # Detect the best available device
 if torch.cuda.is_available():
@@ -30,16 +26,14 @@ else:
 print(f"Using device: {device}")
 
 
-# 🟢 ADDED: Data Augmentation Setup
+# Data Augmentation Setup
 def get_rgb_augmentations():
     return v2.Compose([
-        # 1. Color/Lighting is safe and helpful for RGB images
         v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
         v2.RandomGrayscale(p=0.1),
-        # 2. Gaussian Blur helps with motion blur during fast moves
         v2.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 2.0)),
-        # 3. DO NOT use Affine/Crop unless you transform the actions!
     ])
+
 
 # Custom transform wrapper to handle different image types
 class CameraSpecificTransforms:
@@ -47,31 +41,26 @@ class CameraSpecificTransforms:
         self.rgb_transforms = get_rgb_augmentations()
         
     def __call__(self, batch):
-        # Apply transforms based on camera type
-        # Use batch.keys() to safely check for keys
-        batch_keys = batch.keys() if hasattr(batch, 'keys') else []
-        
-        # Apply RGB transforms to all camera images
-        camera_keys = [k for k in batch_keys if k.startswith("observation.images.")]
+        # Apply transforms to all camera images
+        camera_keys = [k for k in batch.keys() if k.startswith("observation.images.")]
         for key in camera_keys:
             batch[key] = self.rgb_transforms(batch[key])
-            
         return batch
 
-# 🟢 ADDED: Helper to apply joint data augmentation
+
+# Helper to apply joint data augmentation
 def apply_joint_augmentations(batch):
     key = "observation.state"
     if key not in batch:
         return batch
 
     q = batch[key]
-
     # Per-timestep noise
     noise = torch.randn_like(q) * 0.01  # ~0.6°
     mask = (torch.rand_like(q) < 0.3).float()
-
     batch[key] = q + noise * mask
     return batch
+
 
 def random_drop_camera_views(batch, drop_prob=0.3):
     """Randomly drop one camera from the batch during training."""
@@ -93,10 +82,71 @@ def random_drop_camera_views(batch, drop_prob=0.3):
     # Remove the selected camera from the batch
     if dropped_camera_key in batch:
         del batch[dropped_camera_key]
-        # Uncomment the next line for debugging
-        # print(f"Dropped camera: {dropped_camera_key}")
 
     return batch
+
+
+def create_feature_mapping(batch_keys):
+    """Create a mapping from dataset camera names to policy camera names."""
+    feature_mapping = {}
+    
+    # Policy expects: camera1, camera2, camera3
+    policy_camera_names = ["camera1", "camera2", "camera3"]
+    dataset_camera_prefix = "observation.images."
+    
+    # Get available camera features from the batch
+    available_cameras = [key for key in batch_keys if key.startswith(dataset_camera_prefix) and not key.endswith("_is_pad")]
+    
+    # Map available cameras to policy camera names in order
+    for i, camera_key in enumerate(available_cameras):
+        if i < len(policy_camera_names):
+            policy_camera_key = dataset_camera_prefix + policy_camera_names[i]
+            feature_mapping[camera_key] = policy_camera_key
+            
+    return feature_mapping
+
+
+def remap_batch_features(batch):
+    """Remap batch features to match policy expectations."""
+    feature_mapping = create_feature_mapping(batch.keys())
+    
+    # Create a new batch with remapped keys
+    remapped_batch = {}
+    for key, value in batch.items():
+        new_key = feature_mapping.get(key, key)
+        remapped_batch[new_key] = value
+        
+    return remapped_batch
+
+
+def save_camera_frames(batch, step, output_dir, prefix="before_grid"):
+    """Save frames for each camera to visualize grid overlay effect."""
+    # Create directory for saved frames
+    frames_dir = Path(output_dir) / "saved_frames"
+    frames_dir.mkdir(exist_ok=True)
+    
+    # Save frames for each camera
+    for key, value in batch.items():
+        if key.startswith("observation.images.") and isinstance(value, torch.Tensor):
+            # Take the first frame from the batch (shape: [batch_size, channels, height, width])
+            first_frame = value[0]  # Shape: [channels, height, width]
+            
+            # Convert to PIL Image (need to permute from CHW to HWC and scale to 0-255)
+            if first_frame.shape[0] == 3:  # RGB image
+                # Permute from (C, H, W) to (H, W, C) and convert to uint8
+                img_tensor = first_frame.permute(1, 2, 0)  # Shape: [height, width, channels]
+                img_tensor = torch.clamp(img_tensor, 0, 1)  # Ensure values are in [0, 1]
+                img_tensor = (img_tensor * 255).byte()  # Scale to [0, 255] and convert to uint8
+                
+                # Convert to PIL Image
+                img = torchvision.transforms.ToPILImage()(img_tensor.permute(2, 0, 1))  # Back to CHW for ToPILImage
+                
+                # Save image
+                camera_name = key.replace("observation.images.", "")
+                filename = frames_dir / f"step_{step:06d}_{prefix}_{camera_name}.png"
+                img.save(filename)
+                print(f"Saved frame: {filename}")
+
 
 def validate_model(policy, val_dataloader, preprocessor):
     policy.eval()
@@ -112,32 +162,8 @@ def validate_model(policy, val_dataloader, preprocessor):
                 print(f"Warning: Empty batch at index {batch_idx}")
                 continue
                 
-            # Dynamically create feature mapping based on actual dataset cameras
-            feature_mapping = {}
-            
-            # Map dataset camera names to policy camera names
-            # Policy expects: camera1, camera2, camera3
-            policy_camera_names = ["camera1", "camera2", "camera3"]
-            dataset_camera_prefix = "observation.images."
-            policy_camera_prefix = "observation.images."
-            
-            # Get available camera features from the batch
-            available_cameras = [key for key in batch.keys() if key.startswith(dataset_camera_prefix) and not key.endswith("_is_pad")]
-            
-            # Map available cameras to policy camera names in order
-            for i, camera_key in enumerate(available_cameras):
-                if i < len(policy_camera_names):
-                    policy_camera_key = policy_camera_prefix + policy_camera_names[i]
-                    feature_mapping[camera_key] = policy_camera_key
-            
-            # Create a new batch with remapped keys
-            remapped_batch = {}
-            for key, value in batch.items():
-                # Remap image feature keys
-                new_key = feature_mapping.get(key, key)
-                remapped_batch[new_key] = value
-            
-            batch = remapped_batch
+            # Remap features to match policy expectations
+            batch = remap_batch_features(batch)
                             
             # State and action is already normalized
             batch = preprocessor(batch)
@@ -162,7 +188,6 @@ def validate_model(policy, val_dataloader, preprocessor):
                 continue
             
             # Limit validation to a reasonable number of batches to save time
-            # But make sure we have at least a few batches for meaningful average
             if batch_idx >= min(10, len(val_dataloader) - 1):  # Validate on at least 10 batches or all available batches
                 break
     
@@ -171,43 +196,40 @@ def validate_model(policy, val_dataloader, preprocessor):
     print(f"Validation completed: {val_batches} batches, total loss: {val_loss:.4f}, average loss: {avg_val_loss:.4f}")
     return avg_val_loss
 
+
 def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-piper", push_to_hub=False, resume_from_checkpoint=True):
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
 
     training_steps = 100000 
-    log_freq = 10 # Reduced frequency to reduce console spam
+    log_freq = 10
     checkpoint_freq = 1000 
+    frame_save_freq = 100  # Save frames every 100 steps
 
     dataset_metadata = LeRobotDatasetMetadata(dataset_id, force_cache_sync=True, revision="main")
     features = dataset_to_policy_features(dataset_metadata.features)
     output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     input_features = {key: ft for key, ft in features.items() if key not in output_features}
     
-    
-    # 🟢 ADDED: Safety check
+    # Safety check
     if len(output_features) == 0:
         raise ValueError("No output features (actions) found! Check your dataset schema.")
 
     print('input_features:', input_features)
     print('output_features:', output_features)
 
-    
     n_obs_steps = 2
     chunk_size = 24
     n_action_steps = 24
     
-    
-    
     if dataset_metadata.stats is None:
         raise ValueError("Dataset stats are required to initialize the policy.")
 
-    # Initialize Transforms - using camera-specific transforms
+    # Initialize Transforms
     image_transforms = CameraSpecificTransforms()
 
-    # --- MODEL LOADING LOGIC ---
+    # Model Loading Logic
     if resume_from_checkpoint:
-        
         policy = SmolVLAPolicy.from_pretrained(model_id)
         policy.train()
         policy.to(device)
@@ -217,34 +239,27 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         policy.config.n_action_steps = n_action_steps
         policy.config.n_obs_steps = n_obs_steps
         
-        
         preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
-        
         step = 0
     else:
-        
         # Initialize a new model from configuration
         policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
         
         if "observation.state" in policy.config.input_features:
-            policy.config.input_features["observation.state"].shape = [7]  # 7 joints (not removing the 4th joint)
+            policy.config.input_features["observation.state"].shape = [7]  # 7 joints
         
         if "action" in policy.config.output_features:
-            policy.config.output_features["action"].shape = [7]  # 7 joints (not removing the 4th joint)
+            policy.config.output_features["action"].shape = [7]  # 7 joints
             
         # Update image shapes - All RGB images get 3 channels
-        # Based on the feature mapping: front -> camera1, gripper -> camera2, right -> camera3
         if "observation.images.camera1" in policy.config.input_features:
-            # This is the front camera (mapped from observation.images.front)
             policy.config.input_features["observation.images.camera1"].shape = [3, 400, 640]
         if "observation.images.camera2" in policy.config.input_features:
-            # This is the gripper camera (mapped from observation.images.gripper)
             policy.config.input_features["observation.images.camera2"].shape = [3, 400, 640]
         if "observation.images.camera3" in policy.config.input_features:
-            # This is the right camera (mapped from observation.images.right)
             policy.config.input_features["observation.images.camera3"].shape = [3, 400, 640]
         
-        # Update normalization mapping to match command line arguments
+        # Update normalization mapping
         if hasattr(policy.config, 'normalization_mapping'):
             policy.config.normalization_mapping = {
                 "VISUAL": "IDENTITY",
@@ -256,7 +271,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         policy.config.n_obs_steps = n_obs_steps
         policy.config.load_vlm_weights = True
         
-        
         policy.train()
         policy.to(device)
         optimizer = torch.optim.Adam(policy.parameters(), lr=policy.config.optimizer_lr)
@@ -267,6 +281,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         # Add grid overlay processor step to the preprocessor pipeline
         if hasattr(preprocessor, 'steps'):
             # Insert grid overlay step after the rename step but before normalization
+            from models.transformer_diffusion.grid_overlay_processor import GridOverlayProcessorStep
             grid_step = GridOverlayProcessorStep(grid_cell_size=48, camera_names=["camera1", "camera3"])
             # Find the position to insert the grid step (after rename, before normalization)
             insert_pos = 1  # Default position (after Rename)
@@ -276,7 +291,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
                     break
             preprocessor.steps.insert(insert_pos, grid_step)
                 
-        # Start from step 0
         step = 0
     
     def cosine_decay_with_warmup(step):
@@ -303,11 +317,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     scheduler = LambdaLR(optimizer, cosine_decay_with_warmup)
 
     # Ensure preprocessors are on the correct device
-    # (Some LeRobot versions keep them as modules)
     if isinstance(preprocessor, torch.nn.Module):
         preprocessor.to(device)
 
-    # --- DATASET SETUP ---
+    # Dataset Setup
     fps = 10
     frame_time = 1 / fps
     
@@ -328,26 +341,24 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     # Load full dataset to determine episode indices
     full_dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, image_transforms=image_transforms, force_cache_sync=True, revision="main", tolerance_s=0.01)
     
-    # Get unique episode indices (convert tensors to Python values)
+    # Get unique episode indices
     episode_indices = list(set([int(idx.item()) if hasattr(idx, 'item') else int(idx) for idx in full_dataset.hf_dataset["episode_index"]]))
     episode_indices.sort()
     
-    # Split episodes based on episode_index: >= 200 for validation, < 200 for training
-    num_of_training_episodes = 25
-    train_episode_indices = [idx for idx in episode_indices if idx < num_of_training_episodes]
-    val_episode_indices = [idx for idx in episode_indices if idx >= num_of_training_episodes]
+    # Split episodes: 90% for training, 10% for validation
+    num_episodes = len(episode_indices)
+    num_train_episodes = int(0.9 * num_episodes)
+    
+    # Shuffle episodes for random split
+    shuffled_indices = episode_indices.copy()
+    random.shuffle(shuffled_indices)
+    
+    train_episode_indices = shuffled_indices[:num_train_episodes]
+    val_episode_indices = shuffled_indices[num_train_episodes:]
     
     print(f"Total episodes: {len(episode_indices)}")
-    print(f"Training episodes: {len(train_episode_indices)}")
-    print(f"Validation episodes: {len(val_episode_indices)}")
-    
-    # Check if we have any validation episodes
-    if len(val_episode_indices) == 0:
-        print("WARNING: No validation episodes found!")
-        # Use a small portion of training episodes for validation if no validation episodes
-        val_episode_indices = train_episode_indices[-10:]  # Last 10 training episodes
-        train_episode_indices = train_episode_indices[:-10]  # Remaining training episodes
-        print(f"Adjusted - Training episodes: {len(train_episode_indices)}, Validation episodes: {len(val_episode_indices)}")
+    print(f"Training episodes: {len(train_episode_indices)} ({len(train_episode_indices)/len(episode_indices)*100:.1f}%)")
+    print(f"Validation episodes: {len(val_episode_indices)} ({len(val_episode_indices)/len(episode_indices)*100:.1f}%)")
     
     # Create boolean masks for training and validation data
     dataset_episode_indices = [int(idx.item()) if hasattr(idx, 'item') else int(idx) for idx in full_dataset.hf_dataset["episode_index"]]
@@ -355,7 +366,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     val_mask = [idx in val_episode_indices for idx in dataset_episode_indices]
     
     # Create subsets for training and validation
-    
     train_dataset = Subset(full_dataset, [i for i, mask in enumerate(train_mask) if mask])
     val_dataset = Subset(full_dataset, [i for i, mask in enumerate(val_mask) if mask])
     
@@ -388,7 +398,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     if val_batches == 0:
         print("WARNING: No validation batches! Check batch_size and dataset size.")
 
-    # --- TRAINING LOOP ---
+    # Training Loop
     print("Starting training loop...")
     done = False
     epoch = 0
@@ -396,57 +406,34 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         epoch += 1
         prog_bar = tqdm(enumerate(train_dataloader), total=len(train_dataloader), desc=f"Epoch {epoch}, Step {step}")
         for batch_idx, batch in prog_bar:
+            # Remap features to match policy expectations
+            batch = remap_batch_features(batch)
             
-            # Dynamically create feature mapping based on actual dataset cameras
-            feature_mapping = {}
+            # Save frames before grid overlay for visualization (every 100 steps)
+            if step > 0 and step % frame_save_freq == 0:
+                save_camera_frames(batch, step, output_directory, prefix="before_grid")
             
-            # Map dataset camera names to policy camera names
-            # Policy expects: camera1, camera2, camera3
-            policy_camera_names = ["camera1", "camera2", "camera3"]
-            dataset_camera_prefix = "observation.images."
-            policy_camera_prefix = "observation.images."
-            
-            # Get available camera features from the batch
-            available_cameras = [key for key in batch.keys() if key.startswith(dataset_camera_prefix) and not key.endswith("_is_pad")]
-            
-            # Map available cameras to policy camera names in order
-            for i, camera_key in enumerate(available_cameras):
-                if i < len(policy_camera_names):
-                    policy_camera_key = policy_camera_prefix + policy_camera_names[i]
-                    feature_mapping[camera_key] = policy_camera_key
-            
-            # Create a new batch with remapped keys
-            remapped_batch = {}
-            for key, value in batch.items():
-                # Remap image feature keys
-                new_key = feature_mapping.get(key, key)
-                remapped_batch[new_key] = value
-            
-            batch = remapped_batch
-            
-            # Ensure observation.state has 7 dimensions (not removing 4th joint)
+            # Ensure observation.state has 7 dimensions
             if "observation.state" in batch:
                 state = batch["observation.state"]
-                if state.shape[-1] == 7:
-                    # This is what we expect
-                    pass
-                else:
-                    # Unexpected dimensionality
+                if state.shape[-1] != 7:
                     print(f"Warning: observation.state has unexpected shape {state.shape}")
             
             batch = preprocessor(batch)
-                        
-            batch = apply_joint_augmentations(batch)
             
+            # Save frames after grid overlay for visualization (every 100 steps)
+            if step > 0 and step % frame_save_freq == 0:
+                save_camera_frames(batch, step, output_directory, prefix="after_grid")
+            
+            batch = apply_joint_augmentations(batch)
             batch = random_drop_camera_views(batch, drop_prob=0.3)
 
-            # 5. Move all tensor values in batch to device
-            # Note: Some items may be strings or other non-tensor types that cannot be moved to device
+            # Move all tensor values in batch to device
             for key, value in batch.items():
                 if isinstance(value, torch.Tensor):
                     batch[key] = value.to(device)
 
-            # 6. Forward & Backward
+            # Forward & Backward
             loss, _ = policy.forward(batch)
             loss.backward()
             optimizer.step()
@@ -457,23 +444,21 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
                 # Get learning rate from optimizer
                 lr = optimizer.param_groups[0]['lr']
                 prog_bar.set_postfix({"step": step, "loss": f"{loss.item():.3f}", "lr": f"{lr:.2e}"})
-                # Explicitly delete variables to free up memory
                 del loss
             
-            # Run validation every 100 steps
+            # Run validation every 500 steps
             if step > 0 and step % 500 == 0:
                 print(f"\nRunning validation at step {step}...")
                 val_loss = validate_model(policy, val_dataloader, preprocessor)
                 print(f"Validation loss at step {step}: {val_loss:.4f}")
             
-            # 7. Save Checkpoint
+            # Save Checkpoint
             if step > 0 and step % checkpoint_freq == 0:
                 checkpoint_dir = output_directory / f"checkpoint-{step}"
                 checkpoint_dir.mkdir(exist_ok=True)
                 policy.save_pretrained(checkpoint_dir)
                 preprocessor.save_pretrained(checkpoint_dir)
                 postprocessor.save_pretrained(checkpoint_dir)
-                #torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer_state.pth")
                 print(f"\nCheckpoint saved at step {step}")
                 
                 # Force garbage collection after checkpoint save
@@ -501,6 +486,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         policy.push_to_hub(repo)
         preprocessor.push_to_hub(repo)
         postprocessor.push_to_hub(repo)
+
 
 if __name__ == "__main__":
     import argparse
