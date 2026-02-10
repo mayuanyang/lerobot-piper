@@ -112,12 +112,23 @@ def validate_model(policy, val_dataloader, preprocessor):
                 print(f"Warning: Empty batch at index {batch_idx}")
                 continue
                 
-            # Remap image feature names to match what the policy expects
-            feature_mapping = {
-                "observation.images.front": "observation.images.camera1",
-                "observation.images.gripper": "observation.images.camera2",
-                "observation.images.right": "observation.images.camera3"
-            }
+            # Dynamically create feature mapping based on actual dataset cameras
+            feature_mapping = {}
+            
+            # Map dataset camera names to policy camera names
+            # Policy expects: camera1, camera2, camera3
+            policy_camera_names = ["camera1", "camera2", "camera3"]
+            dataset_camera_prefix = "observation.images."
+            policy_camera_prefix = "observation.images."
+            
+            # Get available camera features from the batch
+            available_cameras = [key for key in batch.keys() if key.startswith(dataset_camera_prefix) and not key.endswith("_is_pad")]
+            
+            # Map available cameras to policy camera names in order
+            for i, camera_key in enumerate(available_cameras):
+                if i < len(policy_camera_names):
+                    policy_camera_key = policy_camera_prefix + policy_camera_names[i]
+                    feature_mapping[camera_key] = policy_camera_key
             
             # Create a new batch with remapped keys
             remapped_batch = {}
@@ -386,12 +397,23 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         prog_bar = tqdm(enumerate(train_dataloader), total=len(train_dataloader), desc=f"Epoch {epoch}, Step {step}")
         for batch_idx, batch in prog_bar:
             
-            # Remap image feature names to match what the policy expects
-            feature_mapping = {
-                "observation.images.front": "observation.images.camera1",
-                "observation.images.gripper": "observation.images.camera2",
-                "observation.images.right": "observation.images.camera3"
-            }
+            # Dynamically create feature mapping based on actual dataset cameras
+            feature_mapping = {}
+            
+            # Map dataset camera names to policy camera names
+            # Policy expects: camera1, camera2, camera3
+            policy_camera_names = ["camera1", "camera2", "camera3"]
+            dataset_camera_prefix = "observation.images."
+            policy_camera_prefix = "observation.images."
+            
+            # Get available camera features from the batch
+            available_cameras = [key for key in batch.keys() if key.startswith(dataset_camera_prefix) and not key.endswith("_is_pad")]
+            
+            # Map available cameras to policy camera names in order
+            for i, camera_key in enumerate(available_cameras):
+                if i < len(policy_camera_names):
+                    policy_camera_key = policy_camera_prefix + policy_camera_names[i]
+                    feature_mapping[camera_key] = policy_camera_key
             
             # Create a new batch with remapped keys
             remapped_batch = {}
