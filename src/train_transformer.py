@@ -130,8 +130,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         n_action_steps=n_action_steps, 
         vision_backbone="resnet18",
         pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
-        state_dim=6,  # 7 joints minus the 4th joint which is always 0
-        action_dim=6,  # 7 joints minus the 4th joint which is always 0
+        state_dim=7,  # 7 joints (not removing the 4th joint)
+        action_dim=7,  # 7 joints (not removing the 4th joint)
         d_model=512,  # Smaller model for better gradient flow
         nhead=8,
         num_encoder_layers=4,  # Fewer layers

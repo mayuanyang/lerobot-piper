@@ -207,12 +207,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         policy.config.n_obs_steps = n_obs_steps
         
         
-        # Add RemoveFourthJointProcessorStep to the preprocessor pipeline
         preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
-        
-        # Insert RemoveFourthJointProcessorStep at the beginning of the pipeline
-        from models.transformer_diffusion.remove_fourth_joint_processor import RemoveFourthJointProcessorStep
-        preprocessor.steps.insert(0, RemoveFourthJointProcessorStep())
         
         step = 0
     else:
@@ -221,10 +216,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
         
         if "observation.state" in policy.config.input_features:
-            policy.config.input_features["observation.state"].shape = [6]  # 7 joints minus the 4th joint which is always 0
+            policy.config.input_features["observation.state"].shape = [7]  # 7 joints (not removing the 4th joint)
         
         if "action" in policy.config.output_features:
-            policy.config.output_features["action"].shape = [6]  # 7 joints minus the 4th joint which is always 0
+            policy.config.output_features["action"].shape = [7]  # 7 joints (not removing the 4th joint)
             
         # Update image shapes - All RGB images get 3 channels
         # Based on the feature mapping: front -> camera1, gripper -> camera2, right -> camera3
@@ -254,44 +249,13 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         policy.train()
         policy.to(device)
         optimizer = torch.optim.Adam(policy.parameters(), lr=policy.config.optimizer_lr)
-        # Add RemoveFourthJointProcessorStep to the preprocessor pipeline
-        from models.transformer_diffusion.remove_fourth_joint_processor import RemoveFourthJointProcessorStep
-        
-        # Modify dataset_stats to remove the 4th joint from observation.state and action stats
-        modified_stats = None
-        if dataset_metadata.stats is not None:
-            modified_stats = {}
-            for key, stats_dict in dataset_metadata.stats.items():
-                if key in ["observation.state", "action"] and stats_dict is not None:
-                    # Remove the 4th joint (index 3) from stats
-                    modified_stats[key] = {}
-                    for stat_key, stat_value in stats_dict.items():
-                        if isinstance(stat_value, (list, tuple)) and len(stat_value) == 7:
-                            # Remove the 4th element (index 3) from 7-element arrays
-                            modified_stats[key][stat_key] = list(stat_value[:3]) + list(stat_value[4:])
-                        elif isinstance(stat_value, torch.Tensor) and stat_value.dim() == 1 and stat_value.shape[0] == 7:
-                            # Remove the 4th element (index 3) from 7-element tensors
-                            modified_stats[key][stat_key] = torch.cat([stat_value[:3], stat_value[4:]], dim=0)
-                        else:
-                            # Keep other values as-is
-                            modified_stats[key][stat_key] = stat_value
-                else:
-                    # Keep other features as-is
-                    modified_stats[key] = stats_dict
-        
-        preprocessor.steps.insert(0, RemoveFourthJointProcessorStep())
-        
-        # Update the normalizer step with modified stats
-        for step in preprocessor.steps:
-            if hasattr(step, 'stats') and step.stats is not None:
-                step.stats = modified_stats
         
         # Add grid overlay processor step to the preprocessor pipeline
         if hasattr(preprocessor, 'steps'):
             # Insert grid overlay step after the rename step but before normalization
             grid_step = GridOverlayProcessorStep(grid_cell_size=48, camera_names=["camera1", "camera3"])
             # Find the position to insert the grid step (after rename, before normalization)
-            insert_pos = 2  # Default position (after RemoveFourthJointProcessorStep and Rename)
+            insert_pos = 1  # Default position (after Rename)
             for i, step in enumerate(preprocessor.steps):
                 if hasattr(step, '__class__') and 'Normalizer' in step.__class__.__name__:
                     insert_pos = i
@@ -431,16 +395,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
             
             batch = remapped_batch
             
-            # Ensure observation.state has 6 dimensions after removing 4th joint
-            # The dataset originally has 7-dimensional state, but we remove the 4th joint (index 3)
+            # Ensure observation.state has 7 dimensions (not removing 4th joint)
             if "observation.state" in batch:
                 state = batch["observation.state"]
-                if state.shape[-1] == 6:
-                    # This is what we expect after removing the 4th joint
+                if state.shape[-1] == 7:
+                    # This is what we expect
                     pass
-                elif state.shape[-1] == 7:
-                    # This is the original 7-dimensional state from the dataset
-                    print(f"Warning: observation.state still has 7 dimensions, expected 6 after removing 4th joint")
                 else:
                     # Unexpected dimensionality
                     print(f"Warning: observation.state has unexpected shape {state.shape}")
