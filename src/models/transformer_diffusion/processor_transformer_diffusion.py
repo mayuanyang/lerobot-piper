@@ -46,13 +46,21 @@ def make_pre_post_processors(
                         # Remove the 4th element (index 3) from 7-element tensors
                         modified_stats[key][stat_key] = torch.cat([stat_value[:3], stat_value[4:]], dim=0)
                     elif hasattr(stat_value, 'shape') and len(stat_value.shape) >= 1 and stat_value.shape[-1] == 7:
-                        # Handle multi-dimensional tensors where the last dimension is 7
+                        # Handle multi-dimensional arrays/tensors where the last dimension is 7
                         if len(stat_value.shape) == 1:
-                            # 1D tensor case (already handled above, but adding for completeness)
-                            modified_stats[key][stat_key] = torch.cat([stat_value[:3], stat_value[4:]], dim=0)
+                            # 1D case
+                            if isinstance(stat_value, torch.Tensor):
+                                modified_stats[key][stat_key] = torch.cat([stat_value[:3], stat_value[4:]], dim=0)
+                            else:  # numpy array or similar
+                                import numpy as np
+                                modified_stats[key][stat_key] = np.concatenate([stat_value[:3], stat_value[4:]], axis=0)
                         else:
-                            # Multi-dimensional tensor case - remove 4th element from last dimension
-                            modified_stats[key][stat_key] = torch.cat([stat_value[..., :3], stat_value[..., 4:]], dim=-1)
+                            # Multi-dimensional case - remove 4th element from last dimension
+                            if isinstance(stat_value, torch.Tensor):
+                                modified_stats[key][stat_key] = torch.cat([stat_value[..., :3], stat_value[..., 4:]], dim=-1)
+                            else:  # numpy array or similar
+                                import numpy as np
+                                modified_stats[key][stat_key] = np.concatenate([stat_value[..., :3], stat_value[..., 4:]], axis=-1)
                     elif isinstance(stat_value, (list, tuple)):
                         # Handle list/tuple with different length
                         modified_stats[key][stat_key] = stat_value
