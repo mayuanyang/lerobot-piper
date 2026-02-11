@@ -482,6 +482,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     if val_batches == 0:
         print("WARNING: No validation batches! Check batch_size and dataset size.")
 
+
+    # Extract std_tensor for joint augmentations
+    # Get the standard deviation for observation.state from dataset stats
+    state_stats = dataset_metadata.stats["observation.state"]
+    std_tensor = torch.tensor(state_stats["std"], dtype=torch.float32, device=device)
+    
     # Training Loop
     print("Starting training loop...")
     done = False
@@ -509,11 +515,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
             if step % frame_save_freq == 0:
                 save_camera_frames(batch, step, output_directory, prefix="after_grid")
             
-            # Extract std_tensor for joint augmentations
-            # Get the standard deviation for observation.state from dataset stats
-            state_stats = dataset_metadata.stats["observation.state"]
-            std_tensor = torch.tensor(state_stats["std"], dtype=torch.float32, device=device)
-            
+                        
             batch = apply_joint_augmentations(batch, std_tensor)
             batch = random_drop_camera_views(batch, drop_prob=0.3)
 
