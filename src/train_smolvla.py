@@ -27,11 +27,21 @@ print(f"Using device: {device}")
 
 
 # Data Augmentation Setup
-def get_rgb_augmentations():
+def get_rgb_augmentations(img_size=(400, 640)):
     return v2.Compose([
-        v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-        v2.RandomGrayscale(p=0.1),
-        v2.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 2.0)),
+        # 1. SPATIAL: The most important for generalization
+        # Scales and shifts the image slightly so the model learns "relative" positions
+        v2.RandomResizedCrop(size=img_size, scale=(0.9, 1.0), ratio=(0.95, 1.05), antialias=True),
+        
+        # 2. PHOTOMETRIC: Your existing color logic
+        v2.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
+        
+        # 3. SENSOR NOISE: Simulates real-world camera artifacts
+        v2.RandomGrayscale(p=0.05),
+        v2.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 1.0)),
+        
+        # 4. SHARPNESS: Helps with fine edges of small objects
+        v2.RandomAdjustSharpness(sharpness_factor=2, p=0.2),
     ])
 
 
@@ -262,7 +272,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     output_directory.mkdir(parents=True, exist_ok=True)
 
     training_steps = 100000 
-    log_freq = 10
+    log_freq = 200
     checkpoint_freq = 1000 
     frame_save_freq = 5000  # Save frames every 100 steps
 
@@ -288,6 +298,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     # Initialize Transforms
     train_image_transforms = CameraSpecificTransforms(apply_augmentations=True)
     val_image_transforms = CameraSpecificTransforms(apply_augmentations=False)
+    training_step = 0
 
     # Model Loading Logic
     if resume_from_checkpoint:
@@ -301,7 +312,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         policy.config.n_obs_steps = n_obs_steps
         
         preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
-        step = 0
+        
     else:
         # Initialize a new model from configuration
         policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
@@ -338,10 +349,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         
         # Create preprocessor and postprocessor
         preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
-                
-        step = 0
     
-    def cosine_decay_with_warmup(step):
+    def cosine_decay_with_warmup(scheduler_step):
         """
         Cosine decay with warmup learning rate scheduler
         """
@@ -350,12 +359,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         initial_lr = policy.config.optimizer_lr
         final_lr = policy.config.scheduler_decay_lr
         
-        if step < warmup_steps:
+        if scheduler_step < warmup_steps:
             # Warmup phase: linearly increase learning rate
-            return step / warmup_steps
-        elif step < warmup_steps + decay_steps:
+            return scheduler_step / warmup_steps
+        elif scheduler_step < warmup_steps + decay_steps:
             # Decay phase: cosine decay from initial_lr to final_lr
-            progress = (step - warmup_steps) / decay_steps
+            progress = (scheduler_step - warmup_steps) / decay_steps
             cosine_factor = (1 + torch.cos(torch.tensor(progress * 3.14159))) / 2
             return (final_lr + (initial_lr - final_lr) * cosine_factor) / initial_lr
         else:
@@ -482,8 +491,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         grid_step = GridOverlayProcessorStep(grid_cell_size=40, camera_names=["camera1", "camera3"])
         # Find the position to insert the grid step (after rename, before normalization)
         insert_pos = 1  # Default position (after Rename)
-        for i, step in enumerate(preprocessor.steps):
-            if hasattr(step, '__class__') and 'Normalizer' in step.__class__.__name__:
+        for i, proc_step in enumerate(preprocessor.steps):
+            if hasattr(proc_step, '__class__') and 'Normalizer' in proc_step.__class__.__name__:
                 insert_pos = i
                 break
         preprocessor.steps.insert(insert_pos, grid_step)
@@ -492,16 +501,24 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     print("Starting training loop...")
     done = False
     epoch = 0
-    while not done:
+    # Calculate total steps per epoch
+    total_steps_per_epoch = len(train_dataloader)
+    # Initialize progress bar outside the epoch loop
+    prog_bar = tqdm(total=training_steps, desc="Training Progress")
+
+    while not done and training_step < training_steps:
         epoch += 1
-        prog_bar = tqdm(enumerate(train_dataloader), total=len(train_dataloader), desc=f"Epoch {epoch}, Step {step}")
-        for batch_idx, batch in prog_bar:
+        
+        for batch_idx, batch in enumerate(train_dataloader):
+            # Update progress bar with current training step and total steps per epoch
+            prog_bar.set_description(f"Training Progress (Step: {training_step}/{total_steps_per_epoch})")
+            prog_bar.update(1)
             # Remap features to match policy expectations
             batch = remap_batch_features(batch)
             
-            # Save frames before grid overlay for visualization (every 100 steps)
-            if step % frame_save_freq == 0:
-                save_camera_frames(batch, step, output_directory, prefix="before_grid")
+            # Save frames before grid overlay for visualization
+            if training_step % frame_save_freq == 0:
+                save_camera_frames(batch, training_step, output_directory, prefix="before_grid")
             
             # Ensure observation.state has 7 dimensions
             if "observation.state" in batch:
@@ -511,11 +528,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
             
             batch = preprocessor(batch)
             
-            # Save frames after grid overlay for visualization (every 100 steps)
-            if step % frame_save_freq == 0:
-                save_camera_frames(batch, step, output_directory, prefix="after_grid")
+            # Save frames after grid overlay for visualization
+            if training_step % frame_save_freq == 0:
+                save_camera_frames(batch, training_step, output_directory, prefix="after_grid")
             
-                        
             batch = apply_joint_augmentations(batch, std_tensor)
             batch = random_drop_camera_views(batch, drop_prob=0.3)
 
@@ -531,41 +547,45 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
             scheduler.step()  # Update learning rate
             optimizer.zero_grad()
 
-            if step % log_freq == 0:
-                # Get learning rate from optimizer
-                lr = optimizer.param_groups[0]['lr']
-                prog_bar.set_postfix({"step": step, "loss": f"{loss.item():.3f}", "lr": f"{lr:.2e}"})
-                del loss
+            # Update progress bar every step (not just log_freq)
+            lr = optimizer.param_groups[0]['lr']
+            
+            
+            if training_step % log_freq == 0:
+                # Optional: Log to file or tensorboard here
+                prog_bar.set_postfix({
+                    "epoch": epoch,
+                    "step": training_step,
+                    "loss": f"{loss.item():.3f}",
+                    "lr": f"{lr:.2e}"
+                })
+                
             
             # Run validation every 500 steps
-            if step > 0 and step % 500 == 0:
-                print(f"\nRunning validation at step {step}...")
+            if training_step > 0 and training_step % 500 == 0:
                 val_loss = validate_model(policy, val_dataloader, preprocessor)
-                print(f"Validation loss at step {step}: {val_loss:.4f}")
+                # Consider adding val_loss to postfix if you want to track it
             
             # Save Checkpoint
-            if step > 0 and step % checkpoint_freq == 0:
-                checkpoint_dir = output_directory / f"checkpoint-{step}"
+            if training_step > 0 and training_step % checkpoint_freq == 0:
+                checkpoint_dir = output_directory / f"checkpoint-{training_step}"
                 checkpoint_dir.mkdir(exist_ok=True)
                 policy.save_pretrained(checkpoint_dir)
                 preprocessor.save_pretrained(checkpoint_dir)
                 postprocessor.save_pretrained(checkpoint_dir)
-                print(f"\nCheckpoint saved at step {step}")
-                
-                # Force garbage collection after checkpoint save
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                
-            step += 1
-            if step >= training_steps:
+                print(f"Checkpoint saved at step {training_step}")
+            
+            training_step += 1
+            
+            # Check if we've reached training_steps
+            if training_step >= training_steps:
                 done = True
                 break
+
+    # Close progress bar when done
+    prog_bar.close()
                 
-        # Force garbage collection after each epoch
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        
 
     # Final Save
     policy.save_pretrained(output_directory)
