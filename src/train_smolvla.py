@@ -13,7 +13,7 @@ from torchvision.transforms import v2
 from torch.utils.data import Subset
 import random
 import torchvision
-
+from models.transformer_diffusion.grid_overlay_processor import GridOverlayProcessorStep
 
 # Detect the best available device
 if torch.cuda.is_available():
@@ -338,19 +338,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         
         # Create preprocessor and postprocessor
         preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
-        
-        # Add grid overlay processor step to the preprocessor pipeline
-        if hasattr(preprocessor, 'steps'):
-            # Insert grid overlay step after the rename step but before normalization
-            from models.transformer_diffusion.grid_overlay_processor import GridOverlayProcessorStep
-            grid_step = GridOverlayProcessorStep(grid_cell_size=40, camera_names=["camera1", "camera3"])
-            # Find the position to insert the grid step (after rename, before normalization)
-            insert_pos = 1  # Default position (after Rename)
-            for i, step in enumerate(preprocessor.steps):
-                if hasattr(step, '__class__') and 'Normalizer' in step.__class__.__name__:
-                    insert_pos = i
-                    break
-            preprocessor.steps.insert(insert_pos, grid_step)
                 
         step = 0
     
@@ -487,6 +474,19 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     # Get the standard deviation for observation.state from dataset stats
     state_stats = dataset_metadata.stats["observation.state"]
     std_tensor = torch.tensor(state_stats["std"], dtype=torch.float32, device=device)
+    
+            # Add grid overlay processor step to the preprocessor pipeline
+    if hasattr(preprocessor, 'steps'):
+        # Insert grid overlay step after the rename step but before normalization
+        
+        grid_step = GridOverlayProcessorStep(grid_cell_size=40, camera_names=["camera1", "camera3"])
+        # Find the position to insert the grid step (after rename, before normalization)
+        insert_pos = 1  # Default position (after Rename)
+        for i, step in enumerate(preprocessor.steps):
+            if hasattr(step, '__class__') and 'Normalizer' in step.__class__.__name__:
+                insert_pos = i
+                break
+        preprocessor.steps.insert(insert_pos, grid_step)
     
     # Training Loop
     print("Starting training loop...")
