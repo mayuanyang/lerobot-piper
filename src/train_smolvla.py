@@ -37,10 +37,16 @@ def get_rgb_augmentations():
 
 # Custom transform wrapper to handle different image types
 class CameraSpecificTransforms:
-    def __init__(self):
-        self.rgb_transforms = get_rgb_augmentations()
+    def __init__(self, apply_augmentations=True):
+        self.apply_augmentations = apply_augmentations
+        if apply_augmentations:
+            self.rgb_transforms = get_rgb_augmentations()
         
     def __call__(self, data):
+        # If not applying augmentations, return data unchanged
+        if not self.apply_augmentations:
+            return data
+            
         # Handle both batch dictionaries and individual tensors
         if isinstance(data, dict):
             # This is a batch dictionary
@@ -54,16 +60,25 @@ class CameraSpecificTransforms:
 
 
 # Helper to apply joint data augmentation
-def apply_joint_augmentations(batch):
+def apply_joint_augmentations(batch, std_tensor):
     key = "observation.state"
     if key not in batch:
         return batch
 
     q = batch[key]
-    # Per-timestep noise
-    noise = torch.randn_like(q) * 0.01  # ~0.6°
-    mask = (torch.rand_like(q) < 0.3).float()
-    batch[key] = q + noise * mask
+    
+    # 1. Create noise relative to the specific joint's STD
+    # This ensures "quiet" joints don't get overwhelmed
+    rel_noise = torch.randn_like(q) * (std_tensor * 0.05) # 5% of each joint's typical range
+    
+    # 2. Mask out joints that are disabled (where std is 0)
+    active_mask = (std_tensor > 0).float()
+    
+    # 3. Apply the 30% probability mask
+    prob_mask = (torch.rand_like(q) < 0.3).float()
+    
+    # Apply combined mask
+    batch[key] = q + (rel_noise * prob_mask * active_mask)
     return batch
 
 
@@ -271,7 +286,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         raise ValueError("Dataset stats are required to initialize the policy.")
 
     # Initialize Transforms
-    image_transforms = CameraSpecificTransforms()
+    train_image_transforms = CameraSpecificTransforms(apply_augmentations=True)
+    val_image_transforms = CameraSpecificTransforms(apply_augmentations=False)
 
     # Model Loading Logic
     if resume_from_checkpoint:
@@ -384,13 +400,15 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     delta_timestamps["action"] = [i * frame_time for i in range(policy.config.n_action_steps)]
 
     # Load full dataset to determine episode indices
-    full_dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, image_transforms=image_transforms, force_cache_sync=True, revision="main", tolerance_s=0.01)
+    # Note: We'll create separate datasets for training and validation with different transforms
+    # First, load a dataset without transforms to get episode indices
+    temp_dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, force_cache_sync=True, revision="main", tolerance_s=0.01)
     
     # Get unique episode indices
-    episode_indices = list(set([int(idx.item()) if hasattr(idx, 'item') else int(idx) for idx in full_dataset.hf_dataset["episode_index"]]))
+    episode_indices = list(set([int(idx.item()) if hasattr(idx, 'item') else int(idx) for idx in temp_dataset.hf_dataset["episode_index"]]))
     episode_indices.sort()
     
-    # Split episodes: 90% for training, 10% for validation
+    # Split episodes: 95% for training, 5% for validation
     num_episodes = len(episode_indices)
     num_train_episodes = int(0.95 * num_episodes)
     
@@ -405,14 +423,35 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     print(f"Training episodes: {len(train_episode_indices)} ({len(train_episode_indices)/len(episode_indices)*100:.1f}%)")
     print(f"Validation episodes: {len(val_episode_indices)} ({len(val_episode_indices)/len(episode_indices)*100:.1f}%)")
     
-    # Create boolean masks for training and validation data
-    dataset_episode_indices = [int(idx.item()) if hasattr(idx, 'item') else int(idx) for idx in full_dataset.hf_dataset["episode_index"]]
-    train_mask = [idx in train_episode_indices for idx in dataset_episode_indices]
-    val_mask = [idx in val_episode_indices for idx in dataset_episode_indices]
+    # Create separate datasets for training and validation with appropriate transforms
+    train_dataset = LeRobotDataset(
+        dataset_id, 
+        delta_timestamps=delta_timestamps, 
+        image_transforms=train_image_transforms, 
+        force_cache_sync=True, 
+        revision="main", 
+        tolerance_s=0.01
+    )
+    
+    val_dataset = LeRobotDataset(
+        dataset_id, 
+        delta_timestamps=delta_timestamps, 
+        image_transforms=val_image_transforms, 
+        force_cache_sync=True, 
+        revision="main", 
+        tolerance_s=0.01
+    )
+    
+    # Create boolean masks for training and validation data based on episode indices
+    train_dataset_episode_indices = [int(idx.item()) if hasattr(idx, 'item') else int(idx) for idx in train_dataset.hf_dataset["episode_index"]]
+    val_dataset_episode_indices = [int(idx.item()) if hasattr(idx, 'item') else int(idx) for idx in val_dataset.hf_dataset["episode_index"]]
+    
+    train_mask = [idx in train_episode_indices for idx in train_dataset_episode_indices]
+    val_mask = [idx in val_episode_indices for idx in val_dataset_episode_indices]
     
     # Create subsets for training and validation
-    train_dataset = Subset(full_dataset, [i for i, mask in enumerate(train_mask) if mask])
-    val_dataset = Subset(full_dataset, [i for i, mask in enumerate(val_mask) if mask])
+    train_dataset = Subset(train_dataset, [i for i, mask in enumerate(train_mask) if mask])
+    val_dataset = Subset(val_dataset, [i for i, mask in enumerate(val_mask) if mask])
     
     # Check dataset sizes
     print(f"Training dataset size: {len(train_dataset)}")
@@ -470,7 +509,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
             if step % frame_save_freq == 0:
                 save_camera_frames(batch, step, output_directory, prefix="after_grid")
             
-            batch = apply_joint_augmentations(batch)
+            # Extract std_tensor for joint augmentations
+            # Get the standard deviation for observation.state from dataset stats
+            state_stats = dataset_metadata.stats["observation.state"]
+            std_tensor = torch.tensor(state_stats["std"], dtype=torch.float32, device=device)
+            
+            batch = apply_joint_augmentations(batch, std_tensor)
             batch = random_drop_camera_views(batch, drop_prob=0.3)
 
             # Move all tensor values in batch to device
