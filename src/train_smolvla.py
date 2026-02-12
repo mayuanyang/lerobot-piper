@@ -289,8 +289,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     print('output_features:', output_features)
 
     n_obs_steps = 2
-    chunk_size = 16
-    n_action_steps = 16
+    chunk_size = 50
+    n_action_steps = 50
     
     if dataset_metadata.stats is None:
         raise ValueError("Dataset stats are required to initialize the policy.")
@@ -453,7 +453,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
     print(f"Training dataset size: {len(train_dataset)}")
     print(f"Validation dataset size: {len(val_dataset)}")
     
-    batch_size = 36
+    batch_size = 12
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         num_workers=4,
@@ -511,8 +511,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
         
         for batch_idx, batch in enumerate(train_dataloader):
             # Update progress bar with current training step and total steps per epoch
-            prog_bar.set_description(f"Training Progress (Step: {training_step}/{total_steps_per_epoch})")
-            prog_bar.update(1)
+            
+            
             # Remap features to match policy expectations
             batch = remap_batch_features(batch)
             
@@ -532,8 +532,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
             if training_step % frame_save_freq == 0:
                 save_camera_frames(batch, training_step, output_directory, prefix="after_grid")
             
-            batch = apply_joint_augmentations(batch, std_tensor)
-            batch = random_drop_camera_views(batch, drop_prob=0.3)
+            #batch = apply_joint_augmentations(batch, std_tensor)
+            #batch = random_drop_camera_views(batch, drop_prob=0.3)
 
             # Move all tensor values in batch to device
             for key, value in batch.items():
@@ -555,7 +555,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", model_id="ISdept/smolvla-pi
                 # Optional: Log to file or tensorboard here
                 prog_bar.set_postfix({
                     "epoch": epoch,
-                    "step": training_step,
+                    "step": f"{training_step}/{total_steps_per_epoch}",
                     "loss": f"{loss.item():.3f}",
                     "lr": f"{lr:.2e}"
                 })
