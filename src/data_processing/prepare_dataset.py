@@ -1288,6 +1288,9 @@ def main():
                         first_frames_to_chop = 12  # First episode has extra lag
                     else: 
                         first_frames_to_chop = 10  # Gripper camera lags by 0.1 second (1 frame at 10fps)
+                elif 'right' in camera_name.lower():
+                    if episode_idx == 1:
+                        first_frames_to_chop = 12  # First episode has extra lag
                 cameras_list.append(CameraData(video_path=str(video_path), camera=camera_name, first_frames_to_chop=first_frames_to_chop))
             
             episode_data = EpisodeData(
