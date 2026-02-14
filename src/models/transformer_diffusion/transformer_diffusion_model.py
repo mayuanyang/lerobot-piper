@@ -3,12 +3,36 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.transforms as transforms
+from torchvision.utils import save_image
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.optimization import get_scheduler
 from typing import Dict, Optional
 import math
 import numpy as np
+import os
 
+
+class CropConvNet(nn.Module):
+    """Simple 3-layer ConvNet for processing 64x64 crops."""
+    def __init__(self, input_channels=3, hidden_channels=32, output_channels=64):
+        super().__init__()
+        self.conv_net = nn.Sequential(
+            nn.Conv2d(input_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.LayerNorm([hidden_channels, 64, 64]),  # LayerNorm after first conv layer
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, hidden_channels*2, kernel_size=3, padding=1),
+            nn.LayerNorm([hidden_channels*2, 64, 64]),  # LayerNorm after second conv layer
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels*2, output_channels, kernel_size=3, padding=1),
+            nn.LayerNorm([output_channels, 64, 64]),  # LayerNorm after third conv layer
+            nn.AdaptiveAvgPool2d((1, 1))  # Global average pooling to 1x1
+        )
+        
+    def forward(self, x):
+        # x shape: (B*K, C, 64, 64)
+        features = self.conv_net(x)  # (B*K, output_channels, 1, 1)
+        features = features.view(features.size(0), -1)  # (B*K, output_channels)
+        return features
 
 class SpatialSoftmax(nn.Module):
     """
@@ -36,7 +60,7 @@ class SpatialSoftmax(nn.Module):
     """
 
     def __init__(self, input_shape, num_kp=None, temperature=1.0, learnable_temperature=False, 
-                 object_guided=False, gripper_kp=6, object_kp=5, container_kp=5):
+                 object_guided=False, gripper_kp=6, object_kp=5, container_kp=5, crop_size=64):
         """
         Args:
             input_shape (list): (C, H, W) input feature map shape.
@@ -47,12 +71,14 @@ class SpatialSoftmax(nn.Module):
             gripper_kp (int): number of keypoints for gripper.
             object_kp (int): number of keypoints for object.
             container_kp (int): number of keypoints for container.
+            crop_size (int): size of the square crop (crop_size x crop_size).
         """
         super().__init__()
 
         assert len(input_shape) == 3
         self._in_c, self._in_h, self._in_w = input_shape
         self.object_guided = object_guided
+        self.crop_size = crop_size
 
         if object_guided:
             # Create separate convolution layers for each object type
@@ -215,16 +241,23 @@ class VisionEncoder(nn.Module):
             height = backbone_output.shape[2]
             width = backbone_output.shape[3]
         
+        # Add LayerNorm after backbone features for improved gradient flow
+        self.backbone_norm = nn.LayerNorm(feature_dim)
+        
         # Use object-guided spatial softmax with dedicated keypoints for each object
         self.spatial_softmax = SpatialSoftmax(
             input_shape=(feature_dim, height, width),
-            object_guided=True,  # Enable object-guided spatial softmax
-            gripper_kp=6,        # 6 keypoints for gripper
-            object_kp=5,         # 5 keypoints for object
-            container_kp=5,      # 5 keypoints for container
-            temperature=1.0,     # Moderate temperature for better gradients
-            learnable_temperature=True  # Allow temperature to adapt during training
+            object_guided=False,  # Enable object-guided spatial softmax
+            num_kp=32,
+            gripper_kp=2,        # 1 keypoint for gripper
+            object_kp=2,         # 5 keypoints for object
+            container_kp=2,      # 5 keypoints for container
+            temperature=0.1,     # Moderate temperature for better gradients
+            learnable_temperature=False  # Allow temperature to adapt during training
         )
+        
+        # Initialize the crop ConvNet
+        self.spatial_softmax.crop_conv_net = CropConvNet(input_channels=3, hidden_channels=32, output_channels=64)
         
         self.spatial_norm = nn.GroupNorm(32, feature_dim) # GroupNorm is safer than BN for small batches
         
@@ -234,10 +267,13 @@ class VisionEncoder(nn.Module):
         # Global feature extractor - adaptive average pooling to 1x1
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))  # Reduce to 1x1 spatial features
         
-        # Projection for spatial features
+        # Projection for spatial features with additional normalization
         # Updated to handle concatenated local features and coordinates
+        # Now using 64 (CropConvNet output) + 2 (coordinates) = 66 dimensions
         self.spatial_projection = nn.Sequential(
-            nn.Linear(feature_dim + 2, config.d_model),
+            nn.Linear(64 + 2, config.d_model),
+            nn.LayerNorm(config.d_model),  # Add LayerNorm for better gradient flow
+            nn.GELU(),
             ResidualLinear(config.d_model) # Stabilizes the feature transformation
         )
         
@@ -248,16 +284,54 @@ class VisionEncoder(nn.Module):
             nn.GELU(),
             nn.Dropout(0.1)
         )
+        
+        # Counter for saving images
+        self.save_counter = 0
 
     def forward(self, x, gripper_mask=None, object_mask=None, container_mask=None):
-        x = self.resize_transform(x)
-        features = self.backbone_features(x)
+        x_resized = self.resize_transform(x)
+        features = self.backbone_features(x_resized)
+                
+        # Apply LayerNorm to backbone features for improved gradient flow
+        B, C, H, W = features.shape
+        features = features.permute(0, 2, 3, 1).contiguous()  # (B, H, W, C)
+        features = self.backbone_norm(features)
+        features = features.permute(0, 3, 1, 2).contiguous()  # (B, C, H, W)
         
         # Extract Coords (B, K, 2) and Features (B, K, C) with optional object masks
-        coords, local_feats = self.spatial_softmax(features, gripper_mask, object_mask, container_mask)
+        coords, _ = self.spatial_softmax(features, gripper_mask=gripper_mask, object_mask=object_mask, container_mask=container_mask)
+        
+        # Cropping Logic: Use keypoints to center 32x32 crops on the image
+        # Convert normalized coordinates [-1, 1] to pixel coordinates
+        # coords: (B, K, 2) in range [-1, 1]
+        # We need to convert to pixel coordinates in the image space
+        
+        # Get image dimensions (using the resized image)
+        _, _, img_H, img_W = x_resized.shape
+        
+        # Convert normalized coordinates to pixel coordinates
+        # [-1, 1] -> [0, img_W-1] and [0, img_H-1]
+        pixel_x = (coords[:, :, 0] + 1) * (img_W - 1) / 2
+        pixel_y = (coords[:, :, 1] + 1) * (img_H - 1) / 2
+        
+        # Stack them back together
+        pixel_coords = torch.stack([pixel_x, pixel_y], dim=-1)  # (B, K, 2)
+        
+        # Extract crops centered at these pixel coordinates
+        crops = self.extract_crops(x_resized, pixel_coords, self.spatial_softmax.crop_size)  # (B*K, 3, 64, 64)
+        
+        # Save crops as images if model_output directory exists
+        if os.path.exists("model_output"):
+            self.save_crops_as_images(crops, pixel_coords)
+        
+        # Process crops through the ConvNet
+        local_features = self.spatial_softmax.crop_conv_net(crops)  # (B*K, 64)
+        
+        # Reshape to (B, K, 64)
+        local_features = local_features.view(B, -1, local_features.shape[-1])
         
         # Spatial Tokens: (B, K, d_model)
-        spatial_combined = torch.cat([local_feats, coords], dim=-1)
+        spatial_combined = torch.cat([local_features, coords], dim=-1)
         spatial_tokens = self.spatial_projection(spatial_combined)
         
         # Global Token: (B, 1, d_model)
@@ -266,6 +340,91 @@ class VisionEncoder(nn.Module):
         
         # We return the tokens for the model AND coords for you
         return spatial_tokens, global_token, coords
+    
+    def save_crops_as_images(self, crops, pixel_coords):
+        """
+        Save crops as images to the model_output directory.
+        
+        Args:
+            crops (Tensor): Extracted crops of shape (B*K, C, 32, 32)
+            pixel_coords (Tensor): Pixel coordinates of shape (B, K, 2)
+        """
+        # Create directory if it doesn't exist
+        save_dir = "model_output/crops"
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Save a few crops for visualization
+        num_crops_to_save = min(5, crops.shape[0])  # Save up to 5 crops
+        for i in range(num_crops_to_save):
+            crop = crops[i]  # (C, 32, 32)
+            # Normalize crop to [0, 1] range if needed
+            crop_min = crop.min()
+            crop_max = crop.max()
+            if crop_max > crop_min:  # Avoid division by zero
+                crop_normalized = (crop - crop_min) / (crop_max - crop_min)
+            else:
+                crop_normalized = crop
+            
+            # Save the crop as an image
+            save_path = os.path.join(save_dir, f"crop_{self.save_counter}_{i}.png")
+            save_image(crop_normalized, save_path)
+        
+        self.save_counter += 1
+    
+    def extract_crops(self, image, pixel_coords, crop_size):
+        """
+        Extract crops from an image centered at given pixel coordinates.
+        
+        Args:
+            image (Tensor): Input image tensor of shape (B, C, H, W)
+            pixel_coords (Tensor): Pixel coordinates of shape (B, K, 2)
+            crop_size (int): Size of square crop
+            
+        Returns:
+            Tensor: Extracted crops of shape (B*K, C, crop_size, crop_size)
+        """
+        B, C, H, W = image.shape
+        K = pixel_coords.shape[1]
+        
+        # Half crop size for centering
+        half_crop = crop_size // 2
+        
+        # Create a meshgrid for the crop
+        crop_offsets_y, crop_offsets_x = torch.meshgrid(
+            torch.arange(-half_crop, half_crop, device=image.device),
+            torch.arange(-half_crop, half_crop, device=image.device),
+            indexing='ij'
+        )
+        crop_offsets = torch.stack([crop_offsets_x, crop_offsets_y], dim=-1)  # (crop_size, crop_size, 2)
+        crop_offsets = crop_offsets.unsqueeze(0).unsqueeze(0)  # (1, 1, crop_size, crop_size, 2)
+        
+        # Expand pixel_coords to match crop dimensions
+        pixel_coords_expanded = pixel_coords.unsqueeze(2).unsqueeze(2)  # (B, K, 1, 1, 2)
+        
+        # Add offsets to get all pixel positions in the crops
+        sample_coords = pixel_coords_expanded + crop_offsets  # (B, K, crop_size, crop_size, 2)
+        
+        # Clamp coordinates to image boundaries
+        clamped_x = torch.clamp(sample_coords[..., 0], 0, W - 1)
+        clamped_y = torch.clamp(sample_coords[..., 1], 0, H - 1)
+        sample_coords_clamped = torch.stack([clamped_x, clamped_y], dim=-1)
+        
+        # Normalize coordinates to [-1, 1] for grid_sample
+        normalized_x = (sample_coords_clamped[..., 0] / (W - 1)) * 2 - 1
+        normalized_y = (sample_coords_clamped[..., 1] / (H - 1)) * 2 - 1
+        sample_coords_normalized = torch.stack([normalized_x, normalized_y], dim=-1)
+        
+        # Reshape for grid_sample: (B, K, crop_size, crop_size, 2) -> (B*K, crop_size, crop_size, 2)
+        sample_coords_reshaped = sample_coords_normalized.view(-1, crop_size, crop_size, 2)
+        
+        # Repeat image for each keypoint
+        image_repeated = image.unsqueeze(1).repeat(1, K, 1, 1, 1)  # (B, K, C, H, W)
+        image_repeated = image_repeated.view(-1, C, H, W)  # (B*K, C, H, W)
+        
+        # Extract crops using grid_sample
+        crops = F.grid_sample(image_repeated, sample_coords_reshaped, align_corners=True)
+        
+        return crops
     
 
 class SimpleDiffusionTransformer(nn.Module):
@@ -282,7 +441,10 @@ class SimpleDiffusionTransformer(nn.Module):
             for cam in config.image_features.keys()
         })
                 
-        self.state_encoder = nn.Linear(config.state_dim, config.d_model)
+        self.state_encoder = nn.Sequential(
+            nn.Linear(config.state_dim, config.d_model),
+            nn.LayerNorm(config.d_model)
+        )
         
         # Add positional encoding for state sequences
         self.state_positional_encoding = PositionalEncoding(config.d_model, 200)  # Increased to handle longer sequences
@@ -404,6 +566,10 @@ class SimpleDiffusionTransformer(nn.Module):
         # Combine all camera and state tokens
         cam_tokens_all = torch.cat(all_obs_tokens, dim=2)
         state_tokens = self.state_encoder(batch["observation.state"]).unsqueeze(2)
+        
+                
+        #print(f"cam_tokens - Min: {cam_tokens_all.min().item():.6f}, Max: {cam_tokens_all.max().item():.6f}")
+        #print(f"State tokens - Min: {state_tokens.min().item():.6f}, Max: {state_tokens.max().item():.6f}")
         
         obs_tokens = torch.cat([cam_tokens_all, state_tokens], dim=2)
         B, T, N, D = obs_tokens.shape
