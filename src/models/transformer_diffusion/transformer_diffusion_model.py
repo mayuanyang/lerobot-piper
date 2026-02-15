@@ -12,130 +12,6 @@ import numpy as np
 import os
 
 
-class CropConvNet(nn.Module):
-    """Simple 3-layer ConvNet for processing 64x64 crops."""
-    def __init__(self, input_channels=3, hidden_channels=32, output_channels=64):
-        super().__init__()
-        self.conv_net = nn.Sequential(
-            nn.Conv2d(input_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_channels),  # BatchNorm2d after first conv layer
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels, hidden_channels*2, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_channels*2),  # BatchNorm2d after second conv layer
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels*2, output_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(output_channels),  # BatchNorm2d after third conv layer
-            nn.AdaptiveAvgPool2d((1, 1))  # Global average pooling to 1x1
-        )
-        
-    def forward(self, x):
-        # x shape: (B*K, C, 64, 64)
-        features = self.conv_net(x)  # (B*K, output_channels, 1, 1)
-        features = features.view(features.size(0), -1)  # (B*K, output_channels)
-        return features
-
-class SpatialSoftmax(nn.Module):
-    """
-    Spatial Soft Argmax operation described in "Deep Spatial Autoencoders for Visuomotor Learning" by Finn et al.
-    (https://huggingface.co/papers/1509.06113). A minimal port of the robomimic implementation.
-
-    At a high level, this takes 2D feature maps (from a convnet/ViT) and returns the "center of mass"
-    of activations of each channel, i.e., keypoints in the image space for the policy to focus on.
-
-    Example: take feature maps of size (512x10x12). We generate a grid of normalized coordinates (10x12x2):
-    -----------------------------------------------------
-    | (-1., -1.)   | (-0.82, -1.)   | ... | (1., -1.)   |
-    | (-1., -0.78) | (-0.82, -0.78) | ... | (1., -0.78) |
-    | ...          | ...            | ... | ...         |
-    | (-1., 1.)    | (-0.82, 1.)    | ... | (1., 1.)    |
-    -----------------------------------------------------
-    This is achieved by applying channel-wise softmax over the activations (512x120) and computing the dot
-    product with the coordinates (120x2) to get expected points of maximal activation (512x2).
-
-    The example above results in 512 keypoints (corresponding to the 512 input channels). We can optionally
-    provide num_kp != None to control the number of keypoints. This is achieved by a first applying a learnable
-    linear mapping (in_channels, H, W) -> (num_kp, H, W).
-    """
-
-    def __init__(self, input_shape, num_kp=None, temperature=1.0, learnable_temperature=False, crop_size=64):
-        """
-        Args:
-            input_shape (list): (C, H, W) input feature map shape.
-            num_kp (int): number of keypoints in output. If None, output will have the same number of channels as input.
-            temperature (float): temperature for softmax. Lower values lead to sharper peaks.
-            learnable_temperature (bool): whether temperature should be learnable.
-            crop_size (int): size of the square crop (crop_size x crop_size).
-        """
-        super().__init__()
-
-        assert len(input_shape) == 3
-        self._in_c, self._in_h, self._in_w = input_shape
-        self.crop_size = crop_size
-
-        if num_kp is not None:
-            self.nets = torch.nn.Conv2d(self._in_c, num_kp, kernel_size=1)
-            self._out_c = num_kp
-        else:
-            self.nets = None
-            self._out_c = self._in_c
-        
-
-        if learnable_temperature:
-            self.temperature = nn.Parameter(torch.tensor(temperature))
-        else:
-            self.register_buffer('temperature', torch.tensor(temperature))
-
-
-        # we could use torch.linspace directly but that seems to behave slightly differently than numpy
-        # and causes a small degradation in pc_success of pre-trained models.
-        pos_x, pos_y = np.meshgrid(np.linspace(-1.0, 1.0, self._in_w), np.linspace(-1.0, 1.0, self._in_h))
-        pos_x = torch.from_numpy(pos_x.reshape(self._in_h * self._in_w, 1)).float()
-        pos_y = torch.from_numpy(pos_y.reshape(self._in_h * self._in_w, 1)).float()
-        # register as buffer so it's moved to the correct device.
-        self.register_buffer("pos_grid", torch.cat([pos_x, pos_y], dim=1))
-
-    def forward(self, features: Tensor) -> Tensor:
-        """
-        Forward pass.
-        
-        Args:
-            features (Tensor): Input feature maps.
-        """
-        B, C, H, W = features.shape
-        
-        if self.nets is not None:
-            kp_heatmap = self.nets(features)
-        else:
-            kp_heatmap = features
-
-        # Flatten and softmax
-        heatmap_flat = F.softmax(kp_heatmap.view(B, kp_heatmap.shape[1], -1) / self.temperature, dim=-1)
-        expected_xy = heatmap_flat @ self.pos_grid  # (B, K, 2)
-        
-        # Feature Sampling: Extract local features at these coordinates
-        # grid_sample expects coordinates in [-1, 1], which expected_xy already is
-        # We need to reshape expected_xy to (B, K, 1, 2) for grid_sample
-        grid = expected_xy.unsqueeze(2) 
-        
-        # Sample from the original high-dim features (B, C, H, W)
-        # This gives us (B, C, K, 1) -> features at each keypoint
-        local_features = F.grid_sample(features, grid, align_corners=True)
-        local_features = local_features.squeeze(-1).permute(0, 2, 1) # (B, K, C)
-        
-        # Return both the coordinates and the sampled features
-        return expected_xy, local_features
-
-class ResidualLinear(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
-            nn.GELU(),
-            nn.Linear(dim, dim)
-        )
-    def forward(self, x):
-        return x + self.net(x) # Basic skip connection
       
 class PositionalEncoding(nn.Module):
     """Positional encoding for action sequences."""
@@ -169,215 +45,120 @@ class DiffusionSinusoidalPosEmb(nn.Module):
         return emb
 
 
+import torch
+import torch.nn as nn
+import torchvision.models as models
+
 class VisionEncoder(nn.Module):
-    """Improved encoder with separate Spatial Softmax and Global Features for 7-DOF precision."""
     def __init__(self, config):
         super().__init__()
-        # Add resize transform with configurable image size
-        self.resize_transform = transforms.Resize(config.input_image_size)
-        
-        backbone = getattr(models, config.vision_backbone)(weights="DEFAULT" if config.pretrained_backbone_weights else None)
-        # Remove fc and avgpool, keep spatial layers
-        backbone_children = list(backbone.children())
-        self.backbone_features = nn.Sequential(*backbone_children[:-2])
-        
-        # Enable gradient checkpointing for memory efficiency
-        if hasattr(self.backbone_features, 'gradient_checkpointing'):
-            self.backbone_features.gradient_checkpointing = True
-        
-        # Get feature dimensions (e.g., 512 for ResNet18)
-        # Update dummy input size to match configured image size
-        with torch.no_grad():
-            dummy_input = torch.zeros(1, 3, config.input_image_size[0], config.input_image_size[1])
-            backbone_output = self.backbone_features(dummy_input)
-            feature_dim = backbone_output.shape[1]
-            height = backbone_output.shape[2]
-            width = backbone_output.shape[3]
-        
-        # Add LayerNorm after backbone features for improved gradient flow
-        self.backbone_norm = nn.LayerNorm(feature_dim)
-        
-        # Use spatial softmax with 32 keypoints
-        self.spatial_softmax = SpatialSoftmax(
-            input_shape=(feature_dim, height, width),
-            num_kp=32,
-            temperature=0.1,     # Moderate temperature for better gradients
-            learnable_temperature=False  # Allow temperature to adapt during training
-        )
-        
-        # Initialize the crop ConvNet
-        self.spatial_softmax.crop_conv_net = CropConvNet(input_channels=3, hidden_channels=32, output_channels=64)
-        
-        self.spatial_norm = nn.GroupNorm(32, feature_dim) # GroupNorm is safer than BN for small batches
-        
-        # Add dropout for regularization
-        self.dropout = nn.Dropout(0.1)
-        
-        # Global feature extractor - adaptive average pooling to 1x1
-        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))  # Reduce to 1x1 spatial features
-        
-        # Projection for spatial features with additional normalization
-        # Updated to handle concatenated local features and coordinates
-        # Now using 64 (CropConvNet output) + 2 (coordinates) = 66 dimensions
-        self.spatial_projection = nn.Sequential(
-            nn.Linear(64 + 2, config.d_model),
-            nn.LayerNorm(config.d_model),  # Add LayerNorm for better gradient flow
-            nn.GELU(),
-            ResidualLinear(config.d_model) # Stabilizes the feature transformation
-        )
-        
-        # Projection for global features
-        self.global_projection = nn.Sequential(
-            nn.Linear(feature_dim, config.d_model),
-            nn.LayerNorm(config.d_model),
-            nn.GELU(),
-            nn.Dropout(0.1)
-        )
-        
-        # Counter for saving images
-        self.save_counter = 0
 
-    def forward(self, x, gripper_mask=None, object_mask=None, container_mask=None):
-        x_resized = self.resize_transform(x)
-        features = self.backbone_features(x_resized)
-                
-        # Apply LayerNorm to backbone features for improved gradient flow
-        B, C, H, W = features.shape
-        features = features.permute(0, 2, 3, 1).contiguous()  # (B, H, W, C)
-        features = self.backbone_norm(features)
-        features = features.permute(0, 3, 1, 2).contiguous()  # (B, C, H, W)
-        
-        # Extract Coords (B, K, 2) and Features (B, K, C)
-        coords, _ = self.spatial_softmax(features)
-        
-        # Cropping Logic: Use keypoints to center 32x32 crops on the image
-        # Convert normalized coordinates [-1, 1] to pixel coordinates
-        # coords: (B, K, 2) in range [-1, 1]
-        # We need to convert to pixel coordinates in the image space
-        
-        # Get image dimensions (using the resized image)
-        _, _, img_H, img_W = x_resized.shape
-        
-        # Convert normalized coordinates to pixel coordinates
-        # [-1, 1] -> [0, img_W-1] and [0, img_H-1]
-        pixel_x = (coords[:, :, 0] + 1) * (img_W - 1) / 2
-        pixel_y = (coords[:, :, 1] + 1) * (img_H - 1) / 2
-        
-        # Stack them back together
-        pixel_coords = torch.stack([pixel_x, pixel_y], dim=-1)  # (B, K, 2)
-        
-        # Extract crops centered at these pixel coordinates
-        crops = self.extract_crops(x_resized, pixel_coords, self.spatial_softmax.crop_size)  # (B*K, 3, 64, 64)
-        
-        # Save crops as images if model_output directory exists
-        if os.path.exists("model_output"):
-            self.save_crops_as_images(crops, pixel_coords)
-        
-        # Process crops through the ConvNet
-        local_features = self.spatial_softmax.crop_conv_net(crops)  # (B*K, 64)
-        
-        # Reshape to (B, K, 64)
-        local_features = local_features.view(B, -1, local_features.shape[-1])
-        
-        # Spatial Tokens: (B, K, d_model)
-        spatial_combined = torch.cat([local_features, coords], dim=-1)
-        spatial_tokens = self.spatial_projection(spatial_combined)
-        
-        # Global Token: (B, 1, d_model)
-        global_pool = self.global_pool(features).view(features.size(0), -1)
-        global_token = self.global_projection(global_pool).unsqueeze(1)
-        
-        # We return the tokens for the model AND coords for you
-        return spatial_tokens, global_token, coords
-    
-    def save_crops_as_images(self, crops, pixel_coords):
-        """
-        Save crops as images to the model_output directory.
-        
-        Args:
-            crops (Tensor): Extracted crops of shape (B*K, C, 32, 32)
-            pixel_coords (Tensor): Pixel coordinates of shape (B, K, 2)
-        """
-        # Create directory if it doesn't exist
-        save_dir = "model_output/crops"
-        os.makedirs(save_dir, exist_ok=True)
-        
-        # Save a few crops for visualization
-        num_crops_to_save = min(5, crops.shape[0])  # Save up to 5 crops
-        for i in range(num_crops_to_save):
-            crop = crops[i]  # (C, 32, 32)
-            # Normalize crop to [0, 1] range if needed
-            crop_min = crop.min()
-            crop_max = crop.max()
-            if crop_max > crop_min:  # Avoid division by zero
-                crop_normalized = (crop - crop_min) / (crop_max - crop_min)
-            else:
-                crop_normalized = crop
-            
-            # Save the crop as an image
-            save_path = os.path.join(save_dir, f"crop_{self.save_counter}_{i}.png")
-            save_image(crop_normalized, save_path)
-        
-        self.save_counter += 1
-    
-    def extract_crops(self, image, pixel_coords, crop_size):
-        """
-        Extract crops from an image centered at given pixel coordinates.
-        
-        Args:
-            image (Tensor): Input image tensor of shape (B, C, H, W)
-            pixel_coords (Tensor): Pixel coordinates of shape (B, K, 2)
-            crop_size (int): Size of square crop
-            
-        Returns:
-            Tensor: Extracted crops of shape (B*K, C, crop_size, crop_size)
-        """
-        B, C, H, W = image.shape
-        K = pixel_coords.shape[1]
-        
-        # Half crop size for centering
-        half_crop = crop_size // 2
-        
-        # Create a meshgrid for the crop
-        crop_offsets_y, crop_offsets_x = torch.meshgrid(
-            torch.arange(-half_crop, half_crop, device=image.device),
-            torch.arange(-half_crop, half_crop, device=image.device),
-            indexing='ij'
+        self.config = config
+        self.num_cameras = config.num_cameras
+
+        # ------------------------------
+        # 1. ViT backbone
+        # ------------------------------
+        # Extract image size from config (assuming square images)
+        image_size = config.input_image_size[0] if isinstance(config.input_image_size, (tuple, list)) else config.input_image_size
+        backbone = getattr(models, config.vision_backbone)(
+            weights="DEFAULT",
+            image_size=image_size
         )
-        crop_offsets = torch.stack([crop_offsets_x, crop_offsets_y], dim=-1)  # (crop_size, crop_size, 2)
-        crop_offsets = crop_offsets.unsqueeze(0).unsqueeze(0)  # (1, 1, crop_size, crop_size, 2)
-        
-        # Expand pixel_coords to match crop dimensions
-        pixel_coords_expanded = pixel_coords.unsqueeze(2).unsqueeze(2)  # (B, K, 1, 1, 2)
-        
-        # Add offsets to get all pixel positions in the crops
-        sample_coords = pixel_coords_expanded + crop_offsets  # (B, K, crop_size, crop_size, 2)
-        
-        # Clamp coordinates to image boundaries
-        clamped_x = torch.clamp(sample_coords[..., 0], 0, W - 1)
-        clamped_y = torch.clamp(sample_coords[..., 1], 0, H - 1)
-        sample_coords_clamped = torch.stack([clamped_x, clamped_y], dim=-1)
-        
-        # Normalize coordinates to [-1, 1] for grid_sample
-        normalized_x = (sample_coords_clamped[..., 0] / (W - 1)) * 2 - 1
-        normalized_y = (sample_coords_clamped[..., 1] / (H - 1)) * 2 - 1
-        sample_coords_normalized = torch.stack([normalized_x, normalized_y], dim=-1)
-        
-        # Reshape for grid_sample: (B, K, crop_size, crop_size, 2) -> (B*K, crop_size, crop_size, 2)
-        sample_coords_reshaped = sample_coords_normalized.view(-1, crop_size, crop_size, 2)
-        
-        # Repeat image for each keypoint
-        image_repeated = image.unsqueeze(1).repeat(1, K, 1, 1, 1)  # (B, K, C, H, W)
-        image_repeated = image_repeated.view(-1, C, H, W)  # (B*K, C, H, W)
-        
-        # Extract crops using grid_sample
-        crops = F.grid_sample(image_repeated, sample_coords_reshaped, align_corners=True)
-        
-        return crops
+        self.hidden_dim = backbone.hidden_dim  # 768 for vit_b_16
+        backbone.heads = nn.Identity()
+        self.backbone = backbone
+
+        # ------------------------------
+        # 2. Freeze early layers (optional)
+        # ------------------------------
+        if config.vision_freeze_layers > 0:
+            for name, param in self.backbone.named_parameters():
+                if "encoder.layers" in name:
+                    layer_id = int(name.split("encoder.layers.")[1].split(".")[0])
+                    if layer_id < config.vision_freeze_layers:
+                        param.requires_grad = False
+
+        # ------------------------------
+        # 3. Projection to d_model
+        # ------------------------------
+        self.projection = nn.Sequential(
+            nn.Linear(self.hidden_dim, config.d_model),
+            nn.LayerNorm(config.d_model),
+            nn.GELU()
+        )
+
+        # ------------------------------
+        # 4. Camera embedding
+        # ------------------------------
+        self.camera_embedding = nn.Embedding(
+            self.num_cameras,
+            config.d_model
+        )
+
+        # ------------------------------
+        # 5. num tokens per camera
+        # ------------------------------
+        # CLS + all patch tokens
+        # For ViT, seq_length includes both patch tokens and the CLS token
+        self.num_tokens_per_cam = self.backbone.seq_length
+
+    # ------------------------------
+    # Forward
+    # ------------------------------
+    def forward(self, x):
+        """
+        x: (B, T, N_cam, C, H, W)
+        return:
+            vision_tokens: (B, T, N_cam * num_tokens_per_cam, d_model)
+        """
+
+        B, T, N_cam, C, H, W = x.shape
+
+        # Merge batch, time, camera
+        x = x.view(B * T * N_cam, C, H, W)
+
+        # Resize images to match the expected input size of the backbone
+        if H != self.backbone.image_size or W != self.backbone.image_size:
+            import torchvision.transforms.functional as F
+            x = F.resize(x, (self.backbone.image_size, self.backbone.image_size))
+
+        # Patch embedding
+        x = self.backbone._process_input(x)
+        n = x.shape[0]
+
+        # Add CLS token
+        batch_class_token = self.backbone.class_token.expand(n, -1, -1)
+        x = torch.cat([batch_class_token, x], dim=1)
+
+        # ViT encoder
+        x = self.backbone.encoder(x)  # (B*T*N_cam, num_tokens, hidden_dim)
+
+        # Project
+        x = self.projection(x)
+
+        # Reshape to separate cameras
+        vision_tokens = x.view(
+            B, T, N_cam, self.num_tokens_per_cam, self.config.d_model
+        )
+
+        # Add camera embedding
+        cam_ids = torch.arange(N_cam, device=vision_tokens.device)
+        cam_embed = self.camera_embedding(cam_ids)  # (N_cam, d_model)
+        vision_tokens = vision_tokens + cam_embed.view(1, 1, N_cam, 1, self.config.d_model)
+
+        # Flatten token dimension for obs transformer
+        vision_tokens = vision_tokens.view(
+            B, T, N_cam * self.num_tokens_per_cam, self.config.d_model
+        )
+
+        return vision_tokens
+
+
     
 
 class SimpleDiffusionTransformer(nn.Module):
-    """Simplified diffusion transformer that does denoising directly within the transformer architecture."""
+    """Flow matching transformer for conditional generation."""
     
     def __init__(self, config):
         super().__init__()
@@ -396,12 +177,11 @@ class SimpleDiffusionTransformer(nn.Module):
         )
         
         # Add positional encoding for state sequences
-        self.state_positional_encoding = PositionalEncoding(config.d_model, 200)  # Increased to handle longer sequences
+        self.state_positional_encoding = PositionalEncoding(config.d_model, 1200)  # Increased to handle longer sequences
                 
-        # Projection layer for concatenated observation features
-        # Now we have 2 tokens per camera (spatial + global) plus 1 for state
-        num_obs_tokens = len(config.image_features) * 2 + 1  # (cameras * 2) + state
-        self.obs_projection = nn.Linear(config.d_model * num_obs_tokens, config.d_model)
+        # Calculate the number of observation tokens dynamically
+        # Sum up tokens from all image encoders plus one for the state token
+        num_obs_tokens = sum(encoder.num_tokens_per_cam for encoder in self.image_encoders.values()) + 1  # +1 for state token
         
         # 2. Observation Transformer (Temporal Fusion)
         encoder_layer = nn.TransformerEncoderLayer(
@@ -416,20 +196,7 @@ class SimpleDiffusionTransformer(nn.Module):
         self.obs_transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.num_encoder_layers)
         
         # Positional encoding for observation tokens
-        self.obs_positional_encoding = PositionalEncoding(config.d_model, 200)  # Increased to handle longer sequences
-
-        
-        # 3. Diffusion Components
-        # We denoise the entire action horizon at once: (Horizon, Action_Dim)
-        training_steps = 100
-        self.noise_scheduler = DDPMScheduler(
-            num_train_timesteps=training_steps,  
-            beta_schedule='scaled_linear',  # Less aggressive noise schedule
-            beta_start=0.0001,  # Lower starting noise
-            beta_end=0.02,      # Lower ending noise
-            clip_sample=True,
-            prediction_type='epsilon'
-        )
+        self.obs_positional_encoding = PositionalEncoding(config.d_model, 1200)  # Increased to handle longer sequences
 
         
         # Positional encoding for action sequences
@@ -439,7 +206,7 @@ class SimpleDiffusionTransformer(nn.Module):
         self.action_projection = nn.Linear(config.action_dim, config.d_model)
 
         # Learnable parameter for number of inference steps
-        self.num_inference_steps = nn.Parameter(torch.tensor(training_steps * 1.0))  # Match training steps
+        self.num_inference_steps = nn.Parameter(torch.tensor(100.0))  # Number of integration steps
         
         self.fusion_projection = nn.Sequential(
             nn.Linear(config.d_model * num_obs_tokens, config.d_model),
@@ -447,7 +214,7 @@ class SimpleDiffusionTransformer(nn.Module):
             nn.Linear(config.d_model, config.d_model)
         )
         
-        # Simplified denoising transformer - direct noise prediction
+        # Flow matching transformer - predicts velocity field
         # This replaces the complex UNet with a simpler transformer-based approach
         denoising_layers = nn.TransformerDecoderLayer(
             d_model=config.d_model,
@@ -463,14 +230,14 @@ class SimpleDiffusionTransformer(nn.Module):
             num_layers=config.num_decoder_layers  # Configurable number of layers
         )
         
-        # Final projection to action space
-        self.noise_prediction_head = nn.Sequential(
+        # Final projection to action space (predicts velocity)
+        self.velocity_prediction_head = nn.Sequential(
             nn.Linear(config.d_model, config.d_model // 2),
             nn.Mish(),
             nn.Linear(config.d_model // 2, config.action_dim)
         )
         
-        # Time embedding for diffusion timesteps
+        # Time embedding for flow matching timesteps
         self.time_embedding = nn.Sequential(
             DiffusionSinusoidalPosEmb(config.diffusion_step_embed_dim),
             nn.Linear(config.diffusion_step_embed_dim, config.d_model),
@@ -487,93 +254,97 @@ class SimpleDiffusionTransformer(nn.Module):
         for cam_key, encoder in self.image_encoders.items():
             batch_key = cam_key.replace('_', '.')
             if batch_key in batch:
-                img = batch[batch_key].flatten(0, 1)
+                # Get the image tensor
+                img = batch[batch_key]
                 
-                # Get object masks if available in the batch
-                gripper_mask = batch.get(f"{batch_key}_gripper_mask")
-                object_mask = batch.get(f"{batch_key}_object_mask")
-                container_mask = batch.get(f"{batch_key}_container_mask")
+                # The VisionEncoder expects input of shape (B, T, N_cam, C, H, W)
+                # We need to reshape the image tensor accordingly
+                if img.dim() == 4:  # (B*T, C, H, W)
+                    # Reshape to (B, T, 1, C, H, W)
+                    img = img.view(B, T_obs, 1, *img.shape[-3:])
+                elif img.dim() == 5:  # (B, T, C, H, W)
+                    # Add camera dimension to make it (B, T, 1, C, H, W)
+                    img = img.unsqueeze(2)
                 
-                # Flatten masks if they exist
-                if gripper_mask is not None:
-                    gripper_mask = gripper_mask.flatten(0, 1)
-                if object_mask is not None:
-                    object_mask = object_mask.flatten(0, 1)
-                if container_mask is not None:
-                    container_mask = container_mask.flatten(0, 1)
+                # Pass the image through the VisionEncoder
+                vision_tokens = encoder(img)  # (B, T, N_cam * num_tokens_per_cam, d_model)
                 
-                # Unpack the three outputs with optional object masks
-                s_tokens, g_token, coords = encoder(img, gripper_mask, object_mask, container_mask)
-                
-                # Store coords: Reshape from (B*T_obs, K, 2) -> (B, T_obs, K, 2)
-                spatial_coords_dict[cam_key] = coords.view(B, T_obs, -1, 2)
-                
-                # Prepare tokens for Transformer
-                all_obs_tokens.append(s_tokens.view(B, T_obs, -1, self.config.d_model))
-                all_obs_tokens.append(g_token.view(B, T_obs, 1, self.config.d_model))
+                # Append the vision tokens to all_obs_tokens
+                all_obs_tokens.append(vision_tokens)
 
-        # Combine all camera and state tokens
-        cam_tokens_all = torch.cat(all_obs_tokens, dim=2)
-        state_tokens = self.state_encoder(batch["observation.state"]).unsqueeze(2)
+        # Combine all camera tokens
+        if all_obs_tokens:
+            cam_tokens_all = torch.cat(all_obs_tokens, dim=2)
+        else:
+            # If no camera tokens, create empty tensor
+            cam_tokens_all = torch.empty(B, T_obs, 0, self.config.d_model, device=batch["observation.state"].device)
         
-                
-        #print(f"cam_tokens - Min: {cam_tokens_all.min().item():.6f}, Max: {cam_tokens_all.max().item():.6f}")
-        #print(f"State tokens - Min: {state_tokens.min().item():.6f}, Max: {state_tokens.max().item():.6f}")
+        # Encode state
+        state_tokens = self.state_encoder(batch["observation.state"])  # (B, T, d_model)
         
-        obs_tokens = torch.cat([cam_tokens_all, state_tokens], dim=2)
+        # Add positional encoding to state tokens
+        state_tokens = self.state_positional_encoding(state_tokens)
+        
+        # Combine camera tokens and state tokens
+        # Add a dimension to state_tokens to match the token dimension
+        state_tokens = state_tokens.unsqueeze(2)  # (B, T, 1, d_model)
+        
+        # Concatenate along the token dimension
+        obs_tokens = torch.cat([cam_tokens_all, state_tokens], dim=2)  # (B, T, N_tokens, d_model)
+        
         B, T, N, D = obs_tokens.shape
         
         # Flatten time and token dimensions for the Encoder
         obs_tokens_flat = obs_tokens.view(B, T * N, D)
         obs_tokens_flat = self.obs_positional_encoding(obs_tokens_flat)
         
+        # Pass through the observation transformer
         context = self.obs_transformer(obs_tokens_flat)
 
         return context, spatial_coords_dict
 
 
-    def denoise_step(self, noisy_actions, timesteps, obs_context):
+    def velocity_field(self, actions, timesteps, obs_context):
         """
-        Refined denoising step:
-        Injects time embeddings and balances self-attention (trajectory) 
-        with cross-attention (visual crops).
+        Flow matching step:
+        Predicts the velocity field that transports samples from Gaussian to data distribution.
         """
-        B, T_act, _ = noisy_actions.shape
+        B, T_act, _ = actions.shape
         
         # 1. Action & Time Embeddings
-        action_embeddings = self.action_projection(noisy_actions)
+        action_embeddings = self.action_projection(actions)
         action_embeddings = self.action_positional_encoding(action_embeddings)
         
         # Time embedding: (B, d_model) -> (B, 1, d_model)
         time_emb = self.time_embedding(timesteps.float()).unsqueeze(1)
         
-        # 2. Add time to action tokens (Traditional injection)
+        # 2. Add time to action tokens
         # We expand time across the action horizon
         tgt = action_embeddings + time_emb.expand(-1, T_act, -1)
         
         # 3. Augment Memory with Time
         # We add the time token to the observation context so the 
-        # cross-attention mechanism is aware of the diffusion scale.
+        # cross-attention mechanism is aware of the flow matching time.
         # extended_memory: (B, 1 + (T_obs * N_tokens), d_model)
         extended_memory = torch.cat([time_emb, obs_context], dim=1)
         
-        # 4. Decoder Pass (6 Layers recommended)
+        # 4. Decoder Pass
         # Self-attention ensures T_act is a smooth curve.
         # Cross-attention aligns T_act with your CropConvNet features.
-        denoised_features = self.denoising_transformer(
+        velocity_features = self.denoising_transformer(
             tgt=tgt,
             memory=extended_memory
         )
         
         # Residual connection to preserve gradients
-        denoised_features = denoised_features + action_embeddings
+        velocity_features = velocity_features + action_embeddings
         
-        # 5. Predict the noise (epsilon)
-        return self.noise_prediction_head(denoised_features)
+        # 5. Predict the velocity field
+        return self.velocity_prediction_head(velocity_features)
 
     
     def compute_loss(self, batch):
-        """Diffusion Training: Inject noise and learn to predict it."""
+        """Flow Matching Training: Learn to predict the velocity field."""
         actions = batch["action"] # (B, Horizon, Action_Dim)
         B, T_act = actions.shape[:2]
         
@@ -583,24 +354,28 @@ class SimpleDiffusionTransformer(nn.Module):
         # Infer device from model parameters
         device = next(self.parameters()).device
         
-        # 3. Sample noise and timesteps
+        # 2. Sample time uniformly from [0, 1]
+        timesteps = torch.rand(B, device=device)
+        
+        # 3. Sample Gaussian noise
         noise = torch.randn_like(actions, device=device)
-        timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (B,), device=device).long()
         
-        # 4. Add noise to clean actions (Forward Diffusion)
-        noisy_actions = self.noise_scheduler.add_noise(actions, noise, timesteps)
+        # 4. Construct flow matching targets (straight line coupling)
+        # Interpolate between noise and data
+        noisy_actions = (1 - timesteps[:, None, None]) * noise + timesteps[:, None, None] * actions
         
-        # 5. Call simplified transformer denoiser with per-timestep conditioning
-        pred_noise = self.denoise_step(noisy_actions, timesteps, obs_context)
+        # 5. Predict velocity field
+        pred_velocity = self.velocity_field(noisy_actions, timesteps, obs_context)
         
-        # 6. Compute both original and weighted losses
-        # Original MSE loss
-        loss = F.mse_loss(pred_noise, noise)
+        # 6. Compute flow matching loss
+        # Target velocity is the difference between data and noise
+        target_velocity = actions - noise
+        loss = F.mse_loss(pred_velocity, target_velocity)
         
         return loss
 
     def forward(self, batch):
-        """Inference: Start with pure noise and denoise into a smooth trajectory."""
+        """Inference: Solve ODE using learned velocity field."""
         B = batch["observation.state"].shape[0]
         T_act = self.config.horizon
         
@@ -611,21 +386,19 @@ class SimpleDiffusionTransformer(nn.Module):
         device = next(self.parameters()).device
                 
         # Start from pure Gaussian noise
-        noisy_action = torch.randn((B, T_act, self.config.action_dim), device=device)
+        samples = torch.randn((B, T_act, self.config.action_dim), device=device)
         
-        # Iteratively denoise
-        self.noise_scheduler.set_timesteps(int(self.num_inference_steps.item()))
+        # Solve ODE using Euler integration
+        num_steps = int(self.num_inference_steps.item())
+        dt = 1.0 / num_steps
         
-        for k in self.noise_scheduler.timesteps:
-            # Predict noise using simplified transformer denoiser
-            noise_pred = self.denoise_step(noisy_action, k.expand(B).to(device), obs_context)
-
-            
-            # Step back
-            noisy_action = self.noise_scheduler.step(noise_pred, k, noisy_action).prev_sample
+        for i in range(num_steps):
+            t = torch.full((B,), i / num_steps, device=device)
+            velocity = self.velocity_field(samples, t, obs_context)
+            samples = samples + dt * velocity
             
         # Return both the actions and spatial outputs for visualization
-        return noisy_action, spatial_outputs
+        return samples, spatial_outputs
 
 
 # Keep the original class for backward compatibility, but alias to the new simplified version

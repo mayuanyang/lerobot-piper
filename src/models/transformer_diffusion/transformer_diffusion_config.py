@@ -25,10 +25,13 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     )
 
     # Image processing
-    vision_backbone: str = "resnet18"
+    vision_backbone: str = "vit_b_16"
     pretrained_backbone_weights: str | None = None
     # Input image size (height, width)
-    input_image_size: tuple[int, int] = (320, 320)
+    input_image_size: tuple[int, int] = (224, 224)
+    # Vision encoder parameters
+    num_cameras: int = 1
+    vision_freeze_layers: int = 6
         
     
     # State processing

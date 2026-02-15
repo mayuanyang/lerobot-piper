@@ -38,7 +38,7 @@ def get_augmentations():
         # Gentle color jittering for RGB channels
         v2.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
         # Mild geometric transforms to preserve physical consistency
-        v2.RandomAffine(degrees=5, translate=(0.02, 0.02), scale=(0.98, 1.02)),
+        #v2.RandomAffine(degrees=5, translate=(0.02, 0.02), scale=(0.98, 1.02)),
         # Randomly apply Gaussian noise with 30% probability
         v2.RandomApply([v2.GaussianNoise()], p=0.3),
     ])
@@ -128,8 +128,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         n_obs_steps=obs, 
         horizon=horizon, 
         n_action_steps=n_action_steps, 
-        vision_backbone="resnet18",
-        pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
+        vision_backbone="vit_b_16",
+        pretrained_backbone_weights=None,  # ViT doesn't use this parameter the same way
         state_dim=7,  # 7 joints (not removing the 4th joint)
         action_dim=7,  # 7 joints (not removing the 4th joint)
         d_model=512,  # Smaller model for better gradient flow
@@ -140,7 +140,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         diffusion_step_embed_dim=256,
         kernel_size=3,
         n_groups=8,
-        use_film_scale_modulation=True
+        use_film_scale_modulation=True,
+        num_cameras=len(input_features) if input_features else 1,  # Set number of cameras based on input features
+        vision_freeze_layers=0  # No frozen layers by default
     )
     
     
