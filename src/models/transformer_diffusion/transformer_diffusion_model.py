@@ -18,13 +18,13 @@ class CropConvNet(nn.Module):
         super().__init__()
         self.conv_net = nn.Sequential(
             nn.Conv2d(input_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.LayerNorm([hidden_channels, 64, 64]),  # LayerNorm after first conv layer
+            nn.BatchNorm2d(hidden_channels),  # BatchNorm2d after first conv layer
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_channels, hidden_channels*2, kernel_size=3, padding=1),
-            nn.LayerNorm([hidden_channels*2, 64, 64]),  # LayerNorm after second conv layer
+            nn.BatchNorm2d(hidden_channels*2),  # BatchNorm2d after second conv layer
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_channels*2, output_channels, kernel_size=3, padding=1),
-            nn.LayerNorm([output_channels, 64, 64]),  # LayerNorm after third conv layer
+            nn.BatchNorm2d(output_channels),  # BatchNorm2d after third conv layer
             nn.AdaptiveAvgPool2d((1, 1))  # Global average pooling to 1x1
         )
         
@@ -55,44 +55,24 @@ class SpatialSoftmax(nn.Module):
     The example above results in 512 keypoints (corresponding to the 512 input channels). We can optionally
     provide num_kp != None to control the number of keypoints. This is achieved by a first applying a learnable
     linear mapping (in_channels, H, W) -> (num_kp, H, W).
-    
-    Enhanced version supports guided spatial softmax for specific objects (gripper, object, container).
     """
 
-    def __init__(self, input_shape, num_kp=None, temperature=1.0, learnable_temperature=False, 
-                 object_guided=False, gripper_kp=6, object_kp=5, container_kp=5, crop_size=64):
+    def __init__(self, input_shape, num_kp=None, temperature=1.0, learnable_temperature=False, crop_size=64):
         """
         Args:
             input_shape (list): (C, H, W) input feature map shape.
             num_kp (int): number of keypoints in output. If None, output will have the same number of channels as input.
             temperature (float): temperature for softmax. Lower values lead to sharper peaks.
             learnable_temperature (bool): whether temperature should be learnable.
-            object_guided (bool): whether to use object-guided spatial softmax.
-            gripper_kp (int): number of keypoints for gripper.
-            object_kp (int): number of keypoints for object.
-            container_kp (int): number of keypoints for container.
             crop_size (int): size of the square crop (crop_size x crop_size).
         """
         super().__init__()
 
         assert len(input_shape) == 3
         self._in_c, self._in_h, self._in_w = input_shape
-        self.object_guided = object_guided
         self.crop_size = crop_size
 
-        if object_guided:
-            # Create separate convolution layers for each object type
-            self.gripper_kp = gripper_kp
-            self.object_kp = object_kp
-            self.container_kp = container_kp
-            total_kp = gripper_kp + object_kp + container_kp
-            
-            # Separate conv layers for each object type
-            self.gripper_net = torch.nn.Conv2d(self._in_c, gripper_kp, kernel_size=1)
-            self.object_net = torch.nn.Conv2d(self._in_c, object_kp, kernel_size=1)
-            self.container_net = torch.nn.Conv2d(self._in_c, container_kp, kernel_size=1)
-            self._out_c = total_kp
-        elif num_kp is not None:
+        if num_kp is not None:
             self.nets = torch.nn.Conv2d(self._in_c, num_kp, kernel_size=1)
             self._out_c = num_kp
         else:
@@ -114,43 +94,16 @@ class SpatialSoftmax(nn.Module):
         # register as buffer so it's moved to the correct device.
         self.register_buffer("pos_grid", torch.cat([pos_x, pos_y], dim=1))
 
-    def forward(self, features: Tensor, gripper_mask=None, object_mask=None, container_mask=None) -> Tensor:
+    def forward(self, features: Tensor) -> Tensor:
         """
-        Forward pass with optional object-guided masking.
+        Forward pass.
         
         Args:
             features (Tensor): Input feature maps.
-            gripper_mask (Tensor, optional): Mask for gripper region.
-            object_mask (Tensor, optional): Mask for object region.
-            container_mask (Tensor, optional): Mask for container region.
         """
         B, C, H, W = features.shape
         
-        if self.object_guided:
-            # Apply object-guided spatial softmax
-            gripper_heatmap = self.gripper_net(features)
-            object_heatmap = self.object_net(features)
-            container_heatmap = self.container_net(features)
-            
-            # Apply masks if provided
-            if gripper_mask is not None:
-                # Expand mask to match heatmap dimensions
-                gripper_mask = F.interpolate(gripper_mask, size=(H, W), mode='nearest')
-                gripper_heatmap = gripper_heatmap * gripper_mask
-            
-            if object_mask is not None:
-                # Expand mask to match heatmap dimensions
-                object_mask = F.interpolate(object_mask, size=(H, W), mode='nearest')
-                object_heatmap = object_heatmap * object_mask
-                
-            if container_mask is not None:
-                # Expand mask to match heatmap dimensions
-                container_mask = F.interpolate(container_mask, size=(H, W), mode='nearest')
-                container_heatmap = container_heatmap * container_mask
-            
-            # Concatenate all heatmaps
-            kp_heatmap = torch.cat([gripper_heatmap, object_heatmap, container_heatmap], dim=1)
-        elif self.nets is not None:
+        if self.nets is not None:
             kp_heatmap = self.nets(features)
         else:
             kp_heatmap = features
@@ -244,14 +197,10 @@ class VisionEncoder(nn.Module):
         # Add LayerNorm after backbone features for improved gradient flow
         self.backbone_norm = nn.LayerNorm(feature_dim)
         
-        # Use object-guided spatial softmax with dedicated keypoints for each object
+        # Use spatial softmax with 32 keypoints
         self.spatial_softmax = SpatialSoftmax(
             input_shape=(feature_dim, height, width),
-            object_guided=False,  # Enable object-guided spatial softmax
             num_kp=32,
-            gripper_kp=2,        # 1 keypoint for gripper
-            object_kp=2,         # 5 keypoints for object
-            container_kp=2,      # 5 keypoints for container
             temperature=0.1,     # Moderate temperature for better gradients
             learnable_temperature=False  # Allow temperature to adapt during training
         )
@@ -298,8 +247,8 @@ class VisionEncoder(nn.Module):
         features = self.backbone_norm(features)
         features = features.permute(0, 3, 1, 2).contiguous()  # (B, C, H, W)
         
-        # Extract Coords (B, K, 2) and Features (B, K, C) with optional object masks
-        coords, _ = self.spatial_softmax(features, gripper_mask=gripper_mask, object_mask=object_mask, container_mask=container_mask)
+        # Extract Coords (B, K, 2) and Features (B, K, C)
+        coords, _ = self.spatial_softmax(features)
         
         # Cropping Logic: Use keypoints to center 32x32 crops on the image
         # Convert normalized coordinates [-1, 1] to pixel coordinates
@@ -584,35 +533,43 @@ class SimpleDiffusionTransformer(nn.Module):
 
 
     def denoise_step(self, noisy_actions, timesteps, obs_context):
-        """Single denoising step using transformer-based denoiser."""
+        """
+        Refined denoising step:
+        Injects time embeddings and balances self-attention (trajectory) 
+        with cross-attention (visual crops).
+        """
         B, T_act, _ = noisy_actions.shape
         
-        # Project actions to model dimension and add positional encoding
-        action_embeddings = self.action_projection(noisy_actions)  # (B, T_act, d_model)
-        action_embeddings = self.action_positional_encoding(action_embeddings)  # (B, T_act, d_model)
+        # 1. Action & Time Embeddings
+        action_embeddings = self.action_projection(noisy_actions)
+        action_embeddings = self.action_positional_encoding(action_embeddings)
         
-        # Embed timesteps
-        time_embeddings = self.time_embedding(timesteps.float())  # (B, d_model)
-        time_embeddings = time_embeddings.unsqueeze(1).expand(-1, T_act, -1)  # (B, T_act, d_model)
+        # Time embedding: (B, d_model) -> (B, 1, d_model)
+        time_emb = self.time_embedding(timesteps.float()).unsqueeze(1)
         
-        extended_memory = torch.cat([time_embeddings, obs_context], dim=1)
+        # 2. Add time to action tokens (Traditional injection)
+        # We expand time across the action horizon
+        tgt = action_embeddings + time_emb.expand(-1, T_act, -1)
         
-        # Combine action and time embeddings
-        action_with_time = action_embeddings + time_embeddings  # (B, T_act, d_model)
+        # 3. Augment Memory with Time
+        # We add the time token to the observation context so the 
+        # cross-attention mechanism is aware of the diffusion scale.
+        # extended_memory: (B, 1 + (T_obs * N_tokens), d_model)
+        extended_memory = torch.cat([time_emb, obs_context], dim=1)
         
-        # Use transformer decoder for denoising
-        # obs_context serves as memory/key/value for cross-attention
+        # 4. Decoder Pass (6 Layers recommended)
+        # Self-attention ensures T_act is a smooth curve.
+        # Cross-attention aligns T_act with your CropConvNet features.
         denoised_features = self.denoising_transformer(
-            tgt=action_with_time,  # (B, T_act, d_model)
-            memory=extended_memory     # (B, T_obs, d_model)
-        )  # (B, T_act, d_model)
+            tgt=tgt,
+            memory=extended_memory
+        )
         
+        # Residual connection to preserve gradients
         denoised_features = denoised_features + action_embeddings
         
-        # Predict noise
-        pred_noise = self.noise_prediction_head(denoised_features)  # (B, T_act, action_dim)
-        
-        return pred_noise
+        # 5. Predict the noise (epsilon)
+        return self.noise_prediction_head(denoised_features)
 
     
     def compute_loss(self, batch):
