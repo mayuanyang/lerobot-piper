@@ -370,9 +370,16 @@ class SimpleDiffusionTransformer(nn.Module):
         # 6. Compute flow matching loss
         # Target velocity is the difference between data and noise
         target_velocity = actions - noise
-        loss = F.mse_loss(pred_velocity, target_velocity)
+        loss = F.mse_loss(pred_velocity, target_velocity, reduction="none")
         
-        return loss
+        # 7. Handle padding if present
+        if "action_is_pad" in batch:
+            # Apply padding mask: True means padded, False means valid
+            in_episode_bound = ~batch["action_is_pad"]  # True for valid actions
+            loss = loss * in_episode_bound.unsqueeze(-1)
+        
+        # Return mean loss
+        return loss.mean()
 
     def forward(self, batch):
         """Inference: Solve ODE using learned velocity field."""

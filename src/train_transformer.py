@@ -38,9 +38,9 @@ def get_augmentations():
         # Gentle color jittering for RGB channels
         v2.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
         # Mild geometric transforms to preserve physical consistency
-        #v2.RandomAffine(degrees=5, translate=(0.02, 0.02), scale=(0.98, 1.02)),
+        v2.RandomAffine(degrees=5, translate=(0.05, 0.05)),
         # Randomly apply Gaussian noise with 30% probability
-        v2.RandomApply([v2.GaussianNoise()], p=0.3),
+        #v2.RandomApply([v2.GaussianNoise()], p=0.3),
     ])
 
 
