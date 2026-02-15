@@ -99,9 +99,8 @@ class VisionEncoder(nn.Module):
         # ------------------------------
         # 5. num tokens per camera
         # ------------------------------
-        # CLS + all patch tokens
-        # For ViT, seq_length includes both patch tokens and the CLS token
-        self.num_tokens_per_cam = self.backbone.seq_length
+        # Only using CLS token
+        self.num_tokens_per_cam = 1
 
     # ------------------------------
     # Forward
@@ -133,14 +132,14 @@ class VisionEncoder(nn.Module):
 
         # ViT encoder
         x = self.backbone.encoder(x)  # (B*T*N_cam, num_tokens, hidden_dim)
-
-        # Project
-        x = self.projection(x)
+        
+        # Only use CLS token
+        cls = x[:, 0:1, :]  # 只取 CLS, shape: (B*T*N_cam, 1, hidden_dim)
+        cls = self.projection(cls)  # (B*T*N_cam, 1, d_model)
 
         # Reshape to separate cameras
-        vision_tokens = x.view(
-            B, T, N_cam, self.num_tokens_per_cam, self.config.d_model
-        )
+        vision_tokens = cls.view(B, T, N_cam, 1, self.config.d_model)
+        self.num_tokens_per_cam = 1
 
         # Add camera embedding
         cam_ids = torch.arange(N_cam, device=vision_tokens.device)
@@ -179,7 +178,7 @@ class SimpleDiffusionTransformer(nn.Module):
             nn.Linear(config.state_dim, config.d_model),
             nn.LayerNorm(config.d_model)
         )
-        self.state_positional_encoding = PositionalEncoding(config.d_model, 1200)
+        self.state_positional_encoding = PositionalEncoding(config.d_model, 200)
 
         # ------------------------------
         # 3. Vision Temporal Transformer
@@ -196,13 +195,22 @@ class SimpleDiffusionTransformer(nn.Module):
         self.vision_temporal_transformer = nn.TransformerEncoder(
             encoder_layer_vision, num_layers=config.num_encoder_layers
         )
-        self.vision_positional_encoding = PositionalEncoding(config.d_model, 1200)
+        self.vision_positional_encoding = PositionalEncoding(config.d_model, 200)
 
                 
-        self.fusion_projection = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model * 2),  
-            nn.Mish(),
-            nn.Linear(config.d_model * 2, config.d_model),
+        # Fusion Transformer Encoder (instead of simple MLP)
+        fusion_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.d_model,
+            nhead=config.nhead,
+            dim_feedforward=config.dim_feedforward,
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True
+        )
+        self.fusion_projection = nn.TransformerEncoder(
+            fusion_encoder_layer,
+            num_layers=2  # Lightweight transformer for fusion
         )
 
 
