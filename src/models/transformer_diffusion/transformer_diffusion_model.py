@@ -158,64 +158,60 @@ class VisionEncoder(nn.Module):
     
 
 class SimpleDiffusionTransformer(nn.Module):
-    """Flow matching transformer for conditional generation."""
+    """Flow matching transformer with separate encoding for vision and state."""
     
     def __init__(self, config):
         super().__init__()
         self.config = config
-        # Device will be inferred from the model's device when needed
 
-        # 1. Vision & State Encoding (The "Conditioner")
+        # ------------------------------
+        # 1. Vision Encoder per camera
+        # ------------------------------
         self.image_encoders = nn.ModuleDict({
-            cam.replace('.', '_'): VisionEncoder(config) 
+            cam.replace('.', '_'): VisionEncoder(config)
             for cam in config.image_features.keys()
         })
-                
+
+        # ------------------------------
+        # 2. State Encoder (separate)
+        # ------------------------------
         self.state_encoder = nn.Sequential(
             nn.Linear(config.state_dim, config.d_model),
             nn.LayerNorm(config.d_model)
         )
-        
-        # Add positional encoding for state sequences
-        self.state_positional_encoding = PositionalEncoding(config.d_model, 1200)  # Increased to handle longer sequences
-                
-        # Calculate the number of observation tokens dynamically
-        # Sum up tokens from all image encoders plus one for the state token
-        num_obs_tokens = sum(encoder.num_tokens_per_cam for encoder in self.image_encoders.values()) + 1  # +1 for state token
-        
-        # 2. Observation Transformer (Temporal Fusion)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.d_model, 
-            nhead=config.nhead, 
-            dim_feedforward=config.dim_feedforward, 
-            dropout=0.1,  # Added dropout for regularization
-            activation="gelu", 
-            batch_first=True, 
+        self.state_positional_encoding = PositionalEncoding(config.d_model, 1200)
+
+        # ------------------------------
+        # 3. Vision Temporal Transformer
+        # ------------------------------
+        encoder_layer_vision = nn.TransformerEncoderLayer(
+            d_model=config.d_model,
+            nhead=config.nhead,
+            dim_feedforward=config.dim_feedforward,
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True,
             norm_first=True
         )
-        self.obs_transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.num_encoder_layers)
-        
-        # Positional encoding for observation tokens
-        self.obs_positional_encoding = PositionalEncoding(config.d_model, 1200)  # Increased to handle longer sequences
+        self.vision_temporal_transformer = nn.TransformerEncoder(
+            encoder_layer_vision, num_layers=config.num_encoder_layers
+        )
+        self.vision_positional_encoding = PositionalEncoding(config.d_model, 1200)
 
-        
-        # Positional encoding for action sequences
+                
+        self.fusion_projection = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model * 2),  
+            nn.Mish(),
+            nn.Linear(config.d_model * 2, config.d_model),
+        )
+
+
+        # ------------------------------
+        # 5. Action Encoder / Decoder (same as before)
+        # ------------------------------
         self.action_positional_encoding = PositionalEncoding(config.d_model, config.horizon)
-
-        # Action projection to model dimension
         self.action_projection = nn.Linear(config.action_dim, config.d_model)
 
-        # Learnable parameter for number of inference steps
-        self.num_inference_steps = nn.Parameter(torch.tensor(100.0))  # Number of integration steps
-        
-        self.fusion_projection = nn.Sequential(
-            nn.Linear(config.d_model * num_obs_tokens, config.d_model),
-            nn.Mish(), # Mish helps gradient flow better than ReLU
-            nn.Linear(config.d_model, config.d_model)
-        )
-        
-        # Flow matching transformer - predicts velocity field
-        # This replaces the complex UNet with a simpler transformer-based approach
         denoising_layers = nn.TransformerDecoderLayer(
             d_model=config.d_model,
             nhead=config.nhead,
@@ -227,17 +223,13 @@ class SimpleDiffusionTransformer(nn.Module):
         )
         self.denoising_transformer = nn.TransformerDecoder(
             denoising_layers,
-            num_layers=config.num_decoder_layers  # Configurable number of layers
+            num_layers=config.num_decoder_layers
         )
-        
-        # Final projection to action space (predicts velocity)
         self.velocity_prediction_head = nn.Sequential(
             nn.Linear(config.d_model, config.d_model // 2),
             nn.Mish(),
             nn.Linear(config.d_model // 2, config.action_dim)
         )
-        
-        # Time embedding for flow matching timesteps
         self.time_embedding = nn.Sequential(
             DiffusionSinusoidalPosEmb(config.diffusion_step_embed_dim),
             nn.Linear(config.diffusion_step_embed_dim, config.d_model),
@@ -247,59 +239,59 @@ class SimpleDiffusionTransformer(nn.Module):
 
 
     def get_condition(self, batch):
+        """
+        Separately encode vision tokens and state tokens, then fuse.
+        Returns:
+            context: (B, T_obs * N_tokens, d_model)
+            spatial_coords_dict: for visualization
+        """
         B, T_obs = batch["observation.state"].shape[:2]
-        all_obs_tokens = [] 
-        spatial_coords_dict = {} # To store coords for drawing
+        all_vision_tokens = []
 
+        # ------------------------------
+        # 1. Vision encoding per camera
+        # ------------------------------
         for cam_key, encoder in self.image_encoders.items():
             batch_key = cam_key.replace('_', '.')
             if batch_key in batch:
-                # Get the image tensor
                 img = batch[batch_key]
-                
-                # The VisionEncoder expects input of shape (B, T, N_cam, C, H, W)
-                # We need to reshape the image tensor accordingly
                 if img.dim() == 4:  # (B*T, C, H, W)
-                    # Reshape to (B, T, 1, C, H, W)
                     img = img.view(B, T_obs, 1, *img.shape[-3:])
                 elif img.dim() == 5:  # (B, T, C, H, W)
-                    # Add camera dimension to make it (B, T, 1, C, H, W)
                     img = img.unsqueeze(2)
-                
-                # Pass the image through the VisionEncoder
-                vision_tokens = encoder(img)  # (B, T, N_cam * num_tokens_per_cam, d_model)
-                
-                # Append the vision tokens to all_obs_tokens
-                all_obs_tokens.append(vision_tokens)
 
-        # Combine all camera tokens
-        if all_obs_tokens:
-            cam_tokens_all = torch.cat(all_obs_tokens, dim=2)
+                vision_tokens = encoder(img)  # (B, T, N_tokens_per_cam, d_model)
+                # Apply temporal transformer per camera to fuse time
+                B, T, N, D = vision_tokens.shape
+                vision_tokens_flat = vision_tokens.view(B, T * N, D)
+                vision_tokens_flat = self.vision_positional_encoding(vision_tokens_flat)
+                vision_tokens_encoded = self.vision_temporal_transformer(vision_tokens_flat)
+                all_vision_tokens.append(vision_tokens_encoded)
+
+        if all_vision_tokens:
+            vision_tokens_all = torch.cat(all_vision_tokens, dim=1)  # concat along token dim
         else:
-            # If no camera tokens, create empty tensor
-            cam_tokens_all = torch.empty(B, T_obs, 0, self.config.d_model, device=batch["observation.state"].device)
-        
-        # Encode state
+            vision_tokens_all = torch.empty(B, 0, self.config.d_model, device=batch["observation.state"].device)
+
+        # ------------------------------
+        # 2. State encoding
+        # ------------------------------
         state_tokens = self.state_encoder(batch["observation.state"])  # (B, T, d_model)
-        
-        # Add positional encoding to state tokens
         state_tokens = self.state_positional_encoding(state_tokens)
-        
-        # Combine camera tokens and state tokens
-        # Add a dimension to state_tokens to match the token dimension
-        state_tokens = state_tokens.unsqueeze(2)  # (B, T, 1, d_model)
-        
-        # Concatenate along the token dimension
-        obs_tokens = torch.cat([cam_tokens_all, state_tokens], dim=2)  # (B, T, N_tokens, d_model)
-        
-        B, T, N, D = obs_tokens.shape
-        
-        # Flatten time and token dimensions for the Encoder
-        obs_tokens_flat = obs_tokens.view(B, T * N, D)
-        obs_tokens_flat = self.obs_positional_encoding(obs_tokens_flat)
-        
-        # Pass through the observation transformer
-        context = self.obs_transformer(obs_tokens_flat)
+        # Flatten time dimension
+        state_tokens_flat = state_tokens.view(B, T_obs, self.config.d_model)
+        # Add a singleton token dim to match fusion later
+        state_tokens_flat = state_tokens_flat.unsqueeze(2)  # (B, T, 1, d_model)
+        state_tokens_flat = state_tokens_flat.view(B, T_obs * 1, self.config.d_model)
+
+        # ------------------------------
+        # 3. Concatenate vision + state tokens
+        # ------------------------------
+        obs_tokens = torch.cat([vision_tokens_all, state_tokens_flat], dim=1)  # (B, total_tokens, d_model)
+        # Apply fusion projection (now just Mish activation + Linear layer)
+        context = self.fusion_projection(obs_tokens)
+
+        spatial_coords_dict = {}  # for visualization if needed
 
         return context, spatial_coords_dict
 
