@@ -80,7 +80,13 @@ class VisionEncoder(nn.Module):
                         param.requires_grad = False
 
         # ------------------------------
-        # 3. Projection to d_model
+        # 3. Add a pooling layer to reduce 14x14 patches to 7x7
+        # This reduces 196 tokens to 49 tokens
+        # ------------------------------
+        self.pool = nn.AdaptiveAvgPool2d((7, 7))
+
+        # ------------------------------
+        # 4. Projection to d_model
         # ------------------------------
         self.projection = nn.Sequential(
             nn.Linear(self.hidden_dim, config.d_model),
@@ -89,7 +95,7 @@ class VisionEncoder(nn.Module):
         )
 
         # ------------------------------
-        # 4. Camera embedding
+        # 5. Camera embedding
         # ------------------------------
         self.camera_embedding = nn.Embedding(
             self.num_cameras,
@@ -97,7 +103,7 @@ class VisionEncoder(nn.Module):
         )
 
         # ------------------------------
-        # 5. num tokens per camera (will be computed dynamically)
+        # 6. num tokens per camera (will be computed dynamically)
         # ------------------------------
         self.num_tokens_per_cam = None
 
@@ -112,25 +118,33 @@ class VisionEncoder(nn.Module):
         """
 
         B, T, N_cam, C, H, W = x.shape
-
-        # Merge batch, time, camera
         x = x.view(B * T * N_cam, C, H, W)
 
-        # 1. Standard ViT Patch Extraction
-        # Instead of calling self.backbone(x), we do:
+        # 1. Get ViT features
         x = self.backbone._process_input(x)
         n = x.shape[0]
-
-        # Add CLS token and Positional Encoding
         batch_class_token = self.backbone.class_token.expand(n, -1, -1)
         x = torch.cat([batch_class_token, x], dim=1)
-        x = self.backbone.encoder(x)  # (B*T*N_cam, L, hidden_dim) where L = patches + 1
+        x = self.backbone.encoder(x) # (Batch, 197, 768)
 
-        # 2. Project all tokens (CLS + Patches)
-        # This gives your transformer spatial "context"
-        tokens = self.projection(x)  # (B*T*N_cam, L, d_model)
+        # 2. Separate CLS and Patches
+        cls_token = x[:, 0:1, :]    # (Batch, 1, 768)
+        patch_tokens = x[:, 1:, :]   # (Batch, 196, 768)
+
+        # 3. Spatial Pooling
+        # Reshape to (Batch, 768, 14, 14) to pool spatially
+        patch_tokens = patch_tokens.transpose(1, 2).reshape(n, self.hidden_dim, 14, 14)
+        patch_tokens = self.pool(patch_tokens) # (Batch, 768, 7, 7)
+        patch_tokens = patch_tokens.flatten(2).transpose(1, 2) # (Batch, 49, 768)
+
+        # 4. Re-combine
+        combined = torch.cat([cls_token, patch_tokens], dim=1) # (Batch, 50, 768)
+        
+        # 5. Project
+        tokens = self.projection(combined)
         
         # Store the number of tokens per camera for later use
+        # Note: This will now be 50 instead of 197
         self.num_tokens_per_cam = tokens.shape[1]
 
         # Reshape to separate cameras
