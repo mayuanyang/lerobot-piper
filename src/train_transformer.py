@@ -35,6 +35,8 @@ def get_augmentations():
     """Create data augmentations for training."""
     # Return RGBD-friendly augmentations
     return v2.Compose([
+        # Resize images to 224x224
+        v2.Resize((224, 224)),
         # Gentle color jittering for RGB channels
         v2.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
         # Mild geometric transforms to preserve physical consistency
