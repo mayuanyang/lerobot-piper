@@ -15,7 +15,7 @@ import os
       
 class PositionalEncoding(nn.Module):
     """Positional encoding for action sequences."""
-    def __init__(self, d_model, max_len=100):
+    def __init__(self, d_model, max_len=1000):
         super().__init__()
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
@@ -187,7 +187,7 @@ class SimpleDiffusionTransformer(nn.Module):
             nn.Linear(config.state_dim, config.d_model),
             nn.LayerNorm(config.d_model)
         )
-        self.state_positional_encoding = PositionalEncoding(config.d_model, 200)
+        self.state_positional_encoding = PositionalEncoding(config.d_model)
 
         # ------------------------------
         # 3. Vision Temporal Transformer
@@ -204,7 +204,7 @@ class SimpleDiffusionTransformer(nn.Module):
         self.vision_temporal_transformer = nn.TransformerEncoder(
             encoder_layer_vision, num_layers=config.num_encoder_layers
         )
-        self.vision_positional_encoding = PositionalEncoding(config.d_model, 200)
+        self.vision_positional_encoding = PositionalEncoding(config.d_model)
 
                 
         # Fusion Transformer Encoder (instead of simple MLP)
