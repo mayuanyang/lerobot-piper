@@ -15,6 +15,7 @@ from lerobot.processor import (
 
 # Import from local module
 from .grid_overlay_processor import GridOverlayProcessorStep
+from .image_resize_processor import ImageResizeProcessorStep
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
@@ -33,6 +34,16 @@ def make_pre_post_processors(
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
     ]
+    
+    # Extract camera keys from config
+    camera_keys = [key for key in config.input_features.keys() if "images" in key]
+    
+    # Add image resize processor step if we have camera keys
+    if camera_keys:
+        input_steps.append(ImageResizeProcessorStep(
+            image_size=config.input_image_size,
+            camera_keys=camera_keys
+        ))
     
     # Add grid overlay processor step if requested
     if add_grid_overlay:

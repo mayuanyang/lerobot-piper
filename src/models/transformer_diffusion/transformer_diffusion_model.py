@@ -97,10 +97,9 @@ class VisionEncoder(nn.Module):
         )
 
         # ------------------------------
-        # 5. num tokens per camera
+        # 5. num tokens per camera (will be computed dynamically)
         # ------------------------------
-        # Only using CLS token
-        self.num_tokens_per_cam = 1
+        self.num_tokens_per_cam = None
 
     # ------------------------------
     # Forward
@@ -117,23 +116,25 @@ class VisionEncoder(nn.Module):
         # Merge batch, time, camera
         x = x.view(B * T * N_cam, C, H, W)
 
-        # Resize images to match the expected input size of the backbone
-        if H != self.backbone.image_size or W != self.backbone.image_size:
-            import torchvision.transforms.functional as F
-            x = F.resize(x, (self.backbone.image_size, self.backbone.image_size))
+        # 1. Standard ViT Patch Extraction
+        # Instead of calling self.backbone(x), we do:
+        x = self.backbone._process_input(x)
+        n = x.shape[0]
 
-        # Use VisionTransformer's built-in forward pass which handles CLS token internally
-        x = self.backbone(x)  # (B*T*N_cam, hidden_dim)
+        # Add CLS token and Positional Encoding
+        batch_class_token = self.backbone.class_token.expand(n, -1, -1)
+        x = torch.cat([batch_class_token, x], dim=1)
+        x = self.backbone.encoder(x)  # (B*T*N_cam, L, hidden_dim) where L = patches + 1
+
+        # 2. Project all tokens (CLS + Patches)
+        # This gives your transformer spatial "context"
+        tokens = self.projection(x)  # (B*T*N_cam, L, d_model)
         
-        # Add dimension to match expected format
-        x = x.unsqueeze(1)  # (B*T*N_cam, 1, hidden_dim)
-        
-        # Project to d_model
-        x = self.projection(x)  # (B*T*N_cam, 1, d_model)
+        # Store the number of tokens per camera for later use
+        self.num_tokens_per_cam = tokens.shape[1]
 
         # Reshape to separate cameras
-        vision_tokens = x.view(B, T, N_cam, 1, self.config.d_model)
-        self.num_tokens_per_cam = 1
+        vision_tokens = tokens.view(B, T, N_cam, self.num_tokens_per_cam, self.config.d_model)
 
         # Add camera embedding
         cam_ids = torch.arange(N_cam, device=vision_tokens.device)
