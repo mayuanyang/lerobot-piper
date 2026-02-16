@@ -48,6 +48,7 @@ class DiffusionSinusoidalPosEmb(nn.Module):
 import torch
 import torch.nn as nn
 import torchvision.models as models
+import torchvision.transforms.functional as F
 
 class VisionEncoder(nn.Module):
     def __init__(self, config):
@@ -115,6 +116,19 @@ class VisionEncoder(nn.Module):
 
         # Merge batch, time, camera
         x = x.view(B * T * N_cam, C, H, W)
+
+        # Resize images to match the expected input size of the vision backbone
+        target_H, target_W = self.config.input_image_size
+        if H != target_H or W != target_W:
+            # Handle different tensor formats based on number of dimensions
+            if x.dim() == 3:
+                # 3D: (C, H, W) - Add batch dimension for resize operation
+                expanded_tensor = x.unsqueeze(0)
+                resized_image = F.resize(expanded_tensor, (target_H, target_W))
+                x = resized_image.squeeze(0)
+            else:
+                # 4D+: (..., C, H, W) - Resize directly
+                x = F.resize(x, (target_H, target_W))
 
         # 1. Standard ViT Patch Extraction
         # Instead of calling self.backbone(x), we do:
