@@ -4,7 +4,7 @@ import torchvision.transforms.functional as F
 from lerobot.processor import ProcessorStep
 
 
-class ImageResizeProcessorStep(ProcessorStep[Dict[str, Any], Dict[str, Any]]):
+class ImageResizeProcessorStep(ProcessorStep):
     """Processor step to resize images to the expected input size of the vision backbone."""
     
     def __init__(self, image_size: tuple[int, int], camera_keys: list[str]):
