@@ -1,9 +1,10 @@
 from typing import Any, Dict
 import torch
 import torchvision.transforms.functional as F
-from lerobot.processor import ProcessorStep
+from lerobot.processor import ProcessorStep, ProcessorStepRegistry
 
 
+@ProcessorStepRegistry.register("image_resize_processor")
 class ImageResizeProcessorStep(ProcessorStep):
     """Processor step to resize images to the expected input size of the vision backbone."""
     
