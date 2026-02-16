@@ -206,6 +206,21 @@ class SimpleDiffusionTransformer(nn.Module):
         )
         self.vision_positional_encoding = PositionalEncoding(config.d_model)
 
+        # ------------------------------
+        # 4. Pre-normalization layers for vision and state features
+        # ------------------------------
+        self.vision_pre_norm = nn.LayerNorm(config.d_model)
+        self.state_pre_norm = nn.LayerNorm(config.d_model)
+                
+        # ------------------------------
+        # 5. Projection for vision+state concatenation
+        # ------------------------------
+        # After concatenating vision and state features, we need to project back to d_model
+        self.vision_state_projection = nn.Sequential(
+            nn.Linear(2 * config.d_model, config.d_model),
+            nn.LayerNorm(config.d_model),
+            nn.GELU()
+        )
                 
         # Fusion Transformer Encoder (instead of simple MLP)
         fusion_encoder_layer = nn.TransformerEncoderLayer(
@@ -268,7 +283,18 @@ class SimpleDiffusionTransformer(nn.Module):
         all_vision_tokens = []
 
         # ------------------------------
-        # 1. Vision encoding per camera
+        # 1. State encoding (compute once for reuse)
+        # ------------------------------
+        state_tokens = self.state_encoder(batch["observation.state"])  # (B, T, d_model)
+        state_tokens = self.state_positional_encoding(state_tokens)
+        # Flatten time dimension
+        state_tokens_flat = state_tokens.view(B, T_obs, self.config.d_model)
+        # Add a singleton token dim to match fusion later
+        state_tokens_flat = state_tokens_flat.unsqueeze(2)  # (B, T, 1, d_model)
+        state_tokens_flat = state_tokens_flat.view(B, T_obs * 1, self.config.d_model)
+
+        # ------------------------------
+        # 2. Vision encoding per camera
         # ------------------------------
         for cam_key, encoder in self.image_encoders.items():
             batch_key = cam_key.replace('_', '.')
@@ -281,35 +307,33 @@ class SimpleDiffusionTransformer(nn.Module):
 
                 vision_tokens = encoder(img)  # (B, T, N_tokens_per_cam, d_model)
                 # Apply temporal transformer per camera to fuse time
-                B, T, N, D = vision_tokens.shape
-                vision_tokens_flat = vision_tokens.view(B, T * N, D)
+                B_v, T_v, N_v, D_v = vision_tokens.shape
+                vision_tokens_flat = vision_tokens.view(B_v, T_v * N_v, D_v)
                 vision_tokens_flat = self.vision_positional_encoding(vision_tokens_flat)
                 vision_tokens_encoded = self.vision_temporal_transformer(vision_tokens_flat)
-                all_vision_tokens.append(vision_tokens_encoded)
+                
+                # Pre-normalize vision and state features before concatenation
+                vision_tokens_normalized = self.vision_pre_norm(vision_tokens_encoded)
+                state_expanded = state_tokens_flat.unsqueeze(2).expand(-1, -1, N_v, -1).reshape(B_v, T_v * N_v, D_v)
+                state_normalized = self.state_pre_norm(state_expanded)
+                
+                # Concatenate normalized state token to each normalized vision token
+                vision_with_state = torch.cat([vision_tokens_normalized, state_normalized], dim=-1)
+                
+                # Project back to d_model dimensions
+                vision_with_state = self.vision_state_projection(vision_with_state)
+                all_vision_tokens.append(vision_with_state)
 
         if all_vision_tokens:
             vision_tokens_all = torch.cat(all_vision_tokens, dim=1)  # concat along token dim
+            vision_tokens_all = torch.cat([vision_tokens_all, state_tokens_flat], dim=1)
         else:
             vision_tokens_all = torch.empty(B, 0, self.config.d_model, device=batch["observation.state"].device)
 
         # ------------------------------
-        # 2. State encoding
+        # 3. Final processing
         # ------------------------------
-        state_tokens = self.state_encoder(batch["observation.state"])  # (B, T, d_model)
-        state_tokens = self.state_positional_encoding(state_tokens)
-        # Flatten time dimension
-        state_tokens_flat = state_tokens.view(B, T_obs, self.config.d_model)
-        # Add a singleton token dim to match fusion later
-        state_tokens_flat = state_tokens_flat.unsqueeze(2)  # (B, T, 1, d_model)
-        state_tokens_flat = state_tokens_flat.view(B, T_obs * 1, self.config.d_model)
-
-        # ------------------------------
-        # 3. Concatenate vision + state tokens
-        # ------------------------------
-        obs_tokens = torch.cat([vision_tokens_all, state_tokens_flat], dim=1)  # (B, total_tokens, d_model)
-        
-        obs_tokens = self.obs_ln(obs_tokens)
-        
+        obs_tokens = self.obs_ln(vision_tokens_all)
         context = self.fusion_projection(obs_tokens)
 
         spatial_coords_dict = {}  # for visualization if needed
