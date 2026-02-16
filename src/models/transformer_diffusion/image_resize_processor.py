@@ -17,11 +17,15 @@ class ImageResizeProcessorStep(ProcessorStep):
         self.image_size = image_size
         self.camera_keys = camera_keys
         
-    def forward(self, batch: Dict[str, Any]) -> Dict[str, Any]:
-        """Resize images in the batch to match the expected input size."""
+    def __call__(self, transition: Dict[str, Any]) -> Dict[str, Any]:
+        """Resize images in the transition to match the expected input size."""
+        # Apply resizing to observation images
+        observation = transition.get("observation", {})
         for key in self.camera_keys:
-            if key in batch:
-                image_tensor = batch[key]
+            # Convert policy key format to observation key format
+            obs_key = key
+            if key in observation:
+                image_tensor = observation[key]
                 if isinstance(image_tensor, torch.Tensor) and image_tensor.dim() >= 4:
                     # Image tensor should be (B, T, C, H, W) or (B, C, H, W)
                     B, *dims = image_tensor.shape
@@ -32,6 +36,10 @@ class ImageResizeProcessorStep(ProcessorStep):
                     if H != target_H or W != target_W:
                         # Resize the image
                         resized_image = F.resize(image_tensor, (target_H, target_W))
-                        batch[key] = resized_image
+                        observation[key] = resized_image
                         
-        return batch
+        return transition
+        
+    def transform_features(self, features):
+        """This step doesn't change the features, so return them as-is."""
+        return features
