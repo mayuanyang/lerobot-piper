@@ -56,10 +56,10 @@ def apply_joint_augmentations(batch):
             batch["observation.state"] = batch["observation.state"] + noise
             
         # Add small Gaussian noise to actions
-        if "action" in batch:
-            noise_scale = 0.01  # 1% of the typical action range
-            noise = torch.randn_like(batch["action"]) * noise_scale
-            batch["action"] = batch["action"] + noise
+        # if "action" in batch:
+        #     noise_scale = 0.01  # 1% of the typical action range
+        #     noise = torch.randn_like(batch["action"]) * noise_scale
+        #     batch["action"] = batch["action"] + noise
             
     return batch
 
@@ -290,7 +290,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                     batch[key] = batch[key].to(device, non_blocking=True)
 
             # Apply joint data augmentation
-            #batch = apply_joint_augmentations(batch)
+            batch = apply_joint_augmentations(batch)
             
             # Apply camera dropout
             batch = apply_camera_dropout(batch)
