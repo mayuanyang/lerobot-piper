@@ -119,7 +119,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     print('output_features:', output_features)
     
     # Training parameters
-    obs = 2
+    obs = 4
     horizon = 16
     n_action_steps = 8
     
@@ -249,12 +249,15 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     # Create observation temporal window
     obs_temporal_window = [ -i * frame_time for i in range(obs) ][::-1]
     
+    # Shift action timestamps by 1 position to prevent overlap with observations
+    action_temporal_window = [(i + 1) * frame_time for i in range(horizon)]
+    
     delta_timestamps = {
         "observation.images.front": obs_temporal_window,
         "observation.images.gripper": obs_temporal_window,  
         "observation.images.right": obs_temporal_window,
         "observation.state": obs_temporal_window,
-        "action": [i * frame_time for i in range(horizon)]
+        "action": action_temporal_window
     }
 
     # Load dataset
