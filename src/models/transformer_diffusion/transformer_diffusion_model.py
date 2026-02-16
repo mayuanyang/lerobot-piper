@@ -122,23 +122,17 @@ class VisionEncoder(nn.Module):
             import torchvision.transforms.functional as F
             x = F.resize(x, (self.backbone.image_size, self.backbone.image_size))
 
-        # Patch embedding
-        x = self.backbone._process_input(x)
-        n = x.shape[0]
-
-        # Add CLS token
-        batch_class_token = self.backbone.class_token.expand(n, -1, -1)
-        x = torch.cat([batch_class_token, x], dim=1)
-
-        # ViT encoder
-        x = self.backbone.encoder(x)  # (B*T*N_cam, num_tokens, hidden_dim)
+        # Use VisionTransformer's built-in forward pass which handles CLS token internally
+        x = self.backbone(x)  # (B*T*N_cam, hidden_dim)
         
-        # Only use CLS token
-        cls = x[:, 0:1, :]  # 只取 CLS, shape: (B*T*N_cam, 1, hidden_dim)
-        cls = self.projection(cls)  # (B*T*N_cam, 1, d_model)
+        # Add dimension to match expected format
+        x = x.unsqueeze(1)  # (B*T*N_cam, 1, hidden_dim)
+        
+        # Project to d_model
+        x = self.projection(x)  # (B*T*N_cam, 1, d_model)
 
         # Reshape to separate cameras
-        vision_tokens = cls.view(B, T, N_cam, 1, self.config.d_model)
+        vision_tokens = x.view(B, T, N_cam, 1, self.config.d_model)
         self.num_tokens_per_cam = 1
 
         # Add camera embedding
@@ -212,6 +206,8 @@ class SimpleDiffusionTransformer(nn.Module):
             fusion_encoder_layer,
             num_layers=2  # Lightweight transformer for fusion
         )
+        
+        self.obs_ln = nn.LayerNorm(config.d_model)
 
 
         # ------------------------------
@@ -296,7 +292,9 @@ class SimpleDiffusionTransformer(nn.Module):
         # 3. Concatenate vision + state tokens
         # ------------------------------
         obs_tokens = torch.cat([vision_tokens_all, state_tokens_flat], dim=1)  # (B, total_tokens, d_model)
-        # Apply fusion projection (now just Mish activation + Linear layer)
+        
+        obs_tokens = self.obs_ln(obs_tokens)
+        
         context = self.fusion_projection(obs_tokens)
 
         spatial_coords_dict = {}  # for visualization if needed
@@ -337,7 +335,7 @@ class SimpleDiffusionTransformer(nn.Module):
         )
         
         # Residual connection to preserve gradients
-        velocity_features = velocity_features + action_embeddings
+        #velocity_features = velocity_features + action_embeddings
         
         # 5. Predict the velocity field
         return self.velocity_prediction_head(velocity_features)
