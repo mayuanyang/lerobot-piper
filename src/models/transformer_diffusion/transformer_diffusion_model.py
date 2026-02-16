@@ -3,6 +3,7 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF
 from torchvision.utils import save_image
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.optimization import get_scheduler
@@ -48,7 +49,7 @@ class DiffusionSinusoidalPosEmb(nn.Module):
 import torch
 import torch.nn as nn
 import torchvision.models as models
-import torchvision.transforms.functional as F
+import torchvision.transforms.functional as TF
 
 class VisionEncoder(nn.Module):
     def __init__(self, config):
@@ -124,11 +125,11 @@ class VisionEncoder(nn.Module):
             if x.dim() == 3:
                 # 3D: (C, H, W) - Add batch dimension for resize operation
                 expanded_tensor = x.unsqueeze(0)
-                resized_image = F.resize(expanded_tensor, (target_H, target_W))
+                resized_image = TF.resize(expanded_tensor, (target_H, target_W))
                 x = resized_image.squeeze(0)
             else:
                 # 4D+: (..., C, H, W) - Resize directly
-                x = F.resize(x, (target_H, target_W))
+                x = TF.resize(x, (target_H, target_W))
 
         # 1. Standard ViT Patch Extraction
         # Instead of calling self.backbone(x), we do:
