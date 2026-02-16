@@ -33,13 +33,19 @@ class ImageResizeProcessorStep(ProcessorStep):
                     # Check if resizing is needed
                     target_H, target_W = self.image_size
                     if H != target_H or W != target_W:
-                        # Simple approach: always add and remove batch dimension
-                        # Add batch dimension: (..., H, W) -> (1, ..., H, W)
-                        expanded_tensor = image_tensor.unsqueeze(0)
-                        # Resize the image
-                        resized_image = F.resize(expanded_tensor, (target_H, target_W))
-                        # Remove batch dimension: (1, ...) -> (...)
-                        resized_image = resized_image.squeeze(0)
+                        # For 3D tensors (C, H, W), we need to add a batch dimension
+                        # For 4D+ tensors (..., C, H, W), F.resize should work directly
+                        if image_tensor.dim() == 3:
+                            # 3D: (C, H, W) - Add batch dimension for resize operation
+                            # Add batch dimension: (C, H, W) -> (1, C, H, W)
+                            expanded_tensor = image_tensor.unsqueeze(0)
+                            # Resize the image
+                            resized_image = F.resize(expanded_tensor, (target_H, target_W))
+                            # Remove batch dimension: (1, C, H, W) -> (C, H, W)
+                            resized_image = resized_image.squeeze(0)
+                        else:
+                            # 4D+: (..., C, H, W) - Resize directly
+                            resized_image = F.resize(image_tensor, (target_H, target_W))
                         observation[key] = resized_image
                         
         return transition
