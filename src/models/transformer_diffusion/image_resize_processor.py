@@ -26,9 +26,12 @@ class ImageResizeProcessorStep(ProcessorStep):
             obs_key = key
             if key in observation:
                 image_tensor = observation[key]
-                if isinstance(image_tensor, torch.Tensor) and image_tensor.dim() >= 4:
-                    # Image tensor should be (B, T, C, H, W) or (B, C, H, W)
-                    B, *dims = image_tensor.shape
+                if isinstance(image_tensor, torch.Tensor) and image_tensor.dim() >= 3:
+                    # Handle different tensor formats:
+                    # - 3D: (C, H, W) - single image
+                    # - 4D: (B, C, H, W) or (T, C, H, W) - batch or time series
+                    # - 5D: (B, T, C, H, W) - batch with time series
+                    original_shape = image_tensor.shape
                     H, W = image_tensor.shape[-2:]
                     
                     # Check if resizing is needed
