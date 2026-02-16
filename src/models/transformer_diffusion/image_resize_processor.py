@@ -27,26 +27,27 @@ class ImageResizeProcessorStep(ProcessorStep):
             if key in observation:
                 image_tensor = observation[key]
                 if isinstance(image_tensor, torch.Tensor) and image_tensor.dim() >= 3:
-                    # Handle different tensor formats:
-                    # - 3D: (C, H, W) - single image
-                    # - 4D: (B, C, H, W) or (T, C, H, W) - batch or time series
-                    # - 5D: (B, T, C, H, W) - batch with time series
                     original_shape = image_tensor.shape
+                    # For tensors with 3+ dimensions, the last 2 are spatial dimensions
                     H, W = image_tensor.shape[-2:]
                     
                     # Check if resizing is needed
                     target_H, target_W = self.image_size
                     if H != target_H or W != target_W:
-                        # Handle 3D tensor (C, H, W) specially by adding batch dimension
+                        # Handle different tensor formats based on number of dimensions
                         if image_tensor.dim() == 3:
+                            # 3D: (C, H, W) - Add batch dimension for resize operation
                             # Add batch dimension: (C, H, W) -> (1, C, H, W)
-                            image_tensor = image_tensor.unsqueeze(0)
+                            expanded_tensor = image_tensor.unsqueeze(0)
                             # Resize the image
-                            resized_image = F.resize(image_tensor, (target_H, target_W))
+                            resized_image = F.resize(expanded_tensor, (target_H, target_W))
                             # Remove batch dimension: (1, C, H, W) -> (C, H, W)
                             resized_image = resized_image.squeeze(0)
+                        elif image_tensor.dim() == 4:
+                            # 4D: (B, C, H, W) or (T, C, H, W) - Resize directly
+                            resized_image = F.resize(image_tensor, (target_H, target_W))
                         else:
-                            # For 4D+ tensors, resize directly
+                            # 5D+: (B, T, C, H, W) etc. - Resize directly
                             resized_image = F.resize(image_tensor, (target_H, target_W))
                             
                         observation[key] = resized_image
