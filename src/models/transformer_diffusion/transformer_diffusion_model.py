@@ -10,7 +10,10 @@ from typing import Dict, Optional
 import math
 import numpy as np
 import os
+from pathlib import Path
 
+# Import our custom spatial softmax
+from .spatial_softmax import SpatialSoftmax, save_heatmap_visualization
 
       
 class PositionalEncoding(nn.Module):
@@ -86,7 +89,16 @@ class VisionEncoder(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d((7, 7))
 
         # ------------------------------
-        # 4. Projection to d_model
+        # 5. Spatial softmax head for keypoint detection
+        # ------------------------------
+        self.spatial_head = nn.Sequential(
+            nn.Conv2d(self.hidden_dim, 32, kernel_size=1),  # Reduce 768 to 32 feature maps
+            SpatialSoftmax(temperature=0.1)                 # Extract 32 (x,y) pairs
+        )
+        self.point_projection = nn.Linear(2, config.d_model)  # Project (x,y) to d_model
+
+        # ------------------------------
+        # 6. Projection to d_model
         # ------------------------------
         self.projection = nn.Sequential(
             nn.Linear(self.hidden_dim, config.d_model),
@@ -95,7 +107,7 @@ class VisionEncoder(nn.Module):
         )
 
         # ------------------------------
-        # 5. Camera embedding
+        # 7. Camera embedding
         # ------------------------------
         self.camera_embedding = nn.Embedding(
             self.num_cameras,
@@ -103,9 +115,14 @@ class VisionEncoder(nn.Module):
         )
 
         # ------------------------------
-        # 6. num tokens per camera (will be computed dynamically)
+        # 8. num tokens per camera (will be computed dynamically)
         # ------------------------------
         self.num_tokens_per_cam = None
+        self.num_spatial_tokens = 32  # Number of spatial keypoints
+        
+        # Flag to enable heatmap saving (for debugging)
+        self.save_heatmaps = False
+        self.heatmap_save_dir = None
 
     # ------------------------------
     # Forward
@@ -121,34 +138,46 @@ class VisionEncoder(nn.Module):
         x = x.view(B * T * N_cam, C, H, W)
 
         # 1. Get ViT features
-        x = self.backbone._process_input(x)
-        n = x.shape[0]
+        x_processed = self.backbone._process_input(x)
+        n = x_processed.shape[0]
         batch_class_token = self.backbone.class_token.expand(n, -1, -1)
-        x = torch.cat([batch_class_token, x], dim=1)
-        x = self.backbone.encoder(x) # (Batch, 197, 768)
+        x_with_cls = torch.cat([batch_class_token, x_processed], dim=1)
+        encoded_features = self.backbone.encoder(x_with_cls) # (Batch, 197, 768)
 
         # 2. Separate CLS and Patches
-        cls_token = x[:, 0:1, :]    # (Batch, 1, 768)
-        patch_tokens = x[:, 1:, :]   # (Batch, 196, 768)
+        cls_token = encoded_features[:, 0:1, :]    # (Batch, 1, 768)
+        patch_tokens = encoded_features[:, 1:, :]   # (Batch, 196, 768)
 
-        # 3. Spatial Pooling
+        # 3. Get the 32 (x,y) coordinates from spatial head
+        # First reduce features with conv layer, then apply spatial softmax
+        patch_features = patch_tokens.transpose(1, 2).reshape(n, self.hidden_dim, 14, 14)
+        reduced_features = self.spatial_head[0](patch_features)  # (Batch, 32, 14, 14)
+        coords = self.spatial_head[1](reduced_features)  # (Batch, 32, 2)
+
+        # 4. Convert coordinates into tokens
+        point_tokens = self.point_projection(coords)  # (Batch, 32, d_model)
+
+        # 5. Spatial Pooling for ViT tokens
         # Reshape to (Batch, 768, 14, 14) to pool spatially
-        patch_tokens = patch_tokens.transpose(1, 2).reshape(n, self.hidden_dim, 14, 14)
-        patch_tokens = self.pool(patch_tokens) # (Batch, 768, 7, 7)
-        patch_tokens = patch_tokens.flatten(2).transpose(1, 2) # (Batch, 49, 768)
+        patch_tokens_pooled = patch_tokens.transpose(1, 2).reshape(n, self.hidden_dim, 14, 14)
+        patch_tokens_pooled = self.pool(patch_tokens_pooled)  # (Batch, 768, 7, 7)
+        patch_tokens_flattened = patch_tokens_pooled.flatten(2).transpose(1, 2)  # (Batch, 49, 768)
 
-        # 4. Re-combine
-        combined = torch.cat([cls_token, patch_tokens], dim=1) # (Batch, 50, 768)
+        # 6. Re-combine ViT tokens
+        vit_combined = torch.cat([cls_token, patch_tokens_flattened], dim=1)  # (Batch, 50, 768)
         
-        # 5. Project
-        tokens = self.projection(combined)
+        # 7. Project ViT tokens
+        vit_tokens = self.projection(vit_combined)  # (Batch, 50, d_model)
+        
+        # 8. Concatenate ViT tokens with point tokens
+        # Now we have 50 ViT tokens + 32 point tokens = 82 total tokens
+        combined_tokens = torch.cat([vit_tokens, point_tokens], dim=1)  # (Batch, 82, d_model)
         
         # Store the number of tokens per camera for later use
-        # Note: This will now be 50 instead of 197
-        self.num_tokens_per_cam = tokens.shape[1]
+        self.num_tokens_per_cam = combined_tokens.shape[1]
 
         # Reshape to separate cameras
-        vision_tokens = tokens.view(B, T, N_cam, self.num_tokens_per_cam, self.config.d_model)
+        vision_tokens = combined_tokens.view(B, T, N_cam, self.num_tokens_per_cam, self.config.d_model)
 
         # Add camera embedding
         cam_ids = torch.arange(N_cam, device=vision_tokens.device)
@@ -161,6 +190,72 @@ class VisionEncoder(nn.Module):
         )
 
         return vision_tokens
+
+    def generate_debug_heatmaps(self, x, camera_name="default", batch_index=0, timestep=0):
+        """
+        Generate heatmaps for debugging purposes without affecting the normal forward pass.
+        
+        Args:
+            x: Input tensor of shape (B, T, N_cam, C, H, W)
+            camera_name: Name of the camera for saving files
+            batch_index: Batch index for saving files
+            timestep: Timestep for saving files
+            
+        Returns:
+            heatmap_info: Dictionary containing heatmap data and metadata
+        """
+        with torch.no_grad():
+            B, T, N_cam, C, H, W = x.shape
+            x = x.view(B * T * N_cam, C, H, W)
+
+            # Get ViT features
+            x_processed = self.backbone._process_input(x)
+            n = x_processed.shape[0]
+            batch_class_token = self.backbone.class_token.expand(n, -1, -1)
+            x_with_cls = torch.cat([batch_class_token, x_processed], dim=1)
+            encoded_features = self.backbone.encoder(x_with_cls) # (Batch, 197, 768)
+
+            # Separate CLS and Patches
+            patch_tokens = encoded_features[:, 1:, :]   # (Batch, 196, 768)
+
+            # Reshape patch tokens to feature maps for heatmap generation
+            # patch_tokens: (Batch, 196, 768)
+            # Reshape to (Batch, 768, 14, 14) for heatmap generation
+            patch_features = patch_tokens.transpose(1, 2).reshape(n, self.hidden_dim, 14, 14)
+            
+            # Create spatial softmax for heatmap generation
+            spatial_softmax = SpatialSoftmax(temperature=0.1, learn_temperature=False)
+            
+            # Apply spatial softmax to generate heatmaps and coordinates
+            coords, heatmaps = spatial_softmax.forward_with_heatmaps(patch_features)  # coords: (Batch, 768, 2), heatmaps: (Batch, 768, 14, 14)
+            
+            # Save heatmaps for debugging if requested
+            if self.save_heatmaps and self.heatmap_save_dir is not None:
+                Path(self.heatmap_save_dir).mkdir(parents=True, exist_ok=True)
+                
+                # Save heatmaps for debugging
+                for i in range(min(4, n)):  # Save heatmaps for first 4 samples
+                    # Save one example heatmap per sample
+                    heatmap_to_save = heatmaps[i, 0]  # First channel heatmap
+                    # Get corresponding input image for overlay
+                    input_img = x[i]  # (C, H, W)
+                    # Convert to HWC format for visualization
+                    input_img_hwc = input_img.permute(1, 2, 0)  # (H, W, C)
+                    
+                    # Save heatmap visualization
+                    heatmap_save_path = Path(self.heatmap_save_dir) / f"{camera_name}_batch{batch_index}_sample{i}_timestep{timestep}_heatmap.png"
+                    save_heatmap_visualization(heatmap_to_save, input_img_hwc, heatmap_save_path)
+            
+            # Store heatmap info for returning
+            heatmap_info = {
+                'coords': coords,
+                'heatmaps': heatmaps,
+                'camera_name': camera_name,
+                'batch_index': batch_index,
+                'timestep': timestep
+            }
+            
+            return heatmap_info
 
 
     
@@ -239,9 +334,14 @@ class SimpleDiffusionTransformer(nn.Module):
         
         self.obs_ln = nn.LayerNorm(config.d_model)
 
+        # ------------------------------
+        # 6. Number of inference steps for flow matching sampling
+        # ------------------------------
+        # Register as buffer so it's properly handled during device transfers
+        self.register_buffer('num_inference_steps', torch.tensor(config.num_inference_steps))
 
         # ------------------------------
-        # 5. Action Encoder / Decoder (same as before)
+        # 7. Action Encoder / Decoder (same as before)
         # ------------------------------
         self.action_positional_encoding = PositionalEncoding(config.d_model, config.horizon)
         self.action_projection = nn.Linear(config.action_dim, config.d_model)
@@ -272,12 +372,12 @@ class SimpleDiffusionTransformer(nn.Module):
         )
 
 
-    def get_condition(self, batch):
+    def get_condition(self, batch, generate_heatmaps=False):
         """
         Separately encode vision tokens and state tokens, then fuse.
         Returns:
             context: (B, T_obs * N_tokens, d_model)
-            spatial_coords_dict: for visualization
+            spatial_outputs: for visualization (including heatmaps if requested)
         """
         B, T_obs = batch["observation.state"].shape[:2]
         all_vision_tokens = []
@@ -296,6 +396,7 @@ class SimpleDiffusionTransformer(nn.Module):
         # ------------------------------
         # 2. Vision encoding per camera
         # ------------------------------
+        spatial_outputs = {}  # for visualization
         for cam_key, encoder in self.image_encoders.items():
             batch_key = cam_key.replace('_', '.')
             if batch_key in batch:
@@ -304,6 +405,18 @@ class SimpleDiffusionTransformer(nn.Module):
                     img = img.view(B, T_obs, 1, *img.shape[-3:])
                 elif img.dim() == 5:  # (B, T, C, H, W)
                     img = img.unsqueeze(2)
+
+                # Generate heatmaps for debugging if requested
+                if generate_heatmaps:
+                    heatmap_info = encoder.generate_debug_heatmaps(
+                        img, 
+                        camera_name=cam_key, 
+                        batch_index=0, 
+                        timestep=0
+                    )
+                    spatial_outputs[f"{cam_key}_heatmap"] = heatmap_info
+                else:
+                    spatial_outputs[f"{cam_key}_heatmap"] = None
 
                 vision_tokens = encoder(img)  # (B, T, N_tokens_per_cam, d_model)
                 # Apply temporal transformer per camera to fuse time
@@ -336,9 +449,7 @@ class SimpleDiffusionTransformer(nn.Module):
         obs_tokens = self.obs_ln(vision_tokens_all)
         context = self.fusion_projection(obs_tokens)
 
-        spatial_coords_dict = {}  # for visualization if needed
-
-        return context, spatial_coords_dict
+        return context, spatial_outputs
 
 
     def velocity_field(self, actions, timesteps, obs_context):

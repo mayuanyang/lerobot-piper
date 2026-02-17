@@ -83,9 +83,7 @@ def apply_camera_dropout(batch, camera_keys=["observation.images.front", "observ
     
     # Remove the selected camera from the batch
     if dropped_camera_key in batch:
-        del batch[dropped_camera_key]
-        # Uncomment the next line for debugging
-        # print(f"Dropped camera: {dropped_camera_key}")
+        batch[dropped_camera_key] = torch.zeros_like(batch[dropped_camera_key])
     
     return batch
 
@@ -131,7 +129,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         horizon=horizon, 
         n_action_steps=n_action_steps, 
         vision_backbone="vit_b_16",
-        pretrained_backbone_weights=None,  # ViT doesn't use this parameter the same way
         state_dim=7,  # 7 joints (not removing the 4th joint)
         action_dim=7,  # 7 joints (not removing the 4th joint)
         d_model=512,  # Smaller model for better gradient flow
@@ -142,7 +139,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         diffusion_step_embed_dim=256,
         kernel_size=3,
         n_groups=8,
-        use_film_scale_modulation=True,
         num_cameras=len(input_features) if input_features else 1,  # Set number of cameras based on input features
         vision_freeze_layers=0  # No frozen layers by default
     )
@@ -250,7 +246,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     obs_temporal_window = [ -i * frame_time for i in range(obs) ][::-1]
     
     # Shift action timestamps by 1 position to prevent overlap with observations
-    action_temporal_window = [(i + 1) * frame_time for i in range(horizon)]
+    action_temporal_window = [i * frame_time for i in range(horizon)]
     
     delta_timestamps = {
         "observation.images.front": obs_temporal_window,
@@ -396,8 +392,21 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 # Get spatial softmax outputs for visualization
                 with torch.no_grad():
                     policy.model.eval()
-                    obs_context, spatial_outputs = policy.model.get_condition(batch)
+                    # Enable heatmap saving for debugging
+                    heatmap_dir = Path(output_dir) / "heatmaps"
+                    heatmap_dir.mkdir(exist_ok=True)
+                    
+                    # Enable heatmap saving in vision encoders
+                    for encoder in policy.model.image_encoders.values():
+                        encoder.save_heatmaps = True
+                        encoder.heatmap_save_dir = heatmap_dir
+                    
+                    obs_context, spatial_outputs = policy.model.get_condition(batch, generate_heatmaps=True)
                     policy.model.train()
+                    
+                    # Disable heatmap saving after visualization
+                    for encoder in policy.model.image_encoders.values():
+                        encoder.save_heatmaps = False
                     
                     # Try to get episode index and frame index from batch if available
                     episode_index = None
@@ -410,7 +419,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                     
                     # Update visualizer with spatial outputs for all three cameras
                     for cam_key, spatial_coords in spatial_outputs.items():
-                        if spatial_coords is not None:
+                        if spatial_coords is not None and not cam_key.endswith('_heatmap'):
                             # Get the corresponding image tensor from the batch
                             # Convert cam_key back to batch key format
                             batch_key = cam_key.replace('_', '.')

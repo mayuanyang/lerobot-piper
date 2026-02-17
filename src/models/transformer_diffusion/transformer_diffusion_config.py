@@ -12,7 +12,7 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     """Long Task Transformer Configuration for long-horizon tasks with transformer-based architecture."""
     
     # Inputs / output structure.
-    n_obs_steps: int = 2
+    n_obs_steps: int = 4
     horizon: int = 16
     n_action_steps: int = 8
 
@@ -26,7 +26,7 @@ class TransformerDiffusionConfig(PreTrainedConfig):
 
     # Image processing
     vision_backbone: str = "vit_b_16"
-    pretrained_backbone_weights: str | None = None
+    
     # Input image size (height, width)
     input_image_size: tuple[int, int] = (224, 224)
     # Vision encoder parameters
@@ -51,7 +51,10 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     diffusion_step_embed_dim: int = 128
     kernel_size: int = 3
     n_groups: int = 8
-    use_film_scale_modulation: bool = True
+    
+        
+    # Flow matching sampling parameters
+    num_inference_steps: int = 50
         
     # Training presets
     optimizer_lr: float = 1e-4
