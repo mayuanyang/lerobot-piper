@@ -139,7 +139,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         diffusion_step_embed_dim=256,
         kernel_size=3,
         n_groups=8,
-        num_cameras=len(input_features) if input_features else 1,  # Set number of cameras based on input features
+        num_cameras=3,  # Set number of cameras based on input features
         vision_freeze_layers=0  # No frozen layers by default
     )
     
