@@ -311,7 +311,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 total_vision_grad = 0.0
                 total_vision_params = 0
                 for name, param in policy.model.named_parameters():
-                    if 'vision_temporal_transformer' in name and param.grad is not None:
+                    if 'cross_camera_transformer' in name and param.grad is not None:
                         grad_mean = param.grad.abs().mean().item()
                         param_count = param.numel()
                         total_vision_grad += grad_mean * param_count
@@ -340,7 +340,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 total_encoder_grad = 0.0
                 total_encoder_params = 0
                 for name, param in policy.model.named_parameters():
-                    if 'fusion_projection' in name and param.grad is not None:
+                    if 'fusion_encoder' in name and param.grad is not None:
                         grad_mean = param.grad.abs().mean().item()
                         param_count = param.numel()
                         total_encoder_grad += grad_mean * param_count

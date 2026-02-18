@@ -305,11 +305,6 @@ class SimpleDiffusionTransformer(nn.Module):
             cross_camera_layer, num_layers=2  # 2 layers for cross-camera attention
         )
 
-        # ------------------------------
-        # 4. Pre-normalization layers for vision and state features
-        # ------------------------------
-        self.vision_pre_norm = nn.LayerNorm(config.d_model)
-        self.state_pre_norm = nn.LayerNorm(config.d_model)
         
         # ------------------------------
         # 5. Vision token reduction layer
@@ -330,7 +325,7 @@ class SimpleDiffusionTransformer(nn.Module):
             batch_first=True,
             norm_first=True
         )
-        self.fusion_projection = nn.TransformerEncoder(
+        self.fusion_encoder = nn.TransformerEncoder(
             fusion_encoder_layer,
             num_layers=2  # Lightweight transformer for fusion
         )
@@ -429,13 +424,9 @@ class SimpleDiffusionTransformer(nn.Module):
                 vision_tokens_flat = vision_tokens.view(B_v, T_v * N_v, D_v)
                 vision_tokens_flat = self.vision_positional_encoding(vision_tokens_flat)
                 
-                # Pre-normalize vision tokens
-                vision_tokens_normalized = self.vision_pre_norm(vision_tokens_flat)
-                
-                # Add residual connection from image_encoders to vision tokens
-                vision_tokens_with_residual = vision_tokens_normalized + vision_tokens_flat  # Add residual connection
-                
-                all_vision_tokens.append(vision_tokens_with_residual)
+                # Vision tokens are already normalized by the VisionEncoder
+                # No additional normalization needed here
+                all_vision_tokens.append(vision_tokens_flat)
 
         if all_vision_tokens:
             vision_tokens_all = torch.cat(all_vision_tokens, dim=1)  # concat along token dim
@@ -465,7 +456,7 @@ class SimpleDiffusionTransformer(nn.Module):
         # 3. Final processing
         # ------------------------------
         obs_tokens = self.obs_ln(vision_tokens_fused)
-        context = self.fusion_projection(obs_tokens)
+        context = self.fusion_encoder(obs_tokens)
 
         return context, spatial_outputs
 
