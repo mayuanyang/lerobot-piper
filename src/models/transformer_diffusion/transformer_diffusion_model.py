@@ -302,7 +302,7 @@ class SimpleDiffusionTransformer(nn.Module):
             norm_first=True
         )
         self.cross_camera_transformer = nn.TransformerEncoder(
-            cross_camera_layer, num_layers=2  # 2 layers for cross-camera attention
+            cross_camera_layer, num_layers=config.num_encoder_layers
         )
 
         
@@ -327,7 +327,7 @@ class SimpleDiffusionTransformer(nn.Module):
         )
         self.fusion_encoder = nn.TransformerEncoder(
             fusion_encoder_layer,
-            num_layers=2  # Lightweight transformer for fusion
+            num_layers=config.num_fusion_layers  # Lightweight transformer for fusion
         )
         
         self.obs_ln = nn.LayerNorm(config.d_model)
