@@ -140,7 +140,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         kernel_size=3,
         n_groups=8,
         num_cameras=3,  # Set number of cameras based on input features
-        vision_freeze_layers=0  # No frozen layers by default
+        vision_freeze_layers=6  # No frozen layers by default
     )
     
     
@@ -160,7 +160,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             grid_overlay_cameras=["front", "right"]  # Front and right cameras (original names)
         )
             
-        optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
+        trainable_params = [p for p in policy.parameters() if p.requires_grad]
+        optimizer = torch.optim.Adam(trainable_params, lr=1e-4)
         # Cosine scheduler with warmup
         warmup_steps = 1000
         scheduler = get_cosine_schedule_with_warmup(
@@ -215,19 +216,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             else:
                 other_params.append(param)
         
-        # Higher learning rate for vision encoders to improve gradient flow
-        # Standard learning rate for other components
-        optimizer = torch.optim.Adam([
-            {'params': vision_params, 'lr': 1e-4},   # 10x higher LR for vision encoders
-            {'params': other_params, 'lr': 1e-4}     # Standard LR for other components
-        ], weight_decay=1e-4)
-        
-        # Store parameter groups for dynamic adjustment
-        vision_param_group = optimizer.param_groups[0]
-        other_param_group = optimizer.param_groups[1]
+        trainable_params = [p for p in policy.parameters() if p.requires_grad]
+        optimizer = torch.optim.Adam(trainable_params, lr=1e-4)
         
         # Cosine scheduler with warmup
-        warmup_steps = 100
+        warmup_steps = 500
         scheduler = get_cosine_schedule_with_warmup(
             optimizer, 
             num_warmup_steps=warmup_steps, 
@@ -294,7 +287,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             batch = apply_joint_augmentations(batch)
             
             # Apply camera dropout
-            batch = apply_camera_dropout(batch)
+            #batch = apply_camera_dropout(batch)
 
             # Preprocess (Normalize)
             batch = preprocessor(batch)
@@ -307,11 +300,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             if step % progress_update_freq == 0:  # Print every 10 progress update intervals
                 print(f"\n--- Gradient Analysis at Step {step} ---")
                 
-                # Collect gradients for all components
+                # Collect gradients for trainable components only
                 total_vision_grad = 0.0
                 total_vision_params = 0
                 for name, param in policy.model.named_parameters():
-                    if 'cross_camera_transformer' in name and param.grad is not None:
+                    if param.requires_grad and 'cross_camera_transformer' in name and param.grad is not None:
                         grad_mean = param.grad.abs().mean().item()
                         param_count = param.numel()
                         total_vision_grad += grad_mean * param_count
@@ -320,7 +313,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 total_img_grad = 0.0
                 total_img_params = 0
                 for name, param in policy.model.named_parameters():
-                    if 'image_encoders' in name and param.grad is not None:
+                    if param.requires_grad and 'image_encoders' in name and param.grad is not None:
                         grad_mean = param.grad.abs().mean().item()
                         param_count = param.numel()
                         total_img_grad += grad_mean * param_count
@@ -330,7 +323,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 total_state_grad = 0.0
                 total_state_params = 0
                 for name, param in policy.model.named_parameters():
-                    if 'state_encoder' in name and param.grad is not None:
+                    if param.requires_grad and 'state_encoder' in name and param.grad is not None:
                         grad_mean = param.grad.abs().mean().item()
                         param_count = param.numel()
                         total_state_grad += grad_mean * param_count
@@ -340,7 +333,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 total_encoder_grad = 0.0
                 total_encoder_params = 0
                 for name, param in policy.model.named_parameters():
-                    if 'fusion_encoder' in name and param.grad is not None:
+                    if param.requires_grad and 'fusion_encoder' in name and param.grad is not None:
                         grad_mean = param.grad.abs().mean().item()
                         param_count = param.numel()
                         total_encoder_grad += grad_mean * param_count
@@ -350,7 +343,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 total_denoiser_grad = 0.0
                 total_denoiser_params = 0
                 for name, param in policy.model.named_parameters():
-                    if 'denoising_transformer' in name and param.grad is not None:
+                    if param.requires_grad and 'denoising_transformer' in name and param.grad is not None:
                         grad_mean = param.grad.abs().mean().item()
                         param_count = param.numel()
                         total_denoiser_grad += grad_mean * param_count
@@ -361,7 +354,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 
                 if total_vision_params > 0:
                     avg_vision_grad = total_vision_grad / total_vision_params
-                    grad_info.append(f"vision_temporal_transformer: {avg_vision_grad:.6f}")
+                    grad_info.append(f"cross_camera_transformer: {avg_vision_grad:.6f}")
                     
                 if total_img_params > 0:
                     avg_img_grad = total_img_grad / total_img_params
@@ -373,7 +366,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 
                 if total_encoder_params > 0:
                     avg_encoder_grad = total_encoder_grad / total_encoder_params
-                    grad_info.append(f"fusion_projection: {avg_encoder_grad:.6f}")
+                    grad_info.append(f"fusion_encoder: {avg_encoder_grad:.6f}")
                 
                 if total_denoiser_params > 0:
                     avg_denoiser_grad = total_denoiser_grad / total_denoiser_params
@@ -382,8 +375,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 print(f"Gradients -> {' | '.join(grad_info)}")
                 print("--- End Gradient Analysis ---\n")
             
-            # Calculate gradient norm for monitoring and clip gradients
-            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)  # Reduced clipping threshold
+            # Calculate gradient norm for monitoring and clip gradients (only for trainable parameters)
+            trainable_params = [p for p in policy.parameters() if p.requires_grad]
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)  # Reduced clipping threshold
             
             optimizer.step()
             optimizer.zero_grad()

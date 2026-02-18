@@ -77,8 +77,17 @@ class VisionEncoder(nn.Module):
         # ------------------------------
         if config.vision_freeze_layers > 0:
             for name, param in self.backbone.named_parameters():
-                if "encoder.layers" in name:
-                    layer_id = int(name.split("encoder.layers.")[1].split(".")[0])
+                if "encoder_layer_" in name:
+                    # Handle naming convention like "encoder.layers.encoder_layer_0.ln_1.weight"
+                    # or "encoder_layer_0.bias"
+                    layer_part = name.split("encoder_layer_")[1]
+                    layer_id = int(layer_part.split(".")[0])
+                    if layer_id < config.vision_freeze_layers:
+                        param.requires_grad = False
+                elif "encoder.layers" in name:
+                    # Handle naming convention like "encoder.layers.0.attention.out_proj.weight"
+                    layer_part = name.split("encoder.layers.")[1]
+                    layer_id = int(layer_part.split(".")[0])
                     if layer_id < config.vision_freeze_layers:
                         param.requires_grad = False
 
@@ -95,10 +104,15 @@ class VisionEncoder(nn.Module):
             nn.Conv2d(self.hidden_dim, 32, kernel_size=1),  # Reduce 768 to 32 feature maps
             SpatialSoftmax(temperature=0.1)                 # Extract 32 (x,y) pairs
         )
-        self.point_projection = nn.Linear(2, config.d_model)  # Project (x,y) to d_model
+        # Use a deeper projection for better gradient flow
+        self.point_projection = nn.Sequential(
+            nn.Linear(2, config.d_model // 2),
+            nn.GELU(),
+            nn.Linear(config.d_model // 2, config.d_model)
+        )
 
         # ------------------------------
-        # 6. Projection to d_model
+        # 6. Projection to d_model with residual connection support
         # ------------------------------
         self.projection = nn.Sequential(
             nn.Linear(self.hidden_dim, config.d_model),
@@ -310,10 +324,20 @@ class SimpleDiffusionTransformer(nn.Module):
         # 5. Vision token reduction layer
         # ------------------------------
         # Reduce the number of vision tokens to balance with state tokens
-        # We'll define how many tokens we want to reduce to
-        self.target_vision_tokens = 32  # This can be adjusted
-        # Add adaptive pooling layer for token reduction
-        self.vision_token_pool = nn.AdaptiveAvgPool1d(self.target_vision_tokens)
+        # Calculate total number of vision tokens dynamically
+        # Formula: n_obs_steps * tokens_per_camera * num_cameras
+        # tokens_per_camera = 82 (50 ViT tokens + 32 point tokens)
+        # num_cameras = len(config.image_features)
+        self.tokens_per_camera = 82
+        self.total_vision_tokens = config.n_obs_steps * self.tokens_per_camera * len(config.image_features)
+        
+        self.target_vision_tokens = 96  # This can be adjusted
+        # Use a multi-layer approach for better gradient flow instead of single linear layer
+        self.vision_token_linear = nn.Sequential(
+            nn.Linear(self.total_vision_tokens, self.total_vision_tokens // 2),
+            nn.GELU(),
+            nn.Linear(self.total_vision_tokens // 2, self.target_vision_tokens)
+        )
                 
         # Fusion Transformer Encoder (instead of simple MLP)
         fusion_encoder_layer = nn.TransformerEncoderLayer(
@@ -327,7 +351,7 @@ class SimpleDiffusionTransformer(nn.Module):
         )
         self.fusion_encoder = nn.TransformerEncoder(
             fusion_encoder_layer,
-            num_layers=config.num_fusion_layers  # Lightweight transformer for fusion
+            num_layers=config.num_encoder_layers
         )
         
         self.obs_ln = nn.LayerNorm(config.d_model)
@@ -424,25 +448,29 @@ class SimpleDiffusionTransformer(nn.Module):
                 vision_tokens_flat = vision_tokens.view(B_v, T_v * N_v, D_v)
                 vision_tokens_flat = self.vision_positional_encoding(vision_tokens_flat)
                 
-                # Vision tokens are already normalized by the VisionEncoder
-                # No additional normalization needed here
                 all_vision_tokens.append(vision_tokens_flat)
 
         if all_vision_tokens:
             vision_tokens_all = torch.cat(all_vision_tokens, dim=1)  # concat along token dim
             
+            # Store original vision tokens for residual connection
+            vision_tokens_original = vision_tokens_all.clone()
+            
             # Apply cross-camera attention to fuse information across cameras
             vision_tokens_fused = self.cross_camera_transformer(vision_tokens_all)
+            
+            # Add residual connection from original vision tokens
+            vision_tokens_fused = vision_tokens_fused + vision_tokens_original
             
             # Apply token reduction to balance vision and state tokens
             # vision_tokens_fused shape: (B, num_vision_tokens, d_model)
             # We want to reduce along the token dimension to target_vision_tokens
             B, num_vision_tokens, D = vision_tokens_fused.shape
             if num_vision_tokens > self.target_vision_tokens:
-                # Use adaptive pooling to reduce the number of tokens
+                # Use the linear layer for token reduction
                 vision_tokens_fused_transposed = vision_tokens_fused.transpose(1, 2)  # (B, d_model, num_vision_tokens)
-                # Use the predefined adaptive pooling layer for token reduction
-                vision_tokens_reduced = self.vision_token_pool(vision_tokens_fused_transposed)  # (B, d_model, target_vision_tokens)
+                # Use the linear layer for token reduction
+                vision_tokens_reduced = self.vision_token_linear(vision_tokens_fused_transposed)  # (B, d_model, target_vision_tokens)
                 vision_tokens_reduced = vision_tokens_reduced.transpose(1, 2)  # (B, target_vision_tokens, d_model)
             else:
                 vision_tokens_reduced = vision_tokens_fused
