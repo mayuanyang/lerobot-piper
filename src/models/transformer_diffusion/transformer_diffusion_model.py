@@ -285,9 +285,14 @@ class SimpleDiffusionTransformer(nn.Module):
         self.state_positional_encoding = PositionalEncoding(config.d_model)
 
         # ------------------------------
-        # 3. Vision Temporal Transformer
+        # 3. Vision Positional Encoding
         # ------------------------------
-        encoder_layer_vision = nn.TransformerEncoderLayer(
+        self.vision_positional_encoding = PositionalEncoding(config.d_model)
+        
+        # ------------------------------
+        # 4. Cross-Camera Attention
+        # ------------------------------
+        cross_camera_layer = nn.TransformerEncoderLayer(
             d_model=config.d_model,
             nhead=config.nhead,
             dim_feedforward=config.dim_feedforward,
@@ -296,26 +301,24 @@ class SimpleDiffusionTransformer(nn.Module):
             batch_first=True,
             norm_first=True
         )
-        self.vision_temporal_transformer = nn.TransformerEncoder(
-            encoder_layer_vision, num_layers=config.num_encoder_layers
+        self.cross_camera_transformer = nn.TransformerEncoder(
+            cross_camera_layer, num_layers=2  # 2 layers for cross-camera attention
         )
-        self.vision_positional_encoding = PositionalEncoding(config.d_model)
 
         # ------------------------------
         # 4. Pre-normalization layers for vision and state features
         # ------------------------------
         self.vision_pre_norm = nn.LayerNorm(config.d_model)
         self.state_pre_norm = nn.LayerNorm(config.d_model)
-                
+        
         # ------------------------------
-        # 5. Projection for vision+state concatenation
+        # 5. Vision token reduction layer
         # ------------------------------
-        # After concatenating vision and state features, we need to project back to d_model
-        self.vision_state_projection = nn.Sequential(
-            nn.Linear(2 * config.d_model, config.d_model),
-            nn.LayerNorm(config.d_model),
-            nn.GELU()
-        )
+        # Reduce the number of vision tokens to balance with state tokens
+        # We'll define how many tokens we want to reduce to
+        self.target_vision_tokens = 32  # This can be adjusted
+        # Add adaptive pooling layer for token reduction
+        self.vision_token_pool = nn.AdaptiveAvgPool1d(self.target_vision_tokens)
                 
         # Fusion Transformer Encoder (instead of simple MLP)
         fusion_encoder_layer = nn.TransformerEncoderLayer(
@@ -397,6 +400,8 @@ class SimpleDiffusionTransformer(nn.Module):
         # 2. Vision encoding per camera
         # ------------------------------
         spatial_outputs = {}  # for visualization
+        
+                
         for cam_key, encoder in self.image_encoders.items():
             batch_key = cam_key.replace('_', '.')
             if batch_key in batch:
@@ -419,34 +424,47 @@ class SimpleDiffusionTransformer(nn.Module):
                     spatial_outputs[f"{cam_key}_heatmap"] = None
 
                 vision_tokens = encoder(img)  # (B, T, N_tokens_per_cam, d_model)
-                # Apply temporal transformer per camera to fuse time
+                # Apply positional encoding to vision tokens
                 B_v, T_v, N_v, D_v = vision_tokens.shape
                 vision_tokens_flat = vision_tokens.view(B_v, T_v * N_v, D_v)
                 vision_tokens_flat = self.vision_positional_encoding(vision_tokens_flat)
-                vision_tokens_encoded = self.vision_temporal_transformer(vision_tokens_flat)
                 
-                # Pre-normalize vision and state features before concatenation
-                vision_tokens_normalized = self.vision_pre_norm(vision_tokens_encoded)
-                state_expanded = state_tokens_flat.unsqueeze(2).expand(-1, -1, N_v, -1).reshape(B_v, T_v * N_v, D_v)
-                state_normalized = self.state_pre_norm(state_expanded)
+                # Pre-normalize vision tokens
+                vision_tokens_normalized = self.vision_pre_norm(vision_tokens_flat)
                 
-                # Concatenate normalized state token to each normalized vision token
-                vision_with_state = torch.cat([vision_tokens_normalized, state_normalized], dim=-1)
+                # Add residual connection from image_encoders to vision tokens
+                vision_tokens_with_residual = vision_tokens_normalized + vision_tokens_flat  # Add residual connection
                 
-                # Project back to d_model dimensions
-                vision_with_state = self.vision_state_projection(vision_with_state)
-                all_vision_tokens.append(vision_with_state)
+                all_vision_tokens.append(vision_tokens_with_residual)
 
         if all_vision_tokens:
             vision_tokens_all = torch.cat(all_vision_tokens, dim=1)  # concat along token dim
-            vision_tokens_all = torch.cat([vision_tokens_all, state_tokens_flat], dim=1)
+            
+            # Apply cross-camera attention to fuse information across cameras
+            vision_tokens_fused = self.cross_camera_transformer(vision_tokens_all)
+            
+            # Apply token reduction to balance vision and state tokens
+            # vision_tokens_fused shape: (B, num_vision_tokens, d_model)
+            # We want to reduce along the token dimension to target_vision_tokens
+            B, num_vision_tokens, D = vision_tokens_fused.shape
+            if num_vision_tokens > self.target_vision_tokens:
+                # Use adaptive pooling to reduce the number of tokens
+                vision_tokens_fused_transposed = vision_tokens_fused.transpose(1, 2)  # (B, d_model, num_vision_tokens)
+                # Use the predefined adaptive pooling layer for token reduction
+                vision_tokens_reduced = self.vision_token_pool(vision_tokens_fused_transposed)  # (B, d_model, target_vision_tokens)
+                vision_tokens_reduced = vision_tokens_reduced.transpose(1, 2)  # (B, target_vision_tokens, d_model)
+            else:
+                vision_tokens_reduced = vision_tokens_fused
+            
+            # Concatenate with state tokens
+            vision_tokens_fused = torch.cat([state_tokens_flat, vision_tokens_reduced], dim=1)
         else:
-            vision_tokens_all = torch.empty(B, 0, self.config.d_model, device=batch["observation.state"].device)
+            vision_tokens_fused = torch.empty(B, 0, self.config.d_model, device=batch["observation.state"].device)
 
         # ------------------------------
         # 3. Final processing
         # ------------------------------
-        obs_tokens = self.obs_ln(vision_tokens_all)
+        obs_tokens = self.obs_ln(vision_tokens_fused)
         context = self.fusion_projection(obs_tokens)
 
         return context, spatial_outputs

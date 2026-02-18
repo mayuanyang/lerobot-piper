@@ -218,7 +218,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         # Higher learning rate for vision encoders to improve gradient flow
         # Standard learning rate for other components
         optimizer = torch.optim.Adam([
-            {'params': vision_params, 'lr': 1e-5},   # Higher LR for vision encoders
+            {'params': vision_params, 'lr': 1e-4},   # 10x higher LR for vision encoders
             {'params': other_params, 'lr': 1e-4}     # Standard LR for other components
         ], weight_decay=1e-4)
         
@@ -311,11 +311,20 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 total_vision_grad = 0.0
                 total_vision_params = 0
                 for name, param in policy.model.named_parameters():
-                    if 'image_encoders' in name and param.grad is not None:
+                    if 'vision_temporal_transformer' in name and param.grad is not None:
                         grad_mean = param.grad.abs().mean().item()
                         param_count = param.numel()
                         total_vision_grad += grad_mean * param_count
                         total_vision_params += param_count
+                
+                total_img_grad = 0.0
+                total_img_params = 0
+                for name, param in policy.model.named_parameters():
+                    if 'image_encoders' in name and param.grad is not None:
+                        grad_mean = param.grad.abs().mean().item()
+                        param_count = param.numel()
+                        total_img_grad += grad_mean * param_count
+                        total_img_params += param_count
                 
                 # State encoder gradients
                 total_state_grad = 0.0
@@ -331,7 +340,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 total_encoder_grad = 0.0
                 total_encoder_params = 0
                 for name, param in policy.model.named_parameters():
-                    if 'obs_transformer' in name and param.grad is not None:
+                    if 'fusion_projection' in name and param.grad is not None:
                         grad_mean = param.grad.abs().mean().item()
                         param_count = param.numel()
                         total_encoder_grad += grad_mean * param_count
@@ -349,9 +358,14 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 
                 # Print all gradients in one line
                 grad_info = []
+                
                 if total_vision_params > 0:
                     avg_vision_grad = total_vision_grad / total_vision_params
-                    grad_info.append(f"vision_enc: {avg_vision_grad:.6f}")
+                    grad_info.append(f"vision_temporal_transformer: {avg_vision_grad:.6f}")
+                    
+                if total_img_params > 0:
+                    avg_img_grad = total_img_grad / total_img_params
+                    grad_info.append(f"image_encoders: {avg_img_grad:.6f}")
                 
                 if total_state_params > 0:
                     avg_state_grad = total_state_grad / total_state_params
@@ -359,11 +373,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 
                 if total_encoder_params > 0:
                     avg_encoder_grad = total_encoder_grad / total_encoder_params
-                    grad_info.append(f"transformer_enc: {avg_encoder_grad:.6f}")
+                    grad_info.append(f"fusion_projection: {avg_encoder_grad:.6f}")
                 
                 if total_denoiser_params > 0:
                     avg_denoiser_grad = total_denoiser_grad / total_denoiser_params
-                    grad_info.append(f"transformer_dec: {avg_denoiser_grad:.6f}")
+                    grad_info.append(f"denoising_transformer: {avg_denoiser_grad:.6f}")
                 
                 print(f"Gradients -> {' | '.join(grad_info)}")
                 print("--- End Gradient Analysis ---\n")

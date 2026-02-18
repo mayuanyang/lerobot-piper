@@ -32,6 +32,9 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     # Vision encoder parameters
     num_cameras: int = 1
     vision_freeze_layers: int = 6
+    # Selective camera processing - list of camera keys to use for vision-state token concatenation
+    # Empty list means use all cameras
+    cameras_for_vision_state_concat: list[str] = field(default_factory=lambda: ['observation.images.front'])
         
     
     # State processing
