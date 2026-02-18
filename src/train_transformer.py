@@ -117,7 +117,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     print('output_features:', output_features)
     
     # Training parameters
-    obs = 4
+    obs = 2
     horizon = 16
     n_action_steps = 8
     
@@ -140,7 +140,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         kernel_size=3,
         n_groups=8,
         num_cameras=3,  # Set number of cameras based on input features
-        vision_freeze_layers=6  # No frozen layers by default
+        vision_freeze_layers=0  # UNFREEZE ALL LAYERS for better gradient flow
     )
     
     
@@ -160,8 +160,22 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             grid_overlay_cameras=["front", "right"]  # Front and right cameras (original names)
         )
             
+        # Print optimizer information
+        print(f"Initializing optimizer with learning rate: 1e-4")
+        print(f"Number of trainable parameters: {len(trainable_params)}")
+        
+        # Check if we have different learning rates for vision vs other parameters
+        vision_param_count = len(vision_params)
+        other_param_count = len(other_params)
+        print(f"Vision parameters: {vision_param_count}, Other parameters: {other_param_count}")
+        
         trainable_params = [p for p in policy.parameters() if p.requires_grad]
         optimizer = torch.optim.Adam(trainable_params, lr=1e-4)
+        
+        # Print learning rate groups
+        print(f"Optimizer parameter groups: {len(optimizer.param_groups)}")
+        for i, group in enumerate(optimizer.param_groups):
+            print(f"  Group {i}: lr={group['lr']}, params={len(group['params'])}")
         # Cosine scheduler with warmup
         warmup_steps = 1000
         scheduler = get_cosine_schedule_with_warmup(
@@ -300,6 +314,98 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             if step % progress_update_freq == 0:  # Print every 10 progress update intervals
                 print(f"\n--- Gradient Analysis at Step {step} ---")
                 
+                # Print detailed gradients for VisionEncoder components (aggregated by component type)
+                print("\n=== VisionEncoder Gradients (Per Camera) ===")
+                
+                # Check gradients for each camera encoder separately
+                for camera_name, encoder in policy.model.image_encoders.items():
+                    print(f"\n--- Camera: {camera_name} ---")
+                    
+                    # Check gradients for each component in this encoder
+                    for component_name, component in encoder.named_children():
+                        component_grad_norm = 0.0
+                        component_param_count = 0
+                        component_params_with_grad = 0
+                        component_zero_grad_count = 0
+                        
+                        for param_name, param in component.named_parameters():
+                            param_count = param.numel()
+                            component_param_count += param_count
+                            
+                            if param.requires_grad:
+                                if param.grad is not None:
+                                    grad_norm = param.grad.norm().item()
+                                    component_grad_norm += grad_norm
+                                    component_params_with_grad += param_count
+                                    
+                                    if grad_norm == 0.0:
+                                        component_zero_grad_count += param_count
+                                    elif grad_norm < 1e-6:
+                                        print(f"  WARNING: Very small gradient in {component_name}.{param_name}: {grad_norm:.2e}")
+                                else:
+                                    print(f"  WARNING: No gradient for {component_name}.{param_name}")
+                        
+                        # Print component summary for this camera
+                        if component_param_count > 0:
+                            if component_params_with_grad > 0:
+                                avg_grad_norm = component_grad_norm / component_params_with_grad
+                                zero_grad_percent = (component_zero_grad_count / component_params_with_grad) * 100 if component_params_with_grad > 0 else 0
+                                print(f"  {component_name}: avg_grad_norm={avg_grad_norm:.2e}, params={component_param_count}, "
+                                      f"with_grad={component_params_with_grad}, zero_grad={zero_grad_percent:.1f}%")
+                            else:
+                                print(f"  {component_name}: NO GRADIENTS, params={component_param_count}")
+                
+                # Check for frozen backbone layers per camera
+                print("\n=== Vision Backbone Freeze Status (Per Camera) ===")
+                for camera_name, encoder in policy.model.image_encoders.items():
+                    frozen_layers = 0
+                    total_layers = 0
+                    for name, param in encoder.backbone.named_parameters():
+                        total_layers += 1
+                        if not param.requires_grad:
+                            frozen_layers += 1
+                    print(f"  Camera {camera_name}: {frozen_layers}/{total_layers} layers frozen ({frozen_layers/total_layers*100:.1f}%)")
+                
+                # Aggregate gradients by component type across all cameras (existing code)
+                print("\n=== VisionEncoder Gradients (Aggregated by Component) ===")
+                component_gradients = {}
+                
+                for camera_name, encoder in policy.model.image_encoders.items():
+                    for component_name, component in encoder.named_children():
+                        if component_name not in component_gradients:
+                            component_gradients[component_name] = {
+                                'total_grad_norm': 0.0,
+                                'total_param_count': 0,
+                                'params_with_grad': 0,
+                                'params_without_grad': 0,
+                                'zero_grad_count': 0
+                            }
+                        
+                        for param_name, param in component.named_parameters():
+                            param_count = param.numel()
+                            component_gradients[component_name]['total_param_count'] += param_count
+                            
+                            if param.requires_grad:
+                                if param.grad is not None:
+                                    grad_norm = param.grad.norm().item()
+                                    component_gradients[component_name]['total_grad_norm'] += grad_norm
+                                    component_gradients[component_name]['params_with_grad'] += param_count
+                                    
+                                    if grad_norm == 0.0:
+                                        component_gradients[component_name]['zero_grad_count'] += param_count
+                                else:
+                                    component_gradients[component_name]['params_without_grad'] += param_count
+                # Print aggregated gradients with more details
+                for component_name, grad_info in component_gradients.items():
+                    if grad_info['total_param_count'] > 0:
+                        if grad_info['params_with_grad'] > 0:
+                            avg_grad_norm = grad_info['total_grad_norm'] / grad_info['params_with_grad']
+                            zero_grad_percent = (grad_info['zero_grad_count'] / grad_info['params_with_grad']) * 100 if grad_info['params_with_grad'] > 0 else 0
+                            print(f"  {component_name}: avg_grad_norm={avg_grad_norm:.2e}, params={grad_info['total_param_count']}, "
+                                  f"with_grad={grad_info['params_with_grad']}, zero_grad={zero_grad_percent:.1f}%")
+                        else:
+                            print(f"  {component_name}: NO GRADIENTS, params={grad_info['total_param_count']}")
+                
                 # Collect gradients for trainable components only
                 total_vision_grad = 0.0
                 total_vision_params = 0
@@ -372,7 +478,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                     avg_denoiser_grad = total_denoiser_grad / total_denoiser_params
                     grad_info.append(f"denoising_transformer: {avg_denoiser_grad:.6f}")
                 
-                print(f"Gradients -> {' | '.join(grad_info)}")
+                print(f"\nOverall Gradients -> {' | '.join(grad_info)}")
                 print("--- End Gradient Analysis ---\n")
             
             # Calculate gradient norm for monitoring and clip gradients (only for trainable parameters)

@@ -9,15 +9,49 @@ class SpatialSoftmax(nn.Module):
     """
     Spatial Softmax layer that computes spatial softmax over feature maps
     and returns coordinates for use in neural networks.
+    
+    Supports channel reduction to control the number of output keypoints.
     """
     
-    def __init__(self, temperature=1.0, learn_temperature=False):
+    def __init__(self, input_shape=None, num_kp=None, temperature=1.0, learn_temperature=False):
+        """
+        Args:
+            input_shape (tuple, optional): (C, H, W) input feature map shape. Required if num_kp is specified.
+            num_kp (int, optional): Number of keypoints in output. If None, output will have the same 
+                                  number of channels as input.
+            temperature (float): Temperature parameter for softmax.
+            learn_temperature (bool): Whether to make temperature a learnable parameter.
+        """
         super(SpatialSoftmax, self).__init__()
+        
         self.learn_temperature = learn_temperature
         if learn_temperature:
             self.temperature = nn.Parameter(torch.ones(1) * temperature)
         else:
             self.temperature = temperature
+            
+        # Channel reduction functionality
+        if num_kp is not None:
+            if input_shape is None:
+                raise ValueError("input_shape must be provided when num_kp is specified")
+            self._in_c, self._in_h, self._in_w = input_shape
+            self.nets = nn.Conv2d(self._in_c, num_kp, kernel_size=1)
+            self._out_c = num_kp
+        else:
+            self.nets = None
+            self._out_c = None  # Will be determined from input
+            
+        # Precompute coordinate grid for efficiency
+        if input_shape is not None:
+            _, H, W = input_shape
+            # Create coordinate grids using numpy (similar to lerobot approach)
+            pos_x, pos_y = np.meshgrid(np.linspace(-1.0, 1.0, W), np.linspace(-1.0, 1.0, H))
+            pos_x = torch.from_numpy(pos_x.reshape(H * W, 1)).float()
+            pos_y = torch.from_numpy(pos_y.reshape(H * W, 1)).float()
+            # Register as buffer so it's moved to the correct device
+            self.register_buffer("pos_grid", torch.cat([pos_x, pos_y], dim=1))
+        else:
+            self.pos_grid = None
             
     def forward(self, feature_maps):
         """
@@ -27,7 +61,7 @@ class SpatialSoftmax(nn.Module):
             feature_maps: (B, C, H, W) feature maps
             
         Returns:
-            coords: (B, C, 2) normalized coordinates in range [-1, 1]
+            coords: (B, K, 2) normalized coordinates in range [-1, 1], where K is the number of keypoints
         """
         coords, _ = self.forward_with_heatmaps(feature_maps)
         return coords
@@ -40,37 +74,66 @@ class SpatialSoftmax(nn.Module):
             feature_maps: (B, C, H, W) feature maps
             
         Returns:
-            coords: (B, C, 2) normalized coordinates in range [-1, 1]
-            heatmaps: (B, C, H, W) softmax heatmaps for visualization
+            coords: (B, K, 2) normalized coordinates in range [-1, 1], where K is the number of keypoints
+            heatmaps: (B, K, H, W) softmax heatmaps for visualization (K is output channels)
         """
         B, C, H, W = feature_maps.shape
-        
-        # Flatten spatial dimensions
-        flat_features = feature_maps.view(B, C, -1)  # (B, C, H*W)
-        
-        # Apply softmax with temperature
-        temp = self.temperature if not self.learn_temperature else self.temperature.clamp(min=1e-6)
-        softmax_features = F.softmax(flat_features / temp, dim=-1)  # (B, C, H*W)
-        
-        # Reshape back to spatial dimensions for heatmap
-        heatmaps = softmax_features.view(B, C, H, W)  # (B, C, H, W)
-        
-        # Create coordinate grids
         device = feature_maps.device
-        y_coords = torch.linspace(-1, 1, H, device=device)
-        x_coords = torch.linspace(-1, 1, W, device=device)
-        y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
         
-        # Expand grids to match batch and channel dimensions
-        y_grid = y_grid.unsqueeze(0).unsqueeze(0).expand(B, C, -1, -1)  # (B, C, H, W)
-        x_grid = x_grid.unsqueeze(0).unsqueeze(0).expand(B, C, -1, -1)  # (B, C, H, W)
-        
-        # Compute expected coordinates
-        y_coords_expected = (softmax_features * y_grid.reshape(B, C, -1)).sum(dim=-1)  # (B, C)
-        x_coords_expected = (softmax_features * x_grid.reshape(B, C, -1)).sum(dim=-1)  # (B, C)
-        
-        # Stack coordinates
-        coords = torch.stack([x_coords_expected, y_coords_expected], dim=-1)  # (B, C, 2)
+        # Apply channel reduction if specified
+        if self.nets is not None:
+            feature_maps = self.nets(feature_maps)
+            out_c = self._out_c
+        else:
+            out_c = C
+            
+        # Update pos_grid if it wasn't precomputed or shape doesn't match
+        if self.pos_grid is None or self.pos_grid.shape[0] != H * W:
+            # Create coordinate grids dynamically (your original approach)
+            y_coords = torch.linspace(-1, 1, H, device=device)
+            x_coords = torch.linspace(-1, 1, W, device=device)
+            y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
+            
+            # Expand grids to match batch and channel dimensions
+            y_grid = y_grid.unsqueeze(0).unsqueeze(0).expand(B, out_c, -1, -1)  # (B, out_c, H, W)
+            x_grid = x_grid.unsqueeze(0).unsqueeze(0).expand(B, out_c, -1, -1)  # (B, out_c, H, W)
+            
+            # Flatten spatial dimensions
+            flat_features = feature_maps.view(B, out_c, -1)  # (B, out_c, H*W)
+            
+            # Apply softmax with temperature
+            temp = self.temperature if not self.learn_temperature else self.temperature.clamp(min=1e-6)
+            softmax_features = F.softmax(flat_features / temp, dim=-1)  # (B, out_c, H*W)
+            
+            # Reshape back to spatial dimensions for heatmap
+            heatmaps = softmax_features.view(B, out_c, H, W)  # (B, out_c, H, W)
+            
+            # Compute expected coordinates using element-wise operations (your approach)
+            y_coords_expected = (softmax_features * y_grid.reshape(B, out_c, -1)).sum(dim=-1)  # (B, out_c)
+            x_coords_expected = (softmax_features * x_grid.reshape(B, out_c, -1)).sum(dim=-1)  # (B, out_c)
+            
+            # Stack coordinates
+            coords = torch.stack([x_coords_expected, y_coords_expected], dim=-1)  # (B, out_c, 2)
+        else:
+            # Use precomputed grid with matrix multiplication (lerobot approach)
+            # Ensure pos_grid is on the correct device
+            pos_grid = self.pos_grid.to(device)
+            
+            # Flatten spatial dimensions
+            flat_features = feature_maps.reshape(B * out_c, H * W)  # (B * out_c, H*W)
+            
+            # Apply softmax with temperature
+            temp = self.temperature if not self.learn_temperature else self.temperature.clamp(min=1e-6)
+            attention = F.softmax(flat_features / temp, dim=-1)  # (B * out_c, H*W)
+            
+            # Matrix multiplication with precomputed coordinate grid
+            expected_xy = attention @ pos_grid  # (B * out_c, 2)
+            
+            # Reshape to (B, out_c, 2)
+            coords = expected_xy.view(B, out_c, 2)
+            
+            # Reshape attention back to spatial dimensions for heatmap
+            heatmaps = attention.view(B, out_c, H, W)  # (B, out_c, H, W)
         
         return coords, heatmaps
 

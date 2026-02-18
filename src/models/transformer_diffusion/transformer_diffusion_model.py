@@ -60,59 +60,61 @@ class VisionEncoder(nn.Module):
         self.num_cameras = config.num_cameras
 
         # ------------------------------
-        # 1. ViT backbone
+        # 1. ViT backbone with better initialization
         # ------------------------------
         # Extract image size from config (assuming square images)
         image_size = config.input_image_size[0] if isinstance(config.input_image_size, (tuple, list)) else config.input_image_size
+        
+        # Validate vision backbone
+        if not hasattr(models, config.vision_backbone):
+            raise ValueError(f"Unsupported vision backbone: {config.vision_backbone}")
+            
         backbone = getattr(models, config.vision_backbone)(
             weights="DEFAULT",
             image_size=image_size
         )
         self.hidden_dim = backbone.hidden_dim  # 768 for vit_b_16
+        
+        # Remove the classification head to get raw features
+        # The default head is a Linear layer that maps to 1000 classes
+        # We replace it with Identity() to get the raw 768-dim features
         backbone.heads = nn.Identity()
         self.backbone = backbone
 
         # ------------------------------
-        # 2. Freeze early layers (optional)
+        # 2. Improved layer freezing with better parameter handling
         # ------------------------------
-        if config.vision_freeze_layers > 0:
-            for name, param in self.backbone.named_parameters():
-                if "encoder_layer_" in name:
-                    # Handle naming convention like "encoder.layers.encoder_layer_0.ln_1.weight"
-                    # or "encoder_layer_0.bias"
-                    layer_part = name.split("encoder_layer_")[1]
-                    layer_id = int(layer_part.split(".")[0])
-                    if layer_id < config.vision_freeze_layers:
-                        param.requires_grad = False
-                elif "encoder.layers" in name:
-                    # Handle naming convention like "encoder.layers.0.attention.out_proj.weight"
-                    layer_part = name.split("encoder.layers.")[1]
-                    layer_id = int(layer_part.split(".")[0])
-                    if layer_id < config.vision_freeze_layers:
-                        param.requires_grad = False
+        self._freeze_layers(config.vision_freeze_layers)
 
         # ------------------------------
-        # 3. Add a pooling layer to reduce 14x14 patches to 7x7
-        # This reduces 196 tokens to 49 tokens
+        # 3. Add a pooling layer to reduce 14x14 patches to 5x5
+        # This reduces 196 tokens to 25 tokens (approximately half)
         # ------------------------------
-        self.pool = nn.AdaptiveAvgPool2d((7, 7))
+        self.pool = nn.AdaptiveAvgPool2d((5, 5))
 
         # ------------------------------
-        # 5. Spatial softmax head for keypoint detection
+        # 4. Enhanced spatial softmax head with better initialization and channel reduction
         # ------------------------------
+        # Combined spatial head with convolution and spatial softmax
         self.spatial_head = nn.Sequential(
-            nn.Conv2d(self.hidden_dim, 32, kernel_size=1),  # Reduce 768 to 32 feature maps
-            SpatialSoftmax(temperature=0.1)                 # Extract 32 (x,y) pairs
-        )
-        # Use a deeper projection for better gradient flow
-        self.point_projection = nn.Sequential(
-            nn.Linear(2, config.d_model // 2),
+            nn.Conv2d(self.hidden_dim, self.hidden_dim // 2, kernel_size=1),  
+            SpatialSoftmax(
+                input_shape=(self.hidden_dim // 2, 14, 14), 
+                num_kp=16,  # Control number of keypoints (can be adjusted)
+                temperature=0.1, 
+                learn_temperature=True
+            ),
             nn.GELU(),
-            nn.Linear(config.d_model // 2, config.d_model)
+        )
+        
+        # Improved point projection with residual connection support
+        self.point_projection = nn.Sequential(
+            nn.Linear(2, config.d_model),
+            nn.GELU()
         )
 
         # ------------------------------
-        # 6. Projection to d_model with residual connection support
+        # 5. Enhanced projection to d_model with better initialization
         # ------------------------------
         self.projection = nn.Sequential(
             nn.Linear(self.hidden_dim, config.d_model),
@@ -121,71 +123,149 @@ class VisionEncoder(nn.Module):
         )
 
         # ------------------------------
-        # 7. Camera embedding
+        # 6. Camera embedding with Xavier initialization
         # ------------------------------
         self.camera_embedding = nn.Embedding(
             self.num_cameras,
             config.d_model
         )
+        # Initialize camera embeddings with Xavier initialization
+        nn.init.xavier_uniform_(self.camera_embedding.weight)
 
         # ------------------------------
-        # 8. num tokens per camera (will be computed dynamically)
+        # 7. Token tracking and configuration
         # ------------------------------
         self.num_tokens_per_cam = None
-        self.num_spatial_tokens = 32  # Number of spatial keypoints
+        
         
         # Flag to enable heatmap saving (for debugging)
         self.save_heatmaps = False
         self.heatmap_save_dir = None
+        
+        # Initialize all submodules properly
+        self._init_weights()
 
-    # ------------------------------
-    # Forward
-    # ------------------------------
+    def _freeze_layers(self, freeze_layers):
+        """Improved layer freezing with better parameter handling."""
+        if freeze_layers <= 0:
+            return
+            
+        frozen_count = 0
+        for name, param in self.backbone.named_parameters():
+            # Handle different ViT naming conventions
+            if "encoder_layer_" in name:
+                # Handle naming convention like "encoder.layers.encoder_layer_0.ln_1.weight"
+                layer_part = name.split("encoder_layer_")[1]
+                layer_id = int(layer_part.split(".")[0])
+                if layer_id < freeze_layers:
+                    param.requires_grad = False
+                    frozen_count += 1
+            elif "encoder.layers" in name:
+                # Handle naming convention like "encoder.layers.0.attention.out_proj.weight"
+                layer_part = name.split("encoder.layers.")[1]
+                layer_id = int(layer_part.split(".")[0])
+                if layer_id < freeze_layers:
+                    param.requires_grad = False
+                    frozen_count += 1
+                    
+        print(f"Frozen {frozen_count} parameters in VisionEncoder backbone")
+
+    def _init_weights(self):
+        """Initialize weights for better training stability."""
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                # Initialize conv layers with Kaiming initialization
+                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.Linear):
+                # Initialize linear layers with Xavier initialization
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, (nn.BatchNorm2d, nn.LayerNorm)):
+                # Initialize normalization layers
+                nn.init.constant_(module.weight, 1)
+                nn.init.constant_(module.bias, 0)
+
     def forward(self, x):
         """
         x: (B, T, N_cam, C, H, W)
         return:
             vision_tokens: (B, T, N_cam * num_tokens_per_cam, d_model)
         """
-
+        # Validate input
+        self._validate_input(x)
+        
         B, T, N_cam, C, H, W = x.shape
         x = x.view(B * T * N_cam, C, H, W)
 
-        # 1. Get ViT features
+        # 1. Get ViT features using the standard approach
+        # We manually process the input to get both class token and patch tokens separately
+        # This is necessary because we want to use both the class token and patch tokens
+        # for different parts of our architecture, rather than just the class token
+        # which is what the standard forward method returns.
+        
+        # Process input through convolutional projection (before encoder)
+        # This applies the patch embedding convolution (Conv2d 3->768, 16x16 patches)
+        # and reshapes to (batch, num_patches, hidden_dim) format
         x_processed = self.backbone._process_input(x)
         n = x_processed.shape[0]
+        
+        # Add class token
+        # The class token is a learnable parameter that serves as a "summary" token
+        # It's initialized as a 1x1x768 tensor and gets expanded to match the batch size
+        # This allows the transformer to aggregate information from all patches into a single representation
         batch_class_token = self.backbone.class_token.expand(n, -1, -1)
         x_with_cls = torch.cat([batch_class_token, x_processed], dim=1)
-        encoded_features = self.backbone.encoder(x_with_cls) # (Batch, 197, 768)
-
-        # 2. Separate CLS and Patches
-        cls_token = encoded_features[:, 0:1, :]    # (Batch, 1, 768)
-        patch_tokens = encoded_features[:, 1:, :]   # (Batch, 196, 768)
-
-        # 3. Get the 32 (x,y) coordinates from spatial head
-        # First reduce features with conv layer, then apply spatial softmax
-        patch_features = patch_tokens.transpose(1, 2).reshape(n, self.hidden_dim, 14, 14)
-        reduced_features = self.spatial_head[0](patch_features)  # (Batch, 32, 14, 14)
-        coords = self.spatial_head[1](reduced_features)  # (Batch, 32, 2)
+        
+        
+        # Use hook to capture intermediate features from layer 6 for spatial softmax
+        # This maintains proper gradient flow through the entire encoder
+        intermediate_features = {}
+        
+        def hook_fn(module, input, output):
+            intermediate_features['spatial_features'] = output[:, 1:, :]  # Drop CLS token
+        
+        # Register hook on the 8th layer
+        hook = self.backbone.encoder.layers[6].register_forward_hook(hook_fn)
+        
+        # Process through the full encoder to maintain proper gradient flow
+        encoded_features = self.backbone.encoder(x_with_cls)
+        
+        # Remove hook
+        hook.remove()
+        
+        # Extract intermediate features for spatial softmax
+        spatial_features = intermediate_features['spatial_features']
+        
+        # Extract final tokens
+        x = encoded_features
+        cls_token = x[:, 0:1, :]      # (Batch, 1, 768)
+        patch_tokens = x[:, 1:, :]    # (Batch, 196, 768)
+                
+        # Process spatial features
+        patch_features = spatial_features.transpose(1, 2).reshape(n, self.hidden_dim, 14, 14)
+        spatial_coords = self.spatial_head(patch_features)
 
         # 4. Convert coordinates into tokens
-        point_tokens = self.point_projection(coords)  # (Batch, 32, d_model)
+        point_tokens = self.point_projection(spatial_coords)  # (Batch, 32, d_model)
 
         # 5. Spatial Pooling for ViT tokens
         # Reshape to (Batch, 768, 14, 14) to pool spatially
         patch_tokens_pooled = patch_tokens.transpose(1, 2).reshape(n, self.hidden_dim, 14, 14)
-        patch_tokens_pooled = self.pool(patch_tokens_pooled)  # (Batch, 768, 7, 7)
-        patch_tokens_flattened = patch_tokens_pooled.flatten(2).transpose(1, 2)  # (Batch, 49, 768)
+        patch_tokens_pooled = self.pool(patch_tokens_pooled)  # (Batch, 768, 5, 5)
+        patch_tokens_flattened = patch_tokens_pooled.flatten(2).transpose(1, 2)  # (Batch, 25, 768)
 
         # 6. Re-combine ViT tokens
-        vit_combined = torch.cat([cls_token, patch_tokens_flattened], dim=1)  # (Batch, 50, 768)
+        vit_combined = torch.cat([cls_token, patch_tokens_flattened], dim=1)  # (Batch, 26, 768)
         
         # 7. Project ViT tokens
-        vit_tokens = self.projection(vit_combined)  # (Batch, 50, d_model)
+        vit_tokens = self.projection(vit_combined)  # (Batch, 26, d_model)
         
         # 8. Concatenate ViT tokens with point tokens
-        # Now we have 50 ViT tokens + 32 point tokens = 82 total tokens
-        combined_tokens = torch.cat([vit_tokens, point_tokens], dim=1)  # (Batch, 82, d_model)
+        # Now we have 26 ViT tokens + 16 point tokens = 42 total tokens
+        combined_tokens = torch.cat([vit_tokens, point_tokens], dim=1)  # (Batch, 42, d_model)
         
         # Store the number of tokens per camera for later use
         self.num_tokens_per_cam = combined_tokens.shape[1]
@@ -205,6 +285,20 @@ class VisionEncoder(nn.Module):
 
         return vision_tokens
 
+    def _validate_input(self, x):
+        """Validate input tensor dimensions and values."""
+        if not isinstance(x, torch.Tensor):
+            raise TypeError("Input must be a torch.Tensor")
+        
+        if x.dim() != 6:
+            raise ValueError(f"Expected 6D input (B, T, N_cam, C, H, W), got {x.dim()}D")
+            
+        if x.shape[-3] != 3:  # Assuming RGB images
+            print(f"Warning: Expected 3-channel images, got {x.shape[-3]} channels")
+            
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            raise ValueError("Input contains NaN or Inf values")
+
     def generate_debug_heatmaps(self, x, camera_name="default", batch_index=0, timestep=0):
         """
         Generate heatmaps for debugging purposes without affecting the normal forward pass.
@@ -222,11 +316,22 @@ class VisionEncoder(nn.Module):
             B, T, N_cam, C, H, W = x.shape
             x = x.view(B * T * N_cam, C, H, W)
 
-            # Get ViT features
+            # Get ViT features using the same manual approach as in forward()
+            # This gives us access to both class and patch tokens
+            
+            # Process input through convolutional projection (before encoder)
+            # This applies the patch embedding convolution and reshapes to token format
             x_processed = self.backbone._process_input(x)
             n = x_processed.shape[0]
+            
+            # Add class token
+            # The class token is a learnable parameter that serves as a "summary" token
+            # It's initialized as a 1x1x768 tensor and gets expanded to match the batch size
+            # This allows the transformer to aggregate information from all patches into a single representation
             batch_class_token = self.backbone.class_token.expand(n, -1, -1)
             x_with_cls = torch.cat([batch_class_token, x_processed], dim=1)
+            
+            # Pass through transformer encoder to get both class and patch tokens
             encoded_features = self.backbone.encoder(x_with_cls) # (Batch, 197, 768)
 
             # Separate CLS and Patches
@@ -237,8 +342,13 @@ class VisionEncoder(nn.Module):
             # Reshape to (Batch, 768, 14, 14) for heatmap generation
             patch_features = patch_tokens.transpose(1, 2).reshape(n, self.hidden_dim, 14, 14)
             
-            # Create spatial softmax for heatmap generation
-            spatial_softmax = SpatialSoftmax(temperature=0.1, learn_temperature=False)
+            # Create spatial softmax for heatmap generation with proper input shape
+            spatial_softmax = SpatialSoftmax(
+                input_shape=(self.hidden_dim, 14, 14),
+                num_kp=None,  # Use all channels for debugging
+                temperature=0.1, 
+                learn_temperature=False
+            )
             
             # Apply spatial softmax to generate heatmaps and coordinates
             coords, heatmaps = spatial_softmax.forward_with_heatmaps(patch_features)  # coords: (Batch, 768, 2), heatmaps: (Batch, 768, 14, 14)
@@ -288,6 +398,8 @@ class SimpleDiffusionTransformer(nn.Module):
             cam.replace('.', '_'): VisionEncoder(config)
             for cam in config.image_features.keys()
         })
+        
+        
 
         # ------------------------------
         # 2. State Encoder (separate)
@@ -319,26 +431,7 @@ class SimpleDiffusionTransformer(nn.Module):
             cross_camera_layer, num_layers=config.num_encoder_layers
         )
 
-        
-        # ------------------------------
-        # 5. Vision token reduction layer
-        # ------------------------------
-        # Reduce the number of vision tokens to balance with state tokens
-        # Calculate total number of vision tokens dynamically
-        # Formula: n_obs_steps * tokens_per_camera * num_cameras
-        # tokens_per_camera = 82 (50 ViT tokens + 32 point tokens)
-        # num_cameras = len(config.image_features)
-        self.tokens_per_camera = 82
-        self.total_vision_tokens = config.n_obs_steps * self.tokens_per_camera * len(config.image_features)
-        
-        self.target_vision_tokens = 96  # This can be adjusted
-        # Use a multi-layer approach for better gradient flow instead of single linear layer
-        self.vision_token_linear = nn.Sequential(
-            nn.Linear(self.total_vision_tokens, self.total_vision_tokens // 2),
-            nn.GELU(),
-            nn.Linear(self.total_vision_tokens // 2, self.target_vision_tokens)
-        )
-                
+                        
         # Fusion Transformer Encoder (instead of simple MLP)
         fusion_encoder_layer = nn.TransformerEncoderLayer(
             d_model=config.d_model,
@@ -462,29 +555,17 @@ class SimpleDiffusionTransformer(nn.Module):
             # Add residual connection from original vision tokens
             vision_tokens_fused = vision_tokens_fused + vision_tokens_original
             
-            # Apply token reduction to balance vision and state tokens
-            # vision_tokens_fused shape: (B, num_vision_tokens, d_model)
-            # We want to reduce along the token dimension to target_vision_tokens
-            B, num_vision_tokens, D = vision_tokens_fused.shape
-            if num_vision_tokens > self.target_vision_tokens:
-                # Use the linear layer for token reduction
-                vision_tokens_fused_transposed = vision_tokens_fused.transpose(1, 2)  # (B, d_model, num_vision_tokens)
-                # Use the linear layer for token reduction
-                vision_tokens_reduced = self.vision_token_linear(vision_tokens_fused_transposed)  # (B, d_model, target_vision_tokens)
-                vision_tokens_reduced = vision_tokens_reduced.transpose(1, 2)  # (B, target_vision_tokens, d_model)
-            else:
-                vision_tokens_reduced = vision_tokens_fused
-            
-            # Concatenate with state tokens
-            vision_tokens_fused = torch.cat([state_tokens_flat, vision_tokens_reduced], dim=1)
+            # Skip token reduction since vision_token_linear was removed
+            # Concatenate with state tokens directly
+            vision_tokens_fused = torch.cat([vision_tokens_fused, state_tokens_flat], dim=1)
         else:
             vision_tokens_fused = torch.empty(B, 0, self.config.d_model, device=batch["observation.state"].device)
 
         # ------------------------------
         # 3. Final processing
         # ------------------------------
-        obs_tokens = self.obs_ln(vision_tokens_fused)
-        context = self.fusion_encoder(obs_tokens)
+        #obs_tokens = self.obs_ln(vision_tokens_fused)
+        context = self.fusion_encoder(vision_tokens_fused)
 
         return context, spatial_outputs
 
