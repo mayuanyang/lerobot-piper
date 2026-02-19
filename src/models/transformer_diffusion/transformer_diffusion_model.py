@@ -54,12 +54,14 @@ class DiffusionSinusoidalPosEmb(nn.Module):
 
 
 class VisionEncoder(nn.Module):
-    def __init__(self, config, shared_backbone=None, camera_id=None):
+    def __init__(self, config, shared_backbone=None, camera_id=None, camera_name=None, num_kp=None):
         super().__init__()
 
         self.config = config
         self.num_cameras = config.num_cameras
         self.camera_id = camera_id
+        self.camera_name = camera_name
+        self.num_kp = num_kp
 
         # ------------------------------
         # 1. ViT backbone - shared or individual
@@ -108,6 +110,25 @@ class VisionEncoder(nn.Module):
             nn.LayerNorm(config.d_model),
             nn.GELU()
         )
+
+        # ------------------------------
+        # 5. Camera-specific spatial softmax head
+        # ------------------------------
+        if num_kp is not None and num_kp > 0:
+            # We'll initialize the SpatialSoftmax with a placeholder shape
+            # The actual shape will be determined dynamically in the forward pass
+            self.spatial_head = nn.Sequential(
+                nn.Conv2d(self.hidden_dim, self.hidden_dim // 2, kernel_size=1),  
+                SpatialSoftmax(
+                    input_shape=(self.hidden_dim // 2, 14, 14),  # Placeholder, will be updated dynamically
+                    num_kp=num_kp,  # Camera-specific number of keypoints
+                    temperature=0.1, 
+                    learn_temperature=True
+                ),
+                nn.GELU(),
+            )
+        else:
+            self.spatial_head = None
 
         # ------------------------------
         # 6. Camera embedding with Xavier initialization
@@ -211,17 +232,49 @@ class VisionEncoder(nn.Module):
         batch_class_token = self.backbone.class_token.expand(n, -1, -1)
         x_with_cls = torch.cat([batch_class_token, x_processed], dim=1)
         
+        # Use hook to capture intermediate features from layer 3 for spatial softmax
+        # This maintains proper gradient flow through the entire encoder
+        intermediate_features = {}
+        
+        def hook_fn(module, input, output):
+            intermediate_features['spatial_features'] = output[:, 1:, :]  # Drop CLS token
+        
+        # Register hook on layer 3
+        hook = self.backbone.encoder.layers[3].register_forward_hook(hook_fn)
+        
         # Process through the full encoder to maintain proper gradient flow
         encoded_features = self.backbone.encoder(x_with_cls)
+        
+        # Remove hook
+        hook.remove()
         
         # Extract final tokens
         x = encoded_features
         cls_token = x[:, 0:1, :]      # (Batch, 1, 768)
         patch_tokens = x[:, 1:, :]    # (Batch, 196, 768)
+        
+        # Extract intermediate features for spatial processing if spatial head exists
+        if self.spatial_head is not None and self.num_kp > 0:
+            spatial_features = intermediate_features['spatial_features']
+            
+            # Dynamically compute patch dimensions instead of hardcoding 14x14
+            num_patches = spatial_features.shape[1]
+            h = w = int(math.sqrt(num_patches))
+            
+            # Process spatial features for spatial softmax
+            patch_features = spatial_features.transpose(1, 2).reshape(n, self.hidden_dim, h, w)
+            spatial_coords = self.spatial_head(patch_features)
+            
+            # Store spatial coordinates for later use (e.g., in get_condition)
+            self.cached_spatial_coords = spatial_coords
                 
         # 5. Spatial Pooling for ViT tokens
-        # Reshape to (Batch, 768, 14, 14) to pool spatially
-        patch_tokens_pooled = patch_tokens.transpose(1, 2).reshape(n, self.hidden_dim, 14, 14)
+        # Dynamically compute patch dimensions instead of hardcoding 14x14
+        num_patches = patch_tokens.shape[1]
+        h = w = int(math.sqrt(num_patches))
+        
+        # Reshape to (Batch, 768, h, w) to pool spatially
+        patch_tokens_pooled = patch_tokens.transpose(1, 2).reshape(n, self.hidden_dim, h, w)
         patch_tokens_pooled = self.pool(patch_tokens_pooled)  # (Batch, 768, 5, 5)
         patch_tokens_flattened = patch_tokens_pooled.flatten(2).transpose(1, 2)  # (Batch, 25, 768)
 
@@ -234,7 +287,7 @@ class VisionEncoder(nn.Module):
         # Store the number of tokens per camera for later use
         self.num_tokens_per_cam = vit_tokens.shape[1]
 
-        # Reshape to separate cameras
+        # Reshape to separate cameras and time
         vision_tokens = vit_tokens.view(B, T, N_cam, self.num_tokens_per_cam, self.config.d_model)
 
         # Add camera embedding
@@ -264,18 +317,7 @@ class VisionEncoder(nn.Module):
             raise ValueError("Input contains NaN or Inf values")
 
     def generate_debug_heatmaps(self, x, camera_name="default", batch_index=0, timestep=0):
-        """
-        Generate heatmaps for debugging purposes without affecting the normal forward pass.
         
-        Args:
-            x: Input tensor of shape (B, T, N_cam, C, H, W)
-            camera_name: Name of the camera for saving files
-            batch_index: Batch index for saving files
-            timestep: Timestep for saving files
-            
-        Returns:
-            heatmap_info: Dictionary containing heatmap data and metadata
-        """
         with torch.no_grad():
             B, T, N_cam, C, H, W = x.shape
             x = x.view(B * T * N_cam, C, H, W)
@@ -302,13 +344,16 @@ class VisionEncoder(nn.Module):
             patch_tokens = encoded_features[:, 1:, :]   # (Batch, 196, 768)
 
             # Reshape patch tokens to feature maps for heatmap generation
-            # patch_tokens: (Batch, 196, 768)
-            # Reshape to (Batch, 768, 14, 14) for heatmap generation
-            patch_features = patch_tokens.transpose(1, 2).reshape(n, self.hidden_dim, 14, 14)
+            # Dynamically compute patch dimensions instead of hardcoding 14x14
+            num_patches = patch_tokens.shape[1]
+            h = w = int(math.sqrt(num_patches))
+            
+            # Reshape to (Batch, 768, h, w) for heatmap generation
+            patch_features = patch_tokens.transpose(1, 2).reshape(n, self.hidden_dim, h, w)
             
             # Create spatial softmax for heatmap generation with proper input shape
             spatial_softmax = SpatialSoftmax(
-                input_shape=(self.hidden_dim, 14, 14),
+                input_shape=(self.hidden_dim, h, w),
                 num_kp=None,  # Use all channels for debugging
                 temperature=0.1, 
                 learn_temperature=False
@@ -380,19 +425,35 @@ class SimpleDiffusionTransformer(nn.Module):
         # ------------------------------
         # 2. Vision Encoder per camera (sharing the same backbone)
         # ------------------------------
-        self.image_encoders = nn.ModuleDict({
-            cam.replace('.', '_'): VisionEncoder(config, shared_backbone=self.shared_backbone, camera_id=i)
-            for i, cam in enumerate(config.image_features.keys())
-        })
+        # Camera-specific configurations
+        camera_configs = {
+            'observation_images_front': {'num_kp': 3},    # object, container, possibly gripper
+            'observation_images_gripper': {'num_kp': 1},  # gripper only
+            'observation_images_right': {'num_kp': 2}     # object and container
+        }
+        
+        self.image_encoders = nn.ModuleDict()
+        for i, cam in enumerate(config.image_features.keys()):
+            cam_name = cam.replace('.', '_')
+            num_kp = camera_configs.get(cam_name, {}).get('num_kp', 0)
+            self.image_encoders[cam_name] = VisionEncoder(
+                config, 
+                shared_backbone=self.shared_backbone, 
+                camera_id=i,
+                camera_name=cam_name,
+                num_kp=num_kp
+            )
         
         
 
         # ------------------------------
-        # 3. State Encoder (separate)
+        # 3. Enhanced State Encoder
         # ------------------------------
         self.state_encoder = nn.Sequential(
             nn.Linear(config.state_dim, config.d_model),
-            nn.LayerNorm(config.d_model)
+            nn.LayerNorm(config.d_model),
+            nn.GELU(),
+            nn.Linear(config.d_model, config.d_model)
         )
         self.state_positional_encoding = PositionalEncoding(config.d_model)
 
@@ -400,6 +461,19 @@ class SimpleDiffusionTransformer(nn.Module):
         # 4. Vision Positional Encoding
         # ------------------------------
         self.vision_positional_encoding = PositionalEncoding(config.d_model)
+        # Temporal positional encoding for preserving time structure
+        self.temporal_positional_encoding = PositionalEncoding(config.d_model)
+        
+        # ------------------------------
+        # 5. Normalization factor for embeddings
+        # ------------------------------
+        self.embedding_norm_factor = math.sqrt(config.d_model)
+
+        # ------------------------------
+        # 6. State conditioning layers for FiLM-style modulation
+        # ------------------------------
+        self.state_gamma = nn.Linear(config.d_model, config.d_model)
+        self.state_beta = nn.Linear(config.d_model, config.d_model)
         
         # ------------------------------
         # 5. Cross-Camera Attention
@@ -436,16 +510,23 @@ class SimpleDiffusionTransformer(nn.Module):
         self.obs_ln = nn.LayerNorm(config.d_model)
 
         # ------------------------------
-        # 6. Number of inference steps for flow matching sampling
+        # 6. Coordinate projection for spatial features
+        # ------------------------------
+        self.coord_projection = nn.Linear(2, config.d_model)
+
+        # ------------------------------
+        # 7. Number of inference steps for flow matching sampling
         # ------------------------------
         # Register as buffer so it's properly handled during device transfers
         self.register_buffer('num_inference_steps', torch.tensor(config.num_inference_steps))
 
         # ------------------------------
-        # 7. Action Encoder / Decoder (same as before)
+        # 8. Enhanced Action Encoder / Decoder
         # ------------------------------
+        # Dedicated action input projection like VLAFlowMatching
+        self.action_in_proj = nn.Linear(config.action_dim, config.d_model)
+        
         self.action_positional_encoding = PositionalEncoding(config.d_model, config.horizon)
-        self.action_projection = nn.Linear(config.action_dim, config.d_model)
 
         denoising_layers = nn.TransformerDecoderLayer(
             d_model=config.d_model,
@@ -487,6 +568,8 @@ class SimpleDiffusionTransformer(nn.Module):
         # 1. State encoding (compute once for reuse)
         # ------------------------------
         state_tokens = self.state_encoder(batch["observation.state"])  # (B, T, d_model)
+        # Normalize state embeddings like VLAFlowMatching
+        state_tokens = state_tokens * self.embedding_norm_factor
         state_tokens = self.state_positional_encoding(state_tokens)
         # Flatten time dimension
         state_tokens_flat = state_tokens.view(B, T_obs, self.config.d_model)
@@ -522,12 +605,47 @@ class SimpleDiffusionTransformer(nn.Module):
                     spatial_outputs[f"{cam_key}_heatmap"] = None
 
                 vision_tokens = encoder(img)  # (B, T, N_tokens_per_cam, d_model)
-                # Apply positional encoding to vision tokens
+                # Normalize vision embeddings like VLAFlowMatching
+                vision_tokens = vision_tokens * self.embedding_norm_factor
+                
+                # Apply temporal positional encoding to preserve time structure
+                # More efficient approach: compute PE for T timesteps and broadcast to all tokens
                 B_v, T_v, N_v, D_v = vision_tokens.shape
+                time_pe = self.temporal_positional_encoding(
+                    torch.zeros(B_v, T_v, D_v, device=vision_tokens.device)
+                )
+                time_pe = time_pe.unsqueeze(2)  # (B, T, 1, D)
+                vision_tokens = vision_tokens + time_pe
+                
+                # Apply positional encoding to vision tokens
                 vision_tokens_flat = vision_tokens.view(B_v, T_v * N_v, D_v)
                 vision_tokens_flat = self.vision_positional_encoding(vision_tokens_flat)
                 
                 all_vision_tokens.append(vision_tokens_flat)
+                
+                # Retrieve cached spatial coordinates if they exist
+                if hasattr(encoder, 'cached_spatial_coords') and encoder.cached_spatial_coords is not None:
+                    spatial_coords = encoder.cached_spatial_coords
+                    spatial_outputs[f"{cam_key}_spatial_coords"] = spatial_coords
+                    
+                    # Convert spatial coordinates to tokens and add to vision tokens
+                    # spatial_coords shape: (B*T*N_cam, num_kp, 2)
+                    if spatial_coords is not None and spatial_coords.numel() > 0:
+                        # Project coordinates to d_model dimension
+                        coord_tokens = self.coord_projection(spatial_coords)  # (B*T*N_cam, num_kp, d_model)
+                        coord_tokens = coord_tokens * self.embedding_norm_factor
+                        
+                        # Reshape to match vision tokens format
+                        coord_tokens = coord_tokens.view(B, T_v, encoder.num_kp, self.config.d_model)
+                        
+                        # Apply positional encoding to coordinate tokens
+                        coord_tokens_flat = coord_tokens.view(B, T_v * encoder.num_kp, self.config.d_model)
+                        coord_tokens_flat = self.vision_positional_encoding(coord_tokens_flat)
+                        
+                        # Add coordinate tokens to vision tokens
+                        all_vision_tokens.append(coord_tokens_flat)
+                else:
+                    spatial_outputs[f"{cam_key}_spatial_coords"] = None
 
         if all_vision_tokens:
             vision_tokens_all = torch.cat(all_vision_tokens, dim=1)  # concat along token dim
@@ -541,30 +659,36 @@ class SimpleDiffusionTransformer(nn.Module):
             # Add residual connection from original vision tokens
             vision_tokens_fused = vision_tokens_fused + vision_tokens_original
             
-            # Skip token reduction since vision_token_linear was removed
-            # Concatenate with state tokens directly
-            vision_tokens_fused = torch.cat([vision_tokens_fused, state_tokens_flat], dim=1)
+            # Apply FiLM-style conditioning
+            state_summary = state_tokens.mean(dim=1)  # (B, d_model)
+            gamma = self.state_gamma(state_summary)
+            beta  = self.state_beta(state_summary)
+
+            gamma = gamma.unsqueeze(1)
+            beta  = beta.unsqueeze(1)
+
+            vision_tokens_fused = gamma * vision_tokens_fused + beta
         else:
             vision_tokens_fused = torch.empty(B, 0, self.config.d_model, device=batch["observation.state"].device)
 
         # ------------------------------
         # 3. Final processing
         # ------------------------------
-        #obs_tokens = self.obs_ln(vision_tokens_fused)
-        context = self.fusion_encoder(vision_tokens_fused)
+        obs_tokens = self.obs_ln(vision_tokens_fused)
+        context = self.fusion_encoder(obs_tokens)
 
         return context, spatial_outputs
 
 
     def velocity_field(self, actions, timesteps, obs_context):
         """
-        Flow matching step:
+        Flow Matching step:
         Predicts the velocity field that transports samples from Gaussian to data distribution.
         """
         B, T_act, _ = actions.shape
         
-        # 1. Action & Time Embeddings
-        action_embeddings = self.action_projection(actions)
+        # 1. Action & Time Embeddings (enhanced like VLAFlowMatching)
+        action_embeddings = self.action_in_proj(actions)  # Use dedicated input projection
         action_embeddings = self.action_positional_encoding(action_embeddings)
         
         # Time embedding: (B, d_model) -> (B, 1, d_model)
@@ -595,6 +719,14 @@ class SimpleDiffusionTransformer(nn.Module):
         return self.velocity_prediction_head(velocity_features)
 
     
+    def sample_time(self, bsize, device):
+        """Sample time using Beta(1.5, 1.0) distribution for better training dynamics"""
+        # Beta(1.5, 1.0) distribution favors earlier timesteps
+        beta_dist = torch.distributions.Beta(concentration1=1.5, concentration0=1.0)
+        time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
+        time = time_beta * 0.999 + 0.001  # Scale to [0.001, 0.999]
+        return time
+
     def compute_loss(self, batch):
         """Flow Matching Training: Learn to predict the velocity field."""
         actions = batch["action"] # (B, Horizon, Action_Dim)
@@ -606,8 +738,8 @@ class SimpleDiffusionTransformer(nn.Module):
         # Infer device from model parameters
         device = next(self.parameters()).device
         
-        # 2. Sample time uniformly from [0, 1]
-        timesteps = torch.rand(B, device=device)
+        # 2. Sample time using Beta distribution
+        timesteps = self.sample_time(B, device)
         
         # 3. Sample Gaussian noise
         noise = torch.randn_like(actions, device=device)

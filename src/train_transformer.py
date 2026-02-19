@@ -161,11 +161,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         )
             
         # Define trainable parameters
-        trainable_params = [p for p in policy.parameters() if p.requires_grad]
+        trainable_params = [p for p in policy.model.parameters() if p.requires_grad]
         
         # Print optimizer information
         print(f"Initializing optimizer with learning rate: 1e-4")
-        print(f"Number of trainable parameters: {len(trainable_params)}")
+        total_trainable_params = sum(p.numel() for p in trainable_params)
+        print(f"Number of trainable parameters: {total_trainable_params}")
         
         # Check if we have different learning rates for vision vs other parameters
         vision_params = []
@@ -177,8 +178,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             else:
                 other_params.append(param)
         
-        vision_param_count = len(vision_params)
-        other_param_count = len(other_params)
+        vision_param_count = sum(p.numel() for p in vision_params)
+        other_param_count = sum(p.numel() for p in other_params)
         print(f"Vision parameters: {vision_param_count}, Other parameters: {other_param_count}")
         
         optimizer = torch.optim.Adam(trainable_params, lr=1e-4)
@@ -186,7 +187,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         # Print learning rate groups
         print(f"Optimizer parameter groups: {len(optimizer.param_groups)}")
         for i, group in enumerate(optimizer.param_groups):
-            print(f"  Group {i}: lr={group['lr']}, params={len(group['params'])}")
+            group_param_count = sum(p.numel() for p in group['params'])
+            print(f"  Group {i}: lr={group['lr']}, params={group_param_count}")
         # Cosine scheduler with warmup
         warmup_steps = 1000
         scheduler = get_cosine_schedule_with_warmup(
@@ -241,8 +243,19 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             else:
                 other_params.append(param)
         
+        # Count actual number of parameters, not just parameter tensors
+        vision_param_count = sum(p.numel() for p in vision_params)
+        other_param_count = sum(p.numel() for p in other_params)
+        print(f"Vision parameters: {vision_param_count}, Other parameters: {other_param_count}")
+        
         trainable_params = [p for p in policy.parameters() if p.requires_grad]
         optimizer = torch.optim.Adam(trainable_params, lr=1e-4)
+        
+        # Print learning rate groups
+        print(f"Optimizer parameter groups: {len(optimizer.param_groups)}")
+        for i, group in enumerate(optimizer.param_groups):
+            group_param_count = sum(p.numel() for p in group['params'])
+            print(f"  Group {i}: lr={group['lr']}, params={group_param_count}")
         
         # Cosine scheduler with warmup
         warmup_steps = 500
@@ -345,7 +358,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                             
                             if param.requires_grad:
                                 if param.grad is not None:
-                                    grad_norm = param.grad.norm().item()
+                                    grad_norm = param.grad.abs().sum().item()
                                     component_grad_norm += grad_norm
                                     component_params_with_grad += param_count
                                     
@@ -494,7 +507,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             
             # Calculate gradient norm for monitoring and clip gradients (only for trainable parameters)
             trainable_params = [p for p in policy.parameters() if p.requires_grad]
-            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)  # Reduced clipping threshold
+            
             
             optimizer.step()
             optimizer.zero_grad()
