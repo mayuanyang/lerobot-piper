@@ -95,6 +95,21 @@ class VisionEncoder(nn.Module):
         # 2. Improved layer freezing with better parameter handling
 
         # ------------------------------
+        # 3. Add a pooling layer to reduce 14x14 patches to 5x5
+        # This reduces 196 tokens to 25 tokens (approximately half)
+        # ------------------------------
+        self.pool = nn.AdaptiveAvgPool2d((5, 5))
+
+        # ------------------------------
+        # 4. Enhanced projection to d_model with better initialization
+        # ------------------------------
+        self.projection = nn.Sequential(
+            nn.Linear(self.hidden_dim, config.d_model),
+            nn.LayerNorm(config.d_model),
+            nn.GELU()
+        )
+
+        # ------------------------------
         # 6. Camera embedding with Xavier initialization
         # ------------------------------
         # Only create camera embedding if this is not using a shared backbone
