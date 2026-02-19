@@ -444,7 +444,6 @@ class SimpleDiffusionTransformer(nn.Module):
                 num_kp=num_kp
             )
         
-        
 
         # ------------------------------
         # 3. Enhanced State Encoder
@@ -464,19 +463,15 @@ class SimpleDiffusionTransformer(nn.Module):
         # Temporal positional encoding for preserving time structure
         self.temporal_positional_encoding = PositionalEncoding(config.d_model)
         
-        # ------------------------------
-        # 5. Normalization factor for embeddings
-        # ------------------------------
-        self.embedding_norm_factor = math.sqrt(config.d_model)
 
         # ------------------------------
-        # 6. State conditioning layers for FiLM-style modulation
+        # 5. State conditioning layers for FiLM-style modulation
         # ------------------------------
         self.state_gamma = nn.Linear(config.d_model, config.d_model)
         self.state_beta = nn.Linear(config.d_model, config.d_model)
         
         # ------------------------------
-        # 5. Cross-Camera Attention
+        # 6. Cross-Camera Attention
         # ------------------------------
         cross_camera_layer = nn.TransformerEncoderLayer(
             d_model=config.d_model,
@@ -490,6 +485,7 @@ class SimpleDiffusionTransformer(nn.Module):
         self.cross_camera_transformer = nn.TransformerEncoder(
             cross_camera_layer, num_layers=config.num_encoder_layers
         )
+        self.cross_camera_norm = nn.LayerNorm(config.d_model)
 
                         
         # Fusion Transformer Encoder (instead of simple MLP)
@@ -510,18 +506,18 @@ class SimpleDiffusionTransformer(nn.Module):
         self.obs_ln = nn.LayerNorm(config.d_model)
 
         # ------------------------------
-        # 6. Coordinate projection for spatial features
+        # 7. Coordinate projection for spatial features
         # ------------------------------
         self.coord_projection = nn.Linear(2, config.d_model)
 
         # ------------------------------
-        # 7. Number of inference steps for flow matching sampling
+        # 8. Number of inference steps for flow matching sampling
         # ------------------------------
         # Register as buffer so it's properly handled during device transfers
         self.register_buffer('num_inference_steps', torch.tensor(config.num_inference_steps))
 
         # ------------------------------
-        # 8. Enhanced Action Encoder / Decoder
+        # 9. Enhanced Action Encoder / Decoder
         # ------------------------------
         # Dedicated action input projection like VLAFlowMatching
         self.action_in_proj = nn.Linear(config.action_dim, config.d_model)
@@ -568,8 +564,9 @@ class SimpleDiffusionTransformer(nn.Module):
         # 1. State encoding (compute once for reuse)
         # ------------------------------
         state_tokens = self.state_encoder(batch["observation.state"])  # (B, T, d_model)
-        # Normalize state embeddings like VLAFlowMatching
-        state_tokens = state_tokens * self.embedding_norm_factor
+        #print(f"state_tokens mean abs: {state_tokens.abs().mean():.6f}, max: {state_tokens.abs().max():.6f}")
+
+        
         state_tokens = self.state_positional_encoding(state_tokens)
         # Flatten time dimension
         state_tokens_flat = state_tokens.view(B, T_obs, self.config.d_model)
@@ -605,8 +602,7 @@ class SimpleDiffusionTransformer(nn.Module):
                     spatial_outputs[f"{cam_key}_heatmap"] = None
 
                 vision_tokens = encoder(img)  # (B, T, N_tokens_per_cam, d_model)
-                # Normalize vision embeddings like VLAFlowMatching
-                vision_tokens = vision_tokens * self.embedding_norm_factor
+                #print(f"vision_tokens mean abs: {vision_tokens.abs().mean():.6f}, max: {vision_tokens.abs().max():.6f}")
                 
                 # Apply temporal positional encoding to preserve time structure
                 # More efficient approach: compute PE for T timesteps and broadcast to all tokens
@@ -616,6 +612,8 @@ class SimpleDiffusionTransformer(nn.Module):
                 )
                 time_pe = time_pe.unsqueeze(2)  # (B, T, 1, D)
                 vision_tokens = vision_tokens + time_pe
+
+                #print(f"vision_tokens after temporal mean abs: {vision_tokens.abs().mean():.6f}, max: {vision_tokens.abs().max():.6f}")
                 
                 # Apply positional encoding to vision tokens
                 vision_tokens_flat = vision_tokens.view(B_v, T_v * N_v, D_v)
@@ -633,7 +631,6 @@ class SimpleDiffusionTransformer(nn.Module):
                     if spatial_coords is not None and spatial_coords.numel() > 0:
                         # Project coordinates to d_model dimension
                         coord_tokens = self.coord_projection(spatial_coords)  # (B*T*N_cam, num_kp, d_model)
-                        coord_tokens = coord_tokens * self.embedding_norm_factor
                         
                         # Reshape to match vision tokens format
                         coord_tokens = coord_tokens.view(B, T_v, encoder.num_kp, self.config.d_model)
@@ -655,9 +652,14 @@ class SimpleDiffusionTransformer(nn.Module):
             
             # Apply cross-camera attention to fuse information across cameras
             vision_tokens_fused = self.cross_camera_transformer(vision_tokens_all)
+            #print(f"vision_tokens_fused before norm mean abs: {vision_tokens_fused.abs().mean():.6f}, max: {vision_tokens_fused.abs().max():.6f}")
+            vision_tokens_fused = self.cross_camera_norm(vision_tokens_fused)
+            #print(f"vision_tokens_fused after norm mean abs: {vision_tokens_fused.abs().mean():.6f}, max: {vision_tokens_fused.abs().max():.6f}")
+
             
             # Add residual connection from original vision tokens
             vision_tokens_fused = vision_tokens_fused + vision_tokens_original
+            #print(f"vision_tokens_fused after residual mean abs: {vision_tokens_fused.abs().mean():.6f}, max: {vision_tokens_fused.abs().max():.6f}")
             
             # Apply FiLM-style conditioning
             state_summary = state_tokens.mean(dim=1)  # (B, d_model)
@@ -676,6 +678,8 @@ class SimpleDiffusionTransformer(nn.Module):
         # ------------------------------
         obs_tokens = self.obs_ln(vision_tokens_fused)
         context = self.fusion_encoder(obs_tokens)
+
+        #print(f"context mean abs: {context.abs().mean():.6f}, max: {context.abs().max():.6f}")
 
         return context, spatial_outputs
 
@@ -711,6 +715,8 @@ class SimpleDiffusionTransformer(nn.Module):
             tgt=tgt,
             memory=extended_memory
         )
+        #print(f"velocity_features mean abs: {velocity_features.abs().mean():.6f}, max: {velocity_features.abs().max():.6f}")
+        
         
         # Residual connection to preserve gradients
         #velocity_features = velocity_features + action_embeddings
@@ -750,10 +756,13 @@ class SimpleDiffusionTransformer(nn.Module):
         
         # 5. Predict velocity field
         pred_velocity = self.velocity_field(noisy_actions, timesteps, obs_context)
+        #print(f"pred_velocity mean abs: {pred_velocity.abs().mean():.6f}, max: {pred_velocity.abs().max():.6f}")
         
         # 6. Compute flow matching loss
         # Target velocity is the difference between data and noise
         target_velocity = actions - noise
+        #print(f"target_velocity mean abs: {target_velocity.abs().mean():.6f}, max: {target_velocity.abs().max():.6f}")
+        
         loss = F.mse_loss(pred_velocity, target_velocity, reduction="none")
         
         # 7. Handle padding if present
