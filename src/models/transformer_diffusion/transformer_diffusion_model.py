@@ -11,6 +11,7 @@ import math
 import numpy as np
 import os
 from pathlib import Path
+import torchvision.models as models
 
 # Import our custom spatial softmax
 from .spatial_softmax import SpatialSoftmax, save_heatmap_visualization
@@ -48,89 +49,65 @@ class DiffusionSinusoidalPosEmb(nn.Module):
         return emb
 
 
-import torch
-import torch.nn as nn
-import torchvision.models as models
+
+
+
 
 class VisionEncoder(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, shared_backbone=None, camera_id=None):
         super().__init__()
 
         self.config = config
         self.num_cameras = config.num_cameras
+        self.camera_id = camera_id
 
         # ------------------------------
-        # 1. ViT backbone with better initialization
+        # 1. ViT backbone - shared or individual
         # ------------------------------
-        # Extract image size from config (assuming square images)
-        image_size = config.input_image_size[0] if isinstance(config.input_image_size, (tuple, list)) else config.input_image_size
-        
-        # Validate vision backbone
-        if not hasattr(models, config.vision_backbone):
-            raise ValueError(f"Unsupported vision backbone: {config.vision_backbone}")
+        if shared_backbone is not None:
+            # Use shared backbone
+            self.backbone = shared_backbone
+            self.hidden_dim = shared_backbone.hidden_dim
+            self.owns_backbone = False
+        else:
+            # Create individual backbone
+            # Extract image size from config (assuming square images)
+            image_size = config.input_image_size[0] if isinstance(config.input_image_size, (tuple, list)) else config.input_image_size
             
-        backbone = getattr(models, config.vision_backbone)(
-            weights="DEFAULT",
-            image_size=image_size
-        )
-        self.hidden_dim = backbone.hidden_dim  # 768 for vit_b_16
-        
-        # Remove the classification head to get raw features
-        # The default head is a Linear layer that maps to 1000 classes
-        # We replace it with Identity() to get the raw 768-dim features
-        backbone.heads = nn.Identity()
-        self.backbone = backbone
+            # Validate vision backbone
+            if not hasattr(models, config.vision_backbone):
+                raise ValueError(f"Unsupported vision backbone: {config.vision_backbone}")
+                
+            backbone = getattr(models, config.vision_backbone)(
+                weights="DEFAULT",
+                image_size=image_size
+            )
+            self.hidden_dim = backbone.hidden_dim  # 768 for vit_b_16
+            
+            # Remove the classification head to get raw features
+            # The default head is a Linear layer that maps to 1000 classes
+            # We replace it with Identity() to get the raw 768-dim features
+            backbone.heads = nn.Identity()
+            self.backbone = backbone
+            self.owns_backbone = True
 
         # ------------------------------
         # 2. Improved layer freezing with better parameter handling
-        # ------------------------------
-        self._freeze_layers(config.vision_freeze_layers)
-
-        # ------------------------------
-        # 3. Add a pooling layer to reduce 14x14 patches to 5x5
-        # This reduces 196 tokens to 25 tokens (approximately half)
-        # ------------------------------
-        self.pool = nn.AdaptiveAvgPool2d((5, 5))
-
-        # ------------------------------
-        # 4. Enhanced spatial softmax head with better initialization and channel reduction
-        # ------------------------------
-        # Combined spatial head with convolution and spatial softmax
-        self.spatial_head = nn.Sequential(
-            nn.Conv2d(self.hidden_dim, self.hidden_dim // 2, kernel_size=1),  
-            SpatialSoftmax(
-                input_shape=(self.hidden_dim // 2, 14, 14), 
-                num_kp=16,  # Control number of keypoints (can be adjusted)
-                temperature=0.1, 
-                learn_temperature=True
-            ),
-            nn.GELU(),
-        )
-        
-        # Improved point projection with residual connection support
-        self.point_projection = nn.Sequential(
-            nn.Linear(2, config.d_model),
-            nn.GELU()
-        )
-
-        # ------------------------------
-        # 5. Enhanced projection to d_model with better initialization
-        # ------------------------------
-        self.projection = nn.Sequential(
-            nn.Linear(self.hidden_dim, config.d_model),
-            nn.LayerNorm(config.d_model),
-            nn.GELU()
-        )
 
         # ------------------------------
         # 6. Camera embedding with Xavier initialization
         # ------------------------------
-        self.camera_embedding = nn.Embedding(
-            self.num_cameras,
-            config.d_model
-        )
-        # Initialize camera embeddings with Xavier initialization
-        nn.init.xavier_uniform_(self.camera_embedding.weight)
+        # Only create camera embedding if this is not using a shared backbone
+        # or if we want to keep per-camera embeddings
+        if camera_id is not None:
+            self.camera_embedding = nn.Embedding(
+                self.num_cameras,
+                config.d_model
+            )
+            # Initialize camera embeddings with Xavier initialization
+            nn.init.xavier_uniform_(self.camera_embedding.weight)
+        else:
+            self.camera_embedding = None
 
         # ------------------------------
         # 7. Token tracking and configuration
@@ -219,38 +196,14 @@ class VisionEncoder(nn.Module):
         batch_class_token = self.backbone.class_token.expand(n, -1, -1)
         x_with_cls = torch.cat([batch_class_token, x_processed], dim=1)
         
-        
-        # Use hook to capture intermediate features from layer 6 for spatial softmax
-        # This maintains proper gradient flow through the entire encoder
-        intermediate_features = {}
-        
-        def hook_fn(module, input, output):
-            intermediate_features['spatial_features'] = output[:, 1:, :]  # Drop CLS token
-        
-        # Register hook on the 8th layer
-        hook = self.backbone.encoder.layers[6].register_forward_hook(hook_fn)
-        
         # Process through the full encoder to maintain proper gradient flow
         encoded_features = self.backbone.encoder(x_with_cls)
-        
-        # Remove hook
-        hook.remove()
-        
-        # Extract intermediate features for spatial softmax
-        spatial_features = intermediate_features['spatial_features']
         
         # Extract final tokens
         x = encoded_features
         cls_token = x[:, 0:1, :]      # (Batch, 1, 768)
         patch_tokens = x[:, 1:, :]    # (Batch, 196, 768)
                 
-        # Process spatial features
-        patch_features = spatial_features.transpose(1, 2).reshape(n, self.hidden_dim, 14, 14)
-        spatial_coords = self.spatial_head(patch_features)
-
-        # 4. Convert coordinates into tokens
-        point_tokens = self.point_projection(spatial_coords)  # (Batch, 32, d_model)
-
         # 5. Spatial Pooling for ViT tokens
         # Reshape to (Batch, 768, 14, 14) to pool spatially
         patch_tokens_pooled = patch_tokens.transpose(1, 2).reshape(n, self.hidden_dim, 14, 14)
@@ -263,15 +216,11 @@ class VisionEncoder(nn.Module):
         # 7. Project ViT tokens
         vit_tokens = self.projection(vit_combined)  # (Batch, 26, d_model)
         
-        # 8. Concatenate ViT tokens with point tokens
-        # Now we have 26 ViT tokens + 16 point tokens = 42 total tokens
-        combined_tokens = torch.cat([vit_tokens, point_tokens], dim=1)  # (Batch, 42, d_model)
-        
         # Store the number of tokens per camera for later use
-        self.num_tokens_per_cam = combined_tokens.shape[1]
+        self.num_tokens_per_cam = vit_tokens.shape[1]
 
         # Reshape to separate cameras
-        vision_tokens = combined_tokens.view(B, T, N_cam, self.num_tokens_per_cam, self.config.d_model)
+        vision_tokens = vit_tokens.view(B, T, N_cam, self.num_tokens_per_cam, self.config.d_model)
 
         # Add camera embedding
         cam_ids = torch.arange(N_cam, device=vision_tokens.device)
@@ -392,17 +341,39 @@ class SimpleDiffusionTransformer(nn.Module):
         self.config = config
 
         # ------------------------------
-        # 1. Vision Encoder per camera
+        # 1. Shared ViT backbone for all cameras
+        # ------------------------------
+        # Extract image size from config (assuming square images)
+        image_size = config.input_image_size[0] if isinstance(config.input_image_size, (tuple, list)) else config.input_image_size
+        
+        # Validate vision backbone
+        if not hasattr(models, config.vision_backbone):
+            raise ValueError(f"Unsupported vision backbone: {config.vision_backbone}")
+            
+        self.shared_backbone = getattr(models, config.vision_backbone)(
+            weights="DEFAULT",
+            image_size=image_size
+        )
+        self.shared_backbone.hidden_dim = self.shared_backbone.hidden_dim  # 768 for vit_b_16
+        
+        # Remove the classification head to get raw features
+        # The default head is a Linear layer that maps to 1000 classes
+        # We replace it with Identity() to get the raw 768-dim features
+        self.shared_backbone.heads = nn.Identity()
+        
+        
+        # ------------------------------
+        # 2. Vision Encoder per camera (sharing the same backbone)
         # ------------------------------
         self.image_encoders = nn.ModuleDict({
-            cam.replace('.', '_'): VisionEncoder(config)
-            for cam in config.image_features.keys()
+            cam.replace('.', '_'): VisionEncoder(config, shared_backbone=self.shared_backbone, camera_id=i)
+            for i, cam in enumerate(config.image_features.keys())
         })
         
         
 
         # ------------------------------
-        # 2. State Encoder (separate)
+        # 3. State Encoder (separate)
         # ------------------------------
         self.state_encoder = nn.Sequential(
             nn.Linear(config.state_dim, config.d_model),
@@ -411,12 +382,12 @@ class SimpleDiffusionTransformer(nn.Module):
         self.state_positional_encoding = PositionalEncoding(config.d_model)
 
         # ------------------------------
-        # 3. Vision Positional Encoding
+        # 4. Vision Positional Encoding
         # ------------------------------
         self.vision_positional_encoding = PositionalEncoding(config.d_model)
         
         # ------------------------------
-        # 4. Cross-Camera Attention
+        # 5. Cross-Camera Attention
         # ------------------------------
         cross_camera_layer = nn.TransformerEncoderLayer(
             d_model=config.d_model,
