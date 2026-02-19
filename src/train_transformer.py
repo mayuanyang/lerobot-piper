@@ -160,16 +160,27 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             grid_overlay_cameras=["front", "right"]  # Front and right cameras (original names)
         )
             
+        # Define trainable parameters
+        trainable_params = [p for p in policy.parameters() if p.requires_grad]
+        
         # Print optimizer information
         print(f"Initializing optimizer with learning rate: 1e-4")
         print(f"Number of trainable parameters: {len(trainable_params)}")
         
         # Check if we have different learning rates for vision vs other parameters
+        vision_params = []
+        other_params = []
+        
+        for name, param in policy.named_parameters():
+            if 'image_encoders' in name:
+                vision_params.append(param)
+            else:
+                other_params.append(param)
+        
         vision_param_count = len(vision_params)
         other_param_count = len(other_params)
         print(f"Vision parameters: {vision_param_count}, Other parameters: {other_param_count}")
         
-        trainable_params = [p for p in policy.parameters() if p.requires_grad]
         optimizer = torch.optim.Adam(trainable_params, lr=1e-4)
         
         # Print learning rate groups
