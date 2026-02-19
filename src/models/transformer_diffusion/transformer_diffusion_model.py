@@ -559,6 +559,7 @@ class SimpleDiffusionTransformer(nn.Module):
         """
         B, T_obs = batch["observation.state"].shape[:2]
         all_vision_tokens = []
+        all_coord_tokens = []  # Collect coordinate tokens from all cameras
 
         # ------------------------------
         # 1. State encoding (compute once for reuse)
@@ -637,10 +638,10 @@ class SimpleDiffusionTransformer(nn.Module):
                         
                         # Apply positional encoding to coordinate tokens
                         coord_tokens_flat = coord_tokens.view(B, T_v * encoder.num_kp, self.config.d_model)
-                        coord_tokens_flat = self.vision_positional_encoding(coord_tokens_flat)
                         
-                        # Add coordinate tokens to vision tokens
-                        all_vision_tokens.append(coord_tokens_flat)
+                        # Collect coordinate tokens from all cameras
+                        all_coord_tokens.append(coord_tokens_flat)
+                        
                 else:
                     spatial_outputs[f"{cam_key}_spatial_coords"] = None
 
@@ -677,7 +678,15 @@ class SimpleDiffusionTransformer(nn.Module):
         # 3. Final processing
         # ------------------------------
         obs_tokens = self.obs_ln(vision_tokens_fused)
-        context = self.fusion_encoder(obs_tokens)
+        
+        # Combine observation tokens with coordinate tokens from all cameras
+        if all_coord_tokens:
+            coord_tokens_all = torch.cat(all_coord_tokens, dim=1)
+            all_tokens = torch.cat([obs_tokens, coord_tokens_all], dim=1)
+        else:
+            all_tokens = obs_tokens
+        
+        context = self.fusion_encoder(all_tokens)
 
         #print(f"context mean abs: {context.abs().mean():.6f}, max: {context.abs().max():.6f}")
 
