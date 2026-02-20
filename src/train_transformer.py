@@ -89,16 +89,11 @@ def apply_camera_dropout(batch, camera_keys=["observation.images.front", "observ
 
 
 def apply_state_dropout(batch, state_key="observation.state", dropout_prob=0.3):
-    """Randomly drop observation.state values by setting them to zero with 30% probability."""
-    # Only apply during training and with specified probability
-    if torch.rand(1).item() > dropout_prob:
-        return batch
-    
-    # Apply dropout to observation.state
-    if state_key in batch:
-        batch[state_key] = torch.zeros_like(batch[state_key])
-    
+    state = batch[state_key]
+    mask = (torch.rand(state.size(0), 1, 1, device=state.device) > dropout_prob).float()
+    batch[state_key] = state * mask
     return batch
+
 
 
 def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_from_checkpoint=None, visualize_every_n_batches=1000):
@@ -523,6 +518,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             
             # Calculate gradient norm for monitoring and clip gradients (only for trainable parameters)
             trainable_params = [p for p in policy.parameters() if p.requires_grad]
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, float('inf'))  # Calculate grad norm without clipping
             
             
             optimizer.step()
