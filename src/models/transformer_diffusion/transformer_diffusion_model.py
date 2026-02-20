@@ -97,10 +97,10 @@ class VisionEncoder(nn.Module):
         # 2. Improved layer freezing with better parameter handling
 
         # ------------------------------
-        # 3. Add a pooling layer to reduce 14x14 patches to 5x5
-        # This reduces 196 tokens to 25 tokens (approximately half)
+        # 3. Add a pooling layer to reduce 14x14 patches to 7x7
+        # This reduces 196 tokens to 49 tokens (preserves more spatial information)
         # ------------------------------
-        self.pool = nn.AdaptiveAvgPool2d((5, 5))
+        self.pool = nn.AdaptiveAvgPool2d((7, 7))
 
         # ------------------------------
         # 4. Enhanced projection to d_model with better initialization
@@ -275,7 +275,7 @@ class VisionEncoder(nn.Module):
         
         # Reshape to (Batch, 768, h, w) to pool spatially
         patch_tokens_pooled = patch_tokens.transpose(1, 2).reshape(n, self.hidden_dim, h, w)
-        patch_tokens_pooled = self.pool(patch_tokens_pooled)  # (Batch, 768, 5, 5)
+        patch_tokens_pooled = self.pool(patch_tokens_pooled)  # (Batch, 768, 7, 7)
         patch_tokens_flattened = patch_tokens_pooled.flatten(2).transpose(1, 2)  # (Batch, 25, 768)
 
         # 6. Re-combine ViT tokens
@@ -464,12 +464,6 @@ class SimpleDiffusionTransformer(nn.Module):
         self.temporal_positional_encoding = PositionalEncoding(config.d_model)
         
 
-        # ------------------------------
-        # 5. State conditioning layers for FiLM-style modulation
-        # ------------------------------
-        self.state_gamma = nn.Linear(config.d_model, config.d_model)
-        self.state_beta = nn.Linear(config.d_model, config.d_model)
-        
         # ------------------------------
         # 6. Cross-Camera Attention
         # ------------------------------
@@ -661,16 +655,8 @@ class SimpleDiffusionTransformer(nn.Module):
             # Add residual connection from original vision tokens
             vision_tokens_fused = vision_tokens_fused + vision_tokens_original
             #print(f"vision_tokens_fused after residual mean abs: {vision_tokens_fused.abs().mean():.6f}, max: {vision_tokens_fused.abs().max():.6f}")
-            
-            # Apply FiLM-style conditioning
-            state_summary = state_tokens.mean(dim=1)  # (B, d_model)
-            gamma = self.state_gamma(state_summary)
-            beta  = self.state_beta(state_summary)
 
-            gamma = gamma.unsqueeze(1)
-            beta  = beta.unsqueeze(1)
 
-            vision_tokens_fused = gamma * vision_tokens_fused + beta
         else:
             vision_tokens_fused = torch.empty(B, 0, self.config.d_model, device=batch["observation.state"].device)
 
@@ -686,7 +672,13 @@ class SimpleDiffusionTransformer(nn.Module):
         else:
             all_tokens = obs_tokens
         
+        # Add state tokens to the tokens list for fusion encoder        
+        all_tokens = torch.cat([all_tokens, state_tokens_flat], dim=1)
+        
+        # Process through fusion encoder
         context = self.fusion_encoder(all_tokens)
+        
+        context = context 
 
         #print(f"context mean abs: {context.abs().mean():.6f}, max: {context.abs().max():.6f}")
 

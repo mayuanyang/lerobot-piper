@@ -88,6 +88,19 @@ def apply_camera_dropout(batch, camera_keys=["observation.images.front", "observ
     return batch
 
 
+def apply_state_dropout(batch, state_key="observation.state", dropout_prob=0.3):
+    """Randomly drop observation.state values by setting them to zero with 30% probability."""
+    # Only apply during training and with specified probability
+    if torch.rand(1).item() > dropout_prob:
+        return batch
+    
+    # Apply dropout to observation.state
+    if state_key in batch:
+        batch[state_key] = torch.zeros_like(batch[state_key])
+    
+    return batch
+
+
 def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_from_checkpoint=None, visualize_every_n_batches=1000):
     """Train the SimpleTransformerDiffusion model."""
     output_directory = Path(output_dir)
@@ -323,6 +336,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
             # Apply joint data augmentation
             batch = apply_joint_augmentations(batch)
+            
+            # Apply state dropout
+            batch = apply_state_dropout(batch)
             
             # Apply camera dropout
             #batch = apply_camera_dropout(batch)
