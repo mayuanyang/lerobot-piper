@@ -436,13 +436,17 @@ class SimpleDiffusionTransformer(nn.Module):
         for i, cam in enumerate(config.image_features.keys()):
             cam_name = cam.replace('.', '_')
             num_kp = camera_configs.get(cam_name, {}).get('num_kp', 0)
-            self.image_encoders[cam_name] = VisionEncoder(
+            encoder = VisionEncoder(
                 config, 
                 shared_backbone=self.shared_backbone, 
                 camera_id=i,
                 camera_name=cam_name,
                 num_kp=num_kp
             )
+            # Freeze layers in the encoder if specified
+            if hasattr(config, 'vision_freeze_layers') and config.vision_freeze_layers > 0:
+                encoder._freeze_layers(config.vision_freeze_layers)
+            self.image_encoders[cam_name] = encoder
         
 
         # ------------------------------
@@ -479,25 +483,9 @@ class SimpleDiffusionTransformer(nn.Module):
         self.cross_camera_transformer = nn.TransformerEncoder(
             cross_camera_layer, num_layers=config.num_encoder_layers
         )
-        self.cross_camera_norm = nn.LayerNorm(config.d_model)
-
-                        
-        # Fusion Transformer Encoder (instead of simple MLP)
-        fusion_encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.d_model,
-            nhead=config.nhead,
-            dim_feedforward=config.dim_feedforward,
-            dropout=0.1,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True
-        )
-        self.fusion_encoder = nn.TransformerEncoder(
-            fusion_encoder_layer,
-            num_layers=config.num_encoder_layers
-        )
         
-        self.obs_ln = nn.LayerNorm(config.d_model)
+        self.cross_camera_norm = nn.LayerNorm(config.d_model)
+                        
 
         # ------------------------------
         # 7. Coordinate projection for spatial features
@@ -527,7 +515,7 @@ class SimpleDiffusionTransformer(nn.Module):
             batch_first=True,
             norm_first=True
         )
-        self.denoising_transformer = nn.TransformerDecoder(
+        self.actions_expert = nn.TransformerDecoder(
             denoising_layers,
             num_layers=config.num_decoder_layers
         )
@@ -641,44 +629,43 @@ class SimpleDiffusionTransformer(nn.Module):
 
         if all_vision_tokens:
             vision_tokens_all = torch.cat(all_vision_tokens, dim=1)  # concat along token dim
-            
-            # Store original vision tokens for residual connection
-            vision_tokens_original = vision_tokens_all.clone()
-            
-            # Apply cross-camera attention to fuse information across cameras
-            vision_tokens_fused = self.cross_camera_transformer(vision_tokens_all)
-            #print(f"vision_tokens_fused before norm mean abs: {vision_tokens_fused.abs().mean():.6f}, max: {vision_tokens_fused.abs().max():.6f}")
-            vision_tokens_fused = self.cross_camera_norm(vision_tokens_fused)
-            #print(f"vision_tokens_fused after norm mean abs: {vision_tokens_fused.abs().mean():.6f}, max: {vision_tokens_fused.abs().max():.6f}")
-
-            
-            # Add residual connection from original vision tokens
-            vision_tokens_fused = vision_tokens_fused + vision_tokens_original
-            #print(f"vision_tokens_fused after residual mean abs: {vision_tokens_fused.abs().mean():.6f}, max: {vision_tokens_fused.abs().max():.6f}")
-
-
         else:
-            vision_tokens_fused = torch.empty(B, 0, self.config.d_model, device=batch["observation.state"].device)
+            vision_tokens_all = torch.empty(B, 0, self.config.d_model, device=batch["observation.state"].device)
 
         # ------------------------------
         # 3. Final processing
         # ------------------------------
-        obs_tokens = self.obs_ln(vision_tokens_fused)
-        
         # Combine observation tokens with coordinate tokens from all cameras
         if all_coord_tokens:
             coord_tokens_all = torch.cat(all_coord_tokens, dim=1)
-            all_tokens = torch.cat([obs_tokens, coord_tokens_all], dim=1)
+            obs_tokens = torch.cat([vision_tokens_all, coord_tokens_all], dim=1)
         else:
-            all_tokens = obs_tokens
+            obs_tokens = vision_tokens_all
         
-        # Add state tokens to the tokens list for fusion encoder        
-        all_tokens = torch.cat([all_tokens, state_tokens_flat], dim=1)
+        # Add state tokens to the tokens list for cross-camera transformer        
+        all_tokens = torch.cat([obs_tokens, state_tokens_flat], dim=1)
         
-        # Process through fusion encoder
-        context = self.fusion_encoder(all_tokens)
+        # Create attention mask to prevent vision tokens from attending to state tokens
+        # Calculate token counts for mask creation
+        obs_token_count = obs_tokens.shape[1]
+        state_token_count = state_tokens_flat.shape[1]
+        total_tokens = obs_token_count + state_token_count
         
-        context = context 
+        # Create attention mask (True/False for allow/block)
+        # By default, allow all attentions
+        attention_mask = torch.ones(total_tokens, total_tokens, dtype=torch.bool, device=all_tokens.device)
+        
+        # Block vision tokens from attending to state tokens
+        # Vision tokens can attend to everything except state tokens
+        attention_mask[:obs_token_count, obs_token_count:] = False  # Vision tokens can't attend to state tokens
+        
+        # Convert boolean mask to float mask (False -> -inf, True -> 0)
+        float_mask = torch.zeros_like(attention_mask, dtype=torch.float, device=all_tokens.device)
+        float_mask.masked_fill_(~attention_mask, float('-inf'))
+        
+        # Process through cross-camera transformer with attention mask
+        context = self.cross_camera_transformer(all_tokens, mask=float_mask)
+        context = self.cross_camera_norm(context)
 
         #print(f"context mean abs: {context.abs().mean():.6f}, max: {context.abs().max():.6f}")
 
@@ -712,7 +699,7 @@ class SimpleDiffusionTransformer(nn.Module):
         # 4. Decoder Pass
         # Self-attention ensures T_act is a smooth curve.
         # Cross-attention aligns T_act with your CropConvNet features.
-        velocity_features = self.denoising_transformer(
+        velocity_features = self.actions_expert(
             tgt=tgt,
             memory=extended_memory
         )

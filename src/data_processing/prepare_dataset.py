@@ -95,6 +95,8 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         print(f"❌ ERROR: Chopping {last_frames_to_chop} frames from {original_num_frames} results in 0 or fewer frames. Skipping data generation.")
         return 0
 
+    print(f'First and last frames to chop: {first_frames_to_chop}, {last_frames_to_chop}, original frames: {original_num_frames}, effective frames: {effective_num_frames}')
+    
     # Get joint positions starting from the first_frames_to_chop index
     joint_positions = [frame["joint_positions"] for frame in json_data["frames"][first_frames_to_chop:]]
     
@@ -102,20 +104,21 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     timestamp_base = 0.0
     
     for i in range(effective_num_frames):
-        current_state_scaled = [pos for pos in joint_positions[i]]
-        next_state_scaled = [pos for pos in joint_positions[i + 1]] if i + 1 < effective_num_frames else [pos for pos in joint_positions[i]]
+        s0 = [pos for pos in joint_positions[i]]
+        s1 = [pos for pos in joint_positions[i + 1]] if i + 1 < effective_num_frames else [pos for pos in joint_positions[i]]
         
         # Scale up the 7th DOF (index 6) by 50 times
-        if len(current_state_scaled) > 6:
-            current_state_scaled[6] *= gripper_scale
-        if len(next_state_scaled) > 6:
-            next_state_scaled[6] *= gripper_scale
+        if len(s0) > 6:
+            s0[6] *= gripper_scale
+        if len(s1) > 6:
+            s1[6] *= gripper_scale
         
         if mode == "diff":
-            delta = [next_pos - current_pos for next_pos, current_pos in zip(next_state_scaled, current_state_scaled)]
-            action = [d * delta_scale for d in delta]
-        else:
-            action = next_state_scaled
+            # Following the same semantics as full mode where action represents the "current state"
+            # and observation.state represents the "next state"
+            # So delta should be (current_state - next_state) to be consistent
+            delta = [s1_pos - s0_pos for s1_pos, s0_pos in zip(s1, s0)]
+            delta = [d * delta_scale for d in delta]
             
 
         is_done = (i == effective_num_frames - 1)
@@ -127,8 +130,8 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         # Create frame data with observation images for each camera
         # Adjust frame_index to account for skipped frames
         frame_data = {
-            "observation.state": action,
-            "action": current_state_scaled,  # not too sure why the action comes before the state in lerobot visualization tool, so we manually change the order here to make it more intuitive for visualization
+            "observation.state": s0,
+            "action": delta if mode == "diff" else s1,  # not too sure why the action comes before the state in lerobot visualization tool, so we manually change the order here to make it more intuitive for visualization
             "timestamp": timestamp_base,
             "episode_index": episode_data.episode_index,
             "frame_index": json_data["frames"][i + first_frames_to_chop]["frame_index"] - first_frames_to_chop,  # 局部索引 (0, 1, 2, ...)
@@ -137,7 +140,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
             "next.reward": 1.0 if is_done else 0.0,
             "task_index": 0,
             #"task_description": episode_data.task_description
-        }        
+        }
                 
         lerobot_frames.append(frame_data)
         timestamp_base += 0.1
@@ -1243,7 +1246,7 @@ def main():
     OUTPUT_FOLDER = Path("output/")  # Output folder for processed dataset
     REPO_ID = "ISDept/piper_arm"  # Your desired Hugging Face repo ID
     AGGREGATE_EPISODES = True  # New flag to control aggregation behavior
-    MODE = "full"  # Processing mode: "diff" or "full"
+    MODE = "diff"  # Processing mode: "diff" or "full"
     # ---------------------
     
     # Find all episode folders
@@ -1264,7 +1267,7 @@ def main():
     
     global_index_offset = 0
     
-    last_frames_to_chop = 5  # Default value
+    last_frames_to_chop = 0  # Default value
     for episode_folder, episode_idx in episode_folders:    
         
         # Store parameters for this episode
@@ -1282,15 +1285,15 @@ def main():
                 # Extract camera name from filename
                 camera_name = get_camera_name_from_video_path(video_path)
                 # Set first_frames_to_chop based on camera type
-                first_frames_to_chop = 10  # Default value
+                first_frames_to_chop = 0  # Default value
                 if 'gripper' in camera_name.lower():
                     if episode_idx == 1:
-                        first_frames_to_chop = 12  # First episode has extra lag
+                        first_frames_to_chop = 0  # First episode has extra lag
                     else: 
-                        first_frames_to_chop = 10  # Gripper camera lags by 0.1 second (1 frame at 10fps)
+                        first_frames_to_chop = 0  # Gripper camera lags by 0.1 second (1 frame at 10fps)
                 elif 'right' in camera_name.lower():
                     if episode_idx == 1:
-                        first_frames_to_chop = 12  # First episode has extra lag
+                        first_frames_to_chop = 0  # First episode has extra lag
                 cameras_list.append(CameraData(video_path=str(video_path), camera=camera_name, first_frames_to_chop=first_frames_to_chop))
             
             episode_data = EpisodeData(
@@ -1329,7 +1332,7 @@ def main():
             
             # Process the first episode differently to create initial files
             is_first_episode = (episode_idx == min(e.episode_index for e in all_episodes_data))
-            num_of_frames = process_session(episode, OUTPUT_FOLDER, is_first_episode, last_frames_to_chop, first_frames_to_chop=10, mode=MODE)
+            num_of_frames = process_session(episode, OUTPUT_FOLDER, is_first_episode, last_frames_to_chop, first_frames_to_chop=0, mode=MODE)
             episode.num_of_frames = num_of_frames
             
             # Update global index offset for the next episode

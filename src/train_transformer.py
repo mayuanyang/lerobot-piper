@@ -88,7 +88,7 @@ def apply_camera_dropout(batch, camera_keys=["observation.images.front", "observ
     return batch
 
 
-def apply_state_dropout(batch, state_key="observation.state", dropout_prob=0.3):
+def apply_state_dropout(batch, state_key="observation.state", dropout_prob=0.03):
     state = batch[state_key]
     mask = (torch.rand(state.size(0), 1, 1, device=state.device) > dropout_prob).float()
     batch[state_key] = state * mask
@@ -148,7 +148,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         kernel_size=3,
         n_groups=8,
         num_cameras=3,  # Set number of cameras based on input features
-        vision_freeze_layers=0  # UNFREEZE ALL LAYERS for better gradient flow
+        vision_freeze_layers=8  # UNFREEZE ALL LAYERS for better gradient flow
     )
     
     
@@ -470,25 +470,16 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                         total_state_grad += grad_mean * param_count
                         total_state_params += param_count
                 
-                # Transformer encoder gradients
-                total_encoder_grad = 0.0
-                total_encoder_params = 0
+                                
+                # actions expert gradients
+                total_action_expert_grad = 0.0
+                total_action_expert_params = 0
                 for name, param in policy.model.named_parameters():
-                    if param.requires_grad and 'fusion_encoder' in name and param.grad is not None:
+                    if param.requires_grad and 'actions_expert' in name and param.grad is not None:
                         grad_mean = param.grad.abs().mean().item()
                         param_count = param.numel()
-                        total_encoder_grad += grad_mean * param_count
-                        total_encoder_params += param_count
-                
-                # Transformer denoiser gradients
-                total_denoiser_grad = 0.0
-                total_denoiser_params = 0
-                for name, param in policy.model.named_parameters():
-                    if param.requires_grad and 'denoising_transformer' in name and param.grad is not None:
-                        grad_mean = param.grad.abs().mean().item()
-                        param_count = param.numel()
-                        total_denoiser_grad += grad_mean * param_count
-                        total_denoiser_params += param_count
+                        total_action_expert_grad += grad_mean * param_count
+                        total_action_expert_params += param_count
                 
                 # Print all gradients in one line
                 grad_info = []
@@ -505,13 +496,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                     avg_state_grad = total_state_grad / total_state_params
                     grad_info.append(f"state_enc: {avg_state_grad:.6f}")
                 
-                if total_encoder_params > 0:
-                    avg_encoder_grad = total_encoder_grad / total_encoder_params
-                    grad_info.append(f"fusion_encoder: {avg_encoder_grad:.6f}")
                 
-                if total_denoiser_params > 0:
-                    avg_denoiser_grad = total_denoiser_grad / total_denoiser_params
-                    grad_info.append(f"denoising_transformer: {avg_denoiser_grad:.6f}")
+                if total_action_expert_params > 0:
+                    avg_denoiser_grad = total_action_expert_grad / total_action_expert_params
+                    grad_info.append(f"actions_expert: {avg_denoiser_grad:.6f}")
                 
                 print(f"\nOverall Gradients -> {' | '.join(grad_info)}")
                 print("--- End Gradient Analysis ---\n")
