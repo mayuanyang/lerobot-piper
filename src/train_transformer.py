@@ -190,7 +190,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         other_param_count = sum(p.numel() for p in other_params)
         print(f"Vision parameters: {vision_param_count}, Other parameters: {other_param_count}")
         
-        optimizer = torch.optim.Adam(trainable_params, lr=1e-4)
+        optimizer = torch.optim.Adam(trainable_params, lr=5e-5)
         
         # Print learning rate groups
         print(f"Optimizer parameter groups: {len(optimizer.param_groups)}")
