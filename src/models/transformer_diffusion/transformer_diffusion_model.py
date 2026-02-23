@@ -427,9 +427,9 @@ class SimpleDiffusionTransformer(nn.Module):
         # ------------------------------
         # Camera-specific configurations
         camera_configs = {
-            'observation_images_front': {'num_kp': 3},    # object, container, possibly gripper
-            'observation_images_gripper': {'num_kp': 1},  # gripper only
-            'observation_images_right': {'num_kp': 2}     # object and container
+            'observation_images_front': {'num_kp': 0},    # object, container, possibly gripper
+            'observation_images_gripper': {'num_kp': 0},  # gripper only
+            'observation_images_right': {'num_kp': 0}     # object and container
         }
         
         self.image_encoders = nn.ModuleDict()
