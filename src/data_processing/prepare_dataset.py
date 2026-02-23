@@ -1246,7 +1246,7 @@ def main():
     OUTPUT_FOLDER = Path("output/")  # Output folder for processed dataset
     REPO_ID = "ISDept/piper_arm"  # Your desired Hugging Face repo ID
     AGGREGATE_EPISODES = True  # New flag to control aggregation behavior
-    MODE = "diff"  # Processing mode: "diff" or "full"
+    MODE = "full"  # Processing mode: "diff" or "full"
     # ---------------------
     
     # Find all episode folders
