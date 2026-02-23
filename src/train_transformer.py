@@ -148,7 +148,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         kernel_size=3,
         n_groups=8,
         num_cameras=3,  # Set number of cameras based on input features
-        vision_freeze_layers=8  # UNFREEZE ALL LAYERS for better gradient flow
+        vision_freeze_layers=6
     )
     
     
