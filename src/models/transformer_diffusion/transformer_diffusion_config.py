@@ -57,7 +57,7 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     
         
     # Flow matching sampling parameters
-    num_inference_steps: int = 50
+    num_inference_steps: int = 20
         
     # Training presets
     optimizer_lr: float = 1e-4

@@ -142,7 +142,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         d_model=512,  # Smaller model for better gradient flow
         nhead=8,
         num_encoder_layers=4,  # Fewer layers
-        num_decoder_layers=8,  # Configurable denoising transformer layers
+        num_decoder_layers=16,  # Configurable denoising transformer layers
         dim_feedforward=512,  # Smaller feedforward dimension
         diffusion_step_embed_dim=256,
         kernel_size=3,
