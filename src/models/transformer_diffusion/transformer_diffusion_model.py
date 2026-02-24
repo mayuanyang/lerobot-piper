@@ -468,23 +468,6 @@ class SimpleDiffusionTransformer(nn.Module):
         self.temporal_positional_encoding = PositionalEncoding(config.d_model)
         
 
-        # ------------------------------
-        # 6. Cross-Camera Attention
-        # ------------------------------
-        cross_camera_layer = nn.TransformerEncoderLayer(
-            d_model=config.d_model,
-            nhead=config.nhead,
-            dim_feedforward=config.dim_feedforward,
-            dropout=0.1,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True
-        )
-        self.cross_camera_transformer = nn.TransformerEncoder(
-            cross_camera_layer, num_layers=config.num_encoder_layers
-        )
-        
-        self.cross_camera_norm = nn.LayerNorm(config.d_model)
                         
 
         # ------------------------------
@@ -642,30 +625,13 @@ class SimpleDiffusionTransformer(nn.Module):
         else:
             obs_tokens = vision_tokens_all
         
-        # Add state tokens to the tokens list for cross-camera transformer        
-        all_tokens = torch.cat([obs_tokens, state_tokens_flat], dim=1)
+        # Instead of processing through cross-camera transformer, directly use the concatenated tokens
+        # This allows actions to directly query the "pure" vision and state tokens
+        context = torch.cat([obs_tokens, state_tokens_flat], dim=1)
         
-        # Create attention mask to prevent vision tokens from attending to state tokens
-        # Calculate token counts for mask creation
-        obs_token_count = obs_tokens.shape[1]
-        state_token_count = state_tokens_flat.shape[1]
-        total_tokens = obs_token_count + state_token_count
-        
-        # Create attention mask (True/False for allow/block)
-        # By default, allow all attentions
-        attention_mask = torch.ones(total_tokens, total_tokens, dtype=torch.bool, device=all_tokens.device)
-        
-        # Block vision tokens from attending to state tokens
-        # Vision tokens can attend to everything except state tokens
-        attention_mask[:obs_token_count, obs_token_count:] = False  # Vision tokens can't attend to state tokens
-        
-        # Convert boolean mask to float mask (False -> -inf, True -> 0)
-        float_mask = torch.zeros_like(attention_mask, dtype=torch.float, device=all_tokens.device)
-        float_mask.masked_fill_(~attention_mask, float('-inf'))
-        
-        # Process through cross-camera transformer with attention mask
-        context = self.cross_camera_transformer(all_tokens, mask=float_mask)
-        context = self.cross_camera_norm(context)
+        # Store token counts for attention masking in velocity_field
+        self.obs_token_count = obs_tokens.shape[1]
+        self.state_token_count = state_tokens_flat.shape[1]
 
         #print(f"context mean abs: {context.abs().mean():.6f}, max: {context.abs().max():.6f}")
 
@@ -696,12 +662,31 @@ class SimpleDiffusionTransformer(nn.Module):
         # extended_memory: (B, 1 + (T_obs * N_tokens), d_model)
         extended_memory = torch.cat([time_emb, obs_context], dim=1)
         
-        # 4. Decoder Pass
+        # 4. Create attention mask to prevent actions from attending to state tokens
+        # Calculate token counts for mask creation
+        total_memory_tokens = extended_memory.shape[1]  # 1 (time) + obs_token_count + state_token_count
+        
+        # Create attention mask (True/False for allow/block)
+        # By default, allow all attentions
+        memory_attention_mask = torch.ones(T_act, total_memory_tokens, dtype=torch.bool, device=extended_memory.device)
+        
+        # Block actions from attending to state tokens
+        # State tokens are at positions [1 + obs_token_count : 1 + obs_token_count + state_token_count]
+        state_start_idx = 1 + self.obs_token_count
+        state_end_idx = 1 + self.obs_token_count + self.state_token_count
+        memory_attention_mask[:, state_start_idx:state_end_idx] = False  # Actions can't attend to state tokens
+        
+        # Convert boolean mask to float mask (False -> -inf, True -> 0)
+        float_mask = torch.zeros_like(memory_attention_mask, dtype=torch.float, device=extended_memory.device)
+        float_mask.masked_fill_(~memory_attention_mask, float('-inf'))
+        
+        # 5. Decoder Pass
         # Self-attention ensures T_act is a smooth curve.
         # Cross-attention aligns T_act with your CropConvNet features.
         velocity_features = self.actions_expert(
             tgt=tgt,
-            memory=extended_memory
+            memory=extended_memory,
+            memory_mask=float_mask
         )
         #print(f"velocity_features mean abs: {velocity_features.abs().mean():.6f}, max: {velocity_features.abs().max():.6f}")
         
@@ -709,7 +694,7 @@ class SimpleDiffusionTransformer(nn.Module):
         # Residual connection to preserve gradients
         #velocity_features = velocity_features + action_embeddings
         
-        # 5. Predict the velocity field
+        # 6. Predict the velocity field
         return self.velocity_prediction_head(velocity_features)
 
     
