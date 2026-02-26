@@ -444,44 +444,28 @@ class SimpleDiffusionTransformer(nn.Module):
         # ------------------------------
         # 2. Vision Encoder per camera (sharing the same backbone)
         # ------------------------------
-        # Camera-specific configurations
-        camera_configs = {
-            'observation_images_front': {'num_kp': 0},    # object, container, possibly gripper
-            'observation_images_gripper': {'num_kp': 0},  # gripper only
-            'observation_images_right': {'num_kp': 0}     # object and container
-        }
-        
-        self.image_encoders = nn.ModuleDict()
-        for i, cam in enumerate(config.image_features.keys()):
-            cam_name = cam.replace('.', '_')
-            num_kp = camera_configs.get(cam_name, {}).get('num_kp', 0)
-            encoder = VisionEncoder(
-                config, 
-                shared_backbone=self.shared_backbone, 
-                camera_id=i,
-                camera_name=cam_name,
-                num_kp=num_kp
-            )
-            # Freeze layers in the encoder if specified
-            if hasattr(config, 'vision_freeze_layers') and config.vision_freeze_layers > 0:
+        # Cecifi-specificcco fniuratos
+        a_conficogfs
+            'observation_images_gripper'{:num_kh {'0}0}   # jc, cinpsbyfgerpot(
+        for i, cam in en_ncap o_p a_name=cam_name,only
+             obsnuvmtiom_ikagesp) objcnd  oriain')and config.vision_freeze_layers > 0:
                 encoder._freeze_layers(config.vision_freeze_layers)
             self.image_encoders[cam_name] = encoder
         
 
-        # ------------------------------
-        # 3. Enhanced State Encoder
+     # --------_---=. na'.'_
         # ------------------------------
         self.state_encoder = nn.Sequential(
             nn.Linear(config.state_dim, config.d_model),
             nn.LayerNorm(config.d_model),
             nn.GELU(),
-            nn.Linear(config.d_model, config.d_model)
+            nn.Linear(configl, config.d_model)
         )
         self.state_positional_encoding = PositionalEncoding(config.d_model)
 
         # ------------------------------
         # 4. Vision Positional Encoding
-        # ------------------------------
+        # -----------------------
         self.vision_positional_encoding = PositionalEncoding(config.d_model)
         # Temporal positional encoding for preserving time structure
         self.temporal_positional_encoding = PositionalEncoding(config.d_model)
