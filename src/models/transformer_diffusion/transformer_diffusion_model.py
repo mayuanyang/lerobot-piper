@@ -21,16 +21,35 @@ class PositionalEncoding(nn.Module):
     """Positional encoding for action sequences."""
     def __init__(self, d_model, max_len=1000):
         super().__init__()
-        pe = torch.zeros(max_len, d_model)
+        self.d_model = d_model
+        self.max_len = max_len
+        # Register a buffer for the positional encoding
+        pe = self._generate_positional_encoding(max_len)
+        self.register_buffer('pe', pe)
+
+    def _generate_positional_encoding(self, max_len):
+        """Generate positional encoding tensor."""
+        pe = torch.zeros(max_len, self.d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
+        div_term = torch.exp(torch.arange(0, self.d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / self.d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe.unsqueeze(0))
+        return pe.unsqueeze(0)  # Shape: (1, max_len, d_model)
 
     def forward(self, x):
         # x: (B, seq_len, d_model)
-        return x + self.pe[:, :x.size(1)]
+        seq_len = x.size(1)
+        
+        # If we need more positions than currently available, extend the buffer
+        if seq_len > self.pe.size(1):
+            # Extend with some buffer room
+            new_max_len = max(seq_len + 100, self.max_len * 2)
+            print(f"Extending positional encoding from {self.pe.size(1)} to {new_max_len}")
+            pe = self._generate_positional_encoding(new_max_len)
+            # Ensure the new buffer is on the same device as x
+            self.register_buffer('pe', pe.to(x.device))
+            
+        return x + self.pe[:, :seq_len]
 
 
 class DiffusionSinusoidalPosEmb(nn.Module):

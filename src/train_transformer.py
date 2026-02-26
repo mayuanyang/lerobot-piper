@@ -126,7 +126,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     
     # Training parameters
     obs = 2
-    horizon = 16
+    horizon = 50
     n_action_steps = 8
     
     # Create transformer configuration - simplified version with smaller model
@@ -177,14 +177,25 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         print(f"Number of trainable parameters: {total_trainable_params}")
         
         # Check if we have different learning rates for vision vs other parameters
+        # Corrected parameter counting to handle shared backbone properly
+        vision_param_set = set()
+        other_param_set = set()
         vision_params = []
         other_params = []
         
         for name, param in policy.named_parameters():
+            if not param.requires_grad:
+                continue
+                
+            param_id = id(param)
             if 'image_encoders' in name:
-                vision_params.append(param)
+                if param_id not in vision_param_set:
+                    vision_param_set.add(param_id)
+                    vision_params.append(param)
             else:
-                other_params.append(param)
+                if param_id not in other_param_set:
+                    other_param_set.add(param_id)
+                    other_params.append(param)
         
         vision_param_count = sum(p.numel() for p in vision_params)
         other_param_count = sum(p.numel() for p in other_params)
@@ -242,14 +253,25 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         step = 0
         
         # Implement differential learning rates for better gradient flow
+        # Corrected parameter counting to handle shared backbone properly
+        vision_param_set = set()
+        other_param_set = set()
         vision_params = []
         other_params = []
         
         for name, param in policy.named_parameters():
+            if not param.requires_grad:
+                continue
+                
+            param_id = id(param)
             if 'image_encoders' in name:
-                vision_params.append(param)
+                if param_id not in vision_param_set:
+                    vision_param_set.add(param_id)
+                    vision_params.append(param)
             else:
-                other_params.append(param)
+                if param_id not in other_param_set:
+                    other_param_set.add(param_id)
+                    other_params.append(param)
         
         # Count actual number of parameters, not just parameter tensors
         vision_param_count = sum(p.numel() for p in vision_params)
