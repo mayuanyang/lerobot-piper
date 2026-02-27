@@ -25,16 +25,20 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     )
 
     # Image processing
-    vision_backbone: str = "vit_b_16"
+    vision_backbone: str = "qwen3_vl_8b_instruct"
     
     # Input image size (height, width)
     input_image_size: tuple[int, int] = (224, 224)
     # Vision encoder parameters
-    num_cameras: int = 1
+    num_cameras: int = 3
     vision_freeze_layers: int = 6
     # Selective camera processing - list of camera keys to use for vision-state token concatenation
     # Empty list means use all cameras
-    cameras_for_vision_state_concat: list[str] = field(default_factory=lambda: ['observation.images.front'])
+    cameras_for_vision_state_concat: list[str] = field(default_factory=lambda: [
+        'observation.images.front',
+        'observation.images.left',
+        'observation.images.right'
+    ])
         
     
     # State processing

@@ -3,3 +3,4 @@ torch>=1.10.0
 numpy<2.0.0
 opencv-python>=4.5.0
 lerobot>=0.1.0
+transformers>=4.35.0

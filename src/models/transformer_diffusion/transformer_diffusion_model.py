@@ -16,6 +16,9 @@ import torchvision.models as models
 # Import our custom spatial softmax
 from .spatial_softmax import SpatialSoftmax, save_heatmap_visualization
 
+# Import Qwen3-VL-8B-Instruct components
+from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+
       
 class PositionalEncoding(nn.Module):
     """Positional encoding for action sequences."""
@@ -83,34 +86,28 @@ class VisionEncoder(nn.Module):
         self.num_kp = num_kp
 
         # ------------------------------
-        # 1. ViT backbone - shared or individual
+        # 1. Qwen3-VL-8B-Instruct backbone - shared or individual
         # ------------------------------
         if shared_backbone is not None:
             # Use shared backbone
             self.backbone = shared_backbone
-            self.hidden_dim = shared_backbone.hidden_dim
+            self.hidden_dim = shared_backbone.config.hidden_size
             self.owns_backbone = False
+            # Initialize processor for shared backbone
+            self.processor = shared_backbone.processor if hasattr(shared_backbone, 'processor') else None
         else:
-            # Create individual backbone
-            # Extract image size from config (assuming square images)
-            image_size = config.input_image_size[0] if isinstance(config.input_image_size, (tuple, list)) else config.input_image_size
-            
-            # Validate vision backbone
-            if not hasattr(models, config.vision_backbone):
-                raise ValueError(f"Unsupported vision backbone: {config.vision_backbone}")
-                
-            backbone = getattr(models, config.vision_backbone)(
-                weights="DEFAULT",
-                image_size=image_size
+            # Create individual Qwen3-VL-8B-Instruct backbone
+            print("Loading Qwen3-VL-8B-Instruct model...")
+            self.backbone = Qwen3VLForConditionalGeneration.from_pretrained(
+                "Qwen/Qwen3-VL-8B-Instruct",
+                torch_dtype="auto",
+                device_map="auto",
+                attn_implementation="flash_attention_2"
             )
-            self.hidden_dim = backbone.hidden_dim  # 768 for vit_b_16
-            
-            # Remove the classification head to get raw features
-            # The default head is a Linear layer that maps to 1000 classes
-            # We replace it with Identity() to get the raw 768-dim features
-            backbone.heads = nn.Identity()
-            self.backbone = backbone
+            self.hidden_dim = self.backbone.config.hidden_size  # Should be 4096 for Qwen3-VL-8B
             self.owns_backbone = True
+            # Initialize processor
+            self.processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct")
 
         # ------------------------------
         # 2. Improved layer freezing with better parameter handling
@@ -232,76 +229,61 @@ class VisionEncoder(nn.Module):
         B, T, N_cam, C, H, W = x.shape
         x = x.view(B * T * N_cam, C, H, W)
 
-        # 1. Get ViT features using the standard approach
-        # We manually process the input to get both class token and patch tokens separately
-        # This is necessary because we want to use both the class token and patch tokens
-        # for different parts of our architecture, rather than just the class token
-        # which is what the standard forward method returns.
+        # For Qwen3-VL-8B-Instruct, we need to process the image differently
+        # We'll use the vision transformer part of the model directly
+        # Get vision features from Qwen3-VL
+        vision_outputs = self.backbone.visual(x)
         
-        # Process input through convolutional projection (before encoder)
-        # This applies the patch embedding convolution (Conv2d 3->768, 16x16 patches)
-        # and reshapes to (batch, num_patches, hidden_dim) format
-        x_processed = self.backbone._process_input(x)
-        n = x_processed.shape[0]
+        # Extract patch tokens (excluding class token if present)
+        if hasattr(vision_outputs, 'last_hidden_state'):
+            # For Qwen3-VL, we typically get patch tokens directly
+            patch_tokens = vision_outputs.last_hidden_state
+        else:
+            # Fallback for other formats
+            patch_tokens = vision_outputs if isinstance(vision_outputs, torch.Tensor) else vision_outputs[0]
         
-        # Add class token
-        # The class token is a learnable parameter that serves as a "summary" token
-        # It's initialized as a 1x1x768 tensor and gets expanded to match the batch size
-        # This allows the transformer to aggregate information from all patches into a single representation
-        batch_class_token = self.backbone.class_token.expand(n, -1, -1)
-        x_with_cls = torch.cat([batch_class_token, x_processed], dim=1)
+        # Handle different output formats
+        n = patch_tokens.shape[0]
         
-        # Use hook to capture intermediate features from layer 3 for spatial softmax
-        # This maintains proper gradient flow through the entire encoder
-        intermediate_features = {}
-        
-        def hook_fn(module, input, output):
-            intermediate_features['spatial_features'] = output[:, 1:, :]  # Drop CLS token
-        
-        # Register hook on layer 3
-        hook = self.backbone.encoder.layers[3].register_forward_hook(hook_fn)
-        
-        # Process through the full encoder to maintain proper gradient flow
-        encoded_features = self.backbone.encoder(x_with_cls)
-        
-        # Remove hook
-        hook.remove()
-        
-        # Extract final tokens
-        x = encoded_features
-        cls_token = x[:, 0:1, :]      # (Batch, 1, 768)
-        patch_tokens = x[:, 1:, :]    # (Batch, 196, 768)
-        
-        # Extract intermediate features for spatial processing if spatial head exists
-        if self.spatial_head is not None and self.num_kp > 0:
-            spatial_features = intermediate_features['spatial_features']
+        # If we have a class token, separate it
+        if patch_tokens.shape[1] > 1 and hasattr(self.backbone.visual, 'embeddings'):
+            # Assume first token is class token
+            cls_token = patch_tokens[:, 0:1, :]      # (Batch, 1, hidden_dim)
+            patch_tokens = patch_tokens[:, 1:, :]    # (Batch, num_patches, hidden_dim)
+        else:
+            # No class token or only patch tokens
+            cls_token = torch.mean(patch_tokens, dim=1, keepdim=True)  # Create a pseudo class token
             
-            # Dynamically compute patch dimensions instead of hardcoding 14x14
-            num_patches = spatial_features.shape[1]
+        # Extract intermediate features for spatial processing if spatial head exists
+        # For Qwen3-VL, we'll use the patch tokens directly for spatial processing
+        if self.spatial_head is not None and self.num_kp > 0:
+            # Dynamically compute patch dimensions
+            num_patches = patch_tokens.shape[1]
             h = w = int(math.sqrt(num_patches))
             
             # Process spatial features for spatial softmax
-            patch_features = spatial_features.transpose(1, 2).reshape(n, self.hidden_dim, h, w)
+            # Reshape to (Batch, hidden_dim, h, w) for conv operations
+            patch_features = patch_tokens.transpose(1, 2).reshape(n, self.hidden_dim, h, w)
             spatial_coords = self.spatial_head(patch_features)
             
             # Store spatial coordinates for later use (e.g., in get_condition)
             self.cached_spatial_coords = spatial_coords
                 
-        # 5. Spatial Pooling for ViT tokens
-        # Dynamically compute patch dimensions instead of hardcoding 14x14
+        # Spatial Pooling for tokens
+        # Dynamically compute patch dimensions
         num_patches = patch_tokens.shape[1]
         h = w = int(math.sqrt(num_patches))
         
-        # Reshape to (Batch, 768, h, w) to pool spatially
+        # Reshape to (Batch, hidden_dim, h, w) to pool spatially
         patch_tokens_pooled = patch_tokens.transpose(1, 2).reshape(n, self.hidden_dim, h, w)
-        patch_tokens_pooled = self.pool(patch_tokens_pooled)  # (Batch, 768, 7, 7)
-        patch_tokens_flattened = patch_tokens_pooled.flatten(2).transpose(1, 2)  # (Batch, 25, 768)
+        patch_tokens_pooled = self.pool(patch_tokens_pooled)  # (Batch, hidden_dim, 7, 7)
+        patch_tokens_flattened = patch_tokens_pooled.flatten(2).transpose(1, 2)  # (Batch, 49, hidden_dim)
 
-        # 6. Re-combine ViT tokens
-        vit_combined = torch.cat([cls_token, patch_tokens_flattened], dim=1)  # (Batch, 26, 768)
+        # Re-combine tokens (class token + pooled patch tokens)
+        vit_combined = torch.cat([cls_token, patch_tokens_flattened], dim=1)  # (Batch, 50, hidden_dim)
         
-        # 7. Project ViT tokens
-        vit_tokens = self.projection(vit_combined)  # (Batch, 26, d_model)
+        # Project to d_model
+        vit_tokens = self.projection(vit_combined)  # (Batch, 50, d_model)
         
         # Store the number of tokens per camera for later use
         self.num_tokens_per_cam = vit_tokens.shape[1]
@@ -341,33 +323,32 @@ class VisionEncoder(nn.Module):
             B, T, N_cam, C, H, W = x.shape
             x = x.view(B * T * N_cam, C, H, W)
 
-            # Get ViT features using the same manual approach as in forward()
-            # This gives us access to both class and patch tokens
+            # For Qwen3-VL-8B-Instruct, we need to process the image differently
+            # Get vision features from Qwen3-VL
+            vision_outputs = self.backbone.visual(x)
             
-            # Process input through convolutional projection (before encoder)
-            # This applies the patch embedding convolution and reshapes to token format
-            x_processed = self.backbone._process_input(x)
-            n = x_processed.shape[0]
+            # Extract patch tokens (excluding class token if present)
+            if hasattr(vision_outputs, 'last_hidden_state'):
+                # For Qwen3-VL, we typically get patch tokens directly
+                patch_tokens = vision_outputs.last_hidden_state
+            else:
+                # Fallback for other formats
+                patch_tokens = vision_outputs if isinstance(vision_outputs, torch.Tensor) else vision_outputs[0]
             
-            # Add class token
-            # The class token is a learnable parameter that serves as a "summary" token
-            # It's initialized as a 1x1x768 tensor and gets expanded to match the batch size
-            # This allows the transformer to aggregate information from all patches into a single representation
-            batch_class_token = self.backbone.class_token.expand(n, -1, -1)
-            x_with_cls = torch.cat([batch_class_token, x_processed], dim=1)
+            # Handle different output formats
+            n = patch_tokens.shape[0]
             
-            # Pass through transformer encoder to get both class and patch tokens
-            encoded_features = self.backbone.encoder(x_with_cls) # (Batch, 197, 768)
-
-            # Separate CLS and Patches
-            patch_tokens = encoded_features[:, 1:, :]   # (Batch, 196, 768)
-
+            # If we have a class token, separate it
+            if patch_tokens.shape[1] > 1 and hasattr(self.backbone.visual, 'embeddings'):
+                # Assume first token is class token
+                patch_tokens = patch_tokens[:, 1:, :]    # (Batch, num_patches, hidden_dim)
+            
             # Reshape patch tokens to feature maps for heatmap generation
-            # Dynamically compute patch dimensions instead of hardcoding 14x14
+            # Dynamically compute patch dimensions
             num_patches = patch_tokens.shape[1]
             h = w = int(math.sqrt(num_patches))
             
-            # Reshape to (Batch, 768, h, w) for heatmap generation
+            # Reshape to (Batch, hidden_dim, h, w) for heatmap generation
             patch_features = patch_tokens.transpose(1, 2).reshape(n, self.hidden_dim, h, w)
             
             # Create spatial softmax for heatmap generation with proper input shape
@@ -379,7 +360,7 @@ class VisionEncoder(nn.Module):
             )
             
             # Apply spatial softmax to generate heatmaps and coordinates
-            coords, heatmaps = spatial_softmax.forward_with_heatmaps(patch_features)  # coords: (Batch, 768, 2), heatmaps: (Batch, 768, 14, 14)
+            coords, heatmaps = spatial_softmax.forward_with_heatmaps(patch_features)  # coords: (Batch, hidden_dim, 2), heatmaps: (Batch, hidden_dim, h, w)
             
             # Save heatmaps for debugging if requested
             if self.save_heatmaps and self.heatmap_save_dir is not None:
@@ -420,46 +401,40 @@ class SimpleDiffusionTransformer(nn.Module):
         self.config = config
 
         # ------------------------------
-        # 1. Shared ViT backbone for all cameras
+        # 1. Shared Qwen3-VL-8B-Instruct backbone for all cameras
         # ------------------------------
-        # Extract image size from config (assuming square images)
-        image_size = config.input_image_size[0] if isinstance(config.input_image_size, (tuple, list)) else config.input_image_size
-        
-        # Validate vision backbone
-        if not hasattr(models, config.vision_backbone):
-            raise ValueError(f"Unsupported vision backbone: {config.vision_backbone}")
-            
-        self.shared_backbone = getattr(models, config.vision_backbone)(
-            weights="DEFAULT",
-            image_size=image_size
+        print("Loading shared Qwen3-VL-8B-Instruct backbone...")
+        self.shared_backbone = Qwen3VLForConditionalGeneration.from_pretrained(
+            "Qwen/Qwen3-VL-8B-Instruct",
+            torch_dtype="auto",
+            device_map="auto",
+            attn_implementation="flash_attention_2"
         )
-        self.shared_backbone.hidden_dim = self.shared_backbone.hidden_dim  # 768 for vit_b_16
+        self.shared_backbone.hidden_dim = self.shared_backbone.config.hidden_size  # Should be 4096 for Qwen3-VL-8B
         
-        # Remove the classification head to get raw features
-        # The default head is a Linear layer that maps to 1000 classes
-        # We replace it with Identity() to get the raw 768-dim features
-        self.shared_backbone.heads = nn.Identity()
+        # Initialize processor for the shared backbone
+        self.shared_backbone.processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct")
         
         
         # ------------------------------
         # 2. Vision Encoder per camera (sharing the same backbone)
         # ------------------------------
-        # Cecifi-specificcco fniuratos
-        a_conficogfs
-            'observation_images_gripper'{:num_kh {'0}0}   # jc, cinpsbyfgerpot(
-        for i, cam in en_ncap o_p a_name=cam_name,only
-             obsnuvmtiom_ikagesp) objcnd  oriain')and config.vision_freeze_layers > 0:
+        self.image_encoders = nn.ModuleDict()
+        # Create encoders for each camera
+        camera_names = config.cameras_for_vision_state_concat if config.cameras_for_vision_state_concat else [
+            f'observation.images.cam_{i}' for i in range(config.num_cameras)
+        ]
+        for i, cam_name in enumerate(camera_names):
+            encoder = VisionEncoder(config, shared_backbone=self.shared_backbone, camera_id=i, camera_name=cam_name)
+            if config.vision_freeze_layers > 0:
                 encoder._freeze_layers(config.vision_freeze_layers)
             self.image_encoders[cam_name] = encoder
-        
-
-     # --------_---=. na'.'_
         # ------------------------------
         self.state_encoder = nn.Sequential(
             nn.Linear(config.state_dim, config.d_model),
             nn.LayerNorm(config.d_model),
             nn.GELU(),
-            nn.Linear(configl, config.d_model)
+            nn.Linear(config.d_model, config.d_model)
         )
         self.state_positional_encoding = PositionalEncoding(config.d_model)
 
