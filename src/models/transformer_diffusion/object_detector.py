@@ -59,6 +59,12 @@ class ObjectDetector:
         # Default user prompt - defines what the actual user requirement is
         self.user_prompt = user_prompt or "Locate objects in the picture that are relevant for robotic manipulation."
         
+        # System prompt for 2D bounding box detection
+        self.system_prompt_2d = "You are a precise 2D object detector. For each object, provide its 2D bounding box in JSON format with 'bbox_2d' field containing [x1, y1, x2, y2] where (x1, y1) is the top-left corner and (x2, y2) is the bottom-right corner. All coordinates should be normalized to [0, 1000]. Also provide a 'label' field indicating the object category."
+        
+        # Default user prompt for 2D detection
+        self.user_prompt_2d = 'locate every instance that belongs to the following categories: "plate/dish, scallop, wine bottle, tv, bowl, spoon, air conditioner, coconut drink, cup, chopsticks, person". Report bbox coordinates in JSON format.'
+        
         # Create embeddings for different object types
         # We'll use a small embedding dimension for object type (e.g., 32) and combine it with the coordinate projection
         # Now using 9 parameters for 3D bounding boxes instead of 4
@@ -187,6 +193,78 @@ class ObjectDetector:
             object_types_batch = [['unknown'] * 0 for _ in range(B)]  # Empty list for each batch item
         
         return bounding_boxes_batch, object_types_batch
+
+    def detect_objects_and_get_2d_bounding_boxes(self, image_tensor, user_prompt=None):
+        """
+        Use Qwen3-VL to detect objects in the image and extract 2D bounding boxes.
+        
+        Args:
+            image_tensor: (B, C, H, W) tensor of images
+            user_prompt: Optional override for the user prompt
+            
+        Returns:
+            bounding_boxes: List of lists of dictionaries with 'bbox_2d' and 'label' fields
+        """
+        # Use provided user prompt or fall back to instance default
+        actual_user_prompt = user_prompt or self.user_prompt_2d
+        
+        B, C, H, W = image_tensor.shape
+        bounding_boxes_list = []
+        
+        # Process each image in the batch
+        for i in range(B):
+            # Convert tensor to PIL Image for Qwen3-VL processing
+            img = image_tensor[i].detach().cpu()
+            # Convert from [-1, 1] to [0, 1] if needed
+            if img.min() < 0:
+                img = (img + 1) / 2  # Convert from [-1, 1] to [0, 1]
+            
+            # Convert to PIL Image
+            pil_transform = T.ToPILImage()
+            pil_image = pil_transform(img)
+            
+            # Prepare messages for Qwen3-VL with system and user roles for 2D detection
+            messages = [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": self.system_prompt_2d}]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": pil_image,
+                        },
+                        {"type": "text", "text": actual_user_prompt},
+                    ],
+                }
+            ]
+            
+            # Apply chat template
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt"
+            )
+            inputs = inputs.to(self.model.device)
+            
+            # Generate response
+            generated_ids = self.model.generate(**inputs, max_new_tokens=512)
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            output_text = self.processor.batch_decode(
+                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
+            
+            # Parse 2D bounding boxes from output text
+            bounding_boxes = self._parse_2d_bounding_boxes_from_text(output_text[0])
+            bounding_boxes_list.append(bounding_boxes)
+        
+        return bounding_boxes_list
 
     def _parse_bounding_boxes_from_text(self, text, img_width, img_height):
         """
@@ -399,3 +477,58 @@ class ObjectDetector:
         ax.axis('off')
         
         return fig
+
+    def _parse_2d_bounding_boxes_from_text(self, text):
+        """
+        Parse 2D bounding boxes and object types from Qwen3-VL JSON text output.
+        
+        Args:
+            text: String output from Qwen3-VL
+            
+        Returns:
+            List of dictionaries with 'bbox_2d' and 'label' fields
+        """
+        try:
+            # Find JSON content
+            if "```json" in text:
+                start_idx = text.find("```json")
+                end_idx = text.find("```", start_idx + 7)
+                if end_idx != -1:
+                    json_str = text[start_idx + 7:end_idx].strip()
+                else:
+                    json_str = text[start_idx + 7:].strip()
+            else:
+                # Find first [ and last ]
+                start_idx = text.find('[')
+                end_idx = text.rfind(']')
+                if start_idx != -1 and end_idx != -1:
+                    json_str = text[start_idx:end_idx + 1]
+                else:
+                    return []
+            
+            # Parse JSON
+            bbox_data = json.loads(json_str)
+            
+            # Normalize to list format
+            if isinstance(bbox_data, list):
+                # Validate each item in the list has required fields
+                validated_data = []
+                for item in bbox_data:
+                    if isinstance(item, dict) and 'bbox_2d' in item and 'label' in item:
+                        # Ensure bbox_2d has 4 coordinates
+                        if len(item['bbox_2d']) == 4:
+                            validated_data.append(item)
+                return validated_data
+            elif isinstance(bbox_data, dict):
+                # Check if single dict has required fields
+                if 'bbox_2d' in bbox_data and 'label' in bbox_data:
+                    # Ensure bbox_2d has 4 coordinates
+                    if len(bbox_data['bbox_2d']) == 4:
+                        return [bbox_data]
+                return []
+            else:
+                return []
+                
+        except (json.JSONDecodeError, IndexError, KeyError, TypeError) as e:
+            print(f"Error parsing 2D bounding boxes: {e}")
+            return []

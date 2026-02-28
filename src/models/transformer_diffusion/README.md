@@ -131,3 +131,50 @@ The model supports weighted loss computation for different joints in addition to
 - `TransformerDiffusionConfig`: Configuration class defining model parameters
 - `DiffusionTransformer`: Core neural network implementation
 - `TransformerDiffusionPolicy`: High-level policy interface for training and inference
+
+## 2D Object Detection
+
+The ObjectDetector class now includes support for 2D object detection using the Qwen3-VL model. This functionality allows for detecting objects in images and extracting 2D bounding boxes with associated labels.
+
+### Key Features
+
+- **2D Bounding Box Detection**: Detect objects and extract 2D bounding boxes in [x1, y1, x2, y2] format
+- **Custom Prompts**: Support for custom prompts to specify object categories of interest
+- **Label Association**: Each detected bounding box is associated with a label indicating the object category
+- **Normalized Coordinates**: Bounding box coordinates are normalized to [0, 1000] for consistency
+
+### Usage
+
+```python
+# Initialize the object detector
+detector = ObjectDetector(config)
+
+# Define a custom prompt for object detection
+prompt = 'locate every instance that belongs to the following categories: "plate/dish, scallop, wine bottle, tv, bowl, spoon, air conditioner, coconut drink, cup, chopsticks, person". Report bbox coordinates in JSON format.'
+
+# Detect 2D objects in an image tensor
+bounding_boxes_list = detector.detect_objects_and_get_2d_bounding_boxes(image_tensor, user_prompt=prompt)
+
+# Process results
+for i, bounding_boxes in enumerate(bounding_boxes_list):
+    for bbox in bounding_boxes:
+        label = bbox.get('label', 'unknown')
+        bbox_coords = bbox.get('bbox_2d', [])
+        print(f"Label: {label}, BBox: {bbox_coords}")
+```
+
+### Example Script
+
+See `src/example_2d_object_detection.py` for a complete example of how to use the 2D object detection functionality.
+
+### Visualization
+
+The `src/object_detection_utils.py` file includes utilities for visualizing detected bounding boxes on images:
+
+```python
+from object_detection_utils import plot_bounding_boxes
+
+# Plot detected bounding boxes on an image
+plot_bounding_boxes(image, json_string)
+```
+
