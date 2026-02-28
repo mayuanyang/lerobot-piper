@@ -6,15 +6,18 @@ import torchvision.transforms as transforms
 from torchvision.utils import save_image
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.optimization import get_scheduler
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
 import math
 import numpy as np
 import os
 from pathlib import Path
 import torchvision.models as models
+import torchvision.transforms as T
+import re
+import json
+import random
+import cv2
 
-# Import our custom spatial softmax
-from .spatial_softmax import SpatialSoftmax, save_heatmap_visualization
 
 # Import Qwen3-VL-8B-Instruct components
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
@@ -71,324 +74,368 @@ class DiffusionSinusoidalPosEmb(nn.Module):
         return emb
 
 
-
-
-
-
-class VisionEncoder(nn.Module):
-    def __init__(self, config, shared_backbone=None, camera_id=None, camera_name=None, num_kp=None):
-        super().__init__()
-
+class ObjectDetector:
+    """Simplified object detector using Qwen3-VL for pure bounding box detection."""
+    
+    def __init__(self, config, system_prompt=None, user_prompt=None):
         self.config = config
-        self.num_cameras = config.num_cameras
-        self.camera_id = camera_id
-        self.camera_name = camera_name
-        self.num_kp = num_kp
-
-        # ------------------------------
-        # 1. Qwen3-VL-8B-Instruct backbone - shared or individual
-        # ------------------------------
-        if shared_backbone is not None:
-            # Use shared backbone
-            self.backbone = shared_backbone
-            self.hidden_dim = shared_backbone.config.hidden_size
-            self.owns_backbone = False
-            # Initialize processor for shared backbone
-            self.processor = shared_backbone.processor if hasattr(shared_backbone, 'processor') else None
-        else:
-            # Create individual Qwen3-VL-8B-Instruct backbone
-            print("Loading Qwen3-VL-8B-Instruct model...")
-            self.backbone = Qwen3VLForConditionalGeneration.from_pretrained(
-                "Qwen/Qwen3-VL-8B-Instruct",
-                torch_dtype="auto",
-                device_map="auto",
-                attn_implementation="flash_attention_2"
-            )
-            self.hidden_dim = self.backbone.config.hidden_size  # Should be 4096 for Qwen3-VL-8B
-            self.owns_backbone = True
-            # Initialize processor
-            self.processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct")
-
-        # ------------------------------
-        # 2. Improved layer freezing with better parameter handling
-
-        # ------------------------------
-        # 3. Add a pooling layer to reduce 14x14 patches to 7x7
-        # This reduces 196 tokens to 49 tokens (preserves more spatial information)
-        # ------------------------------
-        self.pool = nn.AdaptiveAvgPool2d((7, 7))
-
-        # ------------------------------
-        # 4. Enhanced projection to d_model with better initialization
-        # ------------------------------
-        self.projection = nn.Sequential(
-            nn.Linear(self.hidden_dim, config.d_model),
-            nn.LayerNorm(config.d_model),
-            nn.GELU()
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # Load Qwen3-VL model and processor
+        print("Loading Qwen3-VL-4B-Instruct model for object detection...")
+        self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+            "Qwen/Qwen3-VL-4B-Instruct",
+            torch_dtype="auto",
+            device_map="auto",
+            attn_implementation="flash_attention_2"
         )
-
-        # ------------------------------
-        # 5. Camera-specific spatial softmax head
-        # ------------------------------
-        if num_kp is not None and num_kp > 0:
-            # We'll initialize the SpatialSoftmax with a placeholder shape
-            # The actual shape will be determined dynamically in the forward pass
-            self.spatial_head = nn.Sequential(
-                nn.Conv2d(self.hidden_dim, self.hidden_dim // 2, kernel_size=1),  
-                SpatialSoftmax(
-                    input_shape=(self.hidden_dim // 2, 14, 14),  # Placeholder, will be updated dynamically
-                    num_kp=num_kp,  # Camera-specific number of keypoints
-                    temperature=0.1, 
-                    learn_temperature=True
-                ),
-                nn.GELU(),
-            )
-        else:
-            self.spatial_head = None
-
-        # ------------------------------
-        # 6. Camera embedding with Xavier initialization
-        # ------------------------------
-        # Only create camera embedding if this is not using a shared backbone
-        # or if we want to keep per-camera embeddings
-        if camera_id is not None:
-            self.camera_embedding = nn.Embedding(
-                self.num_cameras,
-                config.d_model
-            )
-            # Initialize camera embeddings with Xavier initialization
-            nn.init.xavier_uniform_(self.camera_embedding.weight)
-        else:
-            self.camera_embedding = None
-
-        # ------------------------------
-        # 7. Token tracking and configuration
-        # ------------------------------
-        self.num_tokens_per_cam = None
+        self.processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-4B-Instruct")
         
+        # Default system prompt - defines the format
+        self.system_prompt = system_prompt or "You are a precise object detector for robotic manipulation. For each object, provide its 3D bounding box in JSON format with 'bbox_3d' field containing [x_center, y_center, z_center, x_size, y_size, z_size, roll, pitch, yaw] and a 'label' field indicating the object type (e.g., 'object_to_grasp', 'container', 'obstacle')."
         
-        # Flag to enable heatmap saving (for debugging)
-        self.save_heatmaps = False
-        self.heatmap_save_dir = None
+        # Default user prompt - defines what the actual user requirement is
+        self.user_prompt = user_prompt or "Locate objects in the picture that are relevant for robotic manipulation."
         
-        # Initialize all submodules properly
-        self._init_weights()
+        # Create embeddings for different object types
+        # We'll use a small embedding dimension for object type (e.g., 32) and combine it with the coordinate projection
+        self.object_type_embedding_dim = 32
+        self.object_type_embedding = nn.Embedding(10, self.object_type_embedding_dim)  # Support up to 10 object types
+        # Update coordinate projection to account for the additional embedding dimensions
+        # Now using 9 parameters for 3D bounding boxes instead of 4
+        self.coord_projection = nn.Linear(9 + self.object_type_embedding_dim, self.config.d_model)
+        
+        # Object type to index mapping
+        self.object_type_to_idx = {
+            'object_to_grasp': 0,
+            'container': 1,
+            'obstacle': 2,
+            'robot_arm': 3,
+            'workspace': 4,
+            'unknown': 5
+        }
 
-    def _freeze_layers(self, freeze_layers):
-        """Improved layer freezing with better parameter handling."""
-        if freeze_layers <= 0:
-            return
+    def detect_objects_and_get_bounding_boxes(self, image_tensor, user_prompt=None):
+        """
+        Use Qwen3-VL to detect objects in the image and extract bounding boxes.
+        
+        Args:
+            image_tensor: (B, C, H, W) tensor of images
+            user_prompt: Optional override for the user prompt
             
-        frozen_count = 0
-        for name, param in self.backbone.named_parameters():
-            # Handle different ViT naming conventions
-            if "encoder_layer_" in name:
-                # Handle naming convention like "encoder.layers.encoder_layer_0.ln_1.weight"
-                layer_part = name.split("encoder_layer_")[1]
-                layer_id = int(layer_part.split(".")[0])
-                if layer_id < freeze_layers:
-                    param.requires_grad = False
-                    frozen_count += 1
-            elif "encoder.layers" in name:
-                # Handle naming convention like "encoder.layers.0.attention.out_proj.weight"
-                layer_part = name.split("encoder.layers.")[1]
-                layer_id = int(layer_part.split(".")[0])
-                if layer_id < freeze_layers:
-                    param.requires_grad = False
-                    frozen_count += 1
+        Returns:
+            bounding_boxes: (B, N, 9) tensor of 3D bounding boxes [x_center, y_center, z_center, x_size, y_size, z_size, roll, pitch, yaw]
+            object_types: List of lists of object type strings
+        """
+        # Use provided user prompt or fall back to instance default
+        actual_user_prompt = user_prompt or self.user_prompt
+        
+        B, C, H, W = image_tensor.shape
+        bounding_boxes_list = []
+        object_types_list = []
+        
+        # Process each image in the batch
+        for i in range(B):
+            # Convert tensor to PIL Image for Qwen3-VL processing
+            img = image_tensor[i].detach().cpu()
+            # Convert from [-1, 1] to [0, 1] if needed
+            if img.min() < 0:
+                img = (img + 1) / 2  # Convert from [-1, 1] to [0, 1]
+            
+            # Convert to PIL Image
+            pil_transform = T.ToPILImage()
+            pil_image = pil_transform(img)
+            
+            # Prepare messages for Qwen3-VL with system and user roles
+            messages = [
+                {
+                    "role": "system",
+                    "content": self.system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": pil_image,
+                        },
+                        {"type": "text", "text": actual_user_prompt},
+                    ],
+                }
+            ]
+            
+            # Apply chat template
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt"
+            )
+            inputs = inputs.to(self.model.device)
+            
+            # Generate response
+            generated_ids = self.model.generate(**inputs, max_new_tokens=256)
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            output_text = self.processor.batch_decode(
+                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
+            
+            # Parse bounding boxes and object types from output text
+            bounding_boxes, object_types = self._parse_bounding_boxes_from_text(output_text[0], W, H)
+            bounding_boxes_list.append(bounding_boxes)
+            object_types_list.append(object_types)
+        
+        # Pad bounding boxes and object types to same number across batch
+        if bounding_boxes_list:
+            # Find maximum number of boxes
+            max_boxes = max([boxes.shape[0] if boxes is not None else 0 for boxes in bounding_boxes_list])
+            
+            # Pad all boxes and object types to max_boxes
+            padded_boxes = []
+            padded_object_types = []
+            
+            for boxes, obj_types in zip(bounding_boxes_list, object_types_list):
+                if boxes is not None and boxes.numel() > 0:
+                    # Pad boxes
+                    if boxes.shape[0] < max_boxes:
+                        padding = torch.zeros((max_boxes - boxes.shape[0], 9), device=boxes.device)
+                        boxes = torch.cat([boxes, padding], dim=0)
+                    padded_boxes.append(boxes)
                     
-        print(f"Frozen {frozen_count} parameters in VisionEncoder backbone")
-
-    def _init_weights(self):
-        """Initialize weights for better training stability."""
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                # Initialize conv layers with Kaiming initialization
-                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.Linear):
-                # Initialize linear layers with Xavier initialization
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-            elif isinstance(module, (nn.BatchNorm2d, nn.LayerNorm)):
-                # Initialize normalization layers
-                nn.init.constant_(module.weight, 1)
-                nn.init.constant_(module.bias, 0)
-
-    def forward(self, x):
-        """
-        x: (B, T, N_cam, C, H, W)
-        return:
-            vision_tokens: (B, T, N_cam * num_tokens_per_cam, d_model)
-        """
-        # Validate input
-        self._validate_input(x)
-        
-        B, T, N_cam, C, H, W = x.shape
-        x = x.view(B * T * N_cam, C, H, W)
-
-        # For Qwen3-VL-8B-Instruct, we need to process the image differently
-        # We'll use the vision transformer part of the model directly
-        # Get vision features from Qwen3-VL
-        vision_outputs = self.backbone.visual(x)
-        
-        # Extract patch tokens (excluding class token if present)
-        if hasattr(vision_outputs, 'last_hidden_state'):
-            # For Qwen3-VL, we typically get patch tokens directly
-            patch_tokens = vision_outputs.last_hidden_state
+                    # Pad object types
+                    if len(obj_types) < max_boxes:
+                        obj_types.extend(['unknown'] * (max_boxes - len(obj_types)))
+                    padded_object_types.append(obj_types)
+                else:
+                    # Create empty tensors
+                    empty_boxes = torch.zeros((max_boxes, 9), device=image_tensor.device)
+                    empty_object_types = ['unknown'] * max_boxes
+                    
+                    padded_boxes.append(empty_boxes)
+                    padded_object_types.append(empty_object_types)
+            
+            bounding_boxes_batch = torch.stack(padded_boxes, dim=0)  # (B, max_boxes, 9)
+            object_types_batch = padded_object_types  # List of lists
         else:
-            # Fallback for other formats
-            patch_tokens = vision_outputs if isinstance(vision_outputs, torch.Tensor) else vision_outputs[0]
+            bounding_boxes_batch = torch.zeros((B, 0, 9), device=image_tensor.device)
+            object_types_batch = [['unknown'] * 0 for _ in range(B)]  # Empty list for each batch item
         
-        # Handle different output formats
-        n = patch_tokens.shape[0]
+        return bounding_boxes_batch, object_types_batch
+
+    def _parse_bounding_boxes_from_text(self, text, img_width, img_height):
+        """
+        Parse 3D bounding boxes and object types from Qwen3-VL JSON text output.
         
-        # If we have a class token, separate it
-        if patch_tokens.shape[1] > 1 and hasattr(self.backbone.visual, 'embeddings'):
-            # Assume first token is class token
-            cls_token = patch_tokens[:, 0:1, :]      # (Batch, 1, hidden_dim)
-            patch_tokens = patch_tokens[:, 1:, :]    # (Batch, num_patches, hidden_dim)
-        else:
-            # No class token or only patch tokens
-            cls_token = torch.mean(patch_tokens, dim=1, keepdim=True)  # Create a pseudo class token
+        Args:
+            text: String output from Qwen3-VL
+            img_width: Width of the input image
+            img_height: Height of the input image
             
-        # Extract intermediate features for spatial processing if spatial head exists
-        # For Qwen3-VL, we'll use the patch tokens directly for spatial processing
-        if self.spatial_head is not None and self.num_kp > 0:
-            # Dynamically compute patch dimensions
-            num_patches = patch_tokens.shape[1]
-            h = w = int(math.sqrt(num_patches))
+        Returns:
+            tuple: (boxes, object_types) where boxes is a torch.Tensor of shape (N, 4) 
+                   with selected coordinates from 3D bounding boxes, and object_types is a 
+                   list of strings representing object types, or (None, []) if none found
+        """
+        try:
+            # Use the provided function to parse 3D bounding boxes
+            bounding_boxes_data = self.parse_bbox_3d_from_text(text)
+            print(f"Successfully parsed {len(bounding_boxes_data)} bounding box entries.")
+
+            # Extract bounding boxes and object types
+            boxes = []
+            object_types = []
+            for item in bounding_boxes_data:
+                if 'bbox_3d' in item:
+                    # Extract 3D bounding box parameters
+                    bbox_3d = item['bbox_3d']
+                    x_center, y_center, z_center, x_size, y_size, z_size, roll, pitch, yaw = bbox_3d
+                    
+                    # Use all 9 parameters for the 3D bounding box representation
+                    boxes.append([x_center, y_center, z_center, x_size, y_size, z_size, roll, pitch, yaw])
+                    
+                    # Extract object type/label
+                    label = item.get('label', 'unknown')
+                    object_types.append(label)
             
-            # Process spatial features for spatial softmax
-            # Reshape to (Batch, hidden_dim, h, w) for conv operations
-            patch_features = patch_tokens.transpose(1, 2).reshape(n, self.hidden_dim, h, w)
-            spatial_coords = self.spatial_head(patch_features)
-            
-            # Store spatial coordinates for later use (e.g., in get_condition)
-            self.cached_spatial_coords = spatial_coords
-                
-        # Spatial Pooling for tokens
-        # Dynamically compute patch dimensions
-        num_patches = patch_tokens.shape[1]
-        h = w = int(math.sqrt(num_patches))
-        
-        # Reshape to (Batch, hidden_dim, h, w) to pool spatially
-        patch_tokens_pooled = patch_tokens.transpose(1, 2).reshape(n, self.hidden_dim, h, w)
-        patch_tokens_pooled = self.pool(patch_tokens_pooled)  # (Batch, hidden_dim, 7, 7)
-        patch_tokens_flattened = patch_tokens_pooled.flatten(2).transpose(1, 2)  # (Batch, 49, hidden_dim)
-
-        # Re-combine tokens (class token + pooled patch tokens)
-        vit_combined = torch.cat([cls_token, patch_tokens_flattened], dim=1)  # (Batch, 50, hidden_dim)
-        
-        # Project to d_model
-        vit_tokens = self.projection(vit_combined)  # (Batch, 50, d_model)
-        
-        # Store the number of tokens per camera for later use
-        self.num_tokens_per_cam = vit_tokens.shape[1]
-
-        # Reshape to separate cameras and time
-        vision_tokens = vit_tokens.view(B, T, N_cam, self.num_tokens_per_cam, self.config.d_model)
-
-        # Add camera embedding
-        cam_ids = torch.arange(N_cam, device=vision_tokens.device)
-        cam_embed = self.camera_embedding(cam_ids)  # (N_cam, d_model)
-        vision_tokens = vision_tokens + cam_embed.view(1, 1, N_cam, 1, self.config.d_model)
-
-        # Flatten token dimension for obs transformer
-        vision_tokens = vision_tokens.view(
-            B, T, N_cam * self.num_tokens_per_cam, self.config.d_model
-        )
-
-        return vision_tokens
-
-    def _validate_input(self, x):
-        """Validate input tensor dimensions and values."""
-        if not isinstance(x, torch.Tensor):
-            raise TypeError("Input must be a torch.Tensor")
-        
-        if x.dim() != 6:
-            raise ValueError(f"Expected 6D input (B, T, N_cam, C, H, W), got {x.dim()}D")
-            
-        if x.shape[-3] != 3:  # Assuming RGB images
-            print(f"Warning: Expected 3-channel images, got {x.shape[-3]} channels")
-            
-        if torch.isnan(x).any() or torch.isinf(x).any():
-            raise ValueError("Input contains NaN or Inf values")
-
-    def generate_debug_heatmaps(self, x, camera_name="default", batch_index=0, timestep=0):
-        
-        with torch.no_grad():
-            B, T, N_cam, C, H, W = x.shape
-            x = x.view(B * T * N_cam, C, H, W)
-
-            # For Qwen3-VL-8B-Instruct, we need to process the image differently
-            # Get vision features from Qwen3-VL
-            vision_outputs = self.backbone.visual(x)
-            
-            # Extract patch tokens (excluding class token if present)
-            if hasattr(vision_outputs, 'last_hidden_state'):
-                # For Qwen3-VL, we typically get patch tokens directly
-                patch_tokens = vision_outputs.last_hidden_state
+            if boxes:
+                return torch.tensor(boxes, dtype=torch.float32), object_types
             else:
-                # Fallback for other formats
-                patch_tokens = vision_outputs if isinstance(vision_outputs, torch.Tensor) else vision_outputs[0]
+                return None, []
+        except Exception as e:
+            print(f"Error parsing bounding boxes: {e}")
+            return None, []
+
+    def _parse_json(self, json_output):
+        """
+        Parse JSON from Qwen3-VL output, removing markdown fencing.
+        
+        Args:
+            json_output: String output from Qwen3-VL
             
-            # Handle different output formats
-            n = patch_tokens.shape[0]
+        Returns:
+            str: Cleaned JSON string
+        """
+        # Parsing out the markdown fencing
+        lines = json_output.splitlines()
+        for i, line in enumerate(lines):
+            if line == "```json":
+                json_output = "\n".join(lines[i+1:])  # Remove everything before "```json"
+                json_output = json_output.split("```")[0]  # Remove everything after the closing "```"
+                break  # Exit the loop once "```json" is found
+        
+        return json_output
+
+    def parse_bbox_3d_from_text(self, text: str) -> list:
+        """
+        Parse 3D bounding box information from assistant response.
+        
+        Args:
+            text: Assistant response text containing JSON with bbox_3d information
             
-            # If we have a class token, separate it
-            if patch_tokens.shape[1] > 1 and hasattr(self.backbone.visual, 'embeddings'):
-                # Assume first token is class token
-                patch_tokens = patch_tokens[:, 1:, :]    # (Batch, num_patches, hidden_dim)
+        Returns:
+            List of dictionaries containing bbox_3d data
+        """
+        try:
+            # Find JSON content
+            if "```json" in text:
+                start_idx = text.find("```json")
+                end_idx = text.find("```", start_idx + 7)
+                if end_idx != -1:
+                    json_str = text[start_idx + 7:end_idx].strip()
+                else:
+                    json_str = text[start_idx + 7:].strip()
+            else:
+                # Find first [ and last ]
+                start_idx = text.find('[')
+                end_idx = text.rfind(']')
+                if start_idx != -1 and end_idx != -1:
+                    json_str = text[start_idx:end_idx + 1]
+                else:
+                    return []
             
-            # Reshape patch tokens to feature maps for heatmap generation
-            # Dynamically compute patch dimensions
-            num_patches = patch_tokens.shape[1]
-            h = w = int(math.sqrt(num_patches))
+            # Parse JSON
+            bbox_data = json.loads(json_str)
             
-            # Reshape to (Batch, hidden_dim, h, w) for heatmap generation
-            patch_features = patch_tokens.transpose(1, 2).reshape(n, self.hidden_dim, h, w)
-            
-            # Create spatial softmax for heatmap generation with proper input shape
-            spatial_softmax = SpatialSoftmax(
-                input_shape=(self.hidden_dim, h, w),
-                num_kp=None,  # Use all channels for debugging
-                temperature=0.1, 
-                learn_temperature=False
-            )
-            
-            # Apply spatial softmax to generate heatmaps and coordinates
-            coords, heatmaps = spatial_softmax.forward_with_heatmaps(patch_features)  # coords: (Batch, hidden_dim, 2), heatmaps: (Batch, hidden_dim, h, w)
-            
-            # Save heatmaps for debugging if requested
-            if self.save_heatmaps and self.heatmap_save_dir is not None:
-                Path(self.heatmap_save_dir).mkdir(parents=True, exist_ok=True)
+            # Normalize to list format
+            if isinstance(bbox_data, list):
+                return bbox_data
+            elif isinstance(bbox_data, dict):
+                return [bbox_data]
+            else:
+                return []
                 
-                # Save heatmaps for debugging
-                for i in range(min(4, n)):  # Save heatmaps for first 4 samples
-                    # Save one example heatmap per sample
-                    heatmap_to_save = heatmaps[i, 0]  # First channel heatmap
-                    # Get corresponding input image for overlay
-                    input_img = x[i]  # (C, H, W)
-                    # Convert to HWC format for visualization
-                    input_img_hwc = input_img.permute(1, 2, 0)  # (H, W, C)
-                    
-                    # Save heatmap visualization
-                    heatmap_save_path = Path(self.heatmap_save_dir) / f"{camera_name}_batch{batch_index}_sample{i}_timestep{timestep}_heatmap.png"
-                    save_heatmap_visualization(heatmap_to_save, input_img_hwc, heatmap_save_path)
+        except (json.JSONDecodeError, IndexError, KeyError):
+            return []
+
+    def convert_3dbbox(self, point, cam_params):
+        """Convert 3D bounding box to 2D image coordinates"""
+        x, y, z, x_size, y_size, z_size, pitch, yaw, roll = point
+        hx, hy, hz = x_size / 2, y_size / 2, z_size / 2
+        local_corners = [
+            [ hx,  hy,  hz],
+            [ hx,  hy, -hz],
+            [ hx, -hy,  hz],
+            [ hx, -hy, -hz],
+            [-hx,  hy,  hz],
+            [-hx,  hy, -hz],
+            [-hx, -hy,  hz],
+            [-hx, -hy, -hz]
+        ]
+
+        def rotate_xyz(_point, _pitch, _yaw, _roll):
+            x0, y0, z0 = _point
+            x1 = x0
+            y1 = y0 * math.cos(_pitch) - z0 * math.sin(_pitch)
+            z1 = y0 * math.sin(_pitch) + z0 * math.cos(_pitch)
+
+            x2 = x1 * math.cos(_yaw) + z1 * math.sin(_yaw)
+            y2 = y1
+            z2 = -x1 * math.sin(_yaw) + z1 * math.cos(_yaw)
+
+            x3 = x2 * math.cos(_roll) - y2 * math.sin(_roll)
+            y3 = x2 * math.sin(_roll) + y2 * math.cos(_roll)
+            z3 = z2
+
+            return [x3, y3, z3]
+        
+        img_corners = []
+        for corner in local_corners:
+            rotated = self.rotate_xyz(corner, np.deg2rad(pitch), np.deg2rad(yaw), np.deg2rad(roll))
+            X, Y, Z = rotated[0] + x, rotated[1] + y, rotated[2] + z
+            if Z > 0:
+                x_2d = cam_params['fx'] * (X / Z) + cam_params['cx']
+                y_2d = cam_params['fy'] * (Y / Z) + cam_params['cy']
+                img_corners.append([x_2d, y_2d])
+
+        return img_corners
+
+    def rotate_xyz(self, point, pitch, yaw, roll):
+        """Rotate a 3D point by the given angles"""
+        x0, y0, z0 = point
+        x1 = x0
+        y1 = y0 * math.cos(pitch) - z0 * math.sin(pitch)
+        z1 = y0 * math.sin(pitch) + z0 * math.cos(pitch)
+
+        x2 = x1 * math.cos(yaw) + z1 * math.sin(yaw)
+        y2 = y1
+        z2 = -x1 * math.sin(yaw) + z1 * math.cos(yaw)
+
+        x3 = x2 * math.cos(roll) - y2 * math.sin(roll)
+        y3 = x2 * math.sin(roll) + y2 * math.cos(roll)
+        z3 = z2
+
+        return [x3, y3, z3]
+
+    def draw_3dbboxes(self, image_path, cam_params, bbox_3d_list, color=None):
+        """Draw multiple 3D bounding boxes on the same image and return matplotlib figure"""
+        # Read image
+        annotated_image = cv2.imread(image_path)
+        if annotated_image is None:
+            print(f"Error reading image: {image_path}")
+            return None
+
+        edges = [
+            [0,1], [2,3], [4,5], [6,7],
+            [0,2], [1,3], [4,6], [5,7],
+            [0,4], [1,5], [2,6], [3,7]
+        ]
+        
+        # Draw 3D box for each bbox
+        for bbox_data in bbox_3d_list:
+            # Extract bbox_3d from the dictionary
+            if isinstance(bbox_data, dict) and 'bbox_3d' in bbox_data:
+                bbox_3d = bbox_data['bbox_3d']
+            else:
+                bbox_3d = bbox_data
             
-            # Store heatmap info for returning
-            heatmap_info = {
-                'coords': coords,
-                'heatmaps': heatmaps,
-                'camera_name': camera_name,
-                'batch_index': batch_index,
-                'timestep': timestep
-            }
-            
-            return heatmap_info
+            # Convert angles multiplied by 180 to degrees
+            bbox_3d = list(bbox_3d)  # Convert to list for modification
+            bbox_3d[-3:] = [_x * 180 for _x in bbox_3d[-3:]]
+            bbox_2d = self.convert_3dbbox(bbox_3d, cam_params)
+
+            if len(bbox_2d) >= 8:
+                # Generate random color for each box
+                box_color = [random.randint(0, 255) for _ in range(3)]
+                for start, end in edges:
+                    try:
+                        pt1 = tuple([int(_pt) for _pt in bbox_2d[start]])
+                        pt2 = tuple([int(_pt) for _pt in bbox_2d[end]])
+                        cv2.line(annotated_image, pt1, pt2, box_color, 2)
+                    except:
+                        continue
+
+        # Convert BGR to RGB for matplotlib
+        annotated_image_rgb = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
+        
+        # Create matplotlib figure
+        fig, ax = plt.subplots(1, 1, figsize=(12, 8))
+        ax.imshow(annotated_image_rgb)
+        ax.axis('off')
+        
+        return fig
 
 
     
@@ -401,34 +448,20 @@ class SimpleDiffusionTransformer(nn.Module):
         self.config = config
 
         # ------------------------------
-        # 1. Shared Qwen3-VL-8B-Instruct backbone for all cameras
+        # 1. Single shared Object Detector for all cameras
         # ------------------------------
-        print("Loading shared Qwen3-VL-8B-Instruct backbone...")
-        self.shared_backbone = Qwen3VLForConditionalGeneration.from_pretrained(
-            "Qwen/Qwen3-VL-8B-Instruct",
-            torch_dtype="auto",
-            device_map="auto",
-            attn_implementation="flash_attention_2"
-        )
-        self.shared_backbone.hidden_dim = self.shared_backbone.config.hidden_size  # Should be 4096 for Qwen3-VL-8B
+        self.object_detector = ObjectDetector(config)
         
-        # Initialize processor for the shared backbone
-        self.shared_backbone.processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct")
-        
-        
-        # ------------------------------
-        # 2. Vision Encoder per camera (sharing the same backbone)
-        # ------------------------------
-        self.image_encoders = nn.ModuleDict()
-        # Create encoders for each camera
-        camera_names = config.cameras_for_vision_state_concat if config.cameras_for_vision_state_concat else [
+        # Camera names for processing
+        self.camera_names = config.cameras_for_vision_state_concat if config.cameras_for_vision_state_concat else [
             f'observation.images.cam_{i}' for i in range(config.num_cameras)
         ]
-        for i, cam_name in enumerate(camera_names):
-            encoder = VisionEncoder(config, shared_backbone=self.shared_backbone, camera_id=i, camera_name=cam_name)
-            if config.vision_freeze_layers > 0:
-                encoder._freeze_layers(config.vision_freeze_layers)
-            self.image_encoders[cam_name] = encoder
+        self._camera_name_mapping = {}  # Mapping from sanitized names to original names
+        for i, cam_name in enumerate(self.camera_names):
+            # Sanitize the camera name for use as a module key
+            sanitized_name = cam_name.replace('.', '_')
+            self._camera_name_mapping[sanitized_name] = cam_name
+            
         # ------------------------------
         self.state_encoder = nn.Sequential(
             nn.Linear(config.state_dim, config.d_model),
@@ -445,13 +478,6 @@ class SimpleDiffusionTransformer(nn.Module):
         # Temporal positional encoding for preserving time structure
         self.temporal_positional_encoding = PositionalEncoding(config.d_model)
         
-
-                        
-
-        # ------------------------------
-        # 7. Coordinate projection for spatial features
-        # ------------------------------
-        self.coord_projection = nn.Linear(2, config.d_model)
 
         # ------------------------------
         # 8. Number of inference steps for flow matching sampling
@@ -495,22 +521,17 @@ class SimpleDiffusionTransformer(nn.Module):
 
     def get_condition(self, batch, generate_heatmaps=False):
         """
-        Separately encode vision tokens and state tokens, then fuse.
+        Encode state and use Qwen3-VL for object detection to get bounding box tokens.
         Returns:
             context: (B, T_obs * N_tokens, d_model)
-            spatial_outputs: for visualization (including heatmaps if requested)
+            spatial_outputs: for visualization (including bounding boxes if requested)
         """
         B, T_obs = batch["observation.state"].shape[:2]
-        all_vision_tokens = []
-        all_coord_tokens = []  # Collect coordinate tokens from all cameras
 
         # ------------------------------
         # 1. State encoding (compute once for reuse)
         # ------------------------------
         state_tokens = self.state_encoder(batch["observation.state"])  # (B, T, d_model)
-        #print(f"state_tokens mean abs: {state_tokens.abs().mean():.6f}, max: {state_tokens.abs().max():.6f}")
-
-        
         state_tokens = self.state_positional_encoding(state_tokens)
         # Flatten time dimension
         state_tokens_flat = state_tokens.view(B, T_obs, self.config.d_model)
@@ -519,95 +540,131 @@ class SimpleDiffusionTransformer(nn.Module):
         state_tokens_flat = state_tokens_flat.view(B, T_obs * 1, self.config.d_model)
 
         # ------------------------------
-        # 2. Vision encoding per camera
+        # 2. Object detection per camera using Qwen3-VL
         # ------------------------------
         spatial_outputs = {}  # for visualization
+        all_bbox_tokens = []  # Collect bounding box tokens from all cameras
+        all_bbox_coords = []   # Collect bounding box coordinates for spatial encoding
+        all_frame_indices = [] # Collect frame indices for temporal encoding
+        all_object_types = []  # Collect object types for embedding
         
-                
-        for cam_key, encoder in self.image_encoders.items():
-            batch_key = cam_key.replace('_', '.')
-            if batch_key in batch:
-                img = batch[batch_key]
-                if img.dim() == 4:  # (B*T, C, H, W)
-                    img = img.view(B, T_obs, 1, *img.shape[-3:])
-                elif img.dim() == 5:  # (B, T, C, H, W)
-                    img = img.unsqueeze(2)
+        # Process each camera with the shared object detector
+        for frame_idx in range(T_obs):
+            for sanitized_cam_key in self._camera_name_mapping.keys():
+                # Get the original camera name from the mapping
+                original_cam_key = self._camera_name_mapping[sanitized_cam_key]
+                batch_key = original_cam_key
+                if batch_key in batch:
+                    img = batch[batch_key]
+                    if img.dim() == 4:  # (B*T, C, H, W)
+                        img = img.view(B, T_obs, 1, *img.shape[-3:])
+                    elif img.dim() == 5:  # (B, T, C, H, W)
+                        img = img.unsqueeze(2)
 
-                # Generate heatmaps for debugging if requested
-                if generate_heatmaps:
-                    heatmap_info = encoder.generate_debug_heatmaps(
-                        img, 
-                        camera_name=cam_key, 
-                        batch_index=0, 
-                        timestep=0
-                    )
-                    spatial_outputs[f"{cam_key}_heatmap"] = heatmap_info
-                else:
-                    spatial_outputs[f"{cam_key}_heatmap"] = None
+                    # Store null values for heatmaps since we're not generating them in this simplified version
+                    spatial_outputs[f"{sanitized_cam_key}_heatmap"] = None
 
-                vision_tokens = encoder(img)  # (B, T, N_tokens_per_cam, d_model)
-                #print(f"vision_tokens mean abs: {vision_tokens.abs().mean():.6f}, max: {vision_tokens.abs().max():.6f}")
-                
-                # Apply temporal positional encoding to preserve time structure
-                # More efficient approach: compute PE for T timesteps and broadcast to all tokens
-                B_v, T_v, N_v, D_v = vision_tokens.shape
-                time_pe = self.temporal_positional_encoding(
-                    torch.zeros(B_v, T_v, D_v, device=vision_tokens.device)
-                )
-                time_pe = time_pe.unsqueeze(2)  # (B, T, 1, D)
-                vision_tokens = vision_tokens + time_pe
-
-                #print(f"vision_tokens after temporal mean abs: {vision_tokens.abs().mean():.6f}, max: {vision_tokens.abs().max():.6f}")
-                
-                # Apply positional encoding to vision tokens
-                vision_tokens_flat = vision_tokens.view(B_v, T_v * N_v, D_v)
-                vision_tokens_flat = self.vision_positional_encoding(vision_tokens_flat)
-                
-                all_vision_tokens.append(vision_tokens_flat)
-                
-                # Retrieve cached spatial coordinates if they exist
-                if hasattr(encoder, 'cached_spatial_coords') and encoder.cached_spatial_coords is not None:
-                    spatial_coords = encoder.cached_spatial_coords
-                    spatial_outputs[f"{cam_key}_spatial_coords"] = spatial_coords
+                    # Detect objects and get bounding boxes using the shared detector
+                    # Extract image for the current frame and camera
+                    img_frame_cam = img[:, frame_idx:frame_idx+1, :, :, :]  # (B, 1, 1, C, H, W)
+                    B_v, T_v, N_v, C_v, H_v, W_v = img_frame_cam.shape
+                    img_reshaped = img_frame_cam.view(B_v * T_v * N_v, C_v, H_v, W_v)  # (B*1*1, C, H, W)
+                    bounding_boxes, object_types = self.object_detector.detect_objects_and_get_bounding_boxes(img_reshaped)
                     
-                    # Convert spatial coordinates to tokens and add to vision tokens
-                    # spatial_coords shape: (B*T*N_cam, num_kp, 2)
-                    if spatial_coords is not None and spatial_coords.numel() > 0:
-                        # Project coordinates to d_model dimension
-                        coord_tokens = self.coord_projection(spatial_coords)  # (B*T*N_cam, num_kp, d_model)
+                    # Store bounding boxes for visualization
+                    spatial_outputs[f"{sanitized_cam_key}_bounding_boxes_frame_{frame_idx}"] = bounding_boxes
+                    
+                    # Generate tokens from bounding box coordinates and object types
+                    if bounding_boxes is not None and bounding_boxes.numel() > 0:
+                        # Get object type embeddings
+                        object_type_indices = torch.tensor([
+                            self.object_detector.object_type_to_idx.get(obj_type, self.object_detector.object_type_to_idx['unknown']) 
+                            for obj_type in object_types
+                        ], device=bounding_boxes.device)
+                        object_embeddings = self.object_detector.object_type_embedding(object_type_indices)  # (N, object_type_embedding_dim)
                         
-                        # Reshape to match vision tokens format
-                        coord_tokens = coord_tokens.view(B, T_v, encoder.num_kp, self.config.d_model)
+                        # Concatenate bounding box coordinates with object type embeddings
+                        combined_features = torch.cat([bounding_boxes, object_embeddings], dim=1)  # (N, 9 + object_type_embedding_dim)
                         
-                        # Apply positional encoding to coordinate tokens
-                        coord_tokens_flat = coord_tokens.view(B, T_v * encoder.num_kp, self.config.d_model)
+                        # Project to d_model dimension
+                        bbox_tokens = self.object_detector.coord_projection(combined_features)  # (N, d_model)
                         
-                        # Collect coordinate tokens from all cameras
-                        all_coord_tokens.append(coord_tokens_flat)
+                        # Reshape bbox_tokens to match vision tokens format
+                        # Add dimensions to match (B_v, T_v, N_v, N_boxes, d_model)
+                        bbox_tokens = bbox_tokens.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # (1, 1, 1, N_boxes, d_model)
+                        bbox_tokens = bbox_tokens.expand(B_v, T_v, N_v, -1, self.config.d_model)  # (B_v, T_v, N_v, N_boxes, d_model)
                         
-                else:
-                    spatial_outputs[f"{cam_key}_spatial_coords"] = None
-
-        if all_vision_tokens:
-            vision_tokens_all = torch.cat(all_vision_tokens, dim=1)  # concat along token dim
-        else:
-            vision_tokens_all = torch.empty(B, 0, self.config.d_model, device=batch["observation.state"].device)
+                        # Flatten bbox_tokens to (B, T * N_cam * N_boxes, d_model)
+                        bbox_tokens_flat = bbox_tokens.view(B_v, T_v * N_v * bbox_tokens.shape[-2], self.config.d_model)
+                        
+                        # Collect bounding box tokens, coordinates, frame indices, and object types
+                        if bbox_tokens_flat.shape[1] > 0:  # Only collect if there are bounding boxes
+                            all_bbox_tokens.append(bbox_tokens_flat)
+                            
+                            # Collect bounding box coordinates for spatial encoding
+                            # Reshape bounding_boxes to match the token structure
+                            bounding_boxes_reshaped = bounding_boxes.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # (1, 1, 1, N_boxes, 9)
+                            bounding_boxes_reshaped = bounding_boxes_reshaped.expand(B_v, T_v, N_v, -1, 9)  # (B_v, T_v, N_v, N_boxes, 9)
+                            bounding_boxes_flat = bounding_boxes_reshaped.view(B_v, T_v * N_v * bounding_boxes_reshaped.shape[-2], 9)  # (B, T*N_cam*N_boxes, 9)
+                            all_bbox_coords.append(bounding_boxes_flat)
+                            
+                            # Collect frame indices for temporal encoding
+                            frame_indices = torch.full((B_v, bbox_tokens_flat.shape[1]), frame_idx, device=bbox_tokens_flat.device)  # (B, T*N_cam*N_boxes)
+                            all_frame_indices.append(frame_indices)
+                            
+                            # Collect object types
+                            all_object_types.extend(object_types)
 
         # ------------------------------
-        # 3. Final processing
+        # 3. Apply combined positional encoding to bounding box tokens
         # ------------------------------
-        # Combine observation tokens with coordinate tokens from all cameras
-        if all_coord_tokens:
-            coord_tokens_all = torch.cat(all_coord_tokens, dim=1)
-            obs_tokens = torch.cat([vision_tokens_all, coord_tokens_all], dim=1)
+        if all_bbox_tokens and all_bbox_coords and all_frame_indices:
+            # Concatenate all collected tokens, coordinates, and frame indices
+            bbox_tokens_all = torch.cat(all_bbox_tokens, dim=1)  # (B, total_boxes, d_model)
+            bbox_coords_all = torch.cat(all_bbox_coords, dim=1)   # (B, total_boxes, 9)
+            frame_indices_all = torch.cat(all_frame_indices, dim=1)  # (B, total_boxes)
+            
+            # Apply spatial positional encoding based on bounding box coordinates
+            # We'll use the x_center and y_center coordinates (first two values) for spatial encoding
+            # Normalize coordinates to [0, 1] for positional encoding
+            spatial_coords = bbox_coords_all[:, :, :2]  # (B, total_boxes, 2) - x_center, y_center
+            
+            # Create spatial positional encoding
+            # For simplicity, we'll create a learnable embedding based on the coordinates
+            # In a more advanced implementation, we could use a sinusoidal encoding
+            B, N, _ = spatial_coords.shape
+            spatial_pe = torch.zeros(B, N, self.config.d_model, device=spatial_coords.device)
+            # Simple linear transformation of coordinates to positional encoding
+            # This is a basic approach - a more sophisticated method would use a dedicated spatial encoding layer
+            for i in range(B):
+                for j in range(N):
+                    # Use coordinates to modulate the positional encoding
+                    # This is a simplified approach - in practice, you might want a more complex spatial encoding
+                    spatial_pe[i, j, 0::2] = torch.sin(spatial_coords[i, j, 0] * 100)  # x coordinate
+                    spatial_pe[i, j, 1::2] = torch.cos(spatial_coords[i, j, 1] * 100)  # y coordinate
+            
+            # Apply temporal positional encoding based on frame indices
+            # We'll reshape frame_indices to use with the existing temporal_positional_encoding
+            max_frame_idx = frame_indices_all.max().item() if frame_indices_all.numel() > 0 else 0
+            # Ensure we have enough temporal positions
+            if max_frame_idx >= self.temporal_positional_encoding.pe.shape[1]:
+                # Extend temporal positional encoding if needed
+                new_max_len = max(max_frame_idx + 10, self.temporal_positional_encoding.max_len * 2)
+                print(f"Extending temporal positional encoding from {self.temporal_positional_encoding.pe.shape[1]} to {new_max_len}")
+                pe_temporal = self.temporal_positional_encoding._generate_positional_encoding(new_max_len)
+                self.temporal_positional_encoding.register_buffer('pe', pe_temporal.to(self.temporal_positional_encoding.pe.device))
+            
+            # Apply temporal positional encoding
+            temporal_pe = self.temporal_positional_encoding.pe[0, frame_indices_all]  # (B, total_boxes, d_model)
+            
+            # Combine spatial and temporal positional encodings with the bounding box tokens
+            # Add both positional encodings to the bbox tokens
+            obs_tokens = bbox_tokens_all + spatial_pe + temporal_pe
         else:
-            obs_tokens = vision_tokens_all
+            obs_tokens = torch.empty(B, 0, self.config.d_model, device=batch["observation.state"].device)
         
-        # Instead of processing through cross-camera transformer, directly use the concatenated tokens
-        # This allows actions to directly query the "pure" vision and state tokens
+        # Combine observation tokens (only bounding box tokens) with state tokens
         context = torch.cat([obs_tokens, state_tokens_flat], dim=1)
-
-        #print(f"context mean abs: {context.abs().mean():.6f}, max: {context.abs().max():.6f}")
 
         return context, spatial_outputs
 
