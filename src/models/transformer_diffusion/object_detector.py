@@ -49,7 +49,7 @@ class ObjectDetector:
             "Qwen/Qwen3-VL-4B-Instruct",
             torch_dtype="auto",
             device_map="auto",
-            attn_implementation="flash_attention_2"
+            attn_implementation="sdpa"
         )
         self.processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-4B-Instruct")
         
@@ -113,7 +113,7 @@ class ObjectDetector:
             messages = [
                 {
                     "role": "system",
-                    "content": self.system_prompt
+                    "content": [{"type": "text", "text": self.system_prompt}]
                 },
                 {
                     "role": "user",

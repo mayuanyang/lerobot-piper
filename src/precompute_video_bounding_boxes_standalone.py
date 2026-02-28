@@ -10,6 +10,7 @@ import numpy as np
 from pathlib import Path
 import argparse
 import json
+import traceback
 import torchvision.transforms as T
 from PIL import Image
 from tqdm import tqdm
@@ -45,7 +46,7 @@ class StandaloneObjectDetector:
                 "Qwen/Qwen3-VL-4B-Instruct",
                 torch_dtype="auto",
                 device_map="auto",
-                attn_implementation="flash_attention_2"
+                attn_implementation="sdpa"
             )
             self.processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-4B-Instruct")
         except Exception as e:
@@ -102,7 +103,7 @@ class StandaloneObjectDetector:
             messages = [
                 {
                     "role": "system",
-                    "content": self.system_prompt
+                    "content": [{"type": "text", "text": self.system_prompt}]
                 },
                 {
                     "role": "user",
@@ -354,6 +355,7 @@ class VideoBoundingBoxPrecomputer:
                     
                 except Exception as e:
                     print(f"Error processing frame {frame_count}: {e}")
+                    print(f"Stack trace:\n{traceback.format_exc()}")
                     # Still record the frame but with empty results
                     bounding_box_results["frames"].append({
                         "frame_index": frame_count,
@@ -366,7 +368,11 @@ class VideoBoundingBoxPrecomputer:
         
         # Cleanup
         cap.release()
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            # Ignore errors when running in headless environments
+            pass
         
         # Update metadata
         bounding_box_results["processed_frames"] = processed_count
