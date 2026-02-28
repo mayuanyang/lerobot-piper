@@ -273,6 +273,7 @@ class StandaloneObjectDetector:
                 generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
             )
             
+            
             # Parse 2D bounding boxes from output text
             bounding_boxes = self._parse_2d_bounding_boxes_from_text(output_text[0])
             bounding_boxes_list.append(bounding_boxes)
@@ -331,7 +332,8 @@ class StandaloneObjectDetector:
                 return []
                 
         except (json.JSONDecodeError, IndexError, KeyError, TypeError) as e:
-            print(f"Error parsing 2D bounding boxes: {e}")
+            print(f"Error parsing 2D bounding boxes: {e}, the text was: {text}")
+            print(f"Stack trace:\n{traceback.format_exc()}")
             return []
 
     def _parse_bounding_boxes_from_text(self, text, img_width, img_height):
