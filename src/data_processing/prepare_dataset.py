@@ -139,6 +139,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
             "next.done": is_done,
             "next.reward": 1.0 if is_done else 0.0,
             "task_index": 0,
+            "observation.box": [[[0.0, 0.0] for _ in range(4)] for _ in range(3)],  # Initialize with zeros: 3 boxes, 4 points each, 2 coordinates each
             #"task_description": episode_data.task_description
         }
                 
@@ -159,8 +160,9 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         "next.done": Value("bool"),
         "next.reward": Value("float32"),
         "task_index": Value("int64"),
+        "observation.box": Sequence(Sequence(Sequence(Value("float32"), length=2), length=4), length=3),  # 3 boxes with 4 points each having 2 coordinates (x, y)
         #"task_description": Value("string"),
-    }    
+    }
         
     feature_config = Features(feature_config_dict)
     hf_dataset = hf_dataset.cast(feature_config)
@@ -229,6 +231,10 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
                 "next.reward": {"dtype": "float32", "shape": [1]},
                 "observation.state": {
                     "shape": [num_joints],
+                    "dtype": "float32"
+                },
+                "observation.box": {
+                    "shape": [3, 4, 2],  # Up to 3 boxes per frame, 4 points per box, 2 coordinates per point (x, y)
                     "dtype": "float32"
                 },
                 "action": {
