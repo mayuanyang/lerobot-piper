@@ -250,7 +250,7 @@ class LeRobot2DBoundingBoxAdder:
                 # Get sample
                 sample = dataset[idx]
                 
-                # Check if current observation.box values are all zeros
+                # Check if current observation.box values are all zeros or null
                 needs_detection = False
                 if 'observation.box' in sample:
                     current_boxes = sample['observation.box']
@@ -262,6 +262,9 @@ class LeRobot2DBoundingBoxAdder:
                         if current_boxes_array.size == 0:
                             # Empty tensor, treat as all zeros
                             needs_detection = True
+                        elif np.isnan(current_boxes_array).any():
+                            # Tensor contains NaN values, trigger detection
+                            needs_detection = True
                         elif current_boxes_array.ndim >= 2:
                             # Multi-dimensional tensor, check if all values are zeros
                             if np.all(current_boxes_array == 0):
@@ -271,14 +274,37 @@ class LeRobot2DBoundingBoxAdder:
                         else:
                             # Unexpected format, perform detection
                             needs_detection = True
-                    else:
+                    elif current_boxes is None:
+                        # Null value, trigger detection
                         needs_detection = True
+                    else:
+                        # Other formats, check for null-like values
+                        try:
+                            # Convert to numpy array for consistent checking
+                            current_boxes_array = np.array(current_boxes)
+                            if current_boxes_array.size == 0 or np.isnan(current_boxes_array).any():
+                                # Empty array or contains NaN values, trigger detection
+                                needs_detection = True
+                            elif np.all(current_boxes_array == 0):
+                                # All zeros, trigger detection
+                                needs_detection = True
+                            else:
+                                print(f"Sample {idx} already has non-zero boxes, skipping detection...")
+                        except:
+                            # If conversion fails, trigger detection
+                            needs_detection = True
                 else:
                     needs_detection = True
                 
                 # Extract bounding boxes for each camera/image in the sample
                 sample_bounding_boxes = {}
                 sample_boxes_count = 0
+                
+                # Add episode_index and frame_index to the sample_bounding_boxes
+                if 'episode_index' in sample:
+                    sample_bounding_boxes['episode_index'] = sample['episode_index'].item() if isinstance(sample['episode_index'], torch.Tensor) else sample['episode_index']
+                if 'frame_index' in sample:
+                    sample_bounding_boxes['frame_index'] = sample['frame_index'].item() if isinstance(sample['frame_index'], torch.Tensor) else sample['frame_index']
                 
                 if needs_detection:
                     # Look for image observations in the sample
@@ -312,9 +338,24 @@ class LeRobot2DBoundingBoxAdder:
                                         bounding_boxes_list = self.detect_objects_and_get_2d_bounding_boxes(tensor_image, user_prompt)
                                         bounding_boxes = bounding_boxes_list[0] if bounding_boxes_list else []
                                         
-                                        # Store bounding boxes for this camera
-                                        sample_bounding_boxes[camera_name] = bounding_boxes
-                                        sample_boxes_count += len(bounding_boxes)
+                                        # Convert detected bounding boxes to required format immediately
+                                        if bounding_boxes:
+                                            # Initialize with default empty boxes for this camera
+                                            converted_boxes = [[0.0, 0.0, 0.0, 0.0] for _ in range(2)]
+                                            
+                                            # Process up to 2 boxes per camera
+                                            for box_idx, box_data in enumerate(bounding_boxes[:2]):
+                                                if 'bbox_2d' in box_data and len(box_data['bbox_2d']) == 4:
+                                                    # Store the box coordinates directly
+                                                    converted_boxes[box_idx] = box_data['bbox_2d']
+                                            
+                                            # Store converted bounding boxes for this camera
+                                            sample_bounding_boxes[camera_name] = converted_boxes
+                                            sample_boxes_count += len(bounding_boxes)
+                                        else:
+                                            # Store empty boxes for this camera
+                                            sample_bounding_boxes[camera_name] = [[0.0, 0.0, 0.0, 0.0] for _ in range(2)]
+                                            sample_boxes_count += 0
                                     else:
                                         print(f"Unexpected tensor dimensions for {key}: {value.dim()}")
                                         sample_bounding_boxes[camera_name] = []
@@ -328,13 +369,21 @@ class LeRobot2DBoundingBoxAdder:
                     # No detection needed, store empty bounding boxes
                     sample_bounding_boxes = {}
                 
-                bounding_boxes_data.append(sample_bounding_boxes)
+                # Store the bounding boxes data directly
+                if needs_detection and sample_bounding_boxes:
+                    bounding_boxes_data.append(sample_bounding_boxes)
+                else:
+                    bounding_boxes_data.append(sample_bounding_boxes)
+                
                 pbar.set_postfix({"boxes": sample_boxes_count})
                 
                 # Update parquet files every 10 samples
                 if (idx + 1) % 10 == 0 or (idx + 1) == len(indices):
                     print(f"Updating dataset with {idx + 1} samples processed...")
                     self._update_dataset_with_bounding_boxes_partial(repo_id, bounding_boxes_data, indices[:idx+1], revision)
+                    
+                    # Clear bounding_boxes_data after updating parquet files
+                    bounding_boxes_data.clear()
                     
                     # Push to HuggingFace Hub if requested
                     if push_to_hub:
@@ -388,7 +437,7 @@ class LeRobot2DBoundingBoxAdder:
             processed_indices: List of indices that have been processed
             revision: Revision of the dataset to update
         """
-        print(f"Partially updating dataset {repo_id} with bounding box information for {len(processed_indices)} samples...")
+        print(f"Partially updating dataset {repo_id} with bounding box information for {len(bounding_boxes_data)} samples...")
         
         # Construct dataset directory path based on user-provided information
         try:
@@ -406,27 +455,6 @@ class LeRobot2DBoundingBoxAdder:
             print(f"Error constructing dataset directory path: {e}")
             return
         
-        # Update info.json to include the new observation.box feature (only once)
-        info_json_path = dataset_dir / "meta" / "info.json"
-        if info_json_path.exists():
-            try:
-                with open(info_json_path, 'r') as f:
-                    info_data = json.load(f)
-                
-                # Add observation.box feature if not already present
-                if "observation.box" not in info_data["features"]:
-                    info_data["features"]["observation.box"] = {
-                        "shape": [3, 4, 2],  # 3 boxes, 4 points each, 2 coordinates each
-                        "dtype": "float32"
-                    }
-                    
-                    with open(info_json_path, 'w') as f:
-                        json.dump(info_data, f, indent=2)
-                    print("Updated info.json with observation.box feature")
-            except Exception as e:
-                print(f"Error updating info.json: {e}")
-        else:
-            print(f"info.json not found at {info_json_path}")
         
         # Update parquet files with bounding box data
         data_dir = dataset_dir / "data"
@@ -438,74 +466,38 @@ class LeRobot2DBoundingBoxAdder:
                         df = pd.read_parquet(parquet_file)
                         print(f"Loaded parquet file with {len(df)} rows")
                         
-                        # Update bounding box column for processed indices only
-                        # Convert bounding_boxes_data to a format suitable for the dataframe
-                        for i, idx in enumerate(processed_indices):
-                            if idx < len(df):
-                                # Check if current observation.box values are all zeros
-                                current_boxes = df.loc[idx, 'observation.box']
-                                # Convert to numpy array for easier comparison
-                                if isinstance(current_boxes, list):
-                                    current_boxes_array = np.array(current_boxes)
-                                    # Check if all values are zeros
-                                    if np.all(current_boxes_array == 0):
-                                        print(f"Sample {idx} has all-zero boxes, performing detection...")
-                                        
-                                        # Combine bounding boxes from all cameras for this sample
-                                        all_boxes = []
-                                        if i < len(bounding_boxes_data):
-                                            for camera_boxes in bounding_boxes_data[i].values():
-                                                for box_data in camera_boxes:
-                                                    # Convert bbox_2d to a flat list
-                                                    if 'bbox_2d' in box_data:
-                                                        all_boxes.extend(box_data['bbox_2d'])
-                                        
-                                        # Reshape to list of 4-element lists (representing boxes with 4 points each)
-                                        reshaped_boxes = []
-                                        if all_boxes:
-                                            # Reshape to list of 4-element lists
-                                            reshaped_boxes = [all_boxes[i:i+4] for i in range(0, len(all_boxes), 4)]
-                                        
-                                        # Pad with zero boxes to ensure consistent length (exactly 3 boxes)
-                                        while len(reshaped_boxes) < 3:
-                                            reshaped_boxes.append([0.0, 0.0, 0.0, 0.0])
-                                        
-                                        # Truncate to exactly 3 boxes if more were detected
-                                        if len(reshaped_boxes) > 3:
-                                            reshaped_boxes = reshaped_boxes[:3]
-                                            
-                                        # Convert to the required format: [3, 4, 2]
-                                        # Each box should have 4 points, each point with 2 coordinates
-                                        final_boxes = []
-                                        for box in reshaped_boxes:
-                                            # Each box should have 4 points with 2 coordinates each
-                                            # For simplicity, we'll convert the 4 coordinates [x1, y1, x2, y2] 
-                                            # to 4 points [(x1,y1), (x2,y1), (x2,y2), (x1,y2)]
-                                            if len(box) == 4:
-                                                x1, y1, x2, y2 = box
-                                                box_points = [
-                                                    [x1, y1],  # Top-left
-                                                    [x2, y1],  # Top-right
-                                                    [x2, y2],  # Bottom-right
-                                                    [x1, y2]   # Bottom-left
-                                                ]
-                                                final_boxes.append(box_points)
-                                            else:
-                                                # If box doesn't have 4 coordinates, pad with zeros
-                                                box_points = [[0.0, 0.0] for _ in range(4)]
-                                                final_boxes.append(box_points)
-                                        
-                                        # Pad with zero boxes if needed to reach exactly 3 boxes
-                                        while len(final_boxes) < 3:
-                                            zero_box = [[0.0, 0.0] for _ in range(4)]
-                                            final_boxes.append(zero_box)
-                                        
-                                        # Use loc instead of at to avoid the ndarray error
-                                        df.loc[idx, 'observation.box'] = final_boxes
+                        # Loop through bounding_boxes_data and find matching frames in the parquet file
+                        for bbox_data in bounding_boxes_data:
+                            # Extract episode_index and frame_index from bounding_boxes_data
+                            if 'episode_index' in bbox_data and 'frame_index' in bbox_data:
+                                episode_index = bbox_data['episode_index']
+                                frame_index = bbox_data['frame_index']
+                                
+                                # Use where condition to locate the specific frame
+                                mask = (df['episode_index'] == episode_index) & (df['frame_index'] == frame_index)
+                                matching_rows = df[mask]
+                                
+                                if len(matching_rows) > 0:
+                                    # Remove episode_index and frame_index from bbox_data before updating
+                                    bbox_data_copy = bbox_data.copy()
+                                    bbox_data_copy.pop('episode_index', None)
+                                    bbox_data_copy.pop('frame_index', None)
+                                    
+                                    # Check if we have converted bounding box data
+                                    if 'converted_boxes' in bbox_data_copy:
+                                        final_boxes = bbox_data_copy['converted_boxes']
                                     else:
-                                        print(f"Sample {idx} already has non-zero boxes, skipping detection...")
+                                        # If no bounding boxes were detected, use default empty boxes
+                                        # Format: [6, 4] - 6 elements, each with 4 coordinates
+                                        final_boxes = [[0.0, 0.0, 0.0, 0.0] for _ in range(6)]
+                                    
+                                    # Update the observation.box column for the matching row(s)
+                                    df.loc[mask, 'observation.box'] = final_boxes
+                                    print(f"Updated frame with episode_index={episode_index}, frame_index={frame_index}")
                                 else:
-                                    print(f"Sample {idx} has unexpected box format, skipping...")
+                                    print(f"No matching frame found for episode_index={episode_index}, frame_index={frame_index}")
+                            else:
+                                print(f"Missing episode_index or frame_index in bounding_boxes_data")
                         
                         # Save updated dataframe back to parquet
                         df.to_parquet(parquet_file, index=False)
@@ -567,6 +559,39 @@ class LeRobot2DBoundingBoxAdder:
         except Exception as e:
             print(f"Error pushing to HuggingFace Hub: {e}")
 
+    def _convert_detected_bounding_boxes_to_required_format(self, bbox_data):
+        """
+        Convert detected bounding box data to the required format: [6, 4]
+        Where:
+        - 6 elements total (2 per camera for 3 cameras)
+        - Each element is an array of 4 floats [x1, y1, x2, y2]
+        - If a camera doesn't have enough bounding boxes, pad with [0.0, 0.0, 0.0, 0.0]
+        
+        Args:
+            bbox_data: Dictionary with camera names as keys and lists of bounding boxes as values
+                       Each bounding box has 'bbox_2d' field with [x1, y1, x2, y2] coordinates
+            
+        Returns:
+            List of lists representing the bounding boxes in the required format
+        """
+        # Initialize with default empty boxes
+        final_boxes = [[0.0, 0.0, 0.0, 0.0] for _ in range(6)]
+        
+        # Define the order of cameras
+        camera_order = ['gripper', 'front', 'right']
+        
+        # Process bounding boxes for each camera
+        for cam_idx, camera_name in enumerate(camera_order):
+            if camera_name in bbox_data:
+                camera_boxes = bbox_data[camera_name]
+                # Process up to 2 boxes per camera
+                for box_idx, box_data in enumerate(camera_boxes[:2]):
+                    if 'bbox_2d' in box_data and len(box_data['bbox_2d']) == 4:
+                        # Store the box coordinates directly
+                        final_boxes[cam_idx * 2 + box_idx] = box_data['bbox_2d']
+        
+        return final_boxes
+
     def _update_dataset_with_bounding_boxes(self, repo_id, bounding_boxes_data, revision="main"):
         """
         Update the LeRobot dataset with bounding box information.
@@ -581,10 +606,10 @@ class LeRobot2DBoundingBoxAdder:
         # Construct dataset directory path
         try:
             # Use the standard HuggingFace cache directory for lerobot datasets
-            dataset_cache_root = Path("/root/.cache/huggingface/lerobot")
+            dataset_cache_root = Path(f"/root/.cache/huggingface/lerobot/{repo_id}")
             # Convert repo_id to a safe directory name (replace / with ___)
-            safe_repo_id = repo_id.replace("/", "___")
-            dataset_dir = dataset_cache_root / safe_repo_id
+            
+            dataset_dir = dataset_cache_root
             print(f"Dataset directory: {dataset_dir}")
             
             # Check if the directory exists
@@ -592,8 +617,8 @@ class LeRobot2DBoundingBoxAdder:
                 print(f"Dataset directory does not exist: {dataset_dir}")
                 # Try alternative paths
                 alt_paths = [
-                    Path.home() / ".cache/huggingface/lerobot" / safe_repo_id,
-                    Path("/tmp/lerobot") / safe_repo_id
+                    Path.home() / ".cache/huggingface/lerobot",
+                    Path("/tmp/lerobot")
                 ]
                 for alt_path in alt_paths:
                     if alt_path.exists():
@@ -607,27 +632,7 @@ class LeRobot2DBoundingBoxAdder:
             print(f"Error constructing dataset directory path: {e}")
             return
         
-        # Update info.json to include the new observation.box feature
-        info_json_path = dataset_dir / "meta" / "info.json"
-        if info_json_path.exists():
-            try:
-                with open(info_json_path, 'r') as f:
-                    info_data = json.load(f)
                 
-                # Add observation.box feature with correct shape
-                info_data["features"]["observation.box"] = {
-                    "shape": [3, 4, 2],  # 3 boxes, 4 points each, 2 coordinates each
-                    "dtype": "float32"
-                }
-                
-                with open(info_json_path, 'w') as f:
-                    json.dump(info_data, f, indent=2)
-                print("Updated info.json with observation.box feature")
-            except Exception as e:
-                print(f"Error updating info.json: {e}")
-        else:
-            print(f"info.json not found at {info_json_path}")
-        
         # Update parquet files with bounding box data
         data_dir = dataset_dir / "data"
         if data_dir.exists():
@@ -638,76 +643,38 @@ class LeRobot2DBoundingBoxAdder:
                         df = pd.read_parquet(parquet_file)
                         print(f"Loaded parquet file with {len(df)} rows")
                         
-                        # Update bounding box column for all samples
-                        for idx in range(len(df)):
-                            if idx < len(bounding_boxes_data):
-                                # Check if current observation.box values are all zeros
-                                current_boxes = df.loc[idx, 'observation.box']
-                                # Convert to numpy array for easier comparison
-                                if isinstance(current_boxes, list):
-                                    current_boxes_array = np.array(current_boxes)
-                                    # Check if all values are zeros
-                                    if np.all(current_boxes_array == 0):
-                                        print(f"Sample {idx} has all-zero boxes, performing detection...")
-                                        
-                                        # Combine bounding boxes from all cameras for this sample
-                                        all_boxes = []
-                                        for camera_boxes in bounding_boxes_data[idx].values():
-                                            for box_data in camera_boxes:
-                                                # Convert bbox_2d to a flat list
-                                                if 'bbox_2d' in box_data:
-                                                    all_boxes.extend(box_data['bbox_2d'])
-                                        
-                                        # Reshape to list of 4-element lists (representing boxes with 4 points each)
-                                        reshaped_boxes = []
-                                        if all_boxes:
-                                            # Reshape to list of 4-element lists
-                                            reshaped_boxes = [all_boxes[i:i+4] for i in range(0, len(all_boxes), 4)]
-                                        
-                                        # Pad with zero boxes to ensure consistent length (exactly 3 boxes)
-                                        while len(reshaped_boxes) < 3:
-                                            reshaped_boxes.append([0.0, 0.0, 0.0, 0.0])
-                                        
-                                        # Truncate to exactly 3 boxes if more were detected
-                                        if len(reshaped_boxes) > 3:
-                                            reshaped_boxes = reshaped_boxes[:3]
-                                            
-                                        # Convert to the required format: [3, 4, 2]
-                                        # Each box should have 4 points, each point with 2 coordinates
-                                        final_boxes = []
-                                        for box in reshaped_boxes:
-                                            # Each box should have 4 points with 2 coordinates each
-                                            # For simplicity, we'll convert the 4 coordinates [x1, y1, x2, y2] 
-                                            # to 4 points [(x1,y1), (x2,y1), (x2,y2), (x1,y2)]
-                                            if len(box) == 4:
-                                                x1, y1, x2, y2 = box
-                                                box_points = [
-                                                    [x1, y1],  # Top-left
-                                                    [x2, y1],  # Top-right
-                                                    [x2, y2],  # Bottom-right
-                                                    [x1, y2]   # Bottom-left
-                                                ]
-                                                final_boxes.append(box_points)
-                                            else:
-                                                # If box doesn't have 4 coordinates, pad with zeros
-                                                box_points = [[0.0, 0.0] for _ in range(4)]
-                                                final_boxes.append(box_points)
-                                        
-                                        # Pad with zero boxes if needed to reach exactly 3 boxes
-                                        while len(final_boxes) < 3:
-                                            zero_box = [[0.0, 0.0] for _ in range(4)]
-                                            final_boxes.append(zero_box)
-                                        
-                                        # Use loc instead of at to avoid the ndarray error
-                                        df.loc[idx, 'observation.box'] = final_boxes
+                        # Loop through bounding_boxes_data and find matching frames in the parquet file
+                        for bbox_data in bounding_boxes_data:
+                            # Extract episode_index and frame_index from bounding_boxes_data
+                            if 'episode_index' in bbox_data and 'frame_index' in bbox_data:
+                                episode_index = bbox_data['episode_index']
+                                frame_index = bbox_data['frame_index']
+                                
+                                # Use where condition to locate the specific frame
+                                mask = (df['episode_index'] == episode_index) & (df['frame_index'] == frame_index)
+                                matching_rows = df[mask]
+                                
+                                if len(matching_rows) > 0:
+                                    # Remove episode_index and frame_index from bbox_data before updating
+                                    bbox_data_copy = bbox_data.copy()
+                                    bbox_data_copy.pop('episode_index', None)
+                                    bbox_data_copy.pop('frame_index', None)
+                                    
+                                    # Check if we have converted bounding box data
+                                    if 'converted_boxes' in bbox_data_copy:
+                                        final_boxes = bbox_data_copy['converted_boxes']
                                     else:
-                                        print(f"Sample {idx} already has non-zero boxes, skipping detection...")
+                                        # If no bounding boxes were detected, use default empty boxes
+                                        # Format: [6, 4] - 6 elements, each with 4 coordinates
+                                        final_boxes = [[0.0, 0.0, 0.0, 0.0] for _ in range(6)]
+                                    
+                                    # Update the observation.box column for the matching row(s)
+                                    df.loc[mask, 'observation.box'] = final_boxes
+                                    print(f"Updated frame with episode_index={episode_index}, frame_index={frame_index}")
                                 else:
-                                    print(f"Sample {idx} has unexpected box format, skipping...")
+                                    print(f"No matching frame found for episode_index={episode_index}, frame_index={frame_index}")
                             else:
-                                # Handle case where we don't have bounding box data for this sample
-                                # Just leave the existing boxes as they are
-                                pass
+                                print(f"Missing episode_index or frame_index in bounding_boxes_data")
                         
                         # Save updated dataframe back to parquet
                         df.to_parquet(parquet_file, index=False)
