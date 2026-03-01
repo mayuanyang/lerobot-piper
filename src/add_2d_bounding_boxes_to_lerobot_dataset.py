@@ -378,7 +378,7 @@ class LeRobot2DBoundingBoxAdder:
                 pbar.set_postfix({"boxes": sample_boxes_count})
                 
                 # Update parquet files every 10 samples
-                if (idx + 1) % 10 == 0 or (idx + 1) == len(indices):
+                if (idx + 1) % 2 == 0 or (idx + 1) == len(indices):
                     print(f"Updating dataset with {idx + 1} samples processed...")
                     self._update_dataset_with_bounding_boxes_partial(repo_id, bounding_boxes_data, indices[:idx+1], revision)
                     
@@ -476,6 +476,8 @@ class LeRobot2DBoundingBoxAdder:
                                 # Use where condition to locate the specific frame
                                 mask = (df['episode_index'] == episode_index) & (df['frame_index'] == frame_index)
                                 matching_rows = df[mask]
+                                print(f"Mask length: {len(mask)}")
+                                print(f"Matching rows count: {len(matching_rows)}")
                                 
                                 if len(matching_rows) > 0:
                                     # Remove episode_index and frame_index from bbox_data before updating
@@ -483,16 +485,40 @@ class LeRobot2DBoundingBoxAdder:
                                     bbox_data_copy.pop('episode_index', None)
                                     bbox_data_copy.pop('frame_index', None)
                                     
-                                    # Check if we have converted bounding box data
-                                    if 'converted_boxes' in bbox_data_copy:
-                                        final_boxes = bbox_data_copy['converted_boxes']
-                                    else:
-                                        # If no bounding boxes were detected, use default empty boxes
-                                        # Format: [6, 4] - 6 elements, each with 4 coordinates
-                                        final_boxes = [[0.0, 0.0, 0.0, 0.0] for _ in range(6)]
+                                    # Convert camera-based bbox_data to required [6,4] format
+                                    final_boxes = self._convert_detected_bounding_boxes_to_required_format(bbox_data_copy)
                                     
                                     # Update the observation.box column for the matching row(s)
-                                    df.loc[mask, 'observation.box'] = final_boxes
+                                    # Print debug information about the existing data structure
+                                    existing_box = df.loc[mask, 'observation.box'].iloc[0]
+                                    print(f"Existing box type: {type(existing_box)}")
+                                    print(f"Existing box shape: {existing_box.shape if hasattr(existing_box, 'shape') else 'N/A'}")
+                                    print(f"Existing box value: {existing_box}")
+                                    
+                                    # Print debug information about the new data structure
+                                    new_boxes = np.array(final_boxes)
+                                    print(f"New box type: {type(new_boxes)}")
+                                    print(f"New box shape: {new_boxes.shape}")
+                                    print(f"New box value: {new_boxes}")
+                                    
+                                    converted_boxes = [
+                                        [float(x) for x in new_boxes[i]]
+                                        for i in range(6)
+                                    ]
+                                    
+                                                                        
+                                    # Check if we're trying to assign to multiple rows
+                                    if len(matching_rows) > 1:
+                                        print(f"Warning: Found {len(matching_rows)} matching rows. Attempting to update all of them.")
+                                        # We need to assign a list of values, one for each matching row
+                                        # Create a list of converted_boxes, one for each matching row
+                                        values_to_assign = [converted_boxes] * len(matching_rows)
+                                        print(f"Values to assign length: {len(values_to_assign)}")
+                                        df.loc[mask, 'observation.box'] = values_to_assign
+                                    else:
+                                        # Assign the converted boxes
+                                        row_index = df.index[mask][0]
+                                        df.at[row_index, 'observation.box'] = converted_boxes
                                     print(f"Updated frame with episode_index={episode_index}, frame_index={frame_index}")
                                 else:
                                     print(f"No matching frame found for episode_index={episode_index}, frame_index={frame_index}")
@@ -504,6 +530,7 @@ class LeRobot2DBoundingBoxAdder:
                         print(f"Updated parquet file: {parquet_file}")
                     except Exception as e:
                         print(f"Error updating parquet file {parquet_file}: {e}")
+                        print(traceback.format_exc())
         else:
             print(f"Data directory not found at {data_dir}")
         
@@ -653,6 +680,8 @@ class LeRobot2DBoundingBoxAdder:
                                 # Use where condition to locate the specific frame
                                 mask = (df['episode_index'] == episode_index) & (df['frame_index'] == frame_index)
                                 matching_rows = df[mask]
+                                print(f"Mask length: {len(mask)}")
+                                print(f"Matching rows count: {len(matching_rows)}")
                                 
                                 if len(matching_rows) > 0:
                                     # Remove episode_index and frame_index from bbox_data before updating
@@ -660,16 +689,40 @@ class LeRobot2DBoundingBoxAdder:
                                     bbox_data_copy.pop('episode_index', None)
                                     bbox_data_copy.pop('frame_index', None)
                                     
-                                    # Check if we have converted bounding box data
-                                    if 'converted_boxes' in bbox_data_copy:
-                                        final_boxes = bbox_data_copy['converted_boxes']
-                                    else:
-                                        # If no bounding boxes were detected, use default empty boxes
-                                        # Format: [6, 4] - 6 elements, each with 4 coordinates
-                                        final_boxes = [[0.0, 0.0, 0.0, 0.0] for _ in range(6)]
+                                    # Convert camera-based bbox_data to required [6,4] format
+                                    final_boxes = self._convert_detected_bounding_boxes_to_required_format(bbox_data_copy)
                                     
                                     # Update the observation.box column for the matching row(s)
-                                    df.loc[mask, 'observation.box'] = final_boxes
+                                    # Print debug information about the existing data structure
+                                    existing_box = df.loc[mask, 'observation.box'].iloc[0]
+                                    print(f"Existing box type: {type(existing_box)}")
+                                    print(f"Existing box shape: {existing_box.shape if hasattr(existing_box, 'shape') else 'N/A'}")
+                                    print(f"Existing box value: {existing_box}")
+                                    
+                                    # Print debug information about the new data structure
+                                    new_boxes = np.array(final_boxes)
+                                    print(f"New box type: {type(new_boxes)}")
+                                    print(f"New box shape: {new_boxes.shape}")
+                                    print(f"New box value: {new_boxes}")
+                                    
+                                    converted_boxes = [
+                                        [float(x) for x in new_boxes[i]]
+                                        for i in range(6)
+                                    ]
+                                    
+                                    
+                                    # Check if we're trying to assign to multiple rows
+                                    if len(matching_rows) > 1:
+                                        print(f"Warning: Found {len(matching_rows)} matching rows. Attempting to update all of them.")
+                                        # We need to assign a list of values, one for each matching row
+                                        # Create a list of converted_boxes, one for each matching row
+                                        values_to_assign = [converted_boxes] * len(matching_rows)
+                                        print(f"Values to assign length: {len(values_to_assign)}")
+                                        df.loc[mask, 'observation.box'] = values_to_assign
+                                    else:
+                                        # Assign the converted boxes
+                                        row_index = df.index[mask][0]
+                                        df.at[row_index, 'observation.box'] = converted_boxes
                                     print(f"Updated frame with episode_index={episode_index}, frame_index={frame_index}")
                                 else:
                                     print(f"No matching frame found for episode_index={episode_index}, frame_index={frame_index}")
