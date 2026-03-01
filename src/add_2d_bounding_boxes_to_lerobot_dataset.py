@@ -529,10 +529,10 @@ class LeRobot2DBoundingBoxAdder:
         
         try:
             # Construct dataset directory path
-            dataset_cache_root = Path("/root/.cache/huggingface/lerobot")
+            dataset_cache_root = Path(f"/root/.cache/huggingface/lerobot/{repo_id}")
             # Convert repo_id to a safe directory name (replace / with ___)
-            safe_repo_id = repo_id.replace("/", "___")
-            dataset_dir = dataset_cache_root / safe_repo_id
+            
+            dataset_dir = dataset_cache_root
             print(f"Dataset directory: {dataset_dir}")
             
             # Check if the directory exists
@@ -540,8 +540,8 @@ class LeRobot2DBoundingBoxAdder:
                 print(f"Dataset directory does not exist: {dataset_dir}")
                 # Try alternative paths
                 alt_paths = [
-                    Path.home() / ".cache/huggingface/lerobot" / safe_repo_id,
-                    Path("/tmp/lerobot") / safe_repo_id
+                    Path.home() / ".cache/huggingface/lerobot",
+                    Path("/tmp/lerobot")
                 ]
                 for alt_path in alt_paths:
                     if alt_path.exists():
