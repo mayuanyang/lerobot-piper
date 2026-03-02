@@ -378,7 +378,7 @@ class LeRobot2DBoundingBoxAdder:
                 pbar.set_postfix({"boxes": sample_boxes_count})
                 
                 # Update parquet files every 10 samples
-                if (idx + 1) % 50 == 0 or (idx + 1) == len(indices):
+                if (idx + 1) % 500 == 0 or (idx + 1) == len(indices):
                     self._update_dataset_with_bounding_boxes_partial(repo_id, bounding_boxes_data, indices[:idx+1], revision)
                     
                     # Clear bounding_boxes_data after updating parquet files

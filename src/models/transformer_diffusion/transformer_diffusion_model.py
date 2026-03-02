@@ -83,9 +83,10 @@ class SimpleDiffusionTransformer(nn.Module):
         self.config = config
 
         # ------------------------------
-        # 1. Single shared Object Detector for all cameras
+        # 1. Single shared Object Detector for all cameras (initialize as None)
         # ------------------------------
-        self.object_detector = ObjectDetector(config)
+        self.object_detector = None
+        self._object_detector_initialized = False
         
         # Camera names for processing
         self.camera_names = config.cameras_for_vision_state_concat if config.cameras_for_vision_state_concat else [
@@ -252,6 +253,12 @@ class SimpleDiffusionTransformer(nn.Module):
                         # Store null values for heatmaps since we're not generating them in this simplified version
                         spatial_outputs[f"{sanitized_cam_key}_heatmap"] = None
 
+                        # Initialize object detector if not already initialized
+                        if not self._object_detector_initialized:
+                            print("Initializing object detector for inference...")
+                            self.object_detector = ObjectDetector(self.config)
+                            self._object_detector_initialized = True
+                        
                         # Detect objects and get bounding boxes using the shared detector
                         # Extract image for the current frame and camera
                         img_frame_cam = img[:, frame_idx:frame_idx+1, :, :, :]  # (B, 1, 1, C, H, W)

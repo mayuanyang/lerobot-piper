@@ -36,11 +36,11 @@ def get_augmentations():
     # Return RGBD-friendly augmentations
     return v2.Compose([
         # Resize images to 224x224
-        v2.Resize((224, 224)),
+        #v2.Resize((224, 224)),
         # Gentle color jittering for RGB channels
         v2.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
         # Mild geometric transforms to preserve physical consistency
-        v2.RandomAffine(degrees=5, translate=(0.05, 0.05)),
+        #v2.RandomAffine(degrees=5, translate=(0.05, 0.05)),
         # Randomly apply Gaussian noise with 30% probability
         #v2.RandomApply([v2.GaussianNoise()], p=0.3),
     ])
@@ -104,10 +104,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     training_steps = 100000 
     progress_update_freq = 200  # Single frequency for all progress updates
     checkpoint_freq = 1000
-    visualization_freq = visualize_every_n_batches  # Save visualizations every N steps
-    
-    # Counter for batch visualization
-    batch_counter = 0
     
     image_transforms = get_augmentations()
 
@@ -125,7 +121,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     print('output_features:', output_features)
     
     # Training parameters
-    obs = 2
+    obs = 1
     horizon = 50
     n_action_steps = 8
     
@@ -176,30 +172,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         total_trainable_params = sum(p.numel() for p in trainable_params)
         print(f"Number of trainable parameters: {total_trainable_params}")
         
-        # Check if we have different learning rates for vision vs other parameters
-        # Corrected parameter counting to handle shared backbone properly
-        vision_param_set = set()
-        other_param_set = set()
-        vision_params = []
-        other_params = []
-        
-        for name, param in policy.named_parameters():
-            if not param.requires_grad:
-                continue
-                
-            param_id = id(param)
-            if 'image_encoders' in name:
-                if param_id not in vision_param_set:
-                    vision_param_set.add(param_id)
-                    vision_params.append(param)
-            else:
-                if param_id not in other_param_set:
-                    other_param_set.add(param_id)
-                    other_params.append(param)
-        
-        vision_param_count = sum(p.numel() for p in vision_params)
-        other_param_count = sum(p.numel() for p in other_params)
-        print(f"Vision parameters: {vision_param_count}, Other parameters: {other_param_count}")
         
         optimizer = torch.optim.Adam(trainable_params, lr=5e-5)
         
@@ -252,32 +224,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         )
         step = 0
         
-        # Implement differential learning rates for better gradient flow
-        # Corrected parameter counting to handle shared backbone properly
-        vision_param_set = set()
-        other_param_set = set()
-        vision_params = []
-        other_params = []
-        
-        for name, param in policy.named_parameters():
-            if not param.requires_grad:
-                continue
-                
-            param_id = id(param)
-            if 'image_encoders' in name:
-                if param_id not in vision_param_set:
-                    vision_param_set.add(param_id)
-                    vision_params.append(param)
-            else:
-                if param_id not in other_param_set:
-                    other_param_set.add(param_id)
-                    other_params.append(param)
-        
-        # Count actual number of parameters, not just parameter tensors
-        vision_param_count = sum(p.numel() for p in vision_params)
-        other_param_count = sum(p.numel() for p in other_params)
-        print(f"Vision parameters: {vision_param_count}, Other parameters: {other_param_count}")
-        
+
         trainable_params = [p for p in policy.parameters() if p.requires_grad]
         optimizer = torch.optim.Adam(trainable_params, lr=1e-4)
         
@@ -337,7 +284,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     )
 
     # Create visualizer
-    visualizer = SpatialSoftmaxVisualizer(Path(output_dir) / "spatial_softmax_visualizations")
+    #visualizer = SpatialSoftmaxVisualizer(Path(output_dir) / "spatial_softmax_visualizations")
 
     # Training loop
     print("Starting training loop...")
@@ -356,7 +303,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             batch = apply_joint_augmentations(batch)
             
             # Apply state dropout
-            batch = apply_state_dropout(batch)
+            #batch = apply_state_dropout(batch)
             
             # Apply camera dropout
             #batch = apply_camera_dropout(batch)
@@ -372,116 +319,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             if step % progress_update_freq == 0:  # Print every 10 progress update intervals
                 print(f"\n--- Gradient Analysis at Step {step} ---")
                 
-                # Print detailed gradients for VisionEncoder components (aggregated by component type)
-                print("\n=== VisionEncoder Gradients (Per Camera) ===")
-                
-                # Check gradients for each camera encoder separately
-                for camera_name, encoder in policy.model.image_encoders.items():
-                    print(f"\n--- Camera: {camera_name} ---")
-                    
-                    # Check gradients for each component in this encoder
-                    for component_name, component in encoder.named_children():
-                        component_grad_norm = 0.0
-                        component_param_count = 0
-                        component_params_with_grad = 0
-                        component_zero_grad_count = 0
-                        
-                        for param_name, param in component.named_parameters():
-                            param_count = param.numel()
-                            component_param_count += param_count
-                            
-                            if param.requires_grad:
-                                if param.grad is not None:
-                                    grad_norm = param.grad.abs().sum().item()
-                                    component_grad_norm += grad_norm
-                                    component_params_with_grad += param_count
-                                    
-                                    if grad_norm == 0.0:
-                                        component_zero_grad_count += param_count
-                                    elif grad_norm < 1e-6:
-                                        print(f"  WARNING: Very small gradient in {component_name}.{param_name}: {grad_norm:.2e}")
-                                else:
-                                    print(f"  WARNING: No gradient for {component_name}.{param_name}")
-                        
-                        # Print component summary for this camera
-                        if component_param_count > 0:
-                            if component_params_with_grad > 0:
-                                avg_grad_norm = component_grad_norm / component_params_with_grad
-                                zero_grad_percent = (component_zero_grad_count / component_params_with_grad) * 100 if component_params_with_grad > 0 else 0
-                                print(f"  {component_name}: avg_grad_norm={avg_grad_norm:.2e}, params={component_param_count}, "
-                                      f"with_grad={component_params_with_grad}, zero_grad={zero_grad_percent:.1f}%")
-                            else:
-                                print(f"  {component_name}: NO GRADIENTS, params={component_param_count}")
-                
-                # Check for frozen backbone layers per camera
-                print("\n=== Vision Backbone Freeze Status (Per Camera) ===")
-                for camera_name, encoder in policy.model.image_encoders.items():
-                    frozen_layers = 0
-                    total_layers = 0
-                    for name, param in encoder.backbone.named_parameters():
-                        total_layers += 1
-                        if not param.requires_grad:
-                            frozen_layers += 1
-                    print(f"  Camera {camera_name}: {frozen_layers}/{total_layers} layers frozen ({frozen_layers/total_layers*100:.1f}%)")
-                
-                # Aggregate gradients by component type across all cameras (existing code)
-                print("\n=== VisionEncoder Gradients (Aggregated by Component) ===")
-                component_gradients = {}
-                
-                for camera_name, encoder in policy.model.image_encoders.items():
-                    for component_name, component in encoder.named_children():
-                        if component_name not in component_gradients:
-                            component_gradients[component_name] = {
-                                'total_grad_norm': 0.0,
-                                'total_param_count': 0,
-                                'params_with_grad': 0,
-                                'params_without_grad': 0,
-                                'zero_grad_count': 0
-                            }
-                        
-                        for param_name, param in component.named_parameters():
-                            param_count = param.numel()
-                            component_gradients[component_name]['total_param_count'] += param_count
-                            
-                            if param.requires_grad:
-                                if param.grad is not None:
-                                    grad_norm = param.grad.norm().item()
-                                    component_gradients[component_name]['total_grad_norm'] += grad_norm
-                                    component_gradients[component_name]['params_with_grad'] += param_count
-                                    
-                                    if grad_norm == 0.0:
-                                        component_gradients[component_name]['zero_grad_count'] += param_count
-                                else:
-                                    component_gradients[component_name]['params_without_grad'] += param_count
-                # Print aggregated gradients with more details
-                for component_name, grad_info in component_gradients.items():
-                    if grad_info['total_param_count'] > 0:
-                        if grad_info['params_with_grad'] > 0:
-                            avg_grad_norm = grad_info['total_grad_norm'] / grad_info['params_with_grad']
-                            zero_grad_percent = (grad_info['zero_grad_count'] / grad_info['params_with_grad']) * 100 if grad_info['params_with_grad'] > 0 else 0
-                            print(f"  {component_name}: avg_grad_norm={avg_grad_norm:.2e}, params={grad_info['total_param_count']}, "
-                                  f"with_grad={grad_info['params_with_grad']}, zero_grad={zero_grad_percent:.1f}%")
-                        else:
-                            print(f"  {component_name}: NO GRADIENTS, params={grad_info['total_param_count']}")
-                
-                # Collect gradients for trainable components only
-                total_vision_grad = 0.0
-                total_vision_params = 0
-                for name, param in policy.model.named_parameters():
-                    if param.requires_grad and 'cross_camera_transformer' in name and param.grad is not None:
-                        grad_mean = param.grad.abs().mean().item()
-                        param_count = param.numel()
-                        total_vision_grad += grad_mean * param_count
-                        total_vision_params += param_count
-                
-                total_img_grad = 0.0
-                total_img_params = 0
-                for name, param in policy.model.named_parameters():
-                    if param.requires_grad and 'image_encoders' in name and param.grad is not None:
-                        grad_mean = param.grad.abs().mean().item()
-                        param_count = param.numel()
-                        total_img_grad += grad_mean * param_count
-                        total_img_params += param_count
                 
                 # State encoder gradients
                 total_state_grad = 0.0
@@ -493,7 +330,16 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                         total_state_grad += grad_mean * param_count
                         total_state_params += param_count
                 
-                                
+                # State encoder gradients
+                total_box_grad = 0.0
+                total_box_params = 0
+                for name, param in policy.model.named_parameters():
+                    if param.requires_grad and 'box_encoder' in name and param.grad is not None:
+                        grad_mean = param.grad.abs().mean().item()
+                        param_count = param.numel()
+                        total_box_grad += grad_mean * param_count
+                        total_box_params += param_count
+                        
                 # actions expert gradients
                 total_action_expert_grad = 0.0
                 total_action_expert_params = 0
@@ -504,27 +350,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                         total_action_expert_grad += grad_mean * param_count
                         total_action_expert_params += param_count
                 
-                # Print all gradients in one line
-                grad_info = []
+                print(f"State Encoder - Avg Abs Grad: {total_state_grad / total_state_params:.6f} (Total Params: {total_state_params})")
+                print(f"Box Encoder - Avg Abs Grad: {total_box_grad / total_box_params:.6f} (Total Params: {total_box_params})")
+                print(f"Actions Expert - Avg Abs Grad: {total_action_expert_grad / total_action_expert_params:.6f} (Total Params: {total_action_expert_params})")
                 
-                if total_vision_params > 0:
-                    avg_vision_grad = total_vision_grad / total_vision_params
-                    grad_info.append(f"cross_camera_transformer: {avg_vision_grad:.6f}")
-                    
-                if total_img_params > 0:
-                    avg_img_grad = total_img_grad / total_img_params
-                    grad_info.append(f"image_encoders: {avg_img_grad:.6f}")
-                
-                if total_state_params > 0:
-                    avg_state_grad = total_state_grad / total_state_params
-                    grad_info.append(f"state_enc: {avg_state_grad:.6f}")
-                
-                
-                if total_action_expert_params > 0:
-                    avg_denoiser_grad = total_action_expert_grad / total_action_expert_params
-                    grad_info.append(f"actions_expert: {avg_denoiser_grad:.6f}")
-                
-                print(f"\nOverall Gradients -> {' | '.join(grad_info)}")
                 print("--- End Gradient Analysis ---\n")
             
             # Calculate gradient norm for monitoring and clip gradients (only for trainable parameters)
@@ -548,59 +377,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                     "grad_norm": f"{grad_norm:.2f}"
                 })
             
-            # Save visualizations
-            if step % visualization_freq == 0:
-                # Get spatial softmax outputs for visualization
-                with torch.no_grad():
-                    policy.model.eval()
-                    # Enable heatmap saving for debugging
-                    heatmap_dir = Path(output_dir) / "heatmaps"
-                    heatmap_dir.mkdir(exist_ok=True)
-                    
-                    # Enable heatmap saving in vision encoders
-                    for encoder in policy.model.image_encoders.values():
-                        encoder.save_heatmaps = True
-                        encoder.heatmap_save_dir = heatmap_dir
-                    
-                    obs_context, spatial_outputs = policy.model.get_condition(batch, generate_heatmaps=True)
-                    policy.model.train()
-                    
-                    # Disable heatmap saving after visualization
-                    for encoder in policy.model.image_encoders.values():
-                        encoder.save_heatmaps = False
-                    
-                    # Try to get episode index and frame index from batch if available
-                    episode_index = None
-                    if "episode_index" in batch:
-                        episode_index = batch["episode_index"][0].item()  # Get first item in batch
-                    
-                    frame_index = None
-                    if "frame_index" in batch:
-                        frame_index = batch["frame_index"][0].item()  # Get first item in batch
-                    
-                    # Update visualizer with spatial outputs for all three cameras
-                    for cam_key, spatial_coords in spatial_outputs.items():
-                        if spatial_coords is not None and not cam_key.endswith('_heatmap'):
-                            # Get the corresponding image tensor from the batch
-                            # Convert cam_key back to batch key format
-                            batch_key = cam_key.replace('_', '.')
-                            if batch_key in batch:
-                                img_tensor = batch[batch_key]
-                                # Visualize all timesteps from the first item in the batch
-                                # img_tensor shape: (B, T, C, H, W)
-                                # spatial_coords shape: (B, T, K, 2)
-                                batch_idx = 0
-                                # Save each timestep with proper zero-padded numbering for correct sorting
-                                for t in range(min(img_tensor.shape[1], spatial_coords.shape[1])):  # Iterate through timesteps
-                                    # Use zero-padded timestep numbering for proper sorting
-                                    padded_t = f"{t:03d}"  # e.g., 000, 001, 002, ...
-                                    # Flatten coordinates to match visualizer expectations: (K, 2) -> (K*2,)
-                                    flattened_coords = spatial_coords[batch_idx, t].flatten()
-                                    visualizer.update(f"{cam_key}_t{padded_t}", img_tensor[batch_idx, t], flattened_coords)
-                    
-                    # Save visualizations with episode and frame index if available
-                    visualizer.save_visualizations(step, episode=episode_index, frame=frame_index)
-                    visualizer.reset_trajectories()
             
             # Save checkpoint
             if step > 0 and step % checkpoint_freq == 0:
