@@ -591,7 +591,7 @@ class LeRobot2DBoundingBoxAdder:
         Where:
         - 6 elements total (2 per camera for 3 cameras)
         - Each element is an array of 4 floats [x1, y1, x2, y2]
-        - If a camera doesn't have enough bounding boxes, pad with [0.0, 0.0, 0.0, 0.0]
+        - Each camera must have exactly 2 boxes, pad with [0.0, 0.0, 0.0, 0.0] if needed
         
         Args:
             bbox_data: Dictionary with camera names as keys and lists of bounding boxes as values
@@ -622,14 +622,20 @@ class LeRobot2DBoundingBoxAdder:
         
         # Process bounding boxes for each camera
         for cam_idx, camera_name in enumerate(camera_order):
+            # Ensure each camera has exactly 2 boxes
+            camera_boxes = []
             if camera_name in bbox_data:
                 camera_boxes = bbox_data[camera_name]
-                # Process up to 2 boxes per camera
-                # Camera boxes are already in the format [[x1, y1, x2, y2], [x1, y1, x2, y2]]
-                for box_idx, box_coords in enumerate(camera_boxes[:2]):
+            
+            # Process up to 2 boxes per camera, pad with zeros if needed
+            for box_idx in range(2):  # Always process 2 boxes per camera
+                if box_idx < len(camera_boxes):
+                    box_coords = camera_boxes[box_idx]
                     if len(box_coords) == 4:
                         # Store the box coordinates directly
                         final_boxes[cam_idx * 2 + box_idx] = box_coords
+                # If there's no box at this index, it remains [0.0, 0.0, 0.0, 0.0] (already initialized)
+        
         print('The final_boxes is: ', final_boxes)
         return final_boxes
 

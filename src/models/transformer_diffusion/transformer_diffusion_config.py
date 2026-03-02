@@ -36,7 +36,7 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     # Empty list means use all cameras
     cameras_for_vision_state_concat: list[str] = field(default_factory=lambda: [
         'observation.images.front',
-        'observation.images.left',
+        'observation.images.gripper',
         'observation.images.right'
     ])
         

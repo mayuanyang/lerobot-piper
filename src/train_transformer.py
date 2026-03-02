@@ -314,6 +314,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         "observation.images.gripper": obs_temporal_window,  
         "observation.images.right": obs_temporal_window,
         "observation.state": obs_temporal_window,
+        "observation.box": obs_temporal_window,
         "action": action_temporal_window
     }
 

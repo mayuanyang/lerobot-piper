@@ -67,12 +67,12 @@ class ObjectDetector:
         
         # Create embeddings for different object types
         # We'll use a small embedding dimension for object type (e.g., 32) and combine it with the coordinate projection
-        # Now using 9 parameters for 3D bounding boxes instead of 4
+        # Using 4 parameters for 2D bounding boxes
         self.object_type_embedding_dim = 32
         self.object_type_embedding = nn.Embedding(10, self.object_type_embedding_dim)  # Support up to 10 object types
-        # Update coordinate projection to account for the additional embedding dimensions
-        # Now using 9 parameters for 3D bounding boxes instead of 4
-        self.coord_projection = nn.Linear(9 + self.object_type_embedding_dim, self.config.d_model)
+        # Update coordinate projection to account for the embedding dimensions
+        # Using 4 parameters for 2D bounding boxes
+        self.coord_projection = nn.Linear(4 + self.object_type_embedding_dim, self.config.d_model)
         
         # Object type to index mapping
         self.object_type_to_idx = {
@@ -107,13 +107,13 @@ class ObjectDetector:
         for i in range(B):
             # Convert tensor to PIL Image for Qwen3-VL processing
             img = image_tensor[i].detach().cpu()
-            # Convert from [-1, 1] to [0, 1] if needed
-            if img.min() < 0:
-                img = (img + 1) / 2  # Convert from [-1, 1] to [0, 1]
+            # Convert from normalized [0, 1] to [0, 255] for Qwen3-VL
+            if img.max() <= 1.0:
+                img = img * 255  # Convert from [0, 1] to [0, 255]
             
             # Convert to PIL Image
             pil_transform = T.ToPILImage()
-            pil_image = pil_transform(img)
+            pil_image = pil_transform(img.byte())  # Convert to uint8 for PIL
             
             # Prepare messages for Qwen3-VL with system and user roles
             messages = [
@@ -170,7 +170,7 @@ class ObjectDetector:
                 if boxes is not None and boxes.numel() > 0:
                     # Pad boxes
                     if boxes.shape[0] < max_boxes:
-                        padding = torch.zeros((max_boxes - boxes.shape[0], 9), device=boxes.device)
+                        padding = torch.zeros((max_boxes - boxes.shape[0], 4), device=boxes.device)
                         boxes = torch.cat([boxes, padding], dim=0)
                     padded_boxes.append(boxes)
                     
@@ -180,16 +180,16 @@ class ObjectDetector:
                     padded_object_types.append(obj_types)
                 else:
                     # Create empty tensors
-                    empty_boxes = torch.zeros((max_boxes, 9), device=image_tensor.device)
+                    empty_boxes = torch.zeros((max_boxes, 4), device=image_tensor.device)
                     empty_object_types = ['unknown'] * max_boxes
                     
                     padded_boxes.append(empty_boxes)
                     padded_object_types.append(empty_object_types)
             
-            bounding_boxes_batch = torch.stack(padded_boxes, dim=0)  # (B, max_boxes, 9)
+            bounding_boxes_batch = torch.stack(padded_boxes, dim=0)  # (B, max_boxes, 4)
             object_types_batch = padded_object_types  # List of lists
         else:
-            bounding_boxes_batch = torch.zeros((B, 0, 9), device=image_tensor.device)
+            bounding_boxes_batch = torch.zeros((B, 0, 4), device=image_tensor.device)
             object_types_batch = [['unknown'] * 0 for _ in range(B)]  # Empty list for each batch item
         
         return bounding_boxes_batch, object_types_batch
