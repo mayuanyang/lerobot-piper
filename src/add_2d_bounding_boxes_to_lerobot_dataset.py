@@ -378,8 +378,7 @@ class LeRobot2DBoundingBoxAdder:
                 pbar.set_postfix({"boxes": sample_boxes_count})
                 
                 # Update parquet files every 10 samples
-                if (idx + 1) % 2 == 0 or (idx + 1) == len(indices):
-                    print(f"Updating dataset with {idx + 1} samples processed...")
+                if (idx + 1) % 50 == 0 or (idx + 1) == len(indices):
                     self._update_dataset_with_bounding_boxes_partial(repo_id, bounding_boxes_data, indices[:idx+1], revision)
                     
                     # Clear bounding_boxes_data after updating parquet files
@@ -596,13 +595,27 @@ class LeRobot2DBoundingBoxAdder:
         
         Args:
             bbox_data: Dictionary with camera names as keys and lists of bounding boxes as values
-                       Each bounding box has 'bbox_2d' field with [x1, y1, x2, y2] coordinates
+                       Each bounding box is a list of 4 floats [x1, y1, x2, y2]
+                       OR
+                       A dictionary with the format:
+                       [{'episode_index': 0, 'frame_index': 14, 'gripper': [[37, 600, 162, 788], [376, 500, 539, 838]], 
+                         'front': [[273, 405, 350, 525], [486, 405, 616, 575]], 
+                         'right': [[524, 412, 642, 638], [0.0, 0.0, 0.0, 0.0]]}, ...]
             
         Returns:
             List of lists representing the bounding boxes in the required format
         """
         # Initialize with default empty boxes
         final_boxes = [[0.0, 0.0, 0.0, 0.0] for _ in range(6)]
+        
+        # Handle the case where bbox_data is in the user-provided format
+        # (a dictionary with episode_index, frame_index, and camera keys)
+        if isinstance(bbox_data, dict) and ('episode_index' in bbox_data or 'frame_index' in bbox_data):
+            # Remove episode_index and frame_index if they exist
+            bbox_data_copy = bbox_data.copy()
+            bbox_data_copy.pop('episode_index', None)
+            bbox_data_copy.pop('frame_index', None)
+            bbox_data = bbox_data_copy
         
         # Define the order of cameras
         camera_order = ['gripper', 'front', 'right']
@@ -612,11 +625,12 @@ class LeRobot2DBoundingBoxAdder:
             if camera_name in bbox_data:
                 camera_boxes = bbox_data[camera_name]
                 # Process up to 2 boxes per camera
-                for box_idx, box_data in enumerate(camera_boxes[:2]):
-                    if 'bbox_2d' in box_data and len(box_data['bbox_2d']) == 4:
+                # Camera boxes are already in the format [[x1, y1, x2, y2], [x1, y1, x2, y2]]
+                for box_idx, box_coords in enumerate(camera_boxes[:2]):
+                    if len(box_coords) == 4:
                         # Store the box coordinates directly
-                        final_boxes[cam_idx * 2 + box_idx] = box_data['bbox_2d']
-        
+                        final_boxes[cam_idx * 2 + box_idx] = box_coords
+        print('The final_boxes is: ', final_boxes)
         return final_boxes
 
     def _update_dataset_with_bounding_boxes(self, repo_id, bounding_boxes_data, revision="main"):
