@@ -13,10 +13,6 @@ import os
 from pathlib import Path
 import torchvision.models as models
 import torchvision.transforms as T
-import re
-import json
-import random
-import cv2
 
 
 # Import ObjectDetector from separate file
@@ -56,23 +52,6 @@ class PositionalEncoding(nn.Module):
             
         return x + self.pe[:, :seq_len]
 
-
-class DiffusionSinusoidalPosEmb(nn.Module):
-    """Sinusoidal positional embedding for diffusion timesteps."""
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, x):
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
-
-
     
 
 class SimpleDiffusionTransformer(nn.Module):
@@ -81,6 +60,7 @@ class SimpleDiffusionTransformer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.num_bounding_boxes_per_camera = 2
 
         # ------------------------------
         # 1. Single shared Object Detector for all cameras (initialize as None)
@@ -109,6 +89,9 @@ class SimpleDiffusionTransformer(nn.Module):
             nn.Linear(config.d_model // 2, config.d_model)
         )
         self.box_positional_encoding = PositionalEncoding(config.d_model)
+        
+        # Camera embedding for distinguishing between different camera views
+        self.camera_embedding = nn.Embedding(3, config.d_model)  # 3 cameras: gripper, front, right
         
         # ------------------------------
         self.state_encoder = nn.Sequential(
@@ -220,12 +203,28 @@ class SimpleDiffusionTransformer(nn.Module):
             # Normalize the box coordinates
             box_data_normalized = box_data / normalization_factors.view(1, 1, 1, 4)
             
-            # Reshape to (B, T_obs * 6, 4) to process all boxes together
+            # Reshape to (B, T_obs, 3 cameras, 2 boxes, 4) to process boxes per camera
             B, T_obs, N_boxes, N_coords = box_data_normalized.shape
-            box_data_flat = box_data_normalized.view(B, T_obs * N_boxes, N_coords)  # (B, T_obs * 6, 4)
+            box_data_normalized = box_data_normalized.view(B, T_obs, self.config.num_cameras, self.num_bounding_boxes_per_camera, 4)  # (B, T_obs, 3, 2, 4)
             
+                        
             # Encode bounding boxes using the box encoder
-            bbox_tokens_flat = self.box_encoder(box_data_flat)  # (B, T_obs * 6, d_model)
+            bbox_tokens = self.box_encoder(box_data_normalized)  # (B, T_obs, 3, 2, d_model)
+            
+            # Add camera embedding
+            # Camera IDs: 0 for gripper, 1 for front, 2 for right
+            camera_ids = torch.arange(3, device=box_data.device)  # (3,)
+            camera_emb = self.camera_embedding(camera_ids)  # (3, d_model)
+            
+            # Reshape camera embedding to match bbox_tokens dimensions
+            # (3, d_model) -> (1, 1, 3, 1, d_model) to broadcast with (B, T_obs, 3, 2, d_model)
+            camera_emb = camera_emb.view(1, 1, 3, 1, self.config.d_model)
+            
+            # Add camera embedding to bbox tokens
+            bbox_tokens = bbox_tokens + camera_emb  # Broadcasting: (B, T_obs, 3, 2, d_model)
+            
+            # Flatten to (B, T_obs * 6, d_model) for positional encoding
+            bbox_tokens_flat = bbox_tokens.view(B, T_obs * self.config.num_cameras * self.num_bounding_boxes_per_camera, self.config.d_model)
             
             # Apply positional encoding to bounding box tokens
             bbox_tokens_flat = self.box_positional_encoding(bbox_tokens_flat)  # (B, T_obs * 6, d_model)
@@ -236,8 +235,7 @@ class SimpleDiffusionTransformer(nn.Module):
             # Store box data for visualization
             spatial_outputs["observation_box_data"] = box_data_normalized
         else:
-                        
-            # Process each camera with the shared object detector
+            # observation.box is missing usually mean it is in inference, process each camera with the shared object detector
             for frame_idx in range(T_obs):
                 for sanitized_cam_key in self._camera_name_mapping.keys():
                     # Get the original camera name from the mapping
@@ -320,16 +318,35 @@ class SimpleDiffusionTransformer(nn.Module):
                         
 
             # ------------------------------
-            # 3. Apply combined positional encoding to bounding box tokens (inference only)
+            # 3. Apply camera embeddings and positional encoding to bounding box tokens (inference only)
             # ------------------------------
             if all_bbox_tokens:
-                # Concatenate all collected tokens, coordinates, and frame indices
+                # Concatenate all collected tokens
                 bbox_tokens_all = torch.cat(all_bbox_tokens, dim=1)  # (B, total_boxes, d_model)
                 
-                # Combine spatial and temporal positional encodings with the bounding box tokens
-                # Add both positional encodings to the bbox tokens
-                obs_tokens = bbox_tokens_all
-                all_bbox_tokens = [obs_tokens]  # Replace with the processed tokens
+                # Reshape to group by camera: (B, T_obs, num_cameras, num_bounding_boxes_per_camera, d_model)
+                num_cameras = len(self._camera_name_mapping)
+                bbox_tokens_reshaped = bbox_tokens_all.view(B, T_obs, num_cameras, self.num_bounding_boxes_per_camera, self.config.d_model)
+                
+                # Add camera embedding
+                camera_ids = torch.arange(num_cameras, device=bbox_tokens_all.device)  # (num_cameras,)
+                camera_emb = self.camera_embedding(camera_ids)  # (num_cameras, d_model)
+                
+                # Reshape camera embedding to match bbox_tokens dimensions
+                # (num_cameras, d_model) -> (1, 1, num_cameras, 1, d_model) to broadcast
+                camera_emb = camera_emb.view(1, 1, num_cameras, 1, self.config.d_model)
+                
+                # Add camera embedding to bbox tokens
+                bbox_tokens_with_camera = bbox_tokens_reshaped + camera_emb  # Broadcasting
+                
+                # Flatten back to (B, T_obs * num_cameras * num_bounding_boxes_per_camera, d_model)
+                bbox_tokens_flat = bbox_tokens_with_camera.view(B, T_obs * num_cameras * self.num_bounding_boxes_per_camera, self.config.d_model)
+                
+                # Apply positional encoding to bounding box tokens
+                bbox_tokens_flat = self.box_positional_encoding(bbox_tokens_flat)  # (B, T_obs * num_cameras * num_bounding_boxes_per_camera, d_model)
+                
+                # Store the processed tokens
+                all_bbox_tokens = [bbox_tokens_flat]
             else:
                 obs_tokens = torch.empty(B, 0, self.config.d_model, device=batch["observation.state"].device)
         

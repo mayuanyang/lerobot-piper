@@ -5,6 +5,8 @@ from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.factory import make_pre_post_processors
+import numpy as np
+from torch.utils.data import Subset
 
 # Import transformer-specific components
 from models.transformer_diffusion.transformer_diffusion_config import TransformerDiffusionConfig
@@ -132,19 +134,15 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         n_obs_steps=obs, 
         horizon=horizon, 
         n_action_steps=n_action_steps, 
-        vision_backbone="vit_b_16",
+        vision_backbone="qwen3_vl_4b_instruct",
         state_dim=7,  # 7 joints (not removing the 4th joint)
         action_dim=7,  # 7 joints (not removing the 4th joint)
         d_model=512,  # Smaller model for better gradient flow
         nhead=8,
-        num_encoder_layers=4,  # Fewer layers
         num_decoder_layers=16,  # Configurable denoising transformer layers
         dim_feedforward=512,  # Smaller feedforward dimension
         diffusion_step_embed_dim=256,
-        kernel_size=3,
-        n_groups=8,
         num_cameras=3,  # Set number of cameras based on input features
-        vision_freeze_layers=6
     )
     
     
@@ -285,6 +283,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
     # Create visualizer
     #visualizer = SpatialSoftmaxVisualizer(Path(output_dir) / "spatial_softmax_visualizations")
+
+    episode_ids = np.array(dataset.hf_dataset["episode_index"])
+    valid_indices = np.where(episode_ids <= 64)[0]  # first 65 episodes
+
+    dataset = Subset(dataset, valid_indices)
+    print('The partial dataset length', len(dataset))
 
     # Training loop
     print("Starting training loop...")

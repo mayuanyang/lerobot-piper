@@ -12,8 +12,8 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     """Long Task Transformer Configuration for long-horizon tasks with transformer-based architecture."""
     
     # Inputs / output structure.
-    n_obs_steps: int = 4
-    horizon: int = 16
+    n_obs_steps: int = 1
+    horizon: int = 50
     n_action_steps: int = 8
 
     normalization_mapping: dict[str, NormalizationMode] = field(
@@ -25,13 +25,11 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     )
 
     # Image processing
-    vision_backbone: str = "qwen3_vl_8b_instruct"
+    vision_backbone: str = "qwen3_vl_4b_instruct"
     
-    # Input image size (height, width)
-    input_image_size: tuple[int, int] = (224, 224)
     # Vision encoder parameters
     num_cameras: int = 3
-    vision_freeze_layers: int = 6
+    
     # Selective camera processing - list of camera keys to use for vision-state token concatenation
     # Empty list means use all cameras
     cameras_for_vision_state_concat: list[str] = field(default_factory=lambda: [
@@ -50,14 +48,11 @@ class TransformerDiffusionConfig(PreTrainedConfig):
     # Transformer architecture
     d_model: int = 256
     nhead: int = 8
-    num_encoder_layers: int = 6
     num_decoder_layers: int = 6
     dim_feedforward: int = 512
     
     # UNet denoiser parameters
     diffusion_step_embed_dim: int = 128
-    kernel_size: int = 3
-    n_groups: int = 8
     
         
     # Flow matching sampling parameters
