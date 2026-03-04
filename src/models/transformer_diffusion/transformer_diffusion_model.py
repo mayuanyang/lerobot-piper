@@ -79,11 +79,12 @@ class SimpleDiffusionTransformer(nn.Module):
             self._camera_name_mapping[sanitized_name] = cam_name
             
         # ------------------------------
-        # 2. Box encoder for processing bounding box data
+        # 2. Box encoder for processing bounding box data with enhanced features
         # ------------------------------
-        # Linear projection for bounding box coordinates to d_model dimension
+        # Linear projection for enhanced bounding box features to d_model dimension
+        # Enhanced features: [x1, y1, x2, y2, width, height, center_x, center_y, area]
         self.box_encoder = nn.Sequential(
-            nn.Linear(4, config.d_model // 2),  # 4 coordinates per box
+            nn.Linear(9, config.d_model // 2),  # 9 enhanced features per box
             nn.LayerNorm(config.d_model // 2),
             nn.GELU(),
             nn.Linear(config.d_model // 2, config.d_model)
@@ -207,9 +208,25 @@ class SimpleDiffusionTransformer(nn.Module):
             B, T_obs, N_boxes, N_coords = box_data_normalized.shape
             box_data_normalized = box_data_normalized.view(B, T_obs, self.config.num_cameras, self.num_bounding_boxes_per_camera, 4)  # (B, T_obs, 3, 2, 4)
             
-                        
-            # Encode bounding boxes using the box encoder
-            bbox_tokens = self.box_encoder(box_data_normalized)  # (B, T_obs, 3, 2, d_model)
+            # Enhance bounding box features with geometric properties
+            # Extract coordinates
+            x1 = box_data_normalized[..., 0]  # (B, T_obs, 3, 2)
+            y1 = box_data_normalized[..., 1]  # (B, T_obs, 3, 2)
+            x2 = box_data_normalized[..., 2]  # (B, T_obs, 3, 2)
+            y2 = box_data_normalized[..., 3]  # (B, T_obs, 3, 2)
+            
+            # Compute derived features
+            width = x2 - x1  # (B, T_obs, 3, 2)
+            height = y2 - y1  # (B, T_obs, 3, 2)
+            center_x = (x1 + x2) * 0.5  # (B, T_obs, 3, 2)
+            center_y = (y1 + y2) * 0.5  # (B, T_obs, 3, 2)
+            area = width * height  # (B, T_obs, 3, 2)
+            
+            # Stack all features together: [x1, y1, x2, y2, width, height, center_x, center_y, area]
+            enhanced_box_features = torch.stack([x1, y1, x2, y2, width, height, center_x, center_y, area], dim=-1)  # (B, T_obs, 3, 2, 9)
+            
+            # Encode bounding boxes using the enhanced box encoder
+            bbox_tokens = self.box_encoder(enhanced_box_features)  # (B, T_obs, 3, 2, d_model)
             
             # Add camera embedding
             # Camera IDs: 0 for gripper, 1 for front, 2 for right
@@ -290,13 +307,28 @@ class SimpleDiffusionTransformer(nn.Module):
                         bounding_boxes[:, 0::2] /= W_v
                         bounding_boxes[:, 1::2] /= H_v
                         
-                        # Reshape bounding box coordinates to match training format
-                        # bounding_boxes shape: (N_boxes, 4)
-                        # We need to reshape to (1, 1, N_boxes, 4) to match training format (B, T_obs, N_boxes, 4)
-                        bbox_data_reshaped = bounding_boxes.unsqueeze(0).unsqueeze(0)  # (1, 1, N_boxes, 4)
+                        # Enhance bounding box features with geometric properties for inference
+                        # Extract coordinates
+                        x1 = bounding_boxes[:, 0]  # (N_boxes,)
+                        y1 = bounding_boxes[:, 1]  # (N_boxes,)
+                        x2 = bounding_boxes[:, 2]  # (N_boxes,)
+                        y2 = bounding_boxes[:, 3]  # (N_boxes,)
                         
-                        # Encode bounding boxes using the box encoder (same as training)
-                        bbox_tokens = self.box_encoder(bbox_data_reshaped)  # (1, 1, N_boxes, d_model)
+                        # Compute derived features
+                        width = x2 - x1  # (N_boxes,)
+                        height = y2 - y1  # (N_boxes,)
+                        center_x = (x1 + x2) * 0.5  # (N_boxes,)
+                        center_y = (y1 + y2) * 0.5  # (N_boxes,)
+                        area = width * height  # (N_boxes,)
+                        
+                        # Stack all features together: [x1, y1, x2, y2, width, height, center_x, center_y, area]
+                        enhanced_box_features = torch.stack([x1, y1, x2, y2, width, height, center_x, center_y, area], dim=-1)  # (N_boxes, 9)
+                        
+                        # Reshape to match training format: (1, 1, N_boxes, 9)
+                        enhanced_box_features = enhanced_box_features.unsqueeze(0).unsqueeze(0)  # (1, 1, N_boxes, 9)
+                        
+                        # Encode bounding boxes using the enhanced box encoder (same as training)
+                        bbox_tokens = self.box_encoder(enhanced_box_features)  # (1, 1, N_boxes, d_model)
                         
                         # Apply positional encoding to bounding box tokens (same as training)
                         bbox_tokens = self.box_positional_encoding(bbox_tokens)  # (1, 1, N_boxes, d_model)

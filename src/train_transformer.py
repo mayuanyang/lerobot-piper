@@ -150,7 +150,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     if resume_from_checkpoint is not None:
         print(f"Resuming training from checkpoint: {resume_from_checkpoint}")
         # Load policy with its original configuration
-        policy = TransformerDiffusionPolicy.from_pretrained(resume_from_checkpoint)
+        policy = TransformerDiffusionPolicy.from_pretrained(resume_from_checkpoint, strict=False)
         policy.train()
         policy.to(device)
         
