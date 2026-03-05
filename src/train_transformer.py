@@ -334,11 +334,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                         total_state_grad += grad_mean * param_count
                         total_state_params += param_count
                 
-                # State encoder gradients
+                # Box encoder gradients (individual components)
                 total_box_grad = 0.0
                 total_box_params = 0
+                box_component_names = ['category_embedding', 'geom_proj', 'conf_proj', 'pres_proj', 'center_proj', 'missing_box_embedding', 'box_positional_encoding', 'camera_embedding']
                 for name, param in policy.model.named_parameters():
-                    if param.requires_grad and 'box_encoder' in name and param.grad is not None:
+                    if param.requires_grad and any(comp_name in name for comp_name in box_component_names) and param.grad is not None:
                         grad_mean = param.grad.abs().mean().item()
                         param_count = param.numel()
                         total_box_grad += grad_mean * param_count
@@ -355,7 +356,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                         total_action_expert_params += param_count
                 
                 print(f"State Encoder - Avg Abs Grad: {total_state_grad / total_state_params:.6f} (Total Params: {total_state_params})")
-                print(f"Box Encoder - Avg Abs Grad: {total_box_grad / total_box_params:.6f} (Total Params: {total_box_params})")
+                if total_box_params > 0:
+                    print(f"Box Encoder - Avg Abs Grad: {total_box_grad / total_box_params:.6f} (Total Params: {total_box_params})")
+                else:
+                    print(f"Box Encoder - Avg Abs Grad: N/A (Total Params: {total_box_params})")
                 print(f"Actions Expert - Avg Abs Grad: {total_action_expert_grad / total_action_expert_params:.6f} (Total Params: {total_action_expert_params})")
                 
                 print("--- End Gradient Analysis ---\n")

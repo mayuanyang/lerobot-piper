@@ -89,6 +89,7 @@ class SimpleDiffusionTransformer(nn.Module):
         self.conf_proj = nn.Linear(1, config.d_model)  # Confidence
         self.pres_proj = nn.Linear(1, config.d_model)   # Presence (if used in the future)
         self.center_proj = nn.Linear(2, config.d_model)  # Center coordinates (center_x, center_y)
+        self.missing_box_embedding = nn.Parameter(torch.randn(1, config.d_model))  # Learnable embedding for missing boxes
                 
         self.box_positional_encoding = PositionalEncoding(config.d_model)
         
@@ -214,6 +215,34 @@ class SimpleDiffusionTransformer(nn.Module):
             category_id = category_id.view(B, T_obs, self.config.num_cameras, self.num_bounding_boxes_per_camera)  # (B, T_obs, 3, 2)
             confidence = confidence.view(B, T_obs, self.config.num_cameras, self.num_bounding_boxes_per_camera).unsqueeze(-1)    # (B, T_obs, 3, 2, 1)
             
+            # Calculate presence based on whether coordinates are non-zero
+            presence = (coordinates_normalized.sum(dim=-1) != 0).float()  # (B, T_obs, 3, 2)
+            
+            # Sort boxes by presence (real boxes first) and then by category_id to stabilize learning
+            # Create composite sorting key: prioritize presence (1 for real boxes, 0 for missing) then category_id
+            # We negate presence so that real boxes (1) come before missing boxes (0) after ascending sort
+            sorting_key = category_id + (1 - presence) * 1000  # (B, T_obs, 3, 2)
+            
+            # Create sort indices based on the composite sorting key
+            _, sort_indices = torch.sort(sorting_key, dim=-1)  # (B, T_obs, 3, 2)
+            
+            # Expand sort_indices to match coordinates_normalized shape for gathering
+            sort_indices_coords = sort_indices.unsqueeze(-1).expand(-1, -1, -1, -1, coordinates_normalized.size(-1))  # (B, T_obs, 3, 2, 4)
+            
+            # Sort coordinates_normalized
+            coordinates_normalized = torch.gather(coordinates_normalized, dim=-2, index=sort_indices_coords)  # (B, T_obs, 3, 2, 4)
+            
+            # Expand sort_indices to match other tensors for gathering
+            sort_indices_cat = sort_indices  # (B, T_obs, 3, 2)
+            sort_indices_conf = sort_indices.unsqueeze(-1)  # (B, T_obs, 3, 2, 1)
+            
+            # Sort category_id and confidence
+            category_id = torch.gather(category_id, dim=-1, index=sort_indices_cat)  # (B, T_obs, 3, 2)
+            confidence = torch.gather(confidence, dim=-2, index=sort_indices_conf)  # (B, T_obs, 3, 2, 1)
+            
+            # Recalculate presence after sorting
+            presence = (coordinates_normalized.sum(dim=-1) != 0).float().unsqueeze(-1)  # (B, T_obs, 3, 2, 1)
+            
             # Enhance bounding box features with geometric properties
             # Extract coordinates
             x1 = coordinates_normalized[..., 0]  # (B, T_obs, 3, 2)
@@ -232,14 +261,14 @@ class SimpleDiffusionTransformer(nn.Module):
             geom_features = torch.stack([x1, y1, x2, y2, width, height, center_x, center_y, area], dim=-1)  # (B, T_obs, 3, 2, 9)
             
             # Get category embeddings
-            cat_emb = self.category_embedding(category_id) * presence # (B, T_obs, 3, 2, d_cat)
+            cat_emb = self.category_embedding(category_id)
             
             # Project features and sum them
-            geom_proj = self.geom_proj(geom_features) * presence  # (B, T_obs, 3, 2, d_model)
-            conf_proj = self.conf_proj(confidence) * presence    # (B, T_obs, 3, 2, d_model)
+            geom_proj = self.geom_proj(geom_features)  # (B, T_obs, 3, 2, d_model)
+            conf_proj = self.conf_proj(confidence)    # (B, T_obs, 3, 2, d_model)
             
             center = torch.stack([center_x, center_y], dim=-1)
-            center_proj = self.center_proj(center) * presence
+            center_proj = self.center_proj(center)
                         
             # Add camera embedding
             # Camera IDs: 0 for gripper, 1 for front, 2 for right
@@ -251,7 +280,13 @@ class SimpleDiffusionTransformer(nn.Module):
             camera_emb = camera_emb.view(1, 1, self.config.num_cameras, 1, self.config.d_model)
             
             # All tokens
+            # Use missing_box_embedding when presence is zero
+            missing_mask = (presence == 0)  # (B, T_obs, 3, 2, 1)
+            missing_embedding_expanded = self.missing_box_embedding.unsqueeze(0).unsqueeze(0).unsqueeze(2).unsqueeze(2)  # (1, 1, 1, 1, d_model)
+            
+            # Apply missing box embedding where presence is zero
             bbox_tokens = geom_proj + cat_emb + conf_proj + center_proj + camera_emb
+            bbox_tokens = torch.where(missing_mask, missing_embedding_expanded, bbox_tokens)
             
             # Flatten to (B, T_obs * 6, d_model) for positional encoding
             bbox_tokens_flat = bbox_tokens.view(B, T_obs * self.config.num_cameras * self.num_bounding_boxes_per_camera, self.config.d_model)
@@ -267,7 +302,9 @@ class SimpleDiffusionTransformer(nn.Module):
         else:
             # observation.box is missing usually mean it is in inference, process each camera with the shared object detector
             for frame_idx in range(T_obs):
-                for sanitized_cam_key in self._camera_name_mapping.keys():
+                for cam_index, sanitized_cam_key in enumerate(
+                    sorted(self._camera_name_mapping.keys())
+                ):
                     # Get the original camera name from the mapping
                     original_cam_key = self._camera_name_mapping[sanitized_cam_key]
                     batch_key = original_cam_key
@@ -320,6 +357,30 @@ class SimpleDiffusionTransformer(nn.Module):
                         bounding_boxes[:, 0::2] /= W_v
                         bounding_boxes[:, 1::2] /= H_v
                         
+                        # For inference, we don't have category_id and confidence, so we'll use default values
+                        N_boxes = bounding_boxes.shape[0]
+                        category_id = torch.full((N_boxes,), 2, dtype=torch.long, device=bounding_boxes.device)  # Using category_id = 2 for 'unknown' category
+                        confidence = torch.ones((N_boxes, 1), device=bounding_boxes.device)  # (N_boxes, 1)
+                        
+                        # Sort boxes by presence (real boxes first) and then by category_id to stabilize learning
+                        # Calculate presence based on whether coordinates are non-zero
+                        presence = (bounding_boxes.sum(dim=-1) != 0).float()  # (N_boxes,)
+                        
+                        # Create composite sorting key: prioritize presence (1 for real boxes, 0 for missing) then category_id
+                        # Since all category_ids are 2 in inference, we only sort by presence
+                        sorting_key = (1 - presence) * 1000  # (N_boxes,)
+                        
+                        # Create sort indices based on the composite sorting key
+                        _, sort_indices = torch.sort(sorting_key, dim=0)  # (N_boxes,)
+                        
+                        # Sort bounding_boxes, category_id, and confidence
+                        bounding_boxes = bounding_boxes[sort_indices]  # (N_boxes, 4)
+                        category_id = category_id[sort_indices]  # (N_boxes,)
+                        confidence = confidence[sort_indices]  # (N_boxes, 1)
+                        presence = presence[sort_indices]  # (N_boxes,)
+                        
+                        # Update presence after sorting
+                        presence = presence.unsqueeze(-1)  # (N_boxes, 1)
                                                 
                         # Enhance bounding box features with geometric properties for inference
                         # Extract coordinates
@@ -337,33 +398,42 @@ class SimpleDiffusionTransformer(nn.Module):
                         
                         # Stack geometric features together: [x1, y1, x2, y2, width, height, center_x, center_y, area]
                         geom_features = torch.stack([x1, y1, x2, y2, width, height, center_x, center_y, area], dim=-1)  # (N_boxes, 9)
-                        
-                        # For inference, we don't have category_id and confidence, so we'll use default values
-                        category_id = torch.full((N_boxes,), 2, dtype=torch.long)  # Using category_id = 2 for 'unknown' category
-                        confidence = torch.ones(N_boxes, 1, device=bounding_boxes.device)  # (N_boxes, 1)
-                        presence = (geom_features.sum(dim=-1) != 0).float().unsqueeze(-1)  # (N_boxes, 1)
-                        
-                                                
-                        center = torch.stack([center_x, center_y], dim=-1)
-                        
-                        # Reshape to match training format: (1, 1, N_boxes, *)
                         geom_features = geom_features.unsqueeze(0).unsqueeze(0)  # (1, 1, N_boxes, 9)
+                        
+                        # Get category embeddings
+                        cat_emb = self.category_embedding(category_id)
                         cat_emb = cat_emb.unsqueeze(0).unsqueeze(0)  # (1, 1, N_boxes, d_cat)
+                        
+                        # Project confidence
                         confidence = confidence.unsqueeze(0).unsqueeze(0)  # (1, 1, N_boxes, 1)
+                                                
+                        center = torch.stack([center_x, center_y], dim=-1).unsqueeze(0).unsqueeze(0)
+                        
+                        # Camera embedding for distinguishing between different camera views
+                        # In the inference loop, we process one camera at a time
+                        # We need to determine the current camera index
+                        cam_index = list(self._camera_name_mapping.keys()).index(sanitized_cam_key)
+                        camera_id = torch.tensor([cam_index], device=bounding_boxes.device)  # (1,)
+                        camera_emb = self.camera_embedding(camera_id).unsqueeze(0).unsqueeze(0)  # (1, 1, 1, d_model)
+                        
+                        # Repeat the camera embedding for all boxes
+                        camera_emb_for_boxes = camera_emb.repeat(1, 1, N_boxes, 1)  # (1, 1, N_boxes, d_model)
                         
                         # Project features and sum them
-                        geom_proj = self.geom_proj(geom_features) * presence # (1, 1, N_boxes, d_model)
-                        cat_emb = self.category_embedding(category_id) * presence  # (N_boxes, d_cat)
-                        cam_proj = self.camera_embedding(cat_emb) * presence         # (1, 1, N_boxes, d_model)
-                        conf_proj = self.conf_proj(confidence) * presence    # (1, 1, N_boxes, d_model)
-                        center_proj = self.center_proj(center) * presence  # (1, 1, N_boxes, d_model)
+                        geom_proj = self.geom_proj(geom_features) # (1, 1, N_boxes, d_model)
+                        cat_emb = cat_emb
+                        conf_proj = self.conf_proj(confidence)    # (1, 1, N_boxes, d_model)
+                        center_proj = self.center_proj(center)  # (1, 1, N_boxes, d_model)
+                        cam_proj = camera_emb_for_boxes         # (1, 1, N_boxes, d_model)
                         
                         # Sum all projections to get final bbox tokens                        
+                        # Use missing_box_embedding when presence is zero
+                        missing_mask = (presence == 0)  # (1, 1, N_boxes, 1)
+                        missing_embedding_expanded = self.missing_box_embedding.unsqueeze(0).unsqueeze(0).unsqueeze(2)  # (1, 1, 1, d_model)
+                        
+                        # Apply missing box embedding where presence is zero
                         bbox_tokens = geom_proj + cat_emb + conf_proj + center_proj + cam_proj
-                        
-                        # Apply positional encoding to bounding box tokens (same as training)
-                        bbox_tokens = self.box_positional_encoding(bbox_tokens)  # (1, 1, N_boxes, d_model)
-                        
+                        bbox_tokens = torch.where(missing_mask, missing_embedding_expanded, bbox_tokens)
                         
                         # Expand to match vision tokens format
                         # Add dimensions to match (B_v, T_v, N_v, N_boxes, d_model)
@@ -382,32 +452,14 @@ class SimpleDiffusionTransformer(nn.Module):
                         
 
             # ------------------------------
-            # 3. Apply camera embeddings and positional encoding to bounding box tokens (inference only)
+            # 3. Apply positional encoding to bounding box tokens (inference only)
             # ------------------------------
             if all_bbox_tokens:
                 # Concatenate all collected tokens
                 bbox_tokens_all = torch.cat(all_bbox_tokens, dim=1)  # (B, total_boxes, d_model)
                 
-                # Reshape to group by camera: (B, T_obs, num_cameras, num_bounding_boxes_per_camera, d_model)
-                num_cameras = len(self._camera_name_mapping)
-                bbox_tokens_reshaped = bbox_tokens_all.view(B, T_obs, num_cameras, self.num_bounding_boxes_per_camera, self.config.d_model)
-                
-                # Add camera embedding
-                camera_ids = torch.arange(num_cameras, device=bbox_tokens_all.device)  # (num_cameras,)
-                camera_emb = self.camera_embedding(camera_ids)  # (num_cameras, d_model)
-                
-                # Reshape camera embedding to match bbox_tokens dimensions
-                # (num_cameras, d_model) -> (1, 1, num_cameras, 1, d_model) to broadcast
-                camera_emb = camera_emb.view(1, 1, num_cameras, 1, self.config.d_model)
-                
-                # Add camera embedding to bbox tokens
-                bbox_tokens_with_camera = bbox_tokens_reshaped + camera_emb  # Broadcasting
-                
-                # Flatten back to (B, T_obs * num_cameras * num_bounding_boxes_per_camera, d_model)
-                bbox_tokens_flat = bbox_tokens_with_camera.view(B, T_obs * num_cameras * self.num_bounding_boxes_per_camera, self.config.d_model)
-                
                 # Apply positional encoding to bounding box tokens
-                bbox_tokens_flat = self.box_positional_encoding(bbox_tokens_flat)  # (B, T_obs * num_cameras * num_bounding_boxes_per_camera, d_model)
+                bbox_tokens_flat = self.box_positional_encoding(bbox_tokens_all)  # (B, total_boxes, d_model)
                 
                 # Store the processed tokens
                 all_bbox_tokens = [bbox_tokens_flat]
@@ -478,6 +530,14 @@ class SimpleDiffusionTransformer(nn.Module):
 
     def compute_loss(self, batch):
         """Flow Matching Training: Learn to predict the velocity field."""
+        
+        actions = batch["action"]     # [B, T, D]
+
+        delta = actions.clone()
+        delta[:,1:] = actions[:,1:] - actions[:,:-1]
+
+        batch["action"] = delta
+        
         actions = batch["action"] # (B, Horizon, Action_Dim)
         B, T_act = actions.shape[:2]
         
