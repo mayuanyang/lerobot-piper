@@ -715,6 +715,11 @@ def compute_and_save_dataset_stats(output_dir: Path):
             print(f"  ✅ Using fixed stats for {f_name} - Channels: {channels}")
             
         else:
+            # Skip observation.box feature as it causes issues with stats computation
+            if f_name == "observation.box":
+                print(f"  ⚠️ Skipping stats computation for {f_name}")
+                continue
+                
             # Numerical feature handling
             if f_name in combined_df.columns:
                 val = combined_df[f_name].values

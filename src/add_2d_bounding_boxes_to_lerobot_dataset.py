@@ -180,7 +180,6 @@ class LeRobot2DBoundingBoxAdder:
             # Parse JSON
             bbox_data = json.loads(json_str)
             
-            print(f"Parsed bounding box data: {bbox_data}")
             
             # Normalize to list format
             if isinstance(bbox_data, list):
@@ -656,8 +655,8 @@ class LeRobot2DBoundingBoxAdder:
         Returns:
             List of lists representing the bounding boxes in the required format
         """
-        # Initialize with default empty boxes
-        final_boxes = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] for _ in range(6)]
+        # Initialize with default empty boxes - 6 boxes with 6 elements each (total 36 elements)
+        final_boxes = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0] for _ in range(6)]
         
         # Handle the case where bbox_data is in the user-provided format
         # (a dictionary with episode_index, frame_index, and camera keys)

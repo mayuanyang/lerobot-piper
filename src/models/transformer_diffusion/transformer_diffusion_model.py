@@ -81,18 +81,19 @@ class SimpleDiffusionTransformer(nn.Module):
         # ------------------------------
         # 2. Box encoder for processing bounding box data with enhanced features
         # ------------------------------
-        # Linear projection for enhanced bounding box features to d_model dimension
-        # Enhanced features: [x1, y1, x2, y2, width, height, center_x, center_y, area]
-        self.box_encoder = nn.Sequential(
-            nn.Linear(9, config.d_model // 2),  # 9 enhanced features per box
-            nn.LayerNorm(config.d_model // 2),
-            nn.GELU(),
-            nn.Linear(config.d_model // 2, config.d_model)
-        )
+        # Category embedding for categorical features
+        self.category_embedding = nn.Embedding(3, config.d_model)  # Assuming 3 categories, 8-dim embedding
+        
+        # Linear projections for different features
+        self.geom_proj = nn.Linear(9, config.d_model)  # Geometric features: [x1, y1, x2, y2, width, height, center_x, center_y, area]
+        self.conf_proj = nn.Linear(1, config.d_model)  # Confidence
+        self.pres_proj = nn.Linear(1, config.d_model)   # Presence (if used in the future)
+        self.center_proj = nn.Linear(2, config.d_model)  # Center coordinates (center_x, center_y)
+                
         self.box_positional_encoding = PositionalEncoding(config.d_model)
         
         # Camera embedding for distinguishing between different camera views
-        self.camera_embedding = nn.Embedding(3, config.d_model)  # 3 cameras: gripper, front, right
+        self.camera_embedding = nn.Embedding(self.config.num_cameras, config.d_model)  # 3 cameras: gripper, front, right
         
         # ------------------------------
         self.state_encoder = nn.Sequential(
@@ -174,12 +175,8 @@ class SimpleDiffusionTransformer(nn.Module):
         
         # Check if observation.box is available in the batch (from dataset during training)
         if "observation.box" in batch:
-            # Use bounding box data from dataset during training
-            # observation.box shape: (B, T_obs, 6, 4) - 6 boxes with 4 coordinates each
-            box_data = batch["observation.box"]  # (B, T_obs, 6, 4)
+            box_data = batch["observation.box"]  # (B, T_obs, 6, 6)
             
-            # Get image dimensions from observation images
-            # Try to get dimensions from any available camera image
             image_width = 640.0  # default
             image_height = 400.0  # default
             
@@ -195,25 +192,34 @@ class SimpleDiffusionTransformer(nn.Module):
                         image_width = float(img_shape[-1])
                     break  # Use the first image found
             
-            # Normalize bounding box coordinates during training
-            # x coordinates (indices 0 and 2) should be divided by width
-            # y coordinates (indices 1 and 3) should be divided by height
+            # First 4 dimensions are coordinates (x1, y1, x2, y2)
+            coordinates = box_data[..., :4]  # (B, T_obs, 6, 4)
+            # Additional 2 dimensions are category_id and confidence
+            category_id = box_data[..., 4].long()  # (B, T_obs, 6)
+            confidence = box_data[..., 5]   # (B, T_obs, 6)
+            presence = (coordinates.sum(dim=-1) != 0).float().unsqueeze(-1)  # (B, T_obs, 6, 1)
+                        
+            # Normalize bounding box coordinates
             normalization_factors = torch.tensor([image_width, image_height, image_width, image_height], 
-                                              device=box_data.device, dtype=box_data.dtype)
+                                              device=coordinates.device, dtype=coordinates.dtype)
             
             # Normalize the box coordinates
-            box_data_normalized = box_data / normalization_factors.view(1, 1, 1, 4)
+            coordinates_normalized = coordinates / normalization_factors.view(1, 1, 1, 4)
             
             # Reshape to (B, T_obs, 3 cameras, 2 boxes, 4) to process boxes per camera
-            B, T_obs, N_boxes, N_coords = box_data_normalized.shape
-            box_data_normalized = box_data_normalized.view(B, T_obs, self.config.num_cameras, self.num_bounding_boxes_per_camera, 4)  # (B, T_obs, 3, 2, 4)
+            B, T_obs, N_boxes, N_coords = coordinates_normalized.shape
+            coordinates_normalized = coordinates_normalized.view(B, T_obs, self.config.num_cameras, self.num_bounding_boxes_per_camera, 4)  # (B, T_obs, 3, 2, 4)
+            
+            # Reshape category_id, confidence
+            category_id = category_id.view(B, T_obs, self.config.num_cameras, self.num_bounding_boxes_per_camera)  # (B, T_obs, 3, 2)
+            confidence = confidence.view(B, T_obs, self.config.num_cameras, self.num_bounding_boxes_per_camera).unsqueeze(-1)    # (B, T_obs, 3, 2, 1)
             
             # Enhance bounding box features with geometric properties
             # Extract coordinates
-            x1 = box_data_normalized[..., 0]  # (B, T_obs, 3, 2)
-            y1 = box_data_normalized[..., 1]  # (B, T_obs, 3, 2)
-            x2 = box_data_normalized[..., 2]  # (B, T_obs, 3, 2)
-            y2 = box_data_normalized[..., 3]  # (B, T_obs, 3, 2)
+            x1 = coordinates_normalized[..., 0]  # (B, T_obs, 3, 2)
+            y1 = coordinates_normalized[..., 1]  # (B, T_obs, 3, 2)
+            x2 = coordinates_normalized[..., 2]  # (B, T_obs, 3, 2)
+            y2 = coordinates_normalized[..., 3]  # (B, T_obs, 3, 2)
             
             # Compute derived features
             width = x2 - x1  # (B, T_obs, 3, 2)
@@ -222,23 +228,30 @@ class SimpleDiffusionTransformer(nn.Module):
             center_y = (y1 + y2) * 0.5  # (B, T_obs, 3, 2)
             area = width * height  # (B, T_obs, 3, 2)
             
-            # Stack all features together: [x1, y1, x2, y2, width, height, center_x, center_y, area]
-            enhanced_box_features = torch.stack([x1, y1, x2, y2, width, height, center_x, center_y, area], dim=-1)  # (B, T_obs, 3, 2, 9)
+            # Stack geometric features together: [x1, y1, x2, y2, width, height, center_x, center_y, area]
+            geom_features = torch.stack([x1, y1, x2, y2, width, height, center_x, center_y, area], dim=-1)  # (B, T_obs, 3, 2, 9)
             
-            # Encode bounding boxes using the enhanced box encoder
-            bbox_tokens = self.box_encoder(enhanced_box_features)  # (B, T_obs, 3, 2, d_model)
+            # Get category embeddings
+            cat_emb = self.category_embedding(category_id) * presence # (B, T_obs, 3, 2, d_cat)
             
+            # Project features and sum them
+            geom_proj = self.geom_proj(geom_features) * presence  # (B, T_obs, 3, 2, d_model)
+            conf_proj = self.conf_proj(confidence) * presence    # (B, T_obs, 3, 2, d_model)
+            
+            center = torch.stack([center_x, center_y], dim=-1)
+            center_proj = self.center_proj(center) * presence
+                        
             # Add camera embedding
             # Camera IDs: 0 for gripper, 1 for front, 2 for right
-            camera_ids = torch.arange(3, device=box_data.device)  # (3,)
+            camera_ids = torch.arange(self.config.num_cameras, device=box_data.device)  # (3,)
             camera_emb = self.camera_embedding(camera_ids)  # (3, d_model)
             
             # Reshape camera embedding to match bbox_tokens dimensions
             # (3, d_model) -> (1, 1, 3, 1, d_model) to broadcast with (B, T_obs, 3, 2, d_model)
-            camera_emb = camera_emb.view(1, 1, 3, 1, self.config.d_model)
+            camera_emb = camera_emb.view(1, 1, self.config.num_cameras, 1, self.config.d_model)
             
-            # Add camera embedding to bbox tokens
-            bbox_tokens = bbox_tokens + camera_emb  # Broadcasting: (B, T_obs, 3, 2, d_model)
+            # All tokens
+            bbox_tokens = geom_proj + cat_emb + conf_proj + center_proj + camera_emb
             
             # Flatten to (B, T_obs * 6, d_model) for positional encoding
             bbox_tokens_flat = bbox_tokens.view(B, T_obs * self.config.num_cameras * self.num_bounding_boxes_per_camera, self.config.d_model)
@@ -250,7 +263,7 @@ class SimpleDiffusionTransformer(nn.Module):
             all_bbox_tokens.append(bbox_tokens_flat)
             
             # Store box data for visualization
-            spatial_outputs["observation_box_data"] = box_data_normalized
+            spatial_outputs["observation_box_data"] = coordinates_normalized
         else:
             # observation.box is missing usually mean it is in inference, process each camera with the shared object detector
             for frame_idx in range(T_obs):
@@ -307,6 +320,7 @@ class SimpleDiffusionTransformer(nn.Module):
                         bounding_boxes[:, 0::2] /= W_v
                         bounding_boxes[:, 1::2] /= H_v
                         
+                                                
                         # Enhance bounding box features with geometric properties for inference
                         # Extract coordinates
                         x1 = bounding_boxes[:, 0]  # (N_boxes,)
@@ -321,17 +335,35 @@ class SimpleDiffusionTransformer(nn.Module):
                         center_y = (y1 + y2) * 0.5  # (N_boxes,)
                         area = width * height  # (N_boxes,)
                         
-                        # Stack all features together: [x1, y1, x2, y2, width, height, center_x, center_y, area]
-                        enhanced_box_features = torch.stack([x1, y1, x2, y2, width, height, center_x, center_y, area], dim=-1)  # (N_boxes, 9)
+                        # Stack geometric features together: [x1, y1, x2, y2, width, height, center_x, center_y, area]
+                        geom_features = torch.stack([x1, y1, x2, y2, width, height, center_x, center_y, area], dim=-1)  # (N_boxes, 9)
                         
-                        # Reshape to match training format: (1, 1, N_boxes, 9)
-                        enhanced_box_features = enhanced_box_features.unsqueeze(0).unsqueeze(0)  # (1, 1, N_boxes, 9)
+                        # For inference, we don't have category_id and confidence, so we'll use default values
+                        category_id = torch.full((N_boxes,), 2, dtype=torch.long)  # Using category_id = 2 for 'unknown' category
+                        confidence = torch.ones(N_boxes, 1, device=bounding_boxes.device)  # (N_boxes, 1)
+                        presence = (geom_features.sum(dim=-1) != 0).float().unsqueeze(-1)  # (N_boxes, 1)
                         
-                        # Encode bounding boxes using the enhanced box encoder (same as training)
-                        bbox_tokens = self.box_encoder(enhanced_box_features)  # (1, 1, N_boxes, d_model)
+                                                
+                        center = torch.stack([center_x, center_y], dim=-1)
+                        
+                        # Reshape to match training format: (1, 1, N_boxes, *)
+                        geom_features = geom_features.unsqueeze(0).unsqueeze(0)  # (1, 1, N_boxes, 9)
+                        cat_emb = cat_emb.unsqueeze(0).unsqueeze(0)  # (1, 1, N_boxes, d_cat)
+                        confidence = confidence.unsqueeze(0).unsqueeze(0)  # (1, 1, N_boxes, 1)
+                        
+                        # Project features and sum them
+                        geom_proj = self.geom_proj(geom_features) * presence # (1, 1, N_boxes, d_model)
+                        cat_emb = self.category_embedding(category_id) * presence  # (N_boxes, d_cat)
+                        cam_proj = self.camera_embedding(cat_emb) * presence         # (1, 1, N_boxes, d_model)
+                        conf_proj = self.conf_proj(confidence) * presence    # (1, 1, N_boxes, d_model)
+                        center_proj = self.center_proj(center) * presence  # (1, 1, N_boxes, d_model)
+                        
+                        # Sum all projections to get final bbox tokens                        
+                        bbox_tokens = geom_proj + cat_emb + conf_proj + center_proj + cam_proj
                         
                         # Apply positional encoding to bounding box tokens (same as training)
                         bbox_tokens = self.box_positional_encoding(bbox_tokens)  # (1, 1, N_boxes, d_model)
+                        
                         
                         # Expand to match vision tokens format
                         # Add dimensions to match (B_v, T_v, N_v, N_boxes, d_model)
