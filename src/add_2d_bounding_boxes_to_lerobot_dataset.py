@@ -62,10 +62,10 @@ class LeRobot2DBoundingBoxAdder:
             return
         
         # System prompt for 2D bounding box detection
-        self.system_prompt_2d = "You are a precise 2D object detector. For each object, provide its 2D bounding box in JSON format with 'bbox_2d' field containing [x1, y1, x2, y2] where (x1, y1) is the top-left corner and (x2, y2) is the bottom-right corner. All coordinates should be normalized to [0, 1000]. Also provide a 'label' field indicating the object category."
+        self.system_prompt_2d = "You are a precise 2D object detector. For each object, provide its 2D bounding box in JSON format with 'bbox_2d' field containing [x1, y1, x2, y2] where (x1, y1) is the top-left corner and (x2, y2) is the bottom-right corner. Also provide a 'label' field indicating the object category, a 'confidence' field with a value between 0.0 and 1.0 indicating your confidence in the detection"
         
         # Default user prompt for 2D detection
-        self.user_prompt_2d = 'locate every instance that belongs to the following categories: "plate/dish, scallop, wine bottle, tv, bowl, spoon, air conditioner, coconut drink, cup, chopsticks, person". Report bbox coordinates in JSON format.'
+        self.user_prompt_2d = 'locate every instance that belongs to the following categories: "cube, container"'
         
         # Image transformations (only convert to tensor, no resizing)
         self.transform = T.ToTensor()
@@ -157,7 +157,7 @@ class LeRobot2DBoundingBoxAdder:
             text: String output from Qwen3-VL
             
         Returns:
-            List of dictionaries with 'bbox_2d' and 'label' fields
+            List of dictionaries with 'bbox_2d', 'label', 'confidence' fields
         """
         try:
             # Find JSON content
@@ -180,6 +180,8 @@ class LeRobot2DBoundingBoxAdder:
             # Parse JSON
             bbox_data = json.loads(json_str)
             
+            print(f"Parsed bounding box data: {bbox_data}")
+            
             # Normalize to list format
             if isinstance(bbox_data, list):
                 # Validate each item in the list has required fields
@@ -188,15 +190,20 @@ class LeRobot2DBoundingBoxAdder:
                     if isinstance(item, dict) and 'bbox_2d' in item and 'label' in item:
                         # Ensure bbox_2d has 4 coordinates
                         if len(item['bbox_2d']) == 4:
+                            # Add default values for confidence and category_id if not present
+                            if 'confidence' not in item:
+                                item['confidence'] = 1.0  # Default confidence
+                            if 'category_id' not in item:
+                                # Map label to category_id (0 for cube, 1 for container, -1 for others)
+                                label = item['label'].lower()
+                                if 'cube' in label:
+                                    item['category_id'] = 0
+                                elif 'container' in label or 'box' in label:
+                                    item['category_id'] = 1
+                                else:
+                                    item['category_id'] = -1  # Unknown category
                             validated_data.append(item)
                 return validated_data
-            elif isinstance(bbox_data, dict):
-                # Check if single dict has required fields
-                if 'bbox_2d' in bbox_data and 'label' in bbox_data:
-                    # Ensure bbox_2d has 4 coordinates
-                    if len(bbox_data['bbox_2d']) == 4:
-                        return [bbox_data]
-                return []
             else:
                 return []
                 
@@ -341,24 +348,47 @@ class LeRobot2DBoundingBoxAdder:
                                         # Convert detected bounding boxes to required format immediately
                                         if bounding_boxes:
                                             # Initialize with default empty boxes for this camera
-                                            converted_boxes = [[0.0, 0.0, 0.0, 0.0] for _ in range(2)]
+                                            converted_boxes = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0] for _ in range(2)]
                                             
                                             # Process up to 2 boxes per camera
                                             for box_idx, box_data in enumerate(bounding_boxes[:2]):
                                                 if 'bbox_2d' in box_data and len(box_data['bbox_2d']) == 4:
-                                                    # Store the box coordinates directly
-                                                    converted_boxes[box_idx] = box_data['bbox_2d']
+                                                    # Get category_id and confidence, with defaults if not present
+                                                    category_id = box_data.get('category_id', 0.0)  # Default to 0 (cube)
+                                                    confidence = box_data.get('confidence', 1.0)    # Default to 1.0
+                                                    
+                                                    # Store the box coordinates with category_id and confidence
+                                                    converted_boxes[box_idx] = box_data['bbox_2d'] + [float(category_id), float(confidence)]
                                             
                                             # Store converted bounding boxes for this camera
                                             sample_bounding_boxes[camera_name] = converted_boxes
                                             sample_boxes_count += len(bounding_boxes)
+                                            
+                                            # Also store additional information (category_id, confidence)
+                                            # Create extended data structure for this camera
+                                            extended_camera_data = []
+                                            for box_data in bounding_boxes[:2]:
+                                                if 'bbox_2d' in box_data and len(box_data['bbox_2d']) == 4:
+                                                                                                        
+                                                    # Create extended data with all required information
+                                                    extended_data = {
+                                                        'bbox_2d': box_data['bbox_2d'],
+                                                        'category_id': box_data.get('category_id', -1),
+                                                        'confidence': box_data.get('confidence', 1.0),
+                                                        'label': box_data.get('label', 'unknown')
+                                                    }
+                                                    extended_camera_data.append(extended_data)
+                                            
+                                            # Store extended data for this camera
+                                            if extended_camera_data:
+                                                sample_bounding_boxes[f"{camera_name}_extended"] = extended_camera_data
                                         else:
                                             # Store empty boxes for this camera
-                                            sample_bounding_boxes[camera_name] = [[0.0, 0.0, 0.0, 0.0] for _ in range(2)]
+                                            sample_bounding_boxes[camera_name] = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0] for _ in range(2)]
                                             sample_boxes_count += 0
                                     else:
                                         print(f"Unexpected tensor dimensions for {key}: {value.dim()}")
-                                        sample_bounding_boxes[camera_name] = []
+                                        sample_bounding_boxes[camera_name] = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0] for _ in range(2)]
                                 else:
                                     print(f"Unexpected image format for {key}: {type(value)}")
                                     sample_bounding_boxes[camera_name] = []
@@ -369,11 +399,8 @@ class LeRobot2DBoundingBoxAdder:
                     # No detection needed, store empty bounding boxes
                     sample_bounding_boxes = {}
                 
-                # Store the bounding boxes data directly
-                if needs_detection and sample_bounding_boxes:
-                    bounding_boxes_data.append(sample_bounding_boxes)
-                else:
-                    bounding_boxes_data.append(sample_bounding_boxes)
+                # Store the bounding boxes data directly in the list for this sample
+                bounding_boxes_data.append(sample_bounding_boxes)
                 
                 pbar.set_postfix({"boxes": sample_boxes_count})
                 
@@ -406,6 +433,30 @@ class LeRobot2DBoundingBoxAdder:
             with open(bounding_boxes_file, 'w') as f:
                 json.dump(bounding_boxes_data, f, indent=2)
             print(f"Bounding box data saved to {bounding_boxes_file}")
+            
+            # Extract and save extended information separately
+            extended_data = []
+            for bbox_data in bounding_boxes_data:
+                sample_extended = {}
+                for key, value in bbox_data.items():
+                    if key.endswith('_extended'):
+                        # This is extended data, store it
+                        camera_name = key.replace('_extended', '')
+                        sample_extended[camera_name] = value
+                if sample_extended:
+                    # Add episode and frame info if available
+                    if 'episode_index' in bbox_data:
+                        sample_extended['episode_index'] = bbox_data['episode_index']
+                    if 'frame_index' in bbox_data:
+                        sample_extended['frame_index'] = bbox_data['frame_index']
+                    extended_data.append(sample_extended)
+            
+            # Save extended information to a separate file
+            if extended_data:
+                extended_file = output_path / "bounding_boxes_extended.json"
+                with open(extended_file, 'w') as f:
+                    json.dump(extended_data, f, indent=2)
+                print(f"Extended bounding box data saved to {extended_file}")
             
             # Save a mapping of indices to bounding boxes for easy lookup
             index_mapping = {}
@@ -587,26 +638,26 @@ class LeRobot2DBoundingBoxAdder:
 
     def _convert_detected_bounding_boxes_to_required_format(self, bbox_data):
         """
-        Convert detected bounding box data to the required format: [6, 4]
+        Convert detected bounding box data to the required format: [6, 6]
         Where:
         - 6 elements total (2 per camera for 3 cameras)
-        - Each element is an array of 4 floats [x1, y1, x2, y2]
-        - Each camera must have exactly 2 boxes, pad with [0.0, 0.0, 0.0, 0.0] if needed
+        - Each element is an array of 6 floats [x1, y1, x2, y2, category_id, confidence]
+        - Each camera must have exactly 2 boxes, pad with [0.0, 0.0, 0.0, 0.0, 0.0, 0.0] if needed
         
         Args:
             bbox_data: Dictionary with camera names as keys and lists of bounding boxes as values
-                       Each bounding box is a list of 4 floats [x1, y1, x2, y2]
+                       Each bounding box is a list of 6 floats [x1, y1, x2, y2, category_id, confidence]
                        OR
                        A dictionary with the format:
-                       [{'episode_index': 0, 'frame_index': 14, 'gripper': [[37, 600, 162, 788], [376, 500, 539, 838]], 
-                         'front': [[273, 405, 350, 525], [486, 405, 616, 575]], 
-                         'right': [[524, 412, 642, 638], [0.0, 0.0, 0.0, 0.0]]}, ...]
+                       [{'episode_index': 0, 'frame_index': 14, 'gripper': [[37, 600, 162, 788, 0, 0.9], [376, 500, 539, 838, 1, 0.8]], 
+                         'front': [[273, 405, 350, 525, 0, 0.95], [486, 405, 616, 575, 1, 0.85]], 
+                         'right': [[524, 412, 642, 638, 0, 0.92], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]}, ...]
             
         Returns:
             List of lists representing the bounding boxes in the required format
         """
         # Initialize with default empty boxes
-        final_boxes = [[0.0, 0.0, 0.0, 0.0] for _ in range(6)]
+        final_boxes = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] for _ in range(6)]
         
         # Handle the case where bbox_data is in the user-provided format
         # (a dictionary with episode_index, frame_index, and camera keys)
@@ -631,10 +682,13 @@ class LeRobot2DBoundingBoxAdder:
             for box_idx in range(2):  # Always process 2 boxes per camera
                 if box_idx < len(camera_boxes):
                     box_coords = camera_boxes[box_idx]
-                    if len(box_coords) == 4:
+                    if len(box_coords) == 6:
                         # Store the box coordinates directly
                         final_boxes[cam_idx * 2 + box_idx] = box_coords
-                # If there's no box at this index, it remains [0.0, 0.0, 0.0, 0.0] (already initialized)
+                    elif len(box_coords) == 4:
+                        # If we only have 4 coordinates, pad with default values for category_id and confidence
+                        final_boxes[cam_idx * 2 + box_idx] = box_coords + [0.0, 1.0]  # Default category_id=0, confidence=1.0
+                # If there's no box at this index, it remains [0.0, 0.0, 0.0, 0.0, 0.0, 0.0] (already initialized)
         
         print('The final_boxes is: ', final_boxes)
         return final_boxes

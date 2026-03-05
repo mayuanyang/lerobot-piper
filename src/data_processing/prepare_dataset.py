@@ -139,7 +139,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
             "next.done": is_done,
             "next.reward": 1.0 if is_done else 0.0,
             "task_index": 0,
-            "observation.box": [[0.0, 0.0, 0.0, 0.0] for _ in range(6)],  # Initialize with zeros: 6 elements, each with 4 coordinates
+            "observation.box": [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0] for _ in range(6)],  # Initialize with zeros: 6 elements, each with 6 values (x1, y1, x2, y2, category_id, confidence)
             #"task_description": episode_data.task_description
         }
                 
@@ -160,7 +160,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         "next.done": Value("bool"),
         "next.reward": Value("float32"),
         "task_index": Value("int64"),
-        "observation.box": Sequence(Sequence(Value("float32"), length=4), length=6),  # 6 elements, each with 4 coordinates
+        "observation.box": Sequence(Sequence(Value("float32"), length=6), length=6),  # 6 elements, each with 6 values (x1, y1, x2, y2, category_id, confidence)
         #"task_description": Value("string"),
     }
         
@@ -234,7 +234,7 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
                     "dtype": "float32"
                 },
                 "observation.box": {
-                    "shape": [6, 4],  # 6 elements, each with 4 coordinates
+                    "shape": [6, 6],  # 6 elements, each with 6 values (x1, y1, x2, y2, category_id, confidence)
                     "dtype": "float32"
                 },
                 "action": {
