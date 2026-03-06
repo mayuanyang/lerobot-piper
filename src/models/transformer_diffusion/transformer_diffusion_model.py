@@ -90,7 +90,10 @@ class SimpleDiffusionTransformer(nn.Module):
         self.pres_proj = nn.Linear(1, config.d_model)   # Presence (if used in the future)
         self.center_proj = nn.Linear(2, config.d_model)  # Center coordinates (center_x, center_y)
         self.missing_box_embedding = nn.Parameter(torch.randn(1, config.d_model))  # Learnable embedding for missing boxes
-                
+        
+        # Distance token embedding for representing distance between box centers
+        self.distance_token_embedding = nn.Linear(1, config.d_model)  # Embedding for distance scalar value
+        
         self.box_positional_encoding = PositionalEncoding(config.d_model)
         
         # Camera embedding for distinguishing between different camera views
@@ -211,6 +214,9 @@ class SimpleDiffusionTransformer(nn.Module):
             B, T_obs, N_boxes, N_coords = coordinates_normalized.shape
             coordinates_normalized = coordinates_normalized.view(B, T_obs, self.config.num_cameras, self.num_bounding_boxes_per_camera, 4)  # (B, T_obs, 3, 2, 4)
             
+            # Store original shape for distance calculation
+            coords_orig_shape = coordinates_normalized.shape
+            
             # Reshape category_id, confidence
             category_id = category_id.view(B, T_obs, self.config.num_cameras, self.num_bounding_boxes_per_camera)  # (B, T_obs, 3, 2)
             confidence = confidence.view(B, T_obs, self.config.num_cameras, self.num_bounding_boxes_per_camera).unsqueeze(-1)    # (B, T_obs, 3, 2, 1)
@@ -256,6 +262,29 @@ class SimpleDiffusionTransformer(nn.Module):
             center_x = (x1 + x2) * 0.5  # (B, T_obs, 3, 2)
             center_y = (y1 + y2) * 0.5  # (B, T_obs, 3, 2)
             area = width * height  # (B, T_obs, 3, 2)
+            
+            # Calculate distances between the two boxes for each camera
+            # Reshape to (B, T_obs, 3, 2) to easily access box pairs
+            center_x_reshaped = center_x.view(B, T_obs, self.config.num_cameras, self.num_bounding_boxes_per_camera)
+            center_y_reshaped = center_y.view(B, T_obs, self.config.num_cameras, self.num_bounding_boxes_per_camera)
+            
+            # Calculate Euclidean distance between box centers for each camera
+            # Distance between box 0 and box 1 for each camera
+            dx = center_x_reshaped[:, :, :, 0] - center_x_reshaped[:, :, :, 1]  # (B, T_obs, 3)
+            dy = center_y_reshaped[:, :, :, 0] - center_y_reshaped[:, :, :, 1]  # (B, T_obs, 3)
+            distances = torch.sqrt(dx**2 + dy**2).unsqueeze(-1)  # (B, T_obs, 3, 1)
+            
+            # Create distance tokens
+            distance_tokens = self.distance_token_embedding(distances)  # (B, T_obs, 3, d_model)
+            
+            # Flatten distance tokens to (B, T_obs * 3, d_model) for positional encoding
+            distance_tokens_flat = distance_tokens.view(B, T_obs * self.config.num_cameras, self.config.d_model)
+            
+            # Apply positional encoding to distance tokens
+            distance_tokens_flat = self.box_positional_encoding(distance_tokens_flat)  # (B, T_obs * 3, d_model)
+            
+            # Store distance tokens
+            all_bbox_tokens.append(distance_tokens_flat)
             
             # Stack geometric features together: [x1, y1, x2, y2, width, height, center_x, center_y, area]
             geom_features = torch.stack([x1, y1, x2, y2, width, height, center_x, center_y, area], dim=-1)  # (B, T_obs, 3, 2, 9)
@@ -395,6 +424,20 @@ class SimpleDiffusionTransformer(nn.Module):
                         center_x = (x1 + x2) * 0.5  # (N_boxes,)
                         center_y = (y1 + y2) * 0.5  # (N_boxes,)
                         area = width * height  # (N_boxes,)
+                        
+                        # Calculate distance between the two boxes
+                        # We have exactly 2 boxes per camera in inference
+                        if N_boxes >= 2:
+                            dx = center_x[0] - center_x[1]  # Scalar
+                            dy = center_y[0] - center_y[1]  # Scalar
+                            distance = torch.sqrt(dx**2 + dy**2).unsqueeze(0)  # (1,)
+                            
+                            # Create distance token
+                            distance_token = self.distance_token_embedding(distance.unsqueeze(0).unsqueeze(0))  # (1, 1, 1, d_model)
+                            distance_token = distance_token.expand(B_v, T_v, N_v, self.config.d_model)  # (B_v, T_v, N_v, d_model)
+                            
+                            # Collect distance token
+                            all_bbox_tokens.append(distance_token)
                         
                         # Stack geometric features together: [x1, y1, x2, y2, width, height, center_x, center_y, area]
                         geom_features = torch.stack([x1, y1, x2, y2, width, height, center_x, center_y, area], dim=-1)  # (N_boxes, 9)
