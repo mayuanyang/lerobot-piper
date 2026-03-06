@@ -85,7 +85,7 @@ class SimpleDiffusionTransformer(nn.Module):
         self.category_embedding = nn.Embedding(3, config.d_model)  # Assuming 3 categories, 8-dim embedding
         
         # Linear projections for different features
-        self.geom_proj = nn.Linear(9, config.d_model)  # Geometric features: [x1, y1, x2, y2, width, height, center_x, center_y, area]
+        self.geom_proj = nn.Linear(10, config.d_model)  # Geometric features: [x1, y1, x2, y2, width, height, center_x, center_y, area, aspect_ratio]
         self.conf_proj = nn.Linear(1, config.d_model)  # Confidence
         self.pres_proj = nn.Linear(1, config.d_model)   # Presence (if used in the future)
         self.center_proj = nn.Linear(2, config.d_model)  # Center coordinates (center_x, center_y)
@@ -262,6 +262,8 @@ class SimpleDiffusionTransformer(nn.Module):
             center_x = (x1 + x2) * 0.5  # (B, T_obs, 3, 2)
             center_y = (y1 + y2) * 0.5  # (B, T_obs, 3, 2)
             area = width * height  # (B, T_obs, 3, 2)
+            aspect_ratio = width / (height + 1e-6)  # Prevent division by zero
+
             
             # Calculate distances between the two boxes for each camera
             # Reshape to (B, T_obs, 3, 2) to easily access box pairs
@@ -286,8 +288,8 @@ class SimpleDiffusionTransformer(nn.Module):
             # Store distance tokens
             all_bbox_tokens.append(distance_tokens_flat)
             
-            # Stack geometric features together: [x1, y1, x2, y2, width, height, center_x, center_y, area]
-            geom_features = torch.stack([x1, y1, x2, y2, width, height, center_x, center_y, area], dim=-1)  # (B, T_obs, 3, 2, 9)
+            # Stack geometric features together: [x1, y1, x2, y2, width, height, center_x, center_y, area, aspect_ratio]
+            geom_features = torch.stack([x1, y1, x2, y2, width, height, center_x, center_y, area, aspect_ratio], dim=-1)  # (B, T_obs, 3, 2, 9)
             
             # Get category embeddings
             cat_emb = self.category_embedding(category_id)
@@ -424,6 +426,8 @@ class SimpleDiffusionTransformer(nn.Module):
                         center_x = (x1 + x2) * 0.5  # (N_boxes,)
                         center_y = (y1 + y2) * 0.5  # (N_boxes,)
                         area = width * height  # (N_boxes,)
+                        aspect_ratio = width / (height + 1e-6)  # Prevent division by zero
+
                         
                         # Calculate distance between the two boxes
                         # We have exactly 2 boxes per camera in inference
@@ -439,8 +443,8 @@ class SimpleDiffusionTransformer(nn.Module):
                             # Collect distance token
                             all_bbox_tokens.append(distance_token)
                         
-                        # Stack geometric features together: [x1, y1, x2, y2, width, height, center_x, center_y, area]
-                        geom_features = torch.stack([x1, y1, x2, y2, width, height, center_x, center_y, area], dim=-1)  # (N_boxes, 9)
+                        # Stack geometric features together: [x1, y1, x2, y2, width, height, center_x, center_y, area, aspect_ratio]
+                        geom_features = torch.stack([x1, y1, x2, y2, width, height, center_x, center_y, area, aspect_ratio], dim=-1)  # (N_boxes, 9)
                         geom_features = geom_features.unsqueeze(0).unsqueeze(0)  # (1, 1, N_boxes, 9)
                         
                         # Get category embeddings
