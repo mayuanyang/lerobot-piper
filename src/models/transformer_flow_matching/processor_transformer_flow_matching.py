@@ -2,7 +2,7 @@ from typing import Any
 
 import torch
 
-from .transformer_diffusion_config import TransformerDiffusionConfig
+from .transformer_flow_matching_config import TransformerFlowMatchingConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -20,7 +20,7 @@ from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PR
 
 
 def make_pre_post_processors(
-    config: TransformerDiffusionConfig,
+    config: TransformerFlowMatchingConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
     add_grid_overlay: bool = False,
     grid_overlay_cameras: list[str] | None = None,

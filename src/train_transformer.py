@@ -9,9 +9,9 @@ import numpy as np
 from torch.utils.data import Subset
 
 # Import transformer-specific components
-from models.transformer_diffusion.transformer_diffusion_config import TransformerDiffusionConfig
-from models.transformer_diffusion.transformer_diffusion_policy import TransformerDiffusionPolicy
-from models.transformer_diffusion.processor_transformer_diffusion import make_pre_post_processors
+from models.transformer_flow_matching.transformer_flow_matching_config import TransformerFlowMatchingConfig
+from models.transformer_flow_matching.transformer_flow_matching_policy import TransformerFlowMatchingPolicy
+from models.transformer_flow_matching.processor_transformer_flow_matching import make_pre_post_processors
 
 # Import visualization utilities
 from spatial_softmax_visualizer import SpatialSoftmaxVisualizer
@@ -99,7 +99,7 @@ def apply_state_dropout(batch, state_key="observation.state", dropout_prob=0.03)
 
 
 def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_from_checkpoint=None, visualize_every_n_batches=1000):
-    """Train the SimpleTransformerDiffusion model."""
+    """Train the TransformerFlowMatching model."""
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
 
@@ -128,7 +128,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     n_action_steps = 8
     
     # Create transformer configuration - simplified version with smaller model
-    cfg = TransformerDiffusionConfig(
+    cfg = TransformerFlowMatchingConfig(
         input_features=input_features, 
         output_features=output_features, 
         n_obs_steps=obs, 
@@ -150,7 +150,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     if resume_from_checkpoint is not None:
         print(f"Resuming training from checkpoint: {resume_from_checkpoint}")
         # Load policy with its original configuration
-        policy = TransformerDiffusionPolicy.from_pretrained(resume_from_checkpoint, strict=False)
+        policy = TransformerFlowMatchingPolicy.from_pretrained(resume_from_checkpoint, strict=False)
         policy.train()
         policy.to(device)
         
@@ -203,7 +203,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             step = 0
     else:
         # Initialize fresh policy
-        policy = TransformerDiffusionPolicy(cfg)
+        policy = TransformerFlowMatchingPolicy(cfg)
         policy.train()
         policy.to(device)
         

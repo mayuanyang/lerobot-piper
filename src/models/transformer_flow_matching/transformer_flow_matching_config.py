@@ -6,9 +6,9 @@ from lerobot.optim.optimizers import AdamConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 
 
-@PreTrainedConfig.register_subclass("transformer_diffusion")
+@PreTrainedConfig.register_subclass("transformer_flow_matching")
 @dataclass
-class TransformerDiffusionConfig(PreTrainedConfig):
+class TransformerFlowMatchingConfig(PreTrainedConfig):
     """Long Task Transformer Configuration for long-horizon tasks with transformer-based architecture."""
     
     # Inputs / output structure.

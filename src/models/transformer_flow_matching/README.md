@@ -31,7 +31,7 @@ python src/visualize_spatial_softmax.py
 
 ## Architecture Overview
 
-The TransformerDiffusion model consists of:
+The TransformerFlowMatching model consists of:
 
 1. **ResNet-based Image Encoders**: Process camera observations and convert them to feature embeddings
 2. **State Encoder**: Convert observation.state vectors to tokens
@@ -101,10 +101,10 @@ python src/inference_transformer.py --model_path ./outputs/transformer_model
 
 ## Configuration
 
-The model can be configured through the `TransformerDiffusionConfig` class:
+The model can be configured through the `TransformerFlowMatchingConfig` class:
 
 ```python
-config = TransformerDiffusionConfig(
+config = TransformerFlowMatchingConfig(
     n_obs_steps=8,          # Number of observation steps
     horizon=16,             # Prediction horizon
     n_action_steps=8,       # Number of action steps to execute
@@ -128,9 +128,9 @@ The model supports weighted loss computation for different joints in addition to
 
 ## Model Components
 
-- `TransformerDiffusionConfig`: Configuration class defining model parameters
+- `TransformerFlowMatchingConfig`: Configuration class defining model parameters
 - `DiffusionTransformer`: Core neural network implementation
-- `TransformerDiffusionPolicy`: High-level policy interface for training and inference
+- `TransformerFlowMatchingPolicy`: High-level policy interface for training and inference
 
 ## 2D Object Detection
 

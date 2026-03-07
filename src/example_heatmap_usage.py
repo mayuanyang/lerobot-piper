@@ -10,7 +10,7 @@ import numpy as np
 import cv2
 
 # Import our custom modules
-from models.transformer_diffusion.spatial_softmax import SpatialSoftmax, save_heatmap_visualization
+from models.transformer_flow_matching.spatial_softmax import SpatialSoftmax, save_heatmap_visualization
 
 
 def create_dummy_feature_maps(batch_size=1, channels=32, height=14, width=14):

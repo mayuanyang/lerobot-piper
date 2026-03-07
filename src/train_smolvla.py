@@ -13,7 +13,7 @@ from torchvision.transforms import v2
 from torch.utils.data import Subset
 import random
 import torchvision
-from models.transformer_diffusion.grid_overlay_processor import GridOverlayProcessorStep
+from models.transformer_flow_matching.grid_overlay_processor import GridOverlayProcessorStep
 
 # Detect the best available device
 if torch.cuda.is_available():

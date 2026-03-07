@@ -1,19 +1,19 @@
 import torch
 from lerobot.policies.pretrained import PreTrainedPolicy
-from .transformer_diffusion_model import DiffusionTransformer
-from .transformer_diffusion_config import TransformerDiffusionConfig
+from .transformer_flow_matching_model import DiffusionTransformer
+from .transformer_flow_matching_config import TransformerFlowMatchingConfig
 
 
-class TransformerDiffusionPolicy(PreTrainedPolicy):
+class TransformerFlowMatchingPolicy(PreTrainedPolicy):
     """
     Refactored policy for the Piper 7-DOF robot.
     Integrates Spatial Softmax vision and token-based state fusion.
     """
     
-    config_class = TransformerDiffusionConfig
+    config_class = TransformerFlowMatchingConfig
     name = "transformer_diffusion"
     
-    def __init__(self, config: TransformerDiffusionConfig):
+    def __init__(self, config: TransformerFlowMatchingConfig):
         super().__init__(config)
         self.config = config
         
