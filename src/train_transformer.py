@@ -337,7 +337,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 # Box encoder gradients (individual components)
                 total_box_grad = 0.0
                 total_box_params = 0
-                box_component_names = ['category_embedding', 'geom_proj', 'conf_proj', 'pres_proj', 'center_proj', 'missing_box_embedding', 'box_positional_encoding', 'camera_embedding']
+                box_component_names = ['box_encoder']
                 for name, param in policy.model.named_parameters():
                     if param.requires_grad and any(comp_name in name for comp_name in box_component_names) and param.grad is not None:
                         grad_mean = param.grad.abs().mean().item()

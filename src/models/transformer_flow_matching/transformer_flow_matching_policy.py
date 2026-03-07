@@ -1,6 +1,6 @@
 import torch
 from lerobot.policies.pretrained import PreTrainedPolicy
-from .transformer_flow_matching_model import DiffusionTransformer
+from .transformer_flow_matching_model import FlowMatchingTransformer
 from .transformer_flow_matching_config import TransformerFlowMatchingConfig
 
 
@@ -18,7 +18,7 @@ class TransformerFlowMatchingPolicy(PreTrainedPolicy):
         self.config = config
         
         # Initialize the refactored sophisticated model
-        self.model = DiffusionTransformer(config)
+        self.model = FlowMatchingTransformer(config)
         
     def get_optim_params(self) -> dict:
         """Return the policy parameters for optimization."""

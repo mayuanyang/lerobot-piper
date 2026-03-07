@@ -2,10 +2,15 @@ import torch
 from torch import nn
 import math
 import numpy as np
+from typing import Optional
 
 
 class BoxEncoder(nn.Module):
-    """Box encoder for processing bounding box data with enhanced features."""
+    """Box encoder for processing bounding box data with enhanced features.
+
+    A TransformerEncoder is applied over the produced token sequence to fuse
+    distance + box tokens before returning them.
+    """
     
     def __init__(self, config):
         super().__init__()
@@ -34,6 +39,42 @@ class BoxEncoder(nn.Module):
         
         # Camera embedding for distinguishing between different camera views
         self.camera_embedding = nn.Embedding(self.config.num_cameras, config.d_model)  # 3 cameras: gripper, front, right
+
+        # ------------------------------
+        # Token fusion (self-attention across the token sequence)
+        # ------------------------------
+        # Choose a head count that divides d_model to avoid runtime errors.
+        fuse_nhead = int(getattr(config, "box_fuse_nhead", getattr(config, "nhead", 8)))
+        fuse_nhead = max(1, fuse_nhead)
+        while fuse_nhead > 1 and (config.d_model % fuse_nhead) != 0:
+            fuse_nhead -= 1
+        self.fuse_nhead = fuse_nhead
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.d_model,
+            nhead=self.fuse_nhead,
+            dim_feedforward=int(getattr(config, "box_fuse_dim_feedforward", config.d_model * 4)),
+            dropout=float(getattr(config, "box_fuse_dropout", 0.1)),
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.token_fuser = nn.TransformerEncoder(
+            encoder_layer, num_layers=int(getattr(config, "box_fuse_num_layers", 2))
+        )
+        self.token_fuser_norm = nn.LayerNorm(config.d_model)
+
+    def fuse_tokens(
+        self, tokens_flat: torch.Tensor, src_key_padding_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Fuse tokens with a TransformerEncoder.
+
+        Args:
+            tokens_flat: (B, L, d_model)
+            src_key_padding_mask: optional (B, L) boolean mask where True indicates padding.
+        """
+        fused = self.token_fuser(tokens_flat, src_key_padding_mask=src_key_padding_mask)
+        return self.token_fuser_norm(fused)
 
     def encode_boxes_train(self, box_data, batch, image_width=640.0, image_height=400.0):
         """
@@ -306,6 +347,7 @@ class BoxEncoder(nn.Module):
             box_data, batch
         )
         tokens_flat = torch.cat([distance_tokens_flat, bbox_tokens_flat], dim=1)
+        tokens_flat = self.fuse_tokens(tokens_flat)
         return tokens_flat, coordinates_normalized
 
     def encode_tokens_inference(self, bounding_boxes, cam_index, B_v, T_v, N_v):
@@ -325,8 +367,9 @@ class BoxEncoder(nn.Module):
         )
 
         if distance_token is None:
-            return bbox_tokens_flat
+            return self.fuse_tokens(bbox_tokens_flat)
 
         distance_token_flat = distance_token.view(B_v, T_v * N_v, self.config.d_model)
         tokens_flat = torch.cat([distance_token_flat, bbox_tokens_flat], dim=1)
+        tokens_flat = self.fuse_tokens(tokens_flat)
         return tokens_flat

@@ -54,7 +54,7 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :seq_len]
 
 
-class ActionTransformer(nn.Module):
+class FlowMatchingTransformer(nn.Module):
     """Flow matching transformer with separate encoding for vision and state."""
     
     def __init__(self, config):
