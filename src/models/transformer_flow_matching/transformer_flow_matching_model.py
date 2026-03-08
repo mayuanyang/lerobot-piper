@@ -90,6 +90,7 @@ class FlowMatchingTransformer(nn.Module):
             nn.Linear(config.state_dim, config.d_model),
             nn.LayerNorm(config.d_model),
             nn.GELU(),
+            nn.Dropout(p=0.3),
             nn.Linear(config.d_model, config.d_model)
         )
         self.state_positional_encoding = PositionalEncoding(config.d_model)
