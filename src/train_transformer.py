@@ -90,7 +90,7 @@ def apply_camera_dropout(batch, camera_keys=["observation.images.front", "observ
     return batch
 
 
-def apply_state_dropout(batch, state_key="observation.state", dropout_prob=0.03):
+def apply_state_dropout(batch, state_key="observation.state", dropout_prob=0.1):
     state = batch[state_key]
     mask = (torch.rand(state.size(0), 1, 1, device=state.device) > dropout_prob).float()
     batch[state_key] = state * mask
@@ -285,7 +285,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     #visualizer = SpatialSoftmaxVisualizer(Path(output_dir) / "spatial_softmax_visualizations")
 
     episode_ids = np.array(dataset.hf_dataset["episode_index"])
-    valid_indices = np.where(episode_ids <= 99)[0]  # first 65 episodes
+    valid_indices = np.where(episode_ids <= 29)[0]  # first 65 episodes
 
     dataset = Subset(dataset, valid_indices)
     print('The partial dataset length', len(dataset))
@@ -307,7 +307,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             batch = apply_joint_augmentations(batch)
             
             # Apply state dropout
-            #batch = apply_state_dropout(batch)
+            batch = apply_state_dropout(batch)
             
             # Apply camera dropout
             #batch = apply_camera_dropout(batch)

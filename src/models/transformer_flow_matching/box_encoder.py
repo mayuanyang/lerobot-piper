@@ -59,9 +59,18 @@ class BoxEncoder(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.token_fuser = nn.TransformerEncoder(
-            encoder_layer, num_layers=int(getattr(config, "box_fuse_num_layers", 2))
+        # self.token_fuser = nn.TransformerEncoder(
+        #     encoder_layer, num_layers=int(getattr(config, "box_fuse_num_layers", 2))
+        # )
+        
+        self.token_fuser = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model // 2),
+            nn.LayerNorm(config.d_model // 2),
+            nn.GELU(),
+            nn.Linear(config.d_model // 2, config.d_model)
         )
+        
+        # self.token_fuser = nn.Linear(config.d_model, config.d_model // 2)  # Simpler fusion method to reduce memory usage
         self.token_fuser_norm = nn.LayerNorm(config.d_model)
 
     def fuse_tokens(
@@ -73,7 +82,7 @@ class BoxEncoder(nn.Module):
             tokens_flat: (B, L, d_model)
             src_key_padding_mask: optional (B, L) boolean mask where True indicates padding.
         """
-        fused = self.token_fuser(tokens_flat, src_key_padding_mask=src_key_padding_mask)
+        fused = self.token_fuser(tokens_flat)
         return self.token_fuser_norm(fused)
 
     def encode_boxes_train(self, box_data, batch, image_width=640.0, image_height=400.0):
