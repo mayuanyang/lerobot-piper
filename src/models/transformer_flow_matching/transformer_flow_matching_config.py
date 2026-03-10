@@ -26,6 +26,13 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
 
     # Image processing
     vision_backbone: str = "qwen3_vl_4b_instruct"
+    light_weight_vision_backbone: str = "resnet18"  # Optional smaller backbone for ablations
+    use_vision_tokens: bool = True
+    use_pretrained_vision_backbone: bool = True
+    freeze_vision_backbone: bool = True
+    vision_input_size: int = 160
+    vision_token_rows: int = 2
+    vision_token_cols: int = 2
     
     # Vision encoder parameters
     num_cameras: int = 3

@@ -1,23 +1,116 @@
+import warnings
+
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torchvision.models as models
-import torchvision.transforms as transforms
-from torchvision.utils import save_image
-from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
-from diffusers.optimization import get_scheduler
-from typing import Dict, Optional, List, Tuple
-import math
-import numpy as np
-import os
-from pathlib import Path
-import torchvision.models as models
-import torchvision.transforms as T
 
 
 # Import ObjectDetector from separate file
 from .object_detector import ObjectDetector, DiffusionSinusoidalPosEmb
 from .box_encoder import BoxEncoder
+
+
+class ResNet18VisionTokenizer(nn.Module):
+    """Shared lightweight vision tokenizer used for all camera streams."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.input_size = int(getattr(config, "vision_input_size", 160))
+        self.pool_rows = int(getattr(config, "vision_token_rows", 2))
+        self.pool_cols = int(getattr(config, "vision_token_cols", 2))
+        self.freeze_backbone = bool(getattr(config, "freeze_vision_backbone", True))
+
+        weights = None
+        if getattr(config, "use_pretrained_vision_backbone", True):
+            weights = models.ResNet18_Weights.IMAGENET1K_V1
+
+        try:
+            backbone = models.resnet18(weights=weights)
+        except Exception as exc:
+            warnings.warn(
+                f"Failed to load pretrained ResNet18 weights ({exc}). Falling back to randomly initialized weights.",
+                stacklevel=2,
+            )
+            backbone = models.resnet18(weights=None)
+
+        self.backbone = nn.Sequential(*list(backbone.children())[:-2])
+        self.spatial_pool = nn.AdaptiveAvgPool2d((self.pool_rows, self.pool_cols))
+        self.token_projection = nn.Sequential(
+            nn.Linear(512, config.d_model),
+            nn.LayerNorm(config.d_model),
+            nn.GELU(),
+            nn.Linear(config.d_model, config.d_model),
+        )
+
+        self.register_buffer(
+            "imagenet_mean",
+            torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "imagenet_std",
+            torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
+        )
+
+        if self.freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_backbone:
+            self.backbone.eval()
+        return self
+
+    def _preprocess_images(self, images: torch.Tensor) -> torch.Tensor:
+        images = images.float()
+        if images.dtype == torch.uint8 or images.max() > 1.5:
+            images = images / 255.0
+
+        if images.shape[1] == 1:
+            images = images.repeat(1, 3, 1, 1)
+        elif images.shape[1] > 3:
+            images = images[:, :3]
+
+        images = F.interpolate(
+            images,
+            size=(self.input_size, self.input_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        images = images.clamp(0.0, 1.0)
+        return (images - self.imagenet_mean) / self.imagenet_std
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """Encode images into a small fixed number of spatial tokens.
+
+        Args:
+            images: (B, T, C, H, W) or (B, C, H, W)
+
+        Returns:
+            tokens: (B, T * pool_rows * pool_cols, d_model)
+        """
+        if images.dim() == 4:
+            images = images.unsqueeze(1)
+        if images.dim() != 5:
+            raise ValueError(f"Expected images of shape (B, T, C, H, W), got {tuple(images.shape)}")
+
+        bsize, t_obs, channels, height, width = images.shape
+        flat_images = images.reshape(bsize * t_obs, channels, height, width)
+        flat_images = self._preprocess_images(flat_images)
+
+        if self.freeze_backbone:
+            with torch.no_grad():
+                features = self.backbone(flat_images)
+        else:
+            features = self.backbone(flat_images)
+
+        pooled = self.spatial_pool(features)
+        pooled = pooled.flatten(2).transpose(1, 2)
+        pooled = self.token_projection(pooled)
+        num_tokens_per_frame = pooled.shape[1]
+        return pooled.reshape(bsize, t_obs * num_tokens_per_frame, self.config.d_model)
       
 class PositionalEncoding(nn.Module):
     """Positional encoding for action sequences."""
@@ -82,6 +175,21 @@ class FlowMatchingTransformer(nn.Module):
         # ------------------------------
         # 2. Box encoder for processing bounding box data (training + inference)
         # ------------------------------
+        self.use_vision_tokens = bool(getattr(config, "use_vision_tokens", False))
+        if self.use_vision_tokens:
+            backbone_name = str(getattr(config, "light_weight_vision_backbone", "resnet18")).lower()
+            if backbone_name != "resnet18":
+                raise ValueError(
+                    f"Unsupported lightweight vision backbone '{config.vision_backbone}'. Only 'resnet18' is implemented."
+                )
+            self.vision_encoder = ResNet18VisionTokenizer(config)
+            self.vision_camera_embedding = nn.Embedding(config.num_cameras, config.d_model)
+            self.vision_positional_encoding = PositionalEncoding(config.d_model)
+        else:
+            self.vision_encoder = None
+            self.vision_camera_embedding = None
+            self.vision_positional_encoding = None
+
         self.box_encoder = BoxEncoder(config)
         self.box_positional_encoding = PositionalEncoding(config.d_model)
 
@@ -90,7 +198,7 @@ class FlowMatchingTransformer(nn.Module):
             nn.Linear(config.state_dim, config.d_model),
             nn.LayerNorm(config.d_model),
             nn.GELU(),
-            nn.Dropout(p=0.3),
+            nn.Dropout(p=0.1),
             nn.Linear(config.d_model, config.d_model)
         )
         self.state_positional_encoding = PositionalEncoding(config.d_model)
@@ -135,6 +243,51 @@ class FlowMatchingTransformer(nn.Module):
             nn.Linear(config.d_model, config.d_model)
         )
 
+    def _reshape_camera_tensor(self, image_tensor: torch.Tensor, batch_size: int, t_obs: int) -> torch.Tensor:
+        """Normalize camera tensor shapes to (B, T, C, H, W)."""
+        if image_tensor.dim() == 4:
+            if image_tensor.shape[0] == batch_size * t_obs and t_obs > 1:
+                return image_tensor.reshape(batch_size, t_obs, *image_tensor.shape[-3:])
+            if image_tensor.shape[0] == batch_size:
+                return image_tensor.unsqueeze(1)
+            if t_obs == 1:
+                return image_tensor.reshape(batch_size, 1, *image_tensor.shape[-3:])
+        elif image_tensor.dim() == 5:
+            return image_tensor
+        elif image_tensor.dim() == 6 and image_tensor.shape[2] == 1:
+            return image_tensor.squeeze(2)
+
+        raise ValueError(
+            f"Unsupported image tensor shape {tuple(image_tensor.shape)} for batch_size={batch_size}, t_obs={t_obs}."
+        )
+
+    def _encode_vision_tokens(self, batch, batch_size: int, t_obs: int) -> torch.Tensor:
+        """Encode lightweight ResNet18 spatial tokens for each available camera."""
+        device = batch["observation.state"].device
+        if not self.use_vision_tokens or self.vision_encoder is None:
+            return torch.empty(batch_size, 0, self.config.d_model, device=device)
+
+        all_vision_tokens = []
+        for cam_index, camera_key in enumerate(self.camera_names):
+            image_tensor = batch.get(camera_key)
+            if not isinstance(image_tensor, torch.Tensor):
+                continue
+
+            image_tensor = self._reshape_camera_tensor(image_tensor, batch_size, t_obs)
+            camera_tokens = self.vision_encoder(image_tensor)
+            camera_tokens = self.vision_positional_encoding(camera_tokens)
+
+            camera_emb = self.vision_camera_embedding(
+                torch.tensor(cam_index, device=device, dtype=torch.long)
+            ).view(1, 1, -1)
+            camera_tokens = camera_tokens + camera_emb
+            all_vision_tokens.append(camera_tokens)
+
+        if not all_vision_tokens:
+            return torch.empty(batch_size, 0, self.config.d_model, device=device)
+
+        return torch.cat(all_vision_tokens, dim=1)
+
 
     def get_condition(self, batch, generate_heatmaps=False):
         """
@@ -146,6 +299,7 @@ class FlowMatchingTransformer(nn.Module):
             spatial_outputs: for visualization (including bounding boxes if requested)
         """
         B, T_obs = batch["observation.state"].shape[:2]
+        spatial_outputs = {}
 
         # ------------------------------
         # 1. State encoding (compute once for reuse)
@@ -159,7 +313,14 @@ class FlowMatchingTransformer(nn.Module):
         state_tokens_flat = state_tokens_flat.view(B, T_obs * 1, self.config.d_model)
 
         # ------------------------------
-        # 2. Bounding box encoding
+        # 2. Lightweight vision token encoding
+        # ------------------------------
+        vision_tokens_flat = self._encode_vision_tokens(batch, B, T_obs)
+        if vision_tokens_flat.shape[1] > 0:
+            spatial_outputs["vision_tokens_shape"] = tuple(vision_tokens_flat.shape)
+
+        # ------------------------------
+        # 3. Bounding box encoding
         # ------------------------------
         all_bbox_tokens = []  # Collect bounding box tokens
         
@@ -172,6 +333,7 @@ class FlowMatchingTransformer(nn.Module):
             bbox_tokens_flat, coordinates_normalized = self.box_encoder.encode_tokens_train(
                 box_data, batch
             )
+            spatial_outputs["coordinates_normalized"] = coordinates_normalized
 
             # Apply positional encoding once over the combined sequence
             bbox_tokens_flat = self.box_positional_encoding(bbox_tokens_flat)
@@ -188,11 +350,7 @@ class FlowMatchingTransformer(nn.Module):
                     original_cam_key = self._camera_name_mapping[sanitized_cam_key]
                     batch_key = original_cam_key
                     if batch_key in batch:
-                        img = batch[batch_key]
-                        if img.dim() == 4:  # (B*T, C, H, W)
-                            img = img.view(B, T_obs, 1, *img.shape[-3:])
-                        elif img.dim() == 5:  # (B, T, C, H, W)
-                            img = img.unsqueeze(2)
+                        img = self._reshape_camera_tensor(batch[batch_key], B, T_obs).unsqueeze(2)
 
                         # Initialize object detector if not already initialized
                         if not self._object_detector_initialized:
@@ -263,10 +421,11 @@ class FlowMatchingTransformer(nn.Module):
         else:
             bbox_tokens_combined = torch.empty(B, 0, self.config.d_model, device=batch["observation.state"].device)
         
-        # Combine observation tokens (bounding box tokens) with state tokens
-        context = torch.cat([bbox_tokens_combined, state_tokens_flat], dim=1)
+        # Combine observation tokens (vision + bounding boxes + state)
+        context_parts = [tokens for tokens in [vision_tokens_flat, bbox_tokens_combined, state_tokens_flat] if tokens.shape[1] > 0]
+        context = torch.cat(context_parts, dim=1)
 
-        return context
+        return context, spatial_outputs
 
 
     def velocity_field(self, actions, timesteps, obs_context):
@@ -337,7 +496,7 @@ class FlowMatchingTransformer(nn.Module):
         B, T_act = actions.shape[:2]
         
         # 1. Get observation context
-        obs_context = self.get_condition(batch) # (B, T_obs, d_model)
+        obs_context, _ = self.get_condition(batch) # (B, T_obs, d_model)
                 
         # Infer device from model parameters
         device = next(self.parameters()).device
