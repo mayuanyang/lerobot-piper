@@ -90,7 +90,7 @@ def apply_camera_dropout(batch, camera_keys=["observation.images.front", "observ
     return batch
 
 
-def apply_state_dropout(batch, state_key="observation.state", dropout_prob=0.1):
+def apply_state_dropout(batch, state_key="observation.state", dropout_prob=0.05):
     state = batch[state_key]
     mask = (torch.rand(state.size(0), 1, 1, device=state.device) > dropout_prob).float()
     batch[state_key] = state * mask
