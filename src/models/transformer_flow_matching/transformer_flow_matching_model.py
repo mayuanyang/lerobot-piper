@@ -161,7 +161,7 @@ class FlowMatchingTransformer(nn.Module):
         # ------------------------------
         self.object_detector = None
         self._object_detector_initialized = False
-        self.delta_scaling_factor = 2.0
+        self.time_scale = nn.Parameter(torch.tensor(0.1))
         
         # Camera names for processing
         self.camera_names = config.cameras_for_vision_state_concat if config.cameras_for_vision_state_concat else [
@@ -454,9 +454,11 @@ class FlowMatchingTransformer(nn.Module):
         # Time embedding: (B, d_model) -> (B, 1, d_model)
         time_emb = self.time_embedding(timesteps.float()).unsqueeze(1)
         
+        time_emb = time_emb * self.time_scale  # Scale time embedding to prevent dominating early layers, the norm of time_emb will be around 0.1 * sqrt(d_model) which is comparable to other token embeddings
+        
         # 2. Add time to action tokens
         # We expand time across the action horizon, also scaling it down to prevent dominating the initial layers of the decoder
-        tgt = action_embeddings + 0.5 * time_emb.expand(-1, T_act, -1)
+        tgt = action_embeddings + time_emb.expand(-1, T_act, -1)
         
         # 3. Augment Memory with Time
         # We add the time token to the observation context so the 
@@ -560,10 +562,7 @@ class FlowMatchingTransformer(nn.Module):
             velocity = self.velocity_field(samples, t, obs_context)
             samples = samples + dt * velocity
             
-        # Apply inverse scaling to convert back to original scale
-        # Note: Only apply scaling to delta terms, not the first action
-        samples[:, 1:] = samples[:, 1:] / self.delta_scaling_factor
-            
+                    
         # Convert deltas back to absolute actions
         # First action remains as is, subsequent actions are cumulative sums
         absolute_actions = samples.clone()
