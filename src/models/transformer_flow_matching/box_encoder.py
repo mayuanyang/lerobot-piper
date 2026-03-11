@@ -41,37 +41,16 @@ class BoxEncoder(nn.Module):
         self.camera_embedding = nn.Embedding(self.config.num_cameras, config.d_model)  # 3 cameras: gripper, front, right
 
         # ------------------------------
-        # Token fusion (self-attention across the token sequence)
+        # Token fusion (simplified linear projection for better gradient flow)
         # ------------------------------
-        # Choose a head count that divides d_model to avoid runtime errors.
-        fuse_nhead = int(getattr(config, "box_fuse_nhead", getattr(config, "nhead", 8)))
-        fuse_nhead = max(1, fuse_nhead)
-        while fuse_nhead > 1 and (config.d_model % fuse_nhead) != 0:
-            fuse_nhead -= 1
-        self.fuse_nhead = fuse_nhead
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.d_model,
-            nhead=self.fuse_nhead,
-            dim_feedforward=int(getattr(config, "box_fuse_dim_feedforward", config.d_model * 4)),
-            dropout=float(getattr(config, "box_fuse_dropout", 0.1)),
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        # self.token_fuser = nn.TransformerEncoder(
-        #     encoder_layer, num_layers=int(getattr(config, "box_fuse_num_layers", 2))
-        # )
-        
         self.token_fuser = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model // 2),
-            nn.LayerNorm(config.d_model // 2),
+            nn.Linear(config.d_model, config.d_model),
+            nn.LayerNorm(config.d_model),
             nn.GELU(),
-            nn.Linear(config.d_model // 2, config.d_model)
+            nn.Linear(config.d_model, config.d_model),
+            nn.LayerNorm(config.d_model)
         )
         
-        # self.token_fuser = nn.Linear(config.d_model, config.d_model // 2)  # Simpler fusion method to reduce memory usage
-        self.token_fuser_norm = nn.LayerNorm(config.d_model)
 
     def fuse_tokens(
         self, tokens_flat: torch.Tensor, src_key_padding_mask: Optional[torch.Tensor] = None
@@ -82,8 +61,8 @@ class BoxEncoder(nn.Module):
             tokens_flat: (B, L, d_model)
             src_key_padding_mask: optional (B, L) boolean mask where True indicates padding.
         """
-        fused = self.token_fuser(tokens_flat)
-        return self.token_fuser_norm(fused)
+        return self.token_fuser(tokens_flat)
+        
 
     def encode_boxes_train(self, box_data, batch, image_width=640.0, image_height=400.0):
         """

@@ -141,7 +141,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         nhead=8,
         num_decoder_layers=10,  # Configurable denoising transformer layers
         dim_feedforward=512,  # Smaller feedforward dimension
-        diffusion_step_embed_dim=256,
+        diffusion_step_embed_dim=512,
         num_cameras=3,  # Set number of cameras based on input features
     )
     
@@ -166,12 +166,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         trainable_params = [p for p in policy.model.parameters() if p.requires_grad]
         
         # Print optimizer information
-        print(f"Initializing optimizer with learning rate: 1e-4")
+        print(f"Initializing optimizer with learning rate: 5e-5")
         total_trainable_params = sum(p.numel() for p in trainable_params)
         print(f"Number of trainable parameters: {total_trainable_params}")
         
         
-        optimizer = torch.optim.Adam(trainable_params, lr=5e-5)
+        optimizer = torch.optim.Adam(trainable_params, lr=5e-5, weight_decay=1e-4)
         
         # Print learning rate groups
         print(f"Optimizer parameter groups: {len(optimizer.param_groups)}")

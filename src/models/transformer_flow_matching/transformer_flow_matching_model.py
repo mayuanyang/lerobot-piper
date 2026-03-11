@@ -42,6 +42,7 @@ class ResNet18VisionTokenizer(nn.Module):
             nn.LayerNorm(config.d_model),
             nn.GELU(),
             nn.Linear(config.d_model, config.d_model),
+            nn.LayerNorm(config.d_model),
         )
 
         self.register_buffer(
@@ -214,7 +215,13 @@ class FlowMatchingTransformer(nn.Module):
         # 9. Enhanced Action Encoder / Decoder
         # ------------------------------
         # Dedicated action input projection like VLAFlowMatching
-        self.action_in_proj = nn.Linear(config.action_dim, config.d_model)
+        self.action_in_proj = nn.Sequential(
+            nn.Linear(config.action_dim, config.d_model),
+            nn.LayerNorm(config.d_model),
+            nn.Mish(),
+            nn.Linear(config.d_model, config.d_model),
+            nn.LayerNorm(config.d_model)
+        )
         
         self.action_positional_encoding = PositionalEncoding(config.d_model, config.horizon)
 
@@ -231,16 +238,21 @@ class FlowMatchingTransformer(nn.Module):
             action_layers,
             num_layers=config.num_decoder_layers
         )
+        
         self.velocity_prediction_head = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model // 2),
+            nn.Linear(config.d_model, config.d_model),
+            nn.LayerNorm(config.d_model),
             nn.Mish(),
-            nn.Linear(config.d_model // 2, config.action_dim)
+            nn.Linear(config.d_model, config.action_dim)
         )
+        
         self.time_embedding = nn.Sequential(
             DiffusionSinusoidalPosEmb(config.diffusion_step_embed_dim),
             nn.Linear(config.diffusion_step_embed_dim, config.d_model),
+            nn.LayerNorm(config.d_model),
             nn.Mish(),
-            nn.Linear(config.d_model, config.d_model)
+            nn.Linear(config.d_model, config.d_model),
+            nn.LayerNorm(config.d_model)
         )
 
     def _reshape_camera_tensor(self, image_tensor: torch.Tensor, batch_size: int, t_obs: int) -> torch.Tensor:
@@ -443,8 +455,8 @@ class FlowMatchingTransformer(nn.Module):
         time_emb = self.time_embedding(timesteps.float()).unsqueeze(1)
         
         # 2. Add time to action tokens
-        # We expand time across the action horizon
-        tgt = action_embeddings + time_emb.expand(-1, T_act, -1)
+        # We expand time across the action horizon, also scaling it down to prevent dominating the initial layers of the decoder
+        tgt = action_embeddings + 0.5 * time_emb.expand(-1, T_act, -1)
         
         # 3. Augment Memory with Time
         # We add the time token to the observation context so the 
@@ -479,24 +491,14 @@ class FlowMatchingTransformer(nn.Module):
         return time
 
     def compute_loss(self, batch):
-        """Flow Matching Training: Learn to predict the velocity field."""
+        """Flow Matching Training: Learn to predict the velocity field with improved loss computation."""
         
         actions = batch["action"]     # [B, T, D]
         
-        delta = actions.clone()
-        delta[:,1:] = actions[:,1:] - actions[:,:-1]
-
-        # Apply scaling factor to delta values to make them larger and easier to learn
-        
-        delta[:,1:] = delta[:,1:] * self.delta_scaling_factor
-        
-        batch["action"] = delta
-        
-        actions = batch["action"] # (B, Horizon, Action_Dim)
         B, T_act = actions.shape[:2]
         
         # 1. Get observation context
-        obs_context, _ = self.get_condition(batch) # (B, T_obs, d_model)
+        obs_context, _ = self.get_condition(batch)  # (B, T_obs, d_model)
                 
         # Infer device from model parameters
         device = next(self.parameters()).device
@@ -513,23 +515,27 @@ class FlowMatchingTransformer(nn.Module):
         
         # 5. Predict velocity field
         pred_velocity = self.velocity_field(noisy_actions, timesteps, obs_context)
-        #print(f"pred_velocity mean abs: {pred_velocity.abs().mean():.6f}, max: {pred_velocity.abs().max():.6f}")
         
         # 6. Compute flow matching loss
         # Target velocity is the difference between data and noise
         target_velocity = actions - noise
-        #print(f"target_velocity mean abs: {target_velocity.abs().mean():.6f}, max: {target_velocity.abs().max():.6f}")
         
-        loss = F.mse_loss(pred_velocity, target_velocity, reduction="none")
+        # Compute element-wise MSE loss
+        loss_steps = F.mse_loss(pred_velocity, target_velocity, reduction="none")  # (B, T, D)
         
         # 7. Handle padding if present
         if "action_is_pad" in batch:
             # Apply padding mask: True means padded, False means valid
             in_episode_bound = ~batch["action_is_pad"]  # True for valid actions
-            loss = loss * in_episode_bound.unsqueeze(-1)
+            loss_steps = loss_steps * in_episode_bound.unsqueeze(-1)
         
-        # Return mean loss
-        return loss.mean()
+        # 8. Temporal Weighting: Weight earlier steps in the horizon more
+        # Create a decay curve (e.g., exponential decay), actions closer to the start get higher weight
+        weights = torch.exp(-0.2 * torch.arange(T_act, device=loss_steps.device))
+        weights = weights / weights.sum()  # Normalize
+        weighted_loss = (loss_steps.mean(dim=-1) * weights).sum(dim=-1).mean()
+        
+        return weighted_loss
 
     def forward(self, batch):
         """Inference: Solve ODE using learned velocity field."""
@@ -555,8 +561,14 @@ class FlowMatchingTransformer(nn.Module):
             samples = samples + dt * velocity
             
         # Apply inverse scaling to convert back to original scale
+        # Note: Only apply scaling to delta terms, not the first action
         samples[:, 1:] = samples[:, 1:] / self.delta_scaling_factor
             
+        # Convert deltas back to absolute actions
+        # First action remains as is, subsequent actions are cumulative sums
+        absolute_actions = samples.clone()
+        absolute_actions[:, 1:] = samples[:, 0:1] + torch.cumsum(samples[:, 1:], dim=1)
+            
         # Return both the actions and spatial outputs for visualization
-        return samples, spatial_outputs
+        return absolute_actions, spatial_outputs
 
