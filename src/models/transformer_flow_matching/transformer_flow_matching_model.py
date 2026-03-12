@@ -167,6 +167,10 @@ class FlowMatchingTransformer(nn.Module):
         self.action_scale = nn.Parameter(torch.tensor(1.0))
         self.state_scale = nn.Parameter(torch.tensor(1.0))
         
+        self.state_token_offsets = nn.Parameter(
+            torch.randn(4, config.d_model) * 0.02
+        )
+        
         # Camera names for processing
         self.camera_names = config.cameras_for_vision_state_concat if config.cameras_for_vision_state_concat else [
             f'observation.images.cam_{i}' for i in range(config.num_cameras)
@@ -327,6 +331,9 @@ class FlowMatchingTransformer(nn.Module):
         # Add a singleton token dim to match fusion later
         state_tokens_flat = state_tokens_flat.unsqueeze(2)  # (B, T, 1, d_model)
         state_tokens_flat = state_tokens_flat.view(B, T_obs * 1, self.config.d_model)
+        
+        # Augment state tokens: create 4 tokens for each original token with 1% differences
+        state_tokens_augmented = self._augment_state_tokens(state_tokens_flat, B, T_obs)
 
         # ------------------------------
         # 2. Lightweight vision token encoding
@@ -443,10 +450,21 @@ class FlowMatchingTransformer(nn.Module):
         state_tokens_flat = state_tokens_flat * self.state_scale
         
         # Combine observation tokens (vision + bounding boxes + state)
-        context_parts = [tokens for tokens in [vision_tokens_flat, bbox_tokens_combined, state_tokens_flat] if tokens.shape[1] > 0]
+        context_parts = [tokens for tokens in [vision_tokens_flat, bbox_tokens_combined, state_tokens_augmented] if tokens.shape[1] > 0]
         context = torch.cat(context_parts, dim=1)
 
         return context, spatial_outputs
+
+
+    def _augment_state_tokens(self, state_tokens_flat, B, T_obs):
+
+        offsets = self.state_token_offsets.view(1,1,4,-1)
+
+        tokens = state_tokens_flat.unsqueeze(2) + offsets
+
+        tokens = tokens.view(B, T_obs*4, -1)
+
+        return tokens
 
 
     def velocity_field(self, actions, timesteps, obs_context):
