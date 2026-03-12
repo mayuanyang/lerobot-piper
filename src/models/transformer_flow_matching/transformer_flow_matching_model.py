@@ -162,6 +162,10 @@ class FlowMatchingTransformer(nn.Module):
         self.object_detector = None
         self._object_detector_initialized = False
         self.time_scale = nn.Parameter(torch.tensor(0.1))
+        self.box_scale = nn.Parameter(torch.tensor(1.0))
+        self.vision_scale = nn.Parameter(torch.tensor(1.0))
+        self.action_scale = nn.Parameter(torch.tensor(1.0))
+        self.state_scale = nn.Parameter(torch.tensor(1.0))
         
         # Camera names for processing
         self.camera_names = config.cameras_for_vision_state_concat if config.cameras_for_vision_state_concat else [
@@ -433,6 +437,11 @@ class FlowMatchingTransformer(nn.Module):
         else:
             bbox_tokens_combined = torch.empty(B, 0, self.config.d_model, device=batch["observation.state"].device)
         
+        
+        vision_tokens_flat = vision_tokens_flat * self.vision_scale
+        bbox_tokens_combined = bbox_tokens_combined * self.box_scale
+        state_tokens_flat = state_tokens_flat * self.state_scale
+        
         # Combine observation tokens (vision + bounding boxes + state)
         context_parts = [tokens for tokens in [vision_tokens_flat, bbox_tokens_combined, state_tokens_flat] if tokens.shape[1] > 0]
         context = torch.cat(context_parts, dim=1)
@@ -454,16 +463,18 @@ class FlowMatchingTransformer(nn.Module):
         # Time embedding: (B, d_model) -> (B, 1, d_model)
         time_emb = self.time_embedding(timesteps.float()).unsqueeze(1)
         
+        
+        action_embeddings = action_embeddings * self.action_scale
         time_emb = time_emb * self.time_scale  # Scale time embedding to prevent dominating early layers, the norm of time_emb will be around 0.1 * sqrt(d_model) which is comparable to other token embeddings
         
         # 2. Add time to action tokens
-        # We expand time across the action horizon, also scaling it down to prevent dominating the initial layers of the decoder
+        # We expand time across the action horizon so that each action token is aware of the flow matching time, which can help the model learn time-dependent velocity fields.
         tgt = action_embeddings + time_emb.expand(-1, T_act, -1)
         
         # 3. Augment Memory with Time
         # We add the time token to the observation context so the 
         # cross-attention mechanism is aware of the flow matching time.
-        # extended_memory: (B, 1 + (T_obs * N_tokens), d_model)
+        obs_context = obs_context + time_emb.expand(-1, obs_context.shape[1], -1)  # Add time embedding to observation context tokens as well, so the model can learn time-dependent attention patterns. This is important for flow matching since the optimal velocity field changes over time.
         extended_memory = torch.cat([time_emb, obs_context], dim=1)
         
         # 4. Decoder Pass
@@ -485,12 +496,11 @@ class FlowMatchingTransformer(nn.Module):
 
     
     def sample_time(self, bsize, device):
-        """Sample time using Beta(1.5, 1.0) distribution for better training dynamics"""
-        # Beta(1.5, 1.0) distribution favors earlier timesteps
-        beta_dist = torch.distributions.Beta(concentration1=1.5, concentration0=1.0)
-        time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
-        time = time_beta * 0.999 + 0.001  # Scale to [0.001, 0.999]
-        return time
+        # Sample time t from a Beta distribution to focus on earlier steps in the horizon during training. This can help the model learn more accurate velocity fields for the critical early part of the trajectory.
+        beta_dist = torch.distributions.Beta(1.0, 2.0)
+        t = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
+        t = t * 0.999 + 0.001
+        return t
 
     def compute_loss(self, batch):
         """Flow Matching Training: Learn to predict the velocity field with improved loss computation."""
