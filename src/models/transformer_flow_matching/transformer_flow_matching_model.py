@@ -4,6 +4,7 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torchvision.models as models
+import math
 
 
 # Import ObjectDetector from separate file
@@ -57,6 +58,25 @@ class ResNet18VisionTokenizer(nn.Module):
         if self.freeze_backbone:
             for param in self.backbone.parameters():
                 param.requires_grad = False
+
+        # Apply better initialization
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize vision tokenizer weights with better strategies."""
+        
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    torch.nn.init.constant_(module.bias, 0)
+            elif isinstance(module, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d)):
+                torch.nn.init.constant_(module.bias, 0)
+                torch.nn.init.constant_(module.weight, 1.0)
+
+        # Initialize token projection layers
+        if hasattr(self, 'token_projection'):
+            self.token_projection.apply(_basic_init)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -155,6 +175,7 @@ class FlowMatchingTransformer(nn.Module):
         super().__init__()
         self.config = config
         self.num_bounding_boxes_per_camera = 2
+        self.action_chunk_size = 4  # Action chunking size
 
         # ------------------------------
         # 1. Single shared Object Detector for all cameras (initialize as None)
@@ -162,10 +183,9 @@ class FlowMatchingTransformer(nn.Module):
         self.object_detector = None
         self._object_detector_initialized = False
         self.time_scale = nn.Parameter(torch.tensor(0.1))
-        self.box_scale = nn.Parameter(torch.tensor(1.0))
-        self.vision_scale = nn.Parameter(torch.tensor(1.0))
-        self.action_scale = nn.Parameter(torch.tensor(1.0))
-        self.state_scale = nn.Parameter(torch.tensor(1.0))
+        self.box_scale = nn.Parameter(torch.tensor(1.3))
+        self.vision_scale = nn.Parameter(torch.tensor(0.7))
+        self.state_scale = nn.Parameter(torch.tensor(1.3))
         
         self.state_token_offsets = nn.Parameter(
             torch.randn(4, config.d_model) * 0.02
@@ -208,7 +228,8 @@ class FlowMatchingTransformer(nn.Module):
             nn.LayerNorm(config.d_model),
             nn.GELU(),
             nn.Dropout(p=0.1),
-            nn.Linear(config.d_model, config.d_model)
+            nn.Linear(config.d_model, config.d_model),
+            nn.LayerNorm(config.d_model),
         )
         self.state_positional_encoding = PositionalEncoding(config.d_model)
 
@@ -262,6 +283,74 @@ class FlowMatchingTransformer(nn.Module):
             nn.Linear(config.d_model, config.d_model),
             nn.LayerNorm(config.d_model)
         )
+
+        # Apply better initialization
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize model weights with better strategies."""
+        
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    torch.nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.Embedding):
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            elif isinstance(module, (nn.LayerNorm, nn.GroupNorm, nn.BatchNorm1d, nn.BatchNorm2d)):
+                torch.nn.init.constant_(module.bias, 0)
+                torch.nn.init.constant_(module.weight, 1.0)
+
+        # Initialize all submodules
+        self.apply(_basic_init)
+        
+        # Initialize specific components with specialized strategies
+        
+        # Scale parameters: initialize to reasonable values with small variance
+        if hasattr(self, 'time_scale'):
+            torch.nn.init.normal_(self.time_scale, mean=0.1, std=0.02)
+        if hasattr(self, 'box_scale'):
+            torch.nn.init.normal_(self.box_scale, mean=1.0, std=0.1)
+        if hasattr(self, 'vision_scale'):
+            torch.nn.init.normal_(self.vision_scale, mean=0.7, std=0.1)
+        if hasattr(self, 'state_scale'):
+            torch.nn.init.normal_(self.state_scale, mean=1.0, std=0.1)
+        
+        # State token offsets: initialize with smaller variance for stability
+        if hasattr(self, 'state_token_offsets'):
+            torch.nn.init.normal_(self.state_token_offsets, mean=0.0, std=0.01)
+        
+        # Initialize embedding layers with proper scaling
+        if hasattr(self, 'vision_camera_embedding') and self.vision_camera_embedding is not None:
+            torch.nn.init.normal_(self.vision_camera_embedding.weight, mean=0.0, std=0.02)
+        
+        # Initialize transformer components
+        if hasattr(self, 'actions_expert'):
+            # Initialize transformer decoder layers
+            for decoder_layer in self.actions_expert.layers:
+                # Initialize attention layers
+                if hasattr(decoder_layer, 'self_attn'):
+                    torch.nn.init.xavier_uniform_(decoder_layer.self_attn.in_proj_weight)
+                    torch.nn.init.constant_(decoder_layer.self_attn.out_proj.weight, 0)
+                if hasattr(decoder_layer, 'multihead_attn'):
+                    torch.nn.init.xavier_uniform_(decoder_layer.multihead_attn.in_proj_weight)
+                    torch.nn.init.constant_(decoder_layer.multihead_attn.out_proj.weight, 0)
+                
+                # Initialize FFN layers with scaled init
+                if hasattr(decoder_layer, 'linear1'):
+                    torch.nn.init.xavier_uniform_(decoder_layer.linear1.weight)
+                    torch.nn.init.constant_(decoder_layer.linear1.bias, 0)
+                if hasattr(decoder_layer, 'linear2'):
+                    torch.nn.init.xavier_uniform_(decoder_layer.linear2.weight)
+                    torch.nn.init.constant_(decoder_layer.linear2.bias, 0)
+
+        # Initialize output heads with smaller scale for stability
+        if hasattr(self, 'velocity_prediction_head'):
+            for module in self.velocity_prediction_head.modules():
+                if isinstance(module, nn.Linear):
+                    torch.nn.init.xavier_uniform_(module.weight, gain=0.1)
+                    if module.bias is not None:
+                        torch.nn.init.constant_(module.bias, 0)
 
     def _reshape_camera_tensor(self, image_tensor: torch.Tensor, batch_size: int, t_obs: int) -> torch.Tensor:
         """Normalize camera tensor shapes to (B, T, C, H, W)."""
@@ -444,10 +533,13 @@ class FlowMatchingTransformer(nn.Module):
         else:
             bbox_tokens_combined = torch.empty(B, 0, self.config.d_model, device=batch["observation.state"].device)
         
+        # print(f"vision_tokens_flat mean abs: {vision_tokens_flat.abs().mean():.6f}, max: {vision_tokens_flat.abs().max():.6f}")
+        # print(f"bbox_tokens_combined mean abs: {bbox_tokens_combined.abs().mean():.6f}, max: {bbox_tokens_combined.abs().max():.6f}")
+        # print(f"state_tokens_flat mean abs: {state_tokens_flat.abs().mean():.6f}, max: {state_tokens_flat.abs().max():.6f}")
         
-        vision_tokens_flat = vision_tokens_flat * self.vision_scale
-        bbox_tokens_combined = bbox_tokens_combined * self.box_scale
-        state_tokens_flat = state_tokens_flat * self.state_scale
+        vision_tokens_flat = vision_tokens_flat #* self.vision_scale
+        bbox_tokens_combined = bbox_tokens_combined #* self.box_scale
+        state_tokens_flat = state_tokens_flat #* self.state_scale
         
         # Combine observation tokens (vision + bounding boxes + state)
         context_parts = [tokens for tokens in [vision_tokens_flat, bbox_tokens_combined, state_tokens_augmented] if tokens.shape[1] > 0]
@@ -481,9 +573,9 @@ class FlowMatchingTransformer(nn.Module):
         # Time embedding: (B, d_model) -> (B, 1, d_model)
         time_emb = self.time_embedding(timesteps.float()).unsqueeze(1)
         
+        #print(f"time_emb mean abs: {time_emb.abs().mean():.6f}, max: {time_emb.abs().max():.6f}")
         
-        action_embeddings = action_embeddings * self.action_scale
-        time_emb = time_emb * self.time_scale  # Scale time embedding to prevent dominating early layers, the norm of time_emb will be around 0.1 * sqrt(d_model) which is comparable to other token embeddings
+        time_emb = time_emb #* self.time_scale  # Scale time embedding to prevent dominating early layers, the norm of time_emb will be around 0.1 * sqrt(d_model) which is comparable to other token embeddings
         
         # 2. Add time to action tokens
         # We expand time across the action horizon so that each action token is aware of the flow matching time, which can help the model learn time-dependent velocity fields.

@@ -23,15 +23,29 @@ class BoxEncoder(nn.Module):
         
         # Linear projections for different features
         self.geom_proj = nn.Sequential(
-            nn.Linear(10, config.d_model // 2),
+            nn.Linear(19, config.d_model // 2),
             nn.LayerNorm(config.d_model // 2),
             nn.GELU(),
             nn.Linear(config.d_model // 2, config.d_model)
-        )  # Geometric features: [x1, y1, x2, y2, width, height, center_x, center_y, area, aspect_ratio]
+        )  # Geometric features: [x1, y1, x2, y2, width, height, center_x, center_y, area, aspect_ratio,
+            # distance_to_left, distance_to_right, distance_to_top, distance_to_bottom, diagonal_length, density,
+            # orientation_angle, center_distance_from_image_center_x, center_distance_from_image_center_y]
         
-        self.conf_proj = nn.Linear(1, config.d_model)  # Confidence
-        self.pres_proj = nn.Linear(1, config.d_model)   # Presence (if used in the future)
-        self.center_proj = nn.Linear(2, config.d_model)  # Center coordinates (center_x, center_y)
+        self.conf_proj = nn.Sequential(
+            nn.Linear(1, config.d_model),
+            nn.LayerNorm(config.d_model)
+        )
+        
+        self.pres_proj = nn.Sequential(
+            nn.Linear(1, config.d_model),
+            nn.LayerNorm(config.d_model)
+        )
+        
+        self.center_proj = nn.Sequential(
+            nn.Linear(2, config.d_model),
+            nn.LayerNorm(config.d_model)
+        )  # Center coordinates (center_x, center_y)
+        
         self.missing_box_embedding = nn.Parameter(torch.randn(1, config.d_model))  # Learnable embedding for missing boxes
         
         # Distance token embedding for representing distance between box centers
@@ -51,6 +65,60 @@ class BoxEncoder(nn.Module):
             nn.LayerNorm(config.d_model)
         )
         
+        # Apply better initialization
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize box encoder weights with better strategies."""
+        
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    torch.nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.Embedding):
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            elif isinstance(module, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d)):
+                torch.nn.init.constant_(module.bias, 0)
+                torch.nn.init.constant_(module.weight, 1.0)
+
+        # Initialize all sequential modules
+        if hasattr(self, 'geom_proj'):
+            self.geom_proj.apply(_basic_init)
+        if hasattr(self, 'token_fuser'):
+            self.token_fuser.apply(_basic_init)
+        
+        # Initialize individual linear layers
+        if hasattr(self, 'conf_proj'):
+            torch.nn.init.xavier_uniform_(self.conf_proj.weight)
+            if self.conf_proj.bias is not None:
+                torch.nn.init.constant_(self.conf_proj.bias, 0)
+        if hasattr(self, 'pres_proj'):
+            torch.nn.init.xavier_uniform_(self.pres_proj.weight)
+            if self.pres_proj.bias is not None:
+                torch.nn.init.constant_(self.pres_proj.bias, 0)
+        if hasattr(self, 'center_proj'):
+            torch.nn.init.xavier_uniform_(self.center_proj.weight)
+            if self.center_proj.bias is not None:
+                torch.nn.init.constant_(self.center_proj.bias, 0)
+        if hasattr(self, 'distance_token_embedding'):
+            torch.nn.init.xavier_uniform_(self.distance_token_embedding.weight)
+            if self.distance_token_embedding.bias is not None:
+                torch.nn.init.constant_(self.distance_token_embedding.bias, 0)
+        
+        # Initialize embedding layers
+        if hasattr(self, 'category_embedding'):
+            torch.nn.init.normal_(self.category_embedding.weight, mean=0.0, std=0.02)
+        if hasattr(self, 'camera_embedding'):
+            torch.nn.init.normal_(self.camera_embedding.weight, mean=0.0, std=0.02)
+        
+        # Initialize scale parameters
+        if hasattr(self, 'box_token_scale'):
+            torch.nn.init.normal_(self.box_token_scale, mean=3.0, std=0.1)
+        
+        # Initialize missing box embedding with smaller variance
+        if hasattr(self, 'missing_box_embedding'):
+            torch.nn.init.normal_(self.missing_box_embedding, mean=0.0, std=0.02)
 
     def fuse_tokens(
         self, tokens_flat: torch.Tensor, src_key_padding_mask: Optional[torch.Tensor] = None
@@ -156,6 +224,28 @@ class BoxEncoder(nn.Module):
         center_y = (y1 + y2) * 0.5  # (B, T_obs, 3, 2)
         area = width * height  # (B, T_obs, 3, 2)
         aspect_ratio = width / (height + 1e-6)  # Prevent division by zero
+        
+                
+        # Box position relative to image boundaries
+        distance_to_left = x1  # (B, T_obs, 3, 2)
+        distance_to_right = 1.0 - x2  # (B, T_obs, 3, 2)
+        distance_to_top = y1  # (B, T_obs, 3, 2)
+        distance_to_bottom = 1.0 - y2  # (B, T_obs, 3, 2)
+                
+        # Diagonal length of the box
+        diagonal_length = torch.sqrt(width**2 + height**2)  # (B, T_obs, 3, 2)
+        
+        # Box density (area relative to possible maximum area for this aspect ratio)
+        max_possible_area = torch.minimum(x2, 1.0 - x1) * torch.minimum(y2, 1.0 - y1)  # (B, T_obs, 3, 2)
+        density = area / (max_possible_area + 1e-6)  # (B, T_obs, 3, 2)
+        
+        # Box orientation features (angle of diagonal)
+        orientation_angle = torch.atan2(height, width)  # (B, T_obs, 3, 2)
+        
+                
+        # Additional center-based features
+        center_distance_from_image_center_x = torch.abs(center_x - 0.5)  # (B, T_obs, 3, 2)
+        center_distance_from_image_center_y = torch.abs(center_y - 0.5)  # (B, T_obs, 3, 2)
 
         
         # Calculate distances between the two boxes for each camera
@@ -175,8 +265,15 @@ class BoxEncoder(nn.Module):
         # Flatten distance tokens to (B, T_obs * 3, d_model)
         distance_tokens_flat = distance_tokens.view(B, T_obs * self.config.num_cameras, self.config.d_model)
         
-        # Stack geometric features together: [x1, y1, x2, y2, width, height, center_x, center_y, area, aspect_ratio]
-        geom_features = torch.stack([x1, y1, x2, y2, width, height, center_x, center_y, area, aspect_ratio], dim=-1)  # (B, T_obs, 3, 2, 10)
+        # Stack geometric features together: [x1, y1, x2, y2, width, height, center_x, center_y, area, aspect_ratio,
+        # distance_to_left, distance_to_right, distance_to_top, distance_to_bottom, diagonal_length, density,
+        # orientation_angle, center_distance_from_image_center_x, center_distance_from_image_center_y]
+        geom_features = torch.stack([
+            x1, y1, x2, y2, width, height, center_x, center_y, area, aspect_ratio,
+            distance_to_left, distance_to_right, distance_to_top, distance_to_bottom,
+            diagonal_length, density, orientation_angle,
+            center_distance_from_image_center_x, center_distance_from_image_center_y
+        ], dim=-1)  # (B, T_obs, 3, 2, 19)
         
         # Get category embeddings
         cat_emb = self.category_embedding(category_id)
@@ -266,6 +363,27 @@ class BoxEncoder(nn.Module):
         center_y = (y1 + y2) * 0.5  # (N_boxes,)
         area = width * height  # (N_boxes,)
         aspect_ratio = width / (height + 1e-6)  # Prevent division by zero
+        
+        # Additional spatial features for inference
+        # Box position relative to image boundaries
+        distance_to_left = x1  # (N_boxes,)
+        distance_to_right = 1.0 - x2  # (N_boxes,)
+        distance_to_top = y1  # (N_boxes,)
+        distance_to_bottom = 1.0 - y2  # (N_boxes,)
+        
+        # Diagonal length of the box
+        diagonal_length = torch.sqrt(width**2 + height**2)  # (N_boxes,)
+        
+        # Box density (area relative to possible maximum area for this aspect ratio)
+        max_possible_area = torch.minimum(x2, 1.0 - x1) * torch.minimum(y2, 1.0 - y1)  # (N_boxes,)
+        density = area / (max_possible_area + 1e-6)  # (N_boxes,)
+        
+        # Box orientation features (angle of diagonal)
+        orientation_angle = torch.atan2(height, width)  # (N_boxes,)
+        
+        # Additional center-based features
+        center_distance_from_image_center_x = torch.abs(center_x - 0.5)  # (N_boxes,)
+        center_distance_from_image_center_y = torch.abs(center_y - 0.5)  # (N_boxes,)
 
         # Calculate distance between the two boxes
         distance_token = None
@@ -278,9 +396,16 @@ class BoxEncoder(nn.Module):
             distance_token = self.distance_token_embedding(distance.unsqueeze(0).unsqueeze(0))  # (1, 1, 1, d_model)
             distance_token = distance_token.expand(B_v, T_v, N_v, self.config.d_model)  # (B_v, T_v, N_v, d_model)
         
-        # Stack geometric features together: [x1, y1, x2, y2, width, height, center_x, center_y, area, aspect_ratio]
-        geom_features = torch.stack([x1, y1, x2, y2, width, height, center_x, center_y, area, aspect_ratio], dim=-1)  # (N_boxes, 10)
-        geom_features = geom_features.unsqueeze(0).unsqueeze(0)  # (1, 1, N_boxes, 10)
+        # Stack geometric features together: [x1, y1, x2, y2, width, height, center_x, center_y, area, aspect_ratio,
+        # distance_to_left, distance_to_right, distance_to_top, distance_to_bottom, diagonal_length, density,
+        # orientation_angle, center_distance_from_image_center_x, center_distance_from_image_center_y]
+        geom_features = torch.stack([
+            x1, y1, x2, y2, width, height, center_x, center_y, area, aspect_ratio,
+            distance_to_left, distance_to_right, distance_to_top, distance_to_bottom,
+            diagonal_length, density, orientation_angle,
+            center_distance_from_image_center_x, center_distance_from_image_center_y
+        ], dim=-1)  # (N_boxes, 19)
+        geom_features = geom_features.unsqueeze(0).unsqueeze(0)  # (1, 1, N_boxes, 19)
         
         # Get category embeddings
         cat_emb = self.category_embedding(category_id)
