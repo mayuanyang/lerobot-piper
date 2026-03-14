@@ -274,7 +274,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        num_workers=4,
+        num_workers=8,
         batch_size=128,  # Reduced batch size for better gradient flow
         shuffle=True,
         pin_memory=device.type != "cpu",
@@ -285,7 +285,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     #visualizer = SpatialSoftmaxVisualizer(Path(output_dir) / "spatial_softmax_visualizations")
 
     episode_ids = np.array(dataset.hf_dataset["episode_index"])
-    valid_indices = np.where(episode_ids <= 36)[0]  # first 65 episodes
+    valid_indices = np.where(episode_ids <= 36)[0]  # first 40 episodes
 
     dataset = Subset(dataset, valid_indices)
     print('The partial dataset length', len(dataset))
