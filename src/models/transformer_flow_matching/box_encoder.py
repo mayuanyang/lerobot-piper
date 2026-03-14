@@ -62,7 +62,6 @@ class BoxEncoder(nn.Module):
             nn.LayerNorm(config.d_model),
             nn.GELU(),
             nn.Linear(config.d_model, config.d_model),
-            nn.LayerNorm(config.d_model)
         )
         
         # Apply better initialization

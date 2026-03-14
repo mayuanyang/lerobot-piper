@@ -43,7 +43,6 @@ class ResNet18VisionTokenizer(nn.Module):
             nn.LayerNorm(config.d_model),
             nn.GELU(),
             nn.Linear(config.d_model, config.d_model),
-            nn.LayerNorm(config.d_model),
         )
 
         self.register_buffer(
@@ -182,11 +181,7 @@ class FlowMatchingTransformer(nn.Module):
         # ------------------------------
         self.object_detector = None
         self._object_detector_initialized = False
-        self.time_scale = nn.Parameter(torch.tensor(0.1))
-        self.box_scale = nn.Parameter(torch.tensor(1.3))
-        self.vision_scale = nn.Parameter(torch.tensor(0.7))
-        self.state_scale = nn.Parameter(torch.tensor(1.3))
-        
+                
         self.state_token_offsets = nn.Parameter(
             torch.randn(4, config.d_model) * 0.02
         )
@@ -229,9 +224,10 @@ class FlowMatchingTransformer(nn.Module):
             nn.GELU(),
             nn.Dropout(p=0.1),
             nn.Linear(config.d_model, config.d_model),
-            nn.LayerNorm(config.d_model),
         )
         self.state_positional_encoding = PositionalEncoding(config.d_model)
+        
+        self.context_norm = nn.LayerNorm(config.d_model)
 
 
         # ------------------------------
@@ -249,9 +245,8 @@ class FlowMatchingTransformer(nn.Module):
             nn.LayerNorm(config.d_model),
             nn.Mish(),
             nn.Linear(config.d_model, config.d_model),
-            nn.LayerNorm(config.d_model)
         )
-        
+                
         self.action_positional_encoding = PositionalEncoding(config.d_model, config.horizon)
 
         action_layers = nn.TransformerDecoderLayer(
@@ -306,15 +301,6 @@ class FlowMatchingTransformer(nn.Module):
         
         # Initialize specific components with specialized strategies
         
-        # Scale parameters: initialize to reasonable values with small variance
-        if hasattr(self, 'time_scale'):
-            torch.nn.init.normal_(self.time_scale, mean=0.1, std=0.02)
-        if hasattr(self, 'box_scale'):
-            torch.nn.init.normal_(self.box_scale, mean=1.0, std=0.1)
-        if hasattr(self, 'vision_scale'):
-            torch.nn.init.normal_(self.vision_scale, mean=0.7, std=0.1)
-        if hasattr(self, 'state_scale'):
-            torch.nn.init.normal_(self.state_scale, mean=1.0, std=0.1)
         
         # State token offsets: initialize with smaller variance for stability
         if hasattr(self, 'state_token_offsets'):
@@ -537,13 +523,15 @@ class FlowMatchingTransformer(nn.Module):
         # print(f"bbox_tokens_combined mean abs: {bbox_tokens_combined.abs().mean():.6f}, max: {bbox_tokens_combined.abs().max():.6f}")
         # print(f"state_tokens_flat mean abs: {state_tokens_flat.abs().mean():.6f}, max: {state_tokens_flat.abs().max():.6f}")
         
-        vision_tokens_flat = vision_tokens_flat #* self.vision_scale
-        bbox_tokens_combined = bbox_tokens_combined #* self.box_scale
-        state_tokens_flat = state_tokens_flat #* self.state_scale
+        vision_tokens_flat = vision_tokens_flat
+        bbox_tokens_combined = bbox_tokens_combined
+        state_tokens_flat = state_tokens_flat
         
         # Combine observation tokens (vision + bounding boxes + state)
         context_parts = [tokens for tokens in [vision_tokens_flat, bbox_tokens_combined, state_tokens_augmented] if tokens.shape[1] > 0]
         context = torch.cat(context_parts, dim=1)
+        
+        context = self.context_norm(context)
 
         return context, spatial_outputs
 
@@ -558,6 +546,18 @@ class FlowMatchingTransformer(nn.Module):
 
         return tokens
 
+
+    def _generate_causal_mask(self, seq_len, device):
+        """
+        Generate causal mask so position i cannot attend to positions > i.
+        Shape: (seq_len, seq_len)
+        """
+        mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=device),
+            diagonal=1
+        )
+        mask = mask.masked_fill(mask == 1, float("-inf"))
+        return mask
 
     def velocity_field(self, actions, timesteps, obs_context):
         """
@@ -575,7 +575,7 @@ class FlowMatchingTransformer(nn.Module):
         
         #print(f"time_emb mean abs: {time_emb.abs().mean():.6f}, max: {time_emb.abs().max():.6f}")
         
-        time_emb = time_emb #* self.time_scale  # Scale time embedding to prevent dominating early layers, the norm of time_emb will be around 0.1 * sqrt(d_model) which is comparable to other token embeddings
+        time_emb = time_emb
         
         # 2. Add time to action tokens
         # We expand time across the action horizon so that each action token is aware of the flow matching time, which can help the model learn time-dependent velocity fields.
@@ -587,13 +587,18 @@ class FlowMatchingTransformer(nn.Module):
         obs_context = obs_context + time_emb.expand(-1, obs_context.shape[1], -1)  # Add time embedding to observation context tokens as well, so the model can learn time-dependent attention patterns. This is important for flow matching since the optimal velocity field changes over time.
         extended_memory = torch.cat([time_emb, obs_context], dim=1)
         
+        
+        # Create causal mask
+        causal_mask = self._generate_causal_mask(T_act, tgt.device)
+        
         # 4. Decoder Pass
         # Self-attention ensures T_act is a smooth curve.
         # Cross-attention aligns T_act with your CropConvNet features.
         # Allow actions to attend to all tokens (time, vision, and state)
         velocity_features = self.actions_expert(
             tgt=tgt,
-            memory=extended_memory
+            memory=extended_memory,
+            tgt_mask=causal_mask
         )
         #print(f"velocity_features mean abs: {velocity_features.abs().mean():.6f}, max: {velocity_features.abs().max():.6f}")
         
