@@ -40,9 +40,9 @@ class ResNet18VisionTokenizer(nn.Module):
         self.spatial_pool = nn.AdaptiveAvgPool2d((self.pool_rows, self.pool_cols))
         self.token_projection = nn.Sequential(
             nn.Linear(512, config.d_model),
-            nn.LayerNorm(config.d_model),
             nn.GELU(),
             nn.Linear(config.d_model, config.d_model),
+            nn.LayerNorm(config.d_model)
         )
 
         self.register_buffer(
@@ -220,14 +220,8 @@ class FlowMatchingTransformer(nn.Module):
         # ------------------------------
         self.state_encoder = nn.Sequential(
             nn.Linear(config.state_dim, config.d_model),
-            nn.LayerNorm(config.d_model),
-            nn.GELU(),
-            nn.Dropout(p=0.1),
-            nn.Linear(config.d_model, config.d_model),
         )
         self.state_positional_encoding = PositionalEncoding(config.d_model)
-        
-        self.context_norm = nn.LayerNorm(config.d_model)
 
 
         # ------------------------------
@@ -242,9 +236,6 @@ class FlowMatchingTransformer(nn.Module):
         # Dedicated action input projection like VLAFlowMatching
         self.action_in_proj = nn.Sequential(
             nn.Linear(config.action_dim, config.d_model),
-            nn.LayerNorm(config.d_model),
-            nn.Mish(),
-            nn.Linear(config.d_model, config.d_model),
         )
                 
         self.action_positional_encoding = PositionalEncoding(config.d_model, config.horizon)
@@ -264,10 +255,7 @@ class FlowMatchingTransformer(nn.Module):
         )
         
         self.velocity_prediction_head = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model),
-            nn.LayerNorm(config.d_model),
-            nn.Mish(),
-            nn.Linear(config.d_model, config.action_dim)
+            nn.Linear(config.d_model, config.d_model)
         )
         
         self.time_embedding = nn.Sequential(
@@ -531,8 +519,6 @@ class FlowMatchingTransformer(nn.Module):
         context_parts = [tokens for tokens in [vision_tokens_flat, bbox_tokens_combined, state_tokens_augmented] if tokens.shape[1] > 0]
         context = torch.cat(context_parts, dim=1)
         
-        context = self.context_norm(context)
-
         return context, spatial_outputs
 
 
@@ -559,15 +545,15 @@ class FlowMatchingTransformer(nn.Module):
         mask = mask.masked_fill(mask == 1, float("-inf"))
         return mask
 
-    def velocity_field(self, actions, timesteps, obs_context):
+    def velocity_field(self, noisy_actions, timesteps, obs_context):
         """
         Flow Matching step:
         Predicts the velocity field that transports samples from Gaussian to data distribution.
         """
-        B, T_act, _ = actions.shape
+        B, T_act, _ = noisy_actions.shape
         
         # 1. Action & Time Embeddings (enhanced like VLAFlowMatching)
-        action_embeddings = self.action_in_proj(actions)  # Use dedicated input projection
+        action_embeddings = self.action_in_proj(noisy_actions)  # Use dedicated input projection
         action_embeddings = self.action_positional_encoding(action_embeddings)
         
         # Time embedding: (B, d_model) -> (B, 1, d_model)
@@ -575,7 +561,6 @@ class FlowMatchingTransformer(nn.Module):
         
         #print(f"time_emb mean abs: {time_emb.abs().mean():.6f}, max: {time_emb.abs().max():.6f}")
         
-        time_emb = time_emb
         
         # 2. Add time to action tokens
         # We expand time across the action horizon so that each action token is aware of the flow matching time, which can help the model learn time-dependent velocity fields.
@@ -584,12 +569,8 @@ class FlowMatchingTransformer(nn.Module):
         # 3. Augment Memory with Time
         # We add the time token to the observation context so the 
         # cross-attention mechanism is aware of the flow matching time.
-        obs_context = obs_context + time_emb.expand(-1, obs_context.shape[1], -1)  # Add time embedding to observation context tokens as well, so the model can learn time-dependent attention patterns. This is important for flow matching since the optimal velocity field changes over time.
+        
         extended_memory = torch.cat([time_emb, obs_context], dim=1)
-        
-        
-        # Create causal mask
-        causal_mask = self._generate_causal_mask(T_act, tgt.device)
         
         # 4. Decoder Pass
         # Self-attention ensures T_act is a smooth curve.
@@ -597,8 +578,7 @@ class FlowMatchingTransformer(nn.Module):
         # Allow actions to attend to all tokens (time, vision, and state)
         velocity_features = self.actions_expert(
             tgt=tgt,
-            memory=extended_memory,
-            tgt_mask=causal_mask
+            memory=extended_memory
         )
         #print(f"velocity_features mean abs: {velocity_features.abs().mean():.6f}, max: {velocity_features.abs().max():.6f}")
         
@@ -611,11 +591,11 @@ class FlowMatchingTransformer(nn.Module):
 
     
     def sample_time(self, bsize, device):
-        # Sample time t from a Beta distribution to focus on earlier steps in the horizon during training. This can help the model learn more accurate velocity fields for the critical early part of the trajectory.
-        beta_dist = torch.distributions.Beta(1.0, 2.0)
-        t = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
-        t = t * 0.999 + 0.001
-        return t
+        # Sample time from a Beta distribution to encourage learning across the entire flow matching trajectory, with more emphasis on mid-range times.
+        beta_dist = torch.distributions.Beta(concentration1=1.5, concentration0=1.0)
+        time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
+        time = time_beta * 0.999 + 0.001
+        return time
 
     def compute_loss(self, batch):
         """Flow Matching Training: Learn to predict the velocity field with improved loss computation."""
@@ -635,7 +615,7 @@ class FlowMatchingTransformer(nn.Module):
         
         # 3. Sample Gaussian noise
         noise = torch.randn_like(actions, device=device)
-        
+
         # 4. Construct flow matching targets (straight line coupling)
         # Interpolate between noise and data
         noisy_actions = (1 - timesteps[:, None, None]) * noise + timesteps[:, None, None] * actions
@@ -656,13 +636,8 @@ class FlowMatchingTransformer(nn.Module):
             in_episode_bound = ~batch["action_is_pad"]  # True for valid actions
             loss_steps = loss_steps * in_episode_bound.unsqueeze(-1)
         
-        # 8. Temporal Weighting: Weight earlier steps in the horizon more
-        # Create a decay curve (e.g., exponential decay), actions closer to the start get higher weight
-        weights = torch.exp(-0.2 * torch.arange(T_act, device=loss_steps.device))
-        weights = weights / weights.sum()  # Normalize
-        weighted_loss = (loss_steps.mean(dim=-1) * weights).sum(dim=-1).mean()
-        
-        return weighted_loss
+        loss = loss_steps.mean()
+        return loss
 
     def forward(self, batch):
         """Inference: Solve ODE using learned velocity field."""
@@ -683,16 +658,11 @@ class FlowMatchingTransformer(nn.Module):
         dt = 1.0 / num_steps
         
         for i in range(num_steps):
-            t = torch.full((B,), i / num_steps, device=device)
+            t = torch.full((B,), (i + 0.5) / num_steps, device=device)
             velocity = self.velocity_field(samples, t, obs_context)
             samples = samples + dt * velocity
             
-                    
-        # Convert deltas back to absolute actions
-        # First action remains as is, subsequent actions are cumulative sums
-        absolute_actions = samples.clone()
-        absolute_actions[:, 1:] = samples[:, 0:1] + torch.cumsum(samples[:, 1:], dim=1)
             
         # Return both the actions and spatial outputs for visualization
-        return absolute_actions, spatial_outputs
+        return samples, spatial_outputs
 

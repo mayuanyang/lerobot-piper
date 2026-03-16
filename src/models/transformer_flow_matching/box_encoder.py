@@ -26,7 +26,9 @@ class BoxEncoder(nn.Module):
             nn.Linear(19, config.d_model // 2),
             nn.LayerNorm(config.d_model // 2),
             nn.GELU(),
-            nn.Linear(config.d_model // 2, config.d_model)
+            nn.Linear(config.d_model // 2, config.d_model),
+            nn.LayerNorm(config.d_model)
+            
         )  # Geometric features: [x1, y1, x2, y2, width, height, center_x, center_y, area, aspect_ratio,
             # distance_to_left, distance_to_right, distance_to_top, distance_to_bottom, diagonal_length, density,
             # orientation_angle, center_distance_from_image_center_x, center_distance_from_image_center_y]
@@ -62,6 +64,7 @@ class BoxEncoder(nn.Module):
             nn.LayerNorm(config.d_model),
             nn.GELU(),
             nn.Linear(config.d_model, config.d_model),
+            nn.LayerNorm(config.d_model)
         )
         
         # Apply better initialization
@@ -86,20 +89,14 @@ class BoxEncoder(nn.Module):
             self.geom_proj.apply(_basic_init)
         if hasattr(self, 'token_fuser'):
             self.token_fuser.apply(_basic_init)
+        if hasattr(self, 'conf_proj'):
+            self.conf_proj.apply(_basic_init)
+        if hasattr(self, 'pres_proj'):
+            self.pres_proj.apply(_basic_init)
+        if hasattr(self, 'center_proj'):
+            self.center_proj.apply(_basic_init)
         
         # Initialize individual linear layers
-        if hasattr(self, 'conf_proj'):
-            torch.nn.init.xavier_uniform_(self.conf_proj.weight)
-            if self.conf_proj.bias is not None:
-                torch.nn.init.constant_(self.conf_proj.bias, 0)
-        if hasattr(self, 'pres_proj'):
-            torch.nn.init.xavier_uniform_(self.pres_proj.weight)
-            if self.pres_proj.bias is not None:
-                torch.nn.init.constant_(self.pres_proj.bias, 0)
-        if hasattr(self, 'center_proj'):
-            torch.nn.init.xavier_uniform_(self.center_proj.weight)
-            if self.center_proj.bias is not None:
-                torch.nn.init.constant_(self.center_proj.bias, 0)
         if hasattr(self, 'distance_token_embedding'):
             torch.nn.init.xavier_uniform_(self.distance_token_embedding.weight)
             if self.distance_token_embedding.bias is not None:
