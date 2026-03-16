@@ -181,6 +181,7 @@ class FlowMatchingTransformer(nn.Module):
         # ------------------------------
         self.object_detector = None
         self._object_detector_initialized = False
+        self.time_embedding_scale = nn.Parameter(torch.tensor(0.1))  # Learnable scaling for time embedding
                 
         self.state_token_offsets = nn.Parameter(
             torch.randn(4, config.d_model) * 0.02
@@ -220,6 +221,7 @@ class FlowMatchingTransformer(nn.Module):
         # ------------------------------
         self.state_encoder = nn.Sequential(
             nn.Linear(config.state_dim, config.d_model),
+            nn.LayerNorm(config.d_model),
         )
         self.state_positional_encoding = PositionalEncoding(config.d_model)
 
@@ -236,6 +238,7 @@ class FlowMatchingTransformer(nn.Module):
         # Dedicated action input projection like VLAFlowMatching
         self.action_in_proj = nn.Sequential(
             nn.Linear(config.action_dim, config.d_model),
+            nn.LayerNorm(config.d_model),
         )
                 
         self.action_positional_encoding = PositionalEncoding(config.d_model, config.horizon)
@@ -255,7 +258,7 @@ class FlowMatchingTransformer(nn.Module):
         )
         
         self.velocity_prediction_head = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model)
+            nn.Linear(config.d_model, config.action_dim),
         )
         
         self.time_embedding = nn.Sequential(
@@ -557,7 +560,7 @@ class FlowMatchingTransformer(nn.Module):
         action_embeddings = self.action_positional_encoding(action_embeddings)
         
         # Time embedding: (B, d_model) -> (B, 1, d_model)
-        time_emb = self.time_embedding(timesteps.float()).unsqueeze(1)
+        time_emb = self.time_embedding_scale * self.time_embedding(timesteps.float()).unsqueeze(1)
         
         #print(f"time_emb mean abs: {time_emb.abs().mean():.6f}, max: {time_emb.abs().max():.6f}")
         
@@ -566,11 +569,8 @@ class FlowMatchingTransformer(nn.Module):
         # We expand time across the action horizon so that each action token is aware of the flow matching time, which can help the model learn time-dependent velocity fields.
         tgt = action_embeddings + time_emb.expand(-1, T_act, -1)
         
-        # 3. Augment Memory with Time
-        # We add the time token to the observation context so the 
-        # cross-attention mechanism is aware of the flow matching time.
-        
-        extended_memory = torch.cat([time_emb, obs_context], dim=1)
+        # 3. The Memory        
+        extended_memory = obs_context
         
         # 4. Decoder Pass
         # Self-attention ensures T_act is a smooth curve.
@@ -627,8 +627,15 @@ class FlowMatchingTransformer(nn.Module):
         # Target velocity is the difference between data and noise
         target_velocity = actions - noise
         
-        # Compute element-wise MSE loss
-        loss_steps = F.mse_loss(pred_velocity, target_velocity, reduction="none")  # (B, T, D)
+        # Use a weighting scheme that down weight mid-range times to encourage learning at the endpoints of the flow, which can help with stability and convergence.
+        weight = (timesteps[:, None, None] ** 2 + (1 - timesteps[:, None, None]) ** 2)
+
+        loss_steps = weight * F.mse_loss(
+            pred_velocity,
+            target_velocity,
+            reduction="none"
+        )
+
         
         # 7. Handle padding if present
         if "action_is_pad" in batch:
@@ -653,14 +660,21 @@ class FlowMatchingTransformer(nn.Module):
         # Start from pure Gaussian noise
         samples = torch.randn((B, T_act, self.config.action_dim), device=device)
         
-        # Solve ODE using Euler integration
+        # This is RK2 / midpoint solver.
         num_steps = int(self.num_inference_steps.item())
         dt = 1.0 / num_steps
         
         for i in range(num_steps):
-            t = torch.full((B,), (i + 0.5) / num_steps, device=device)
-            velocity = self.velocity_field(samples, t, obs_context)
-            samples = samples + dt * velocity
+            t = torch.full((B,), i / num_steps, device=device)
+
+            v1 = self.velocity_field(samples, t, obs_context)
+
+            midpoint = samples + 0.5 * dt * v1
+            t_mid = torch.full((B,), (i + 0.5) / num_steps, device=device)
+
+            v2 = self.velocity_field(midpoint, t_mid, obs_context)
+
+            samples = samples + dt * v2
             
             
         # Return both the actions and spatial outputs for visualization
