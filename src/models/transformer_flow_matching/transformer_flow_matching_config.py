@@ -30,7 +30,7 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     use_vision_tokens: bool = True
     use_pretrained_vision_backbone: bool = True
     freeze_vision_backbone: bool = True
-    vision_input_size: int = 160
+    vision_input_size: int = 225
     vision_token_rows: int = 2
     vision_token_cols: int = 2
     

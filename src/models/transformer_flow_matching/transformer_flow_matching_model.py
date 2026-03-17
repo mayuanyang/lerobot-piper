@@ -18,7 +18,7 @@ class ResNet18VisionTokenizer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.input_size = int(getattr(config, "vision_input_size", 160))
+        self.input_size = int(getattr(config, "vision_input_size", 225))
         self.pool_rows = int(getattr(config, "vision_token_rows", 2))
         self.pool_cols = int(getattr(config, "vision_token_cols", 2))
         self.freeze_backbone = bool(getattr(config, "freeze_vision_backbone", True))
@@ -221,6 +221,7 @@ class FlowMatchingTransformer(nn.Module):
         # ------------------------------
         self.state_encoder = nn.Sequential(
             nn.Linear(config.state_dim, config.d_model),
+            nn.Mish(),
             nn.LayerNorm(config.d_model),
         )
         self.state_positional_encoding = PositionalEncoding(config.d_model)
@@ -237,7 +238,10 @@ class FlowMatchingTransformer(nn.Module):
         # ------------------------------
         # Dedicated action input projection like VLAFlowMatching
         self.action_in_proj = nn.Sequential(
-            nn.Linear(config.action_dim, config.d_model),
+            nn.Linear(config.action_dim, config.d_model // 2),
+            nn.Mish(),
+            nn.LayerNorm(config.d_model // 2),
+            nn.Linear(config.d_model // 2, config.d_model),
             nn.LayerNorm(config.d_model),
         )
                 
@@ -264,11 +268,13 @@ class FlowMatchingTransformer(nn.Module):
         self.time_embedding = nn.Sequential(
             DiffusionSinusoidalPosEmb(config.diffusion_step_embed_dim),
             nn.Linear(config.diffusion_step_embed_dim, config.d_model),
-            nn.LayerNorm(config.d_model),
             nn.Mish(),
+            nn.LayerNorm(config.d_model),
             nn.Linear(config.d_model, config.d_model),
             nn.LayerNorm(config.d_model)
         )
+        
+        self.obs_batch_norm = nn.LayerNorm(config.d_model)
 
         # Apply better initialization
         self._init_weights()
@@ -391,6 +397,8 @@ class FlowMatchingTransformer(nn.Module):
         # 1. State encoding (compute once for reuse)
         # ------------------------------
         state_tokens = self.state_encoder(batch["observation.state"])  # (B, T, d_model)
+        
+
         state_tokens = self.state_positional_encoding(state_tokens)
         # Flatten time dimension
         state_tokens_flat = state_tokens.view(B, T_obs, self.config.d_model)
@@ -405,6 +413,7 @@ class FlowMatchingTransformer(nn.Module):
         # 2. Lightweight vision token encoding
         # ------------------------------
         vision_tokens_flat = self._encode_vision_tokens(batch, B, T_obs)
+        
         if vision_tokens_flat.shape[1] > 0:
             spatial_outputs["vision_tokens_shape"] = tuple(vision_tokens_flat.shape)
 
@@ -510,13 +519,14 @@ class FlowMatchingTransformer(nn.Module):
         else:
             bbox_tokens_combined = torch.empty(B, 0, self.config.d_model, device=batch["observation.state"].device)
         
-        # print(f"vision_tokens_flat mean abs: {vision_tokens_flat.abs().mean():.6f}, max: {vision_tokens_flat.abs().max():.6f}")
-        # print(f"bbox_tokens_combined mean abs: {bbox_tokens_combined.abs().mean():.6f}, max: {bbox_tokens_combined.abs().max():.6f}")
-        # print(f"state_tokens_flat mean abs: {state_tokens_flat.abs().mean():.6f}, max: {state_tokens_flat.abs().max():.6f}")
+        vision_tokens_flat = vision_tokens_flat * 0.5
+        bbox_tokens_combined = bbox_tokens_combined * 0.6
+        state_tokens_flat = state_tokens_flat * 1.0
+
+        # print(f"vision_tokens_flat norm: {vision_tokens_flat.norm():.6f}, max: {vision_tokens_flat.abs().max():.6f}")
+        # print(f"bbox_tokens_combined norm: {bbox_tokens_combined.norm():.6f}, max: {bbox_tokens_combined.abs().max():.6f}")
+        # print(f"state_tokens_flat norm: {state_tokens_flat.norm():.6f}, max: {state_tokens_flat.abs().max():.6f}")
         
-        vision_tokens_flat = vision_tokens_flat
-        bbox_tokens_combined = bbox_tokens_combined
-        state_tokens_flat = state_tokens_flat
         
         # Combine observation tokens (vision + bounding boxes + state)
         context_parts = [tokens for tokens in [vision_tokens_flat, bbox_tokens_combined, state_tokens_augmented] if tokens.shape[1] > 0]
@@ -560,18 +570,24 @@ class FlowMatchingTransformer(nn.Module):
         action_embeddings = self.action_positional_encoding(action_embeddings)
         
         # Time embedding: (B, d_model) -> (B, 1, d_model)
-        time_emb = self.time_embedding_scale * self.time_embedding(timesteps.float()).unsqueeze(1)
+        time_emb = 0.1 * self.time_embedding(timesteps.float()).unsqueeze(1)
         
-        #print(f"time_emb mean abs: {time_emb.abs().mean():.6f}, max: {time_emb.abs().max():.6f}")
+        #print(f"time_emb mean abs: {time_emb.norm():.6f}, max: {time_emb.abs().max():.6f}")
         
         
         # 2. Add time to action tokens
         # We expand time across the action horizon so that each action token is aware of the flow matching time, which can help the model learn time-dependent velocity fields.
         tgt = action_embeddings + time_emb.expand(-1, T_act, -1)
         
-        # 3. The Memory        
-        extended_memory = obs_context
-        
+        # 3. The Memory - Apply BatchNormalizalii ots stabibizeztraraingg
+        # Normalize obs_context trunadviatineernifdcevgrdate s_cfom =dsl_prbveogmasxetrsflow 2)).transpose(1, 2)
+        extended_memory = self.obs_batch_norm(obs_context)
+                
+        # print(f"action_embeddings mean abs: {torch.norm(action_embeddings, dim=2).mean()}, max: {action_embeddings.abs().max():.6f}")
+        # print(f"time_emb mean abs: {torch.norm(time_emb, dim=2).mean()}, max: {time_emb.abs().max():.6f}")
+        # print(f"extended_memory mean abs: {torch.norm(extended_memory, dim=2).mean()}, max: {extended_memory.abs().max():.6f}")
+        # print(f"tgt mean abs: {torch.norm(tgt, dim=2).mean()}, max: {tgt.abs().max():.6f}")
+
         # 4. Decoder Pass
         # Self-attention ensures T_act is a smooth curve.
         # Cross-attention aligns T_act with your CropConvNet features.
@@ -580,7 +596,9 @@ class FlowMatchingTransformer(nn.Module):
             tgt=tgt,
             memory=extended_memory
         )
-        #print(f"velocity_features mean abs: {velocity_features.abs().mean():.6f}, max: {velocity_features.abs().max():.6f}")
+        
+
+        #print(f"velocity_features mean abs: {velocity_features.norm():.6f}, max: {velocity_features.abs().max():.6f}")
         
         
         # Residual connection to preserve gradients

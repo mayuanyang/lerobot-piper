@@ -24,8 +24,8 @@ class BoxEncoder(nn.Module):
         # Linear projections for different features
         self.geom_proj = nn.Sequential(
             nn.Linear(19, config.d_model // 2),
-            nn.LayerNorm(config.d_model // 2),
             nn.GELU(),
+            nn.LayerNorm(config.d_model // 2),
             nn.Linear(config.d_model // 2, config.d_model),
             nn.LayerNorm(config.d_model)
             
@@ -35,17 +35,21 @@ class BoxEncoder(nn.Module):
         
         self.conf_proj = nn.Sequential(
             nn.Linear(1, config.d_model),
-            nn.LayerNorm(config.d_model)
+            nn.GELU(),
+            nn.LayerNorm(config.d_model),
         )
         
         self.pres_proj = nn.Sequential(
             nn.Linear(1, config.d_model),
-            nn.LayerNorm(config.d_model)
+            nn.GELU(),
+            nn.LayerNorm(config.d_model),
         )
         
         self.center_proj = nn.Sequential(
             nn.Linear(2, config.d_model),
-            nn.LayerNorm(config.d_model)
+            nn.GELU(),
+            nn.LayerNorm(config.d_model),
+            
         )  # Center coordinates (center_x, center_y)
         
         self.missing_box_embedding = nn.Parameter(torch.randn(1, config.d_model))  # Learnable embedding for missing boxes
@@ -61,8 +65,8 @@ class BoxEncoder(nn.Module):
         # ------------------------------
         self.token_fuser = nn.Sequential(
             nn.Linear(config.d_model, config.d_model),
-            nn.LayerNorm(config.d_model),
             nn.GELU(),
+            nn.LayerNorm(config.d_model),
             nn.Linear(config.d_model, config.d_model),
             nn.LayerNorm(config.d_model)
         )
