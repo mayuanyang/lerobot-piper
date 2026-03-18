@@ -225,6 +225,16 @@ class FlowMatchingTransformer(nn.Module):
             nn.LayerNorm(config.d_model),
         )
         self.state_positional_encoding = PositionalEncoding(config.d_model)
+        
+        # State cross attention component
+        self.state_cross_attn = nn.MultiheadAttention(
+            embed_dim=config.d_model,
+            num_heads=config.nhead,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.state_cross_attn_norm = nn.LayerNorm(config.d_model)
+        self.state_cross_attn_dropout = nn.Dropout(0.1)
 
 
         # ------------------------------
@@ -522,6 +532,20 @@ class FlowMatchingTransformer(nn.Module):
         vision_tokens_flat = vision_tokens_flat * 0.5
         bbox_tokens_combined = bbox_tokens_combined * 0.6
         state_tokens_flat = state_tokens_flat * 1.0
+
+        # Apply state cross attention: state tokens cross attend to vision and box tokens
+        vision_and_box_tokens = torch.cat([vision_tokens_flat, bbox_tokens_combined], dim=1)
+        if vision_and_box_tokens.shape[1] > 0:
+            # Apply cross attention: state tokens as queries, vision+box tokens as keys/values
+            state_cross_attn_out, _ = self.state_cross_attn(
+                query=state_tokens_augmented,
+                key=vision_and_box_tokens,
+                value=vision_and_box_tokens
+            )
+            # Apply residual connection and normalization
+            state_tokens_augmented = self.state_cross_attn_norm(
+                state_tokens_augmented + self.state_cross_attn_dropout(state_cross_attn_out)
+            )
 
         # print(f"vision_tokens_flat norm: {vision_tokens_flat.norm():.6f}, max: {vision_tokens_flat.abs().max():.6f}")
         # print(f"bbox_tokens_combined norm: {bbox_tokens_combined.norm():.6f}, max: {bbox_tokens_combined.abs().max():.6f}")
