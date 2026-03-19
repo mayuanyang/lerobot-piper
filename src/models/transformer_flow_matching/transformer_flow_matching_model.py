@@ -175,14 +175,18 @@ class FlowMatchingTransformer(nn.Module):
         self.config = config
         self.num_bounding_boxes_per_camera = 2
         self.action_chunk_size = 4  # Action chunking size
+        
+        self.state_scale = nn.Parameter(torch.tensor(0.0))  # Learnable scaling for state tokens
+        self.vision_scale = nn.Parameter(torch.tensor(0.0))  # Learnable scaling for vision tokens
+        self.box_scale = nn.Parameter(torch.tensor(0.0))     # Learnable scaling for box tokens
+        self.time_embedding_scale = nn.Parameter(torch.tensor(0.0))  # Learnable scaling for time embedding
 
         # ------------------------------
         # 1. Single shared Object Detector for all cameras (initialize as None)
         # ------------------------------
         self.object_detector = None
         self._object_detector_initialized = False
-        self.time_embedding_scale = nn.Parameter(torch.tensor(0.1))  # Learnable scaling for time embedding
-                
+                        
         self.state_token_offsets = nn.Parameter(
             torch.randn(4, config.d_model) * 0.02
         )
@@ -284,7 +288,7 @@ class FlowMatchingTransformer(nn.Module):
             nn.LayerNorm(config.d_model)
         )
         
-        self.obs_batch_norm = nn.LayerNorm(config.d_model)
+        #self.obs_batch_norm = nn.LayerNorm(config.d_model)
 
         # Apply better initialization
         self._init_weights()
@@ -529,9 +533,9 @@ class FlowMatchingTransformer(nn.Module):
         else:
             bbox_tokens_combined = torch.empty(B, 0, self.config.d_model, device=batch["observation.state"].device)
         
-        vision_tokens_flat = vision_tokens_flat * 0.5
-        bbox_tokens_combined = bbox_tokens_combined * 0.6
-        state_tokens_flat = state_tokens_flat * 1.0
+        vision_tokens_flat = vision_tokens_flat * self.vision_scale
+        bbox_tokens_combined = bbox_tokens_combined * self.box_scale
+        state_tokens_flat = state_tokens_flat * self.state_scale
 
         # Apply state cross attention: state tokens cross attend to vision and box tokens
         vision_and_box_tokens = torch.cat([vision_tokens_flat, bbox_tokens_combined], dim=1)
@@ -594,7 +598,7 @@ class FlowMatchingTransformer(nn.Module):
         action_embeddings = self.action_positional_encoding(action_embeddings)
         
         # Time embedding: (B, d_model) -> (B, 1, d_model)
-        time_emb = 0.1 * self.time_embedding(timesteps.float()).unsqueeze(1)
+        time_emb = self.time_embedding_scale * self.time_embedding(timesteps.float()).unsqueeze(1)
         
         #print(f"time_emb mean abs: {time_emb.norm():.6f}, max: {time_emb.abs().max():.6f}")
         
@@ -603,9 +607,8 @@ class FlowMatchingTransformer(nn.Module):
         # We expand time across the action horizon so that each action token is aware of the flow matching time, which can help the model learn time-dependent velocity fields.
         tgt = action_embeddings + time_emb.expand(-1, T_act, -1)
         
-        # 3. The Memory - Apply BatchNormalizalii ots stabibizeztraraingg
-        # Normalize obs_context trunadviatineernifdcevgrdate s_cfom =dsl_prbveogmasxetrsflow 2)).transpose(1, 2)
-        extended_memory = self.obs_batch_norm(obs_context)
+        # 3. The Memory
+        extended_memory = obs_context
                 
         # print(f"action_embeddings mean abs: {torch.norm(action_embeddings, dim=2).mean()}, max: {action_embeddings.abs().max():.6f}")
         # print(f"time_emb mean abs: {torch.norm(time_emb, dim=2).mean()}, max: {time_emb.abs().max():.6f}")
