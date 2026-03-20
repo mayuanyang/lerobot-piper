@@ -224,8 +224,10 @@ class FlowMatchingTransformer(nn.Module):
 
         # ------------------------------
         self.state_encoder = nn.Sequential(
-            nn.Linear(config.state_dim, config.d_model),
+            nn.Linear(config.state_dim, config.d_model // 2),
             nn.Mish(),
+            nn.LayerNorm(config.d_model // 2),
+            nn.Linear(config.d_model // 2, config.d_model),
             nn.LayerNorm(config.d_model),
         )
         self.state_positional_encoding = PositionalEncoding(config.d_model)
@@ -421,7 +423,7 @@ class FlowMatchingTransformer(nn.Module):
         state_tokens_flat = state_tokens_flat.view(B, T_obs * 1, self.config.d_model)
         
         # Augment state tokens: create 4 tokens for each original token with 1% differences
-        state_tokens_augmented = self._augment_state_tokens(state_tokens_flat, B, T_obs)
+        state_tokens_augmented = state_tokens #self._augment_state_tokens(state_tokens_flat, B, T_obs)
 
         # ------------------------------
         # 2. Lightweight vision token encoding
@@ -537,27 +539,14 @@ class FlowMatchingTransformer(nn.Module):
         bbox_tokens_combined = bbox_tokens_combined * self.box_scale
         state_tokens_flat = state_tokens_flat * self.state_scale
 
-        # Apply state cross attention: state tokens cross attend to vision and box tokens
-        vision_and_box_tokens = torch.cat([vision_tokens_flat, bbox_tokens_combined], dim=1)
-        if vision_and_box_tokens.shape[1] > 0:
-            # Apply cross attention: state tokens as queries, vision+box tokens as keys/values
-            state_cross_attn_out, _ = self.state_cross_attn(
-                query=state_tokens_augmented,
-                key=vision_and_box_tokens,
-                value=vision_and_box_tokens
-            )
-            # Apply residual connection and normalization
-            state_tokens_augmented = self.state_cross_attn_norm(
-                state_tokens_augmented + self.state_cross_attn_dropout(state_cross_attn_out)
-            )
-
+        
         # print(f"vision_tokens_flat norm: {vision_tokens_flat.norm():.6f}, max: {vision_tokens_flat.abs().max():.6f}")
         # print(f"bbox_tokens_combined norm: {bbox_tokens_combined.norm():.6f}, max: {bbox_tokens_combined.abs().max():.6f}")
         # print(f"state_tokens_flat norm: {state_tokens_flat.norm():.6f}, max: {state_tokens_flat.abs().max():.6f}")
         
         
         # Combine observation tokens (vision + bounding boxes + state)
-        context_parts = [tokens for tokens in [vision_tokens_flat, bbox_tokens_combined, state_tokens_augmented] if tokens.shape[1] > 0]
+        context_parts = [tokens for tokens in [vision_tokens_flat, bbox_tokens_combined, state_tokens_flat] if tokens.shape[1] > 0]
         context = torch.cat(context_parts, dim=1)
         
         return context, spatial_outputs
