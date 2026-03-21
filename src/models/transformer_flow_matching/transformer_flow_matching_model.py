@@ -397,6 +397,39 @@ class FlowMatchingTransformer(nn.Module):
         return torch.cat(all_vision_tokens, dim=1)
 
 
+
+    def _add_noise_tokens(self, state_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Add 3 noise tokens for each input state token with 0-2% noise.
+        
+        Args:
+            state_tokens: (B, T_obs, d_model) - original state tokens
+            
+        Returns:
+            augmented_tokens: (B, T_obs * 4, d_model) - original + 3 noise tokens per original token
+        """
+        B, T_obs, d_model = state_tokens.shape
+        
+        # Create noise for 3 additional tokens per original token (0-2% noise)
+        noise_scale = torch.rand(B, T_obs, 3, 1, device=state_tokens.device) * 0.02  # (B, T_obs, 3, 1) - 0 to 2% noise
+        noise = torch.randn(B, T_obs, 3, d_model, device=state_tokens.device) * noise_scale  # (B, T_obs, 3, d_model)
+        
+        # Original tokens (no noise) - repeat for 4 tokens per original token
+        original_part = state_tokens.unsqueeze(2).expand(-1, -1, 4, -1)[:, :, :1, :]  # (B, T_obs, 1, d_model)
+        original_repeated = original_part.expand(-1, -1, 4, -1)  # (B, T_obs, 4, d_model)
+        
+        # Add noise to the repeated original tokens (first token remains unchanged, next 3 get noise)
+        noise_padding = torch.zeros(B, T_obs, 1, d_model, device=state_tokens.device)  # No noise for first token
+        noise_with_padding = torch.cat([noise_padding, noise], dim=2)  # (B, T_obs, 4, d_model)
+        
+        # Combine original tokens with noise
+        all_tokens = original_repeated + noise_with_padding  # (B, T_obs, 4, d_model)
+        
+        # Reshape to (B, T_obs * 4, d_model)
+        augmented_tokens = all_tokens.view(B, T_obs * 4, d_model)
+        
+        return augmented_tokens
+
     def get_condition(self, batch, generate_heatmaps=False):
         """
         Encode state and bounding box data to get context tokens.
@@ -414,16 +447,10 @@ class FlowMatchingTransformer(nn.Module):
         # ------------------------------
         state_tokens = self.state_encoder(batch["observation.state"])  # (B, T, d_model)
         
-
         state_tokens = self.state_positional_encoding(state_tokens)
-        # Flatten time dimension
-        state_tokens_flat = state_tokens.view(B, T_obs, self.config.d_model)
-        # Add a singleton token dim to match fusion later
-        state_tokens_flat = state_tokens_flat.unsqueeze(2)  # (B, T, 1, d_model)
-        state_tokens_flat = state_tokens_flat.view(B, T_obs * 1, self.config.d_model)
         
-        # Augment state tokens: create 4 tokens for each original token with 1% differences
-        state_tokens_augmented = state_tokens #self._augment_state_tokens(state_tokens_flat, B, T_obs)
+        # Add noise augmentation: create 3 noise tokens for each original token with 0-2% noise
+        state_tokens_flat = self._add_noise_tokens(state_tokens)  # (B, T_obs * 4, d_model)
 
         # ------------------------------
         # 2. Lightweight vision token encoding
