@@ -176,10 +176,10 @@ class FlowMatchingTransformer(nn.Module):
         self.num_bounding_boxes_per_camera = 2
         self.action_chunk_size = 4  # Action chunking size
         
-        self.state_scale = nn.Parameter(torch.tensor(0.0))  # Learnable scaling for state tokens
-        self.vision_scale = nn.Parameter(torch.tensor(0.0))  # Learnable scaling for vision tokens
-        self.box_scale = nn.Parameter(torch.tensor(0.0))     # Learnable scaling for box tokens
-        self.time_embedding_scale = nn.Parameter(torch.tensor(0.0))  # Learnable scaling for time embedding
+        self.state_scale = nn.Parameter(torch.tensor(1.0))  # Learnable scaling for state tokens
+        self.vision_scale = nn.Parameter(torch.tensor(1.0))  # Learnable scaling for vision tokens
+        self.box_scale = nn.Parameter(torch.tensor(1.0))     # Learnable scaling for box tokens
+        self.time_embedding_scale = nn.Parameter(torch.tensor(0.2))  # Learnable scaling for time embedding
 
         # ------------------------------
         # 1. Single shared Object Detector for all cameras (initialize as None)
@@ -241,6 +241,16 @@ class FlowMatchingTransformer(nn.Module):
         )
         self.state_cross_attn_norm = nn.LayerNorm(config.d_model)
         self.state_cross_attn_dropout = nn.Dropout(0.1)
+        
+        # Box-vision self attention component for fusing box and vision tokens
+        self.box_vision_self_attn = nn.MultiheadAttention(
+            embed_dim=config.d_model,
+            num_heads=config.nhead,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.box_vision_self_attn_norm = nn.LayerNorm(config.d_model)
+        self.box_vision_self_attn_dropout = nn.Dropout(0.1)
 
 
         # ------------------------------
@@ -571,36 +581,31 @@ class FlowMatchingTransformer(nn.Module):
         # print(f"bbox_tokens_combined norm: {bbox_tokens_combined.norm():.6f}, max: {bbox_tokens_combined.abs().max():.6f}")
         # print(f"state_tokens_flat norm: {state_tokens_flat.norm():.6f}, max: {state_tokens_flat.abs().max():.6f}")
         
+        # Apply self-attention between box and vision tokens to create fused tokens
+      
+        # Concatenate vision and box tokens for self-attention
+        box_vision_tokens = torch.cat([bbox_tokens_combined, vision_tokens_flat], dim=1)  # (B, vision_len + box_len, d_model)
         
-        # Combine observation tokens (vision + bounding boxes + state)
-        context_parts = [tokens for tokens in [vision_tokens_flat, bbox_tokens_combined, state_tokens_flat] if tokens.shape[1] > 0]
+        # Apply self-attention between box and vision tokens
+        box_vision_attn_out, _ = self.box_vision_self_attn(
+            query=box_vision_tokens,
+            key=box_vision_tokens,
+            value=box_vision_tokens
+        )
+        box_vision_tokens = self.box_vision_self_attn_norm(
+            box_vision_tokens + self.box_vision_self_attn_dropout(box_vision_attn_out)
+        )
+        
+
+        
+        # Combine observation tokens (fused vision + fused boxes + state)
+        context_parts = [tokens for tokens in [state_tokens_flat, box_vision_tokens, vision_tokens_flat  ,bbox_tokens_combined] if tokens.shape[1] > 0]
+        
+        
         context = torch.cat(context_parts, dim=1)
         
         return context, spatial_outputs
 
-
-    def _augment_state_tokens(self, state_tokens_flat, B, T_obs):
-
-        offsets = self.state_token_offsets.view(1,1,4,-1)
-
-        tokens = state_tokens_flat.unsqueeze(2) + offsets
-
-        tokens = tokens.view(B, T_obs*4, -1)
-
-        return tokens
-
-
-    def _generate_causal_mask(self, seq_len, device):
-        """
-        Generate causal mask so position i cannot attend to positions > i.
-        Shape: (seq_len, seq_len)
-        """
-        mask = torch.triu(
-            torch.ones(seq_len, seq_len, device=device),
-            diagonal=1
-        )
-        mask = mask.masked_fill(mask == 1, float("-inf"))
-        return mask
 
     def velocity_field(self, noisy_actions, timesteps, obs_context):
         """
@@ -623,8 +628,10 @@ class FlowMatchingTransformer(nn.Module):
         # We expand time across the action horizon so that each action token is aware of the flow matching time, which can help the model learn time-dependent velocity fields.
         tgt = action_embeddings + time_emb.expand(-1, T_act, -1)
         
-        # 3. The Memory
-        extended_memory = obs_context
+        # 3. The Memory - Concatenate time embedding with observation context
+        # Expand time embedding to match the sequence length of obs_context
+        time_emb_expanded = time_emb.expand(-1, obs_context.shape[1], -1)  # (B, seq_len, d_model)
+        extended_memory = torch.cat([obs_context, time_emb_expanded], dim=1)  # Concatenate along sequence dimension
                 
         # print(f"action_embeddings mean abs: {torch.norm(action_embeddings, dim=2).mean()}, max: {action_embeddings.abs().max():.6f}")
         # print(f"time_emb mean abs: {torch.norm(time_emb, dim=2).mean()}, max: {time_emb.abs().max():.6f}")
@@ -634,7 +641,7 @@ class FlowMatchingTransformer(nn.Module):
         # 4. Decoder Pass
         # Self-attention ensures T_act is a smooth curve.
         # Cross-attention aligns T_act with your CropConvNet features.
-        # Allow actions to attend to all tokens (time, vision, and state)
+        # Allow actions to attend to all tokens (time, vision, boxes, state, and time embedding)
         velocity_features = self.actions_expert(
             tgt=tgt,
             memory=extended_memory
