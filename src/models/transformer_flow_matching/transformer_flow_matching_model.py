@@ -166,7 +166,41 @@ class PositionalEncoding(nn.Module):
             
         return x + self.pe[:, :seq_len]
 
+class CrossAttentionBlock(nn.Module):
+    def __init__(self, d_model, nhead, dropout=0.1, dim_feedforward=2048):
+        super().__init__()
+        
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=nhead,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        self.norm1 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        
+        # Feedforward (VERY important for capacity)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Linear(dim_feedforward, d_model)
+        )
+        
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout2 = nn.Dropout(dropout)
 
+    def forward(self, query, key, value):
+        # Cross-attention
+        attn_out, _ = self.cross_attn(query=query, key=key, value=value)
+        x = self.norm1(query + self.dropout1(attn_out))
+        
+        # FFN
+        ffn_out = self.ffn(x)
+        x = self.norm2(x + self.dropout2(ffn_out))
+        
+        return x
+      
 class FlowMatchingTransformer(nn.Module):
     """Flow matching transformer with separate encoding for vision and state."""
     
@@ -180,6 +214,8 @@ class FlowMatchingTransformer(nn.Module):
         self.vision_scale = nn.Parameter(torch.tensor(1.0))  # Learnable scaling for vision tokens
         self.box_scale = nn.Parameter(torch.tensor(1.0))     # Learnable scaling for box tokens
         self.time_embedding_scale = nn.Parameter(torch.tensor(0.2))  # Learnable scaling for time embedding
+        
+        self.modality_embedding = nn.Embedding(3, config.d_model)
 
         # ------------------------------
         # 1. Single shared Object Detector for all cameras (initialize as None)
@@ -232,26 +268,54 @@ class FlowMatchingTransformer(nn.Module):
         )
         self.state_positional_encoding = PositionalEncoding(config.d_model)
         
-        # State cross attention component
-        self.state_cross_attn = nn.MultiheadAttention(
-            embed_dim=config.d_model,
-            num_heads=config.nhead,
-            dropout=0.1,
-            batch_first=True
-        )
-        self.state_cross_attn_norm = nn.LayerNorm(config.d_model)
-        self.state_cross_attn_dropout = nn.Dropout(0.1)
+                
+        self.box_to_vision_cross_attn = nn.ModuleList([
+            CrossAttentionBlock(
+                d_model=config.d_model,
+                nhead=config.nhead,
+                dropout=0.1,
+                dim_feedforward=config.dim_feedforward
+            )
+            for _ in range(2)  # e.g. 2–4
+        ])
         
-        # Box-vision self attention component for fusing box and vision tokens
-        self.box_vision_self_attn = nn.MultiheadAttention(
-            embed_dim=config.d_model,
-            num_heads=config.nhead,
-            dropout=0.1,
-            batch_first=True
-        )
-        self.box_vision_self_attn_norm = nn.LayerNorm(config.d_model)
-        self.box_vision_self_attn_dropout = nn.Dropout(0.1)
+        self.state_to_vision_cross_attn = nn.ModuleList([
+            CrossAttentionBlock(
+                d_model=config.d_model,
+                nhead=config.nhead,
+                dropout=0.1,
+                dim_feedforward=config.dim_feedforward
+            )
+            for _ in range(2)  # e.g. 2–4
+        ])
+        
+        self.state_to_box_cross_attn = nn.ModuleList([
+            CrossAttentionBlock(
+                d_model=config.d_model,
+                nhead=config.nhead,
+                dropout=0.1,
+                dim_feedforward=config.dim_feedforward
+            )
+            for _ in range(2)  # e.g. 2–4
+        ])
 
+        # Transformer encoder for processing context parts
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.d_model,
+            nhead=config.nhead,
+            dim_feedforward=config.dim_feedforward,
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True
+        )
+        
+        self.context_transformer_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=2  # Light encoder for context processing
+        )
+        
+        self.context_encoder_norm = nn.LayerNorm(config.d_model)
 
         # ------------------------------
         # 8. Number of inference steps for flow matching sampling
@@ -572,6 +636,20 @@ class FlowMatchingTransformer(nn.Module):
         else:
             bbox_tokens_combined = torch.empty(B, 0, self.config.d_model, device=batch["observation.state"].device)
         
+        # Apply modality embeddings to each token type
+        if state_tokens_flat.shape[1] > 0:
+            state_modality_emb = self.modality_embedding(torch.tensor(0, device=state_tokens_flat.device)).unsqueeze(0).unsqueeze(0)
+            state_tokens_flat = state_tokens_flat + state_modality_emb.expand_as(state_tokens_flat)
+        
+        if vision_tokens_flat.shape[1] > 0:
+            vision_modality_emb = self.modality_embedding(torch.tensor(1, device=vision_tokens_flat.device)).unsqueeze(0).unsqueeze(0)
+            vision_tokens_flat = vision_tokens_flat + vision_modality_emb.expand_as(vision_tokens_flat)
+            
+        if bbox_tokens_combined.shape[1] > 0:
+            box_modality_emb = self.modality_embedding(torch.tensor(2, device=bbox_tokens_combined.device)).unsqueeze(0).unsqueeze(0)
+            bbox_tokens_combined = bbox_tokens_combined + box_modality_emb.expand_as(bbox_tokens_combined)
+
+        # Apply scaling after modality embeddings
         vision_tokens_flat = vision_tokens_flat * self.vision_scale
         bbox_tokens_combined = bbox_tokens_combined * self.box_scale
         state_tokens_flat = state_tokens_flat * self.state_scale
@@ -582,27 +660,39 @@ class FlowMatchingTransformer(nn.Module):
         # print(f"state_tokens_flat norm: {state_tokens_flat.norm():.6f}, max: {state_tokens_flat.abs().max():.6f}")
         
         # Apply self-attention between box and vision tokens to create fused tokens
-      
-        # Concatenate vision and box tokens for self-attention
-        box_vision_tokens = torch.cat([bbox_tokens_combined, vision_tokens_flat], dim=1)  # (B, vision_len + box_len, d_model)
+        box_vision_tokens = bbox_tokens_combined
+        for layer in self.box_to_vision_cross_attn:
+          box_vision_tokens = layer(
+              query=box_vision_tokens,
+              key=vision_tokens_flat,
+              value=vision_tokens_flat
+          )
+          
+          
+        state_vision_tokens = state_tokens_flat
+        for layer in self.state_to_vision_cross_attn:
+          state_vision_tokens = layer(
+              query=state_vision_tokens,
+              key=vision_tokens_flat,
+              value=vision_tokens_flat
+          )
         
-        # Apply self-attention between box and vision tokens
-        box_vision_attn_out, _ = self.box_vision_self_attn(
-            query=box_vision_tokens,
-            key=box_vision_tokens,
-            value=box_vision_tokens
-        )
-        box_vision_tokens = self.box_vision_self_attn_norm(
-            box_vision_tokens + self.box_vision_self_attn_dropout(box_vision_attn_out)
-        )
+        state_box_tokens = state_tokens_flat
+        for layer in self.state_to_box_cross_attn:
+          state_box_tokens = layer(
+              query=state_box_tokens,
+              key=bbox_tokens_combined,
+              value=bbox_tokens_combined
+          )       
         
-
         
         # Combine observation tokens (fused vision + fused boxes + state)
-        context_parts = [tokens for tokens in [state_tokens_flat, box_vision_tokens, vision_tokens_flat  ,bbox_tokens_combined] if tokens.shape[1] > 0]
+        context_parts = [tokens for tokens in [state_box_tokens,state_vision_tokens, box_vision_tokens] if tokens.shape[1] > 0]
         
-        
-        context = torch.cat(context_parts, dim=1)
+        # Apply transformer encoder to process context parts
+        combined_context = torch.cat(context_parts, dim=1)  # (B, total_seq_len, d_model)
+        encoded_context = self.context_transformer_encoder(combined_context)
+        context = self.context_encoder_norm(encoded_context)
         
         return context, spatial_outputs
 
@@ -631,7 +721,7 @@ class FlowMatchingTransformer(nn.Module):
         # 3. The Memory - Concatenate time embedding with observation context
         # Expand time embedding to match the sequence length of obs_context
         time_emb_expanded = time_emb.expand(-1, obs_context.shape[1], -1)  # (B, seq_len, d_model)
-        extended_memory = torch.cat([obs_context, time_emb_expanded], dim=1)  # Concatenate along sequence dimension
+        extended_memory = obs_context + time_emb_expanded
                 
         # print(f"action_embeddings mean abs: {torch.norm(action_embeddings, dim=2).mean()}, max: {action_embeddings.abs().max():.6f}")
         # print(f"time_emb mean abs: {torch.norm(time_emb, dim=2).mean()}, max: {time_emb.abs().max():.6f}")
