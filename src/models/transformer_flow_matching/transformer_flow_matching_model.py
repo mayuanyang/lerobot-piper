@@ -687,7 +687,8 @@ class FlowMatchingTransformer(nn.Module):
         
         
         # Combine observation tokens (fused vision + fused boxes + state)
-        context_parts = [tokens for tokens in [state_box_tokens,state_vision_tokens, box_vision_tokens] if tokens.shape[1] > 0]
+        #context_parts = [tokens for tokens in [state_box_tokens,state_vision_tokens, box_vision_tokens] if tokens.shape[1] > 0]
+        context_parts = [tokens for tokens in [state_tokens_flat, bbox_tokens_combined, vision_tokens_flat] if tokens.shape[1] > 0]
         
         # Apply transformer encoder to process context parts
         combined_context = torch.cat(context_parts, dim=1)  # (B, total_seq_len, d_model)
@@ -721,7 +722,8 @@ class FlowMatchingTransformer(nn.Module):
         # 3. The Memory - Concatenate time embedding with observation context
         # Expand time embedding to match the sequence length of obs_context
         time_emb_expanded = time_emb.expand(-1, obs_context.shape[1], -1)  # (B, seq_len, d_model)
-        extended_memory = obs_context + time_emb_expanded
+        #extended_memory = obs_context + time_emb_expanded
+        extended_memory = torch.cat([obs_context, time_emb_expanded], dim=1)
                 
         # print(f"action_embeddings mean abs: {torch.norm(action_embeddings, dim=2).mean()}, max: {action_embeddings.abs().max():.6f}")
         # print(f"time_emb mean abs: {torch.norm(time_emb, dim=2).mean()}, max: {time_emb.abs().max():.6f}")
