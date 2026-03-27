@@ -5,6 +5,7 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 import torchvision.models as models
 import math
+from transformers import AutoModel, AutoProcessor
 
 
 # Import ObjectDetector from separate file
@@ -12,39 +13,52 @@ from .object_detector import ObjectDetector, DiffusionSinusoidalPosEmb
 from .box_encoder import BoxEncoder
 
 
-class ResNet18VisionTokenizer(nn.Module):
-    """Shared lightweight vision tokenizer used for all camera streams."""
-
+class SmolVLAVisionTokenizer(nn.Module):
+    """Vision tokenizer using SmolVLM backbone for enhanced feature extraction."""
+    
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.input_size = int(getattr(config, "vision_input_size", 225))
-        self.pool_rows = int(getattr(config, "vision_token_rows", 2))
-        self.pool_cols = int(getattr(config, "vision_token_cols", 2))
+        self.input_size = int(getattr(config, "vision_input_size", 224))
+        self.pool_rows = int(getattr(config, "vision_token_rows", 4))
+        self.pool_cols = int(getattr(config, "vision_token_cols", 4))
         self.freeze_backbone = bool(getattr(config, "freeze_vision_backbone", True))
-
-        weights = None
-        if getattr(config, "use_pretrained_vision_backbone", True):
-            weights = models.ResNet18_Weights.IMAGENET1K_V1
-
-        try:
-            backbone = models.resnet18(weights=weights)
-        except Exception as exc:
-            warnings.warn(
-                f"Failed to load pretrained ResNet18 weights ({exc}). Falling back to randomly initialized weights.",
-                stacklevel=2,
-            )
-            backbone = models.resnet18(weights=None)
-
-        self.backbone = nn.Sequential(*list(backbone.children())[:-2])
-        self.spatial_pool = nn.AdaptiveAvgPool2d((self.pool_rows, self.pool_cols))
-        self.token_projection = nn.Sequential(
-            nn.Linear(512, config.d_model),
+        self.model_id = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+        
+        # Initialize SmolVLM vision encoder
+        print(f"Loading SmolVLM vision backbone: {self.model_id}")
+        self.vision_model = AutoModel.from_pretrained(
+            self.model_id,
+            trust_remote_code=True,
+            torch_dtype=torch.float32
+        )
+        
+        # Extract vision model components
+        if hasattr(self.vision_model, 'vision_model'):
+            self.vision_encoder = self.vision_model.vision_model
+        else:
+            self.vision_encoder = self.vision_model
+        
+        # Get feature dimensions
+        self.feature_dim = self.vision_encoder.config.hidden_size if hasattr(self.vision_encoder.config, 'hidden_size') else 768
+        
+        # Connector/projection layer (similar to SmolVLA)
+        self.connector = nn.Sequential(
+            nn.Linear(self.feature_dim, config.d_model * 2),
             nn.GELU(),
-            nn.Linear(config.d_model, config.d_model),
+            nn.LayerNorm(config.d_model * 2),
+            nn.Linear(config.d_model * 2, config.d_model),
             nn.LayerNorm(config.d_model)
         )
-
+        
+        # Spatial pooling for token generation
+        self.spatial_pool = nn.AdaptiveAvgPool2d((self.pool_rows, self.pool_cols))
+        
+        # Learnable positional encoding for spatial tokens
+        self.spatial_pos_encoding = nn.Parameter(
+            torch.randn(self.pool_rows * self.pool_cols, config.d_model) * 0.02
+        )
+        
         self.register_buffer(
             "imagenet_mean",
             torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1),
@@ -55,17 +69,22 @@ class ResNet18VisionTokenizer(nn.Module):
         )
 
         if self.freeze_backbone:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
+            self._freeze_vision_encoder()
 
         # Apply better initialization
         self._init_weights()
+
+    def _freeze_vision_encoder(self):
+        """Freeze vision encoder parameters."""
+        self.vision_encoder.eval()
+        for param in self.vision_encoder.parameters():
+            param.requires_grad = False
 
     def _init_weights(self):
         """Initialize vision tokenizer weights with better strategies."""
         
         def _basic_init(module):
-            if isinstance(module, nn.Linear):
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
                 torch.nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     torch.nn.init.constant_(module.bias, 0)
@@ -73,14 +92,18 @@ class ResNet18VisionTokenizer(nn.Module):
                 torch.nn.init.constant_(module.bias, 0)
                 torch.nn.init.constant_(module.weight, 1.0)
 
-        # Initialize token projection layers
-        if hasattr(self, 'token_projection'):
-            self.token_projection.apply(_basic_init)
+        # Initialize enhancement layers
+        if hasattr(self, 'connector'):
+            self.connector.apply(_basic_init)
+        
+        # Initialize spatial positional encoding
+        if hasattr(self, 'spatial_pos_encoding'):
+            torch.nn.init.normal_(self.spatial_pos_encoding, mean=0.0, std=0.02)
 
     def train(self, mode: bool = True):
         super().train(mode)
         if self.freeze_backbone:
-            self.backbone.eval()
+            self.vision_encoder.eval()
         return self
 
     def _preprocess_images(self, images: torch.Tensor) -> torch.Tensor:
@@ -96,14 +119,14 @@ class ResNet18VisionTokenizer(nn.Module):
         images = F.interpolate(
             images,
             size=(self.input_size, self.input_size),
-            mode="bilinear",
+            mode="bicubic",
             align_corners=False,
         )
         images = images.clamp(0.0, 1.0)
         return (images - self.imagenet_mean) / self.imagenet_std
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        """Encode images into a small fixed number of spatial tokens.
+        """Encode images into enhanced spatial tokens using SmolVLM backbone.
 
         Args:
             images: (B, T, C, H, W) or (B, C, H, W)
@@ -120,17 +143,43 @@ class ResNet18VisionTokenizer(nn.Module):
         flat_images = images.reshape(bsize * t_obs, channels, height, width)
         flat_images = self._preprocess_images(flat_images)
 
+        # Use SmolVLM vision encoder
         if self.freeze_backbone:
             with torch.no_grad():
-                features = self.backbone(flat_images)
+                vision_features = self.vision_encoder(
+                    pixel_values=flat_images.to(dtype=self.vision_encoder.dtype if hasattr(self.vision_encoder, 'dtype') else torch.float32)
+                )
+                if hasattr(vision_features, 'last_hidden_state'):
+                    features = vision_features.last_hidden_state
+                else:
+                    features = vision_features
         else:
-            features = self.backbone(flat_images)
-
-        pooled = self.spatial_pool(features)
-        pooled = pooled.flatten(2).transpose(1, 2)
-        pooled = self.token_projection(pooled)
-        num_tokens_per_frame = pooled.shape[1]
-        return pooled.reshape(bsize, t_obs * num_tokens_per_frame, self.config.d_model)
+            vision_features = self.vision_encoder(
+                pixel_values=flat_images.to(dtype=self.vision_encoder.dtype if hasattr(self.vision_encoder, 'dtype') else torch.float32)
+            )
+            if hasattr(vision_features, 'last_hidden_state'):
+                features = vision_features.last_hidden_state
+            else:
+                features = vision_features
+        
+        # Apply connector/projection (similar to SmolVLA)
+        projected_features = self.connector(features)
+        
+        # Reshape to spatial grid for token generation
+        # Assume features are in sequence format, reshape to spatial
+        batch_size_times_t_obs = projected_features.shape[0]
+        seq_len = projected_features.shape[1]
+        
+        # Simple approach: take mean and replicate for spatial tokens
+        pooled_features = projected_features.mean(dim=1, keepdim=True)  # (B*T, 1, d_model)
+        # Expand to create spatial tokens
+        spatial_tokens = pooled_features.expand(-1, self.pool_rows * self.pool_cols, -1)  # (B*T, pool_rows*pool_cols, d_model)
+        
+        # Add spatial positional encoding
+        tokens = spatial_tokens + self.spatial_pos_encoding.unsqueeze(0)  # (B*T, pool_rows*pool_cols, d_model)
+        
+        num_tokens_per_frame = tokens.shape[1]
+        return tokens.reshape(bsize, t_obs * num_tokens_per_frame, self.config.d_model)
       
 class PositionalEncoding(nn.Module):
     """Positional encoding for action sequences."""
@@ -223,10 +272,7 @@ class FlowMatchingTransformer(nn.Module):
         self.object_detector = None
         self._object_detector_initialized = False
                         
-        self.state_token_offsets = nn.Parameter(
-            torch.randn(4, config.d_model) * 0.02
-        )
-        
+                
         # Camera names for processing
         self.camera_names = config.cameras_for_vision_state_concat if config.cameras_for_vision_state_concat else [
             f'observation.images.cam_{i}' for i in range(config.num_cameras)
@@ -240,20 +286,11 @@ class FlowMatchingTransformer(nn.Module):
         # ------------------------------
         # 2. Box encoder for processing bounding box data (training + inference)
         # ------------------------------
-        self.use_vision_tokens = bool(getattr(config, "use_vision_tokens", False))
-        if self.use_vision_tokens:
-            backbone_name = str(getattr(config, "light_weight_vision_backbone", "resnet18")).lower()
-            if backbone_name != "resnet18":
-                raise ValueError(
-                    f"Unsupported lightweight vision backbone '{config.vision_backbone}'. Only 'resnet18' is implemented."
-                )
-            self.vision_encoder = ResNet18VisionTokenizer(config)
-            self.vision_camera_embedding = nn.Embedding(config.num_cameras, config.d_model)
-            self.vision_positional_encoding = PositionalEncoding(config.d_model)
-        else:
-            self.vision_encoder = None
-            self.vision_camera_embedding = None
-            self.vision_positional_encoding = None
+        # Make vision tokens mandatory
+        self.use_vision_tokens = True
+        self.vision_encoder = SmolVLAVisionTokenizer(config)
+        self.vision_camera_embedding = nn.Embedding(config.num_cameras, config.d_model)
+        self.vision_positional_encoding = PositionalEncoding(config.d_model)
 
         self.box_encoder = BoxEncoder(config)
         self.box_positional_encoding = PositionalEncoding(config.d_model)
@@ -386,13 +423,7 @@ class FlowMatchingTransformer(nn.Module):
         # Initialize all submodules
         self.apply(_basic_init)
         
-        # Initialize specific components with specialized strategies
-        
-        
-        # State token offsets: initialize with smaller variance for stability
-        if hasattr(self, 'state_token_offsets'):
-            torch.nn.init.normal_(self.state_token_offsets, mean=0.0, std=0.01)
-        
+                
         # Initialize embedding layers with proper scaling
         if hasattr(self, 'vision_camera_embedding') and self.vision_camera_embedding is not None:
             torch.nn.init.normal_(self.vision_camera_embedding.weight, mean=0.0, std=0.02)
