@@ -30,7 +30,7 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     use_vision_tokens: bool = True
     use_pretrained_vision_backbone: bool = True
     freeze_vision_backbone: bool = True
-    vision_input_size: int = 224
+    vision_input_size: int = 256  # Must be divisible by patch_size*scale_factor=16*4=64; 256/16=16 patches → 16×16=256 → 64 tokens after connector
     vision_token_rows: int = 2
     vision_token_cols: int = 2
     

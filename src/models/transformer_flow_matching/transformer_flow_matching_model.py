@@ -653,11 +653,17 @@ class FlowMatchingTransformer(nn.Module):
           )       
         
         
-        # Combine observation tokens using cross-attended (fused) representations:
-        # - state_box_tokens: robot state grounded in object positions
-        # - state_vision_tokens: robot state grounded in visual context
-        # - box_vision_tokens: object locations grounded in visual context
-        context_parts = [tokens for tokens in [state_box_tokens, state_vision_tokens, box_vision_tokens] if tokens.shape[1] > 0]
+        # Combine observation tokens:
+        # Include RAW tokens alongside cross-attended versions so each encoder has
+        # a direct gradient path (cross-attention queries alone vanish when dominated
+        # by vision value vectors).
+        context_parts = [tokens for tokens in [
+            state_tokens_flat,      # direct gradient to state encoder
+            bbox_tokens_combined,   # direct gradient to box encoder
+            state_box_tokens,       # state enriched with object positions
+            state_vision_tokens,    # state enriched with visual context
+            box_vision_tokens,      # objects enriched with visual context
+        ] if tokens.shape[1] > 0]
         
         # Apply transformer encoder to process context parts
         combined_context = torch.cat(context_parts, dim=1)  # (B, total_seq_len, d_model)
@@ -719,6 +725,16 @@ class FlowMatchingTransformer(nn.Module):
         return self.velocity_prediction_head(velocity_features)
 
     
+    def log_scales(self) -> dict:
+        """Return current learnable scale values for monitoring during training."""
+        return {
+            "state_scale": self.state_scale.item(),
+            "vision_scale": self.vision_scale.item(),
+            "box_scale": self.box_scale.item(),
+            "time_embedding_scale": self.time_embedding_scale.item(),
+            "box_token_scale": self.box_encoder.box_token_scale.item(),
+        }
+
     def sample_time(self, bsize, device):
         # Sample time from a Beta distribution to encourage learning across the entire flow matching trajectory, with more emphasis on mid-range times.
         beta_dist = torch.distributions.Beta(concentration1=1.5, concentration0=1.0)

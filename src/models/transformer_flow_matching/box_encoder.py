@@ -16,7 +16,7 @@ class BoxEncoder(nn.Module):
         super().__init__()
         self.config = config
         self.num_bounding_boxes_per_camera = 2
-        self.box_token_scale = nn.Parameter(torch.tensor(3.0))
+        self.box_token_scale = nn.Parameter(torch.tensor(5.0))  # Higher init to ensure box tokens are visible
         
         # Category embedding for categorical features
         self.category_embedding = nn.Embedding(3, config.d_model)  # Assuming 3 categories
@@ -61,15 +61,12 @@ class BoxEncoder(nn.Module):
         self.camera_embedding = nn.Embedding(self.config.num_cameras, config.d_model)  # 3 cameras: gripper, front, right
 
         # ------------------------------
-        # Token fusion (simplified linear projection for better gradient flow)
+        # Token fusion with residual connection for gradient flow
         # ------------------------------
-        self.token_fuser = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model),
-            nn.GELU(),
-            nn.LayerNorm(config.d_model),
-            nn.Linear(config.d_model, config.d_model),
-            nn.LayerNorm(config.d_model)
-        )
+        self.token_fuser_fc1 = nn.Linear(config.d_model, config.d_model)
+        self.token_fuser_norm1 = nn.LayerNorm(config.d_model)
+        self.token_fuser_fc2 = nn.Linear(config.d_model, config.d_model)
+        self.token_fuser_norm2 = nn.LayerNorm(config.d_model)
         
         # Apply better initialization
         self._init_weights()
@@ -91,8 +88,9 @@ class BoxEncoder(nn.Module):
         # Initialize all sequential modules
         if hasattr(self, 'geom_proj'):
             self.geom_proj.apply(_basic_init)
-        if hasattr(self, 'token_fuser'):
-            self.token_fuser.apply(_basic_init)
+        for attr in ['token_fuser_fc1', 'token_fuser_fc2']:
+            if hasattr(self, attr):
+                _basic_init(getattr(self, attr))
         if hasattr(self, 'conf_proj'):
             self.conf_proj.apply(_basic_init)
         if hasattr(self, 'pres_proj'):
@@ -123,13 +121,17 @@ class BoxEncoder(nn.Module):
     def fuse_tokens(
         self, tokens_flat: torch.Tensor, src_key_padding_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Fuse tokens with a TransformerEncoder.
+        """Fuse tokens with a 2-layer residual MLP for strong gradient flow.
 
         Args:
             tokens_flat: (B, L, d_model)
             src_key_padding_mask: optional (B, L) boolean mask where True indicates padding.
         """
-        return self.token_fuser(tokens_flat)
+        # Residual MLP block 1
+        h = self.token_fuser_norm1(tokens_flat + torch.nn.functional.gelu(self.token_fuser_fc1(tokens_flat)))
+        # Residual MLP block 2
+        h = self.token_fuser_norm2(h + self.token_fuser_fc2(h))
+        return h
         
 
     def encode_boxes_train(self, box_data, batch, image_width=640.0, image_height=400.0):
