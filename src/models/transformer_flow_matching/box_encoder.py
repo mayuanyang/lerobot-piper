@@ -322,11 +322,12 @@ class BoxEncoder(nn.Module):
             bbox_tokens_flat: Encoded box tokens
             distance_token: Encoded distance token (if applicable)
         """
-        # For inference, we don't have category_id and confidence, so we'll use default values
+        # For inference, assign sequential category IDs (0, 1, 2...) to match training distribution
+        # rather than always defaulting to category 2 (unknown).
         N_boxes = bounding_boxes.shape[0]
         device = bounding_boxes.device
         
-        category_id = torch.full((N_boxes,), 2, dtype=torch.long, device=device)  # Using category_id = 2 for 'unknown' category
+        category_id = torch.arange(N_boxes, dtype=torch.long, device=device).clamp(max=2)
         confidence = torch.ones((N_boxes, 1), device=device)  # (N_boxes, 1)
         
         # Sort boxes by presence (real boxes first) and then by category_id to stabilize learning

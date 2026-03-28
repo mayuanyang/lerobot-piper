@@ -12,7 +12,7 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     """Long Task Transformer Configuration for long-horizon tasks with transformer-based architecture."""
     
     # Inputs / output structure.
-    n_obs_steps: int = 1
+    n_obs_steps: int = 2  # 2 obs steps gives the model velocity information (position delta)
     horizon: int = 50
     n_action_steps: int = 8
 
@@ -30,7 +30,7 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     use_vision_tokens: bool = True
     use_pretrained_vision_backbone: bool = True
     freeze_vision_backbone: bool = True
-    vision_input_size: int = 225
+    vision_input_size: int = 224
     vision_token_rows: int = 2
     vision_token_cols: int = 2
     
@@ -53,10 +53,10 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     action_dim: int = 7  # Default for 7-DOF arm
     
     # Transformer architecture
-    d_model: int = 256
+    d_model: int = 512       # 512-dim model; each attention head is 64-dim (standard)
     nhead: int = 8
-    num_decoder_layers: int = 6
-    dim_feedforward: int = 512
+    num_decoder_layers: int = 8   # deeper decoder for richer action generation
+    dim_feedforward: int = 2048   # standard 4×d_model feedforward width
     
     # UNet denoiser parameters
     diffusion_step_embed_dim: int = 128

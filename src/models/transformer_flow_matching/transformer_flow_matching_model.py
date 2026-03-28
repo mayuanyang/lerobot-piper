@@ -14,17 +14,20 @@ from .box_encoder import BoxEncoder
 
 
 class SmolVLAVisionTokenizer(nn.Module):
-    """Vision tokenizer using SmolVLM backbone for enhanced feature extraction."""
-    
+    """Vision tokenizer using SmolVLM backbone, mirroring the original SmolVLA approach:
+    - Uses the pretrained SigLIP ViT vision encoder (all layers, last_hidden_state)
+    - Uses the pretrained SmolVLM connector (pixel-shuffle + MLP resampler)
+    - Keeps all patch tokens (no spatial pooling/collapsing)
+    - Scales embeddings by sqrt(hidden_dim) before downstream use
+    """
+
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.input_size = int(getattr(config, "vision_input_size", 224))
-        self.pool_rows = int(getattr(config, "vision_token_rows", 4))
-        self.pool_cols = int(getattr(config, "vision_token_cols", 4))
         self.freeze_backbone = bool(getattr(config, "freeze_vision_backbone", True))
         self.model_id = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
-        
+
         # Initialize SmolVLM vision encoder
         print(f"Loading SmolVLM vision backbone: {self.model_id}")
         self.vision_model = AutoModel.from_pretrained(
@@ -32,33 +35,27 @@ class SmolVLAVisionTokenizer(nn.Module):
             trust_remote_code=True,
             torch_dtype=torch.float32
         )
-        
-        # Extract vision model components
+
+        # Extract SigLIP ViT vision encoder
         if hasattr(self.vision_model, 'vision_model'):
             self.vision_encoder = self.vision_model.vision_model
         else:
             self.vision_encoder = self.vision_model
-        
-        # Get feature dimensions
-        self.feature_dim = self.vision_encoder.config.hidden_size if hasattr(self.vision_encoder.config, 'hidden_size') else 768
-        
-        # Connector/projection layer (similar to SmolVLA)
-        self.connector = nn.Sequential(
-            nn.Linear(self.feature_dim, config.d_model * 2),
-            nn.GELU(),
-            nn.LayerNorm(config.d_model * 2),
-            nn.Linear(config.d_model * 2, config.d_model),
-            nn.LayerNorm(config.d_model)
-        )
-        
-        # Spatial pooling for token generation
-        self.spatial_pool = nn.AdaptiveAvgPool2d((self.pool_rows, self.pool_cols))
-        
-        # Learnable positional encoding for spatial tokens
-        self.spatial_pos_encoding = nn.Parameter(
-            torch.randn(self.pool_rows * self.pool_cols, config.d_model) * 0.02
-        )
-        
+
+        # Use the pretrained SmolVLM connector (pixel-shuffle + MLP resampler)
+        # This projects from vision hidden size → VLM text hidden size
+        if hasattr(self.vision_model, 'connector'):
+            self.connector = self.vision_model.connector
+            connector_out_dim = self.vision_model.config.text_config.hidden_size
+        else:
+            raise ValueError("SmolVLM model does not have a 'connector' attribute. Check model structure.")
+
+        # Projection from VLM text dim → config.d_model (only if dims differ)
+        if connector_out_dim != config.d_model:
+            self.proj = nn.Linear(connector_out_dim, config.d_model)
+        else:
+            self.proj = nn.Identity()
+
         self.register_buffer(
             "imagenet_mean",
             torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1),
@@ -71,39 +68,25 @@ class SmolVLAVisionTokenizer(nn.Module):
         if self.freeze_backbone:
             self._freeze_vision_encoder()
 
-        # Apply better initialization
-        self._init_weights()
+        # Only initialize the projection layer (connector is pretrained)
+        if isinstance(self.proj, nn.Linear):
+            torch.nn.init.xavier_uniform_(self.proj.weight)
+            torch.nn.init.constant_(self.proj.bias, 0)
 
     def _freeze_vision_encoder(self):
-        """Freeze vision encoder parameters."""
+        """Freeze vision encoder and connector parameters (both are pretrained)."""
         self.vision_encoder.eval()
         for param in self.vision_encoder.parameters():
             param.requires_grad = False
-
-    def _init_weights(self):
-        """Initialize vision tokenizer weights with better strategies."""
-        
-        def _basic_init(module):
-            if isinstance(module, (nn.Linear, nn.Conv2d)):
-                torch.nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    torch.nn.init.constant_(module.bias, 0)
-            elif isinstance(module, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d)):
-                torch.nn.init.constant_(module.bias, 0)
-                torch.nn.init.constant_(module.weight, 1.0)
-
-        # Initialize enhancement layers
-        if hasattr(self, 'connector'):
-            self.connector.apply(_basic_init)
-        
-        # Initialize spatial positional encoding
-        if hasattr(self, 'spatial_pos_encoding'):
-            torch.nn.init.normal_(self.spatial_pos_encoding, mean=0.0, std=0.02)
+        self.connector.eval()
+        for param in self.connector.parameters():
+            param.requires_grad = False
 
     def train(self, mode: bool = True):
         super().train(mode)
         if self.freeze_backbone:
             self.vision_encoder.eval()
+            self.connector.eval()
         return self
 
     def _preprocess_images(self, images: torch.Tensor) -> torch.Tensor:
@@ -126,13 +109,19 @@ class SmolVLAVisionTokenizer(nn.Module):
         return (images - self.imagenet_mean) / self.imagenet_std
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        """Encode images into enhanced spatial tokens using SmolVLM backbone.
+        """Encode images into patch tokens using SmolVLM backbone (all layers, all tokens).
+
+        Mirrors SmolVLA's embed_image:
+          1. SigLIP ViT → last_hidden_state (all patch tokens)
+          2. Pretrained connector (pixel-shuffle + MLP resampler)
+          3. sqrt(hidden_dim) scaling
+          4. Linear projection → config.d_model
 
         Args:
             images: (B, T, C, H, W) or (B, C, H, W)
 
         Returns:
-            tokens: (B, T * pool_rows * pool_cols, d_model)
+            tokens: (B, T * num_patch_tokens, d_model)
         """
         if images.dim() == 4:
             images = images.unsqueeze(1)
@@ -143,41 +132,32 @@ class SmolVLAVisionTokenizer(nn.Module):
         flat_images = images.reshape(bsize * t_obs, channels, height, width)
         flat_images = self._preprocess_images(flat_images)
 
-        # Use SmolVLM vision encoder
+        vision_dtype = next(self.vision_encoder.parameters()).dtype
+
+        # Step 1: Run SigLIP ViT — all layers, keep all patch tokens
         if self.freeze_backbone:
             with torch.no_grad():
-                vision_features = self.vision_encoder(
-                    pixel_values=flat_images.to(dtype=self.vision_encoder.dtype if hasattr(self.vision_encoder, 'dtype') else torch.float32)
-                )
-                if hasattr(vision_features, 'last_hidden_state'):
-                    features = vision_features.last_hidden_state
-                else:
-                    features = vision_features
+                patch_tokens = self.vision_encoder(
+                    pixel_values=flat_images.to(dtype=vision_dtype)
+                ).last_hidden_state  # (B*T, num_patches, vision_hidden_size)
         else:
-            vision_features = self.vision_encoder(
-                pixel_values=flat_images.to(dtype=self.vision_encoder.dtype if hasattr(self.vision_encoder, 'dtype') else torch.float32)
-            )
-            if hasattr(vision_features, 'last_hidden_state'):
-                features = vision_features.last_hidden_state
-            else:
-                features = vision_features
-        
-        # Apply connector/projection (similar to SmolVLA)
-        projected_features = self.connector(features)
-        
-        # Reshape to spatial grid for token generation
-        # Assume features are in sequence format, reshape to spatial
-        batch_size_times_t_obs = projected_features.shape[0]
-        seq_len = projected_features.shape[1]
-        
-        # Simple approach: take mean and replicate for spatial tokens
-        pooled_features = projected_features.mean(dim=1, keepdim=True)  # (B*T, 1, d_model)
-        # Expand to create spatial tokens
-        spatial_tokens = pooled_features.expand(-1, self.pool_rows * self.pool_cols, -1)  # (B*T, pool_rows*pool_cols, d_model)
-        
-        # Add spatial positional encoding
-        tokens = spatial_tokens + self.spatial_pos_encoding.unsqueeze(0)  # (B*T, pool_rows*pool_cols, d_model)
-        
+            patch_tokens = self.vision_encoder(
+                pixel_values=flat_images.to(dtype=vision_dtype)
+            ).last_hidden_state  # (B*T, num_patches, vision_hidden_size)
+
+        # Step 2: Pretrained connector (pixel-shuffle + MLP resampler)
+        if self.freeze_backbone:
+            with torch.no_grad():
+                features = self.connector(patch_tokens)  # (B*T, num_tokens, connector_out_dim)
+        else:
+            features = self.connector(patch_tokens)  # (B*T, num_tokens, connector_out_dim)
+
+        # Step 3: Scale by sqrt(hidden_dim), matching SmolVLA's embed_prefix normalization
+        features = features * math.sqrt(features.shape[-1])
+
+        # Step 4: Project to d_model
+        tokens = self.proj(features)  # (B*T, num_tokens, d_model)
+
         num_tokens_per_frame = tokens.shape[1]
         return tokens.reshape(bsize, t_obs * num_tokens_per_frame, self.config.d_model)
       
@@ -256,9 +236,6 @@ class FlowMatchingTransformer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.num_bounding_boxes_per_camera = 2
-        self.action_chunk_size = 4  # Action chunking size
-        
         self.state_scale = nn.Parameter(torch.tensor(1.0))  # Learnable scaling for state tokens
         self.vision_scale = nn.Parameter(torch.tensor(1.0))  # Learnable scaling for vision tokens
         self.box_scale = nn.Parameter(torch.tensor(1.0))     # Learnable scaling for box tokens
@@ -267,10 +244,9 @@ class FlowMatchingTransformer(nn.Module):
         self.modality_embedding = nn.Embedding(3, config.d_model)
 
         # ------------------------------
-        # 1. Single shared Object Detector for all cameras (initialize as None)
+        # 1. Single shared Object Detector for all cameras
         # ------------------------------
-        self.object_detector = None
-        self._object_detector_initialized = False
+        self.object_detector = ObjectDetector(self.config)
                         
                 
         # Camera names for processing
@@ -503,38 +479,6 @@ class FlowMatchingTransformer(nn.Module):
 
 
 
-    def _add_noise_tokens(self, state_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Add 3 noise tokens for each input state token with 0-2% noise.
-        
-        Args:
-            state_tokens: (B, T_obs, d_model) - original state tokens
-            
-        Returns:
-            augmented_tokens: (B, T_obs * 4, d_model) - original + 3 noise tokens per original token
-        """
-        B, T_obs, d_model = state_tokens.shape
-        
-        # Create noise for 3 additional tokens per original token (0-2% noise)
-        noise_scale = torch.rand(B, T_obs, 3, 1, device=state_tokens.device) * 0.02  # (B, T_obs, 3, 1) - 0 to 2% noise
-        noise = torch.randn(B, T_obs, 3, d_model, device=state_tokens.device) * noise_scale  # (B, T_obs, 3, d_model)
-        
-        # Original tokens (no noise) - repeat for 4 tokens per original token
-        original_part = state_tokens.unsqueeze(2).expand(-1, -1, 4, -1)[:, :, :1, :]  # (B, T_obs, 1, d_model)
-        original_repeated = original_part.expand(-1, -1, 4, -1)  # (B, T_obs, 4, d_model)
-        
-        # Add noise to the repeated original tokens (first token remains unchanged, next 3 get noise)
-        noise_padding = torch.zeros(B, T_obs, 1, d_model, device=state_tokens.device)  # No noise for first token
-        noise_with_padding = torch.cat([noise_padding, noise], dim=2)  # (B, T_obs, 4, d_model)
-        
-        # Combine original tokens with noise
-        all_tokens = original_repeated + noise_with_padding  # (B, T_obs, 4, d_model)
-        
-        # Reshape to (B, T_obs * 4, d_model)
-        augmented_tokens = all_tokens.view(B, T_obs * 4, d_model)
-        
-        return augmented_tokens
-
     def get_condition(self, batch, generate_heatmaps=False):
         """
         Encode state and bounding box data to get context tokens.
@@ -553,9 +497,7 @@ class FlowMatchingTransformer(nn.Module):
         state_tokens = self.state_encoder(batch["observation.state"])  # (B, T, d_model)
         
         state_tokens = self.state_positional_encoding(state_tokens)
-        
-        # Add noise augmentation: create 3 noise tokens for each original token with 0-2% noise
-        state_tokens_flat = self._add_noise_tokens(state_tokens)  # (B, T_obs * 4, d_model)
+        state_tokens_flat = state_tokens  # (B, T_obs, d_model)
 
         # ------------------------------
         # 2. Lightweight vision token encoding
@@ -598,12 +540,6 @@ class FlowMatchingTransformer(nn.Module):
                     if batch_key in batch:
                         img = self._reshape_camera_tensor(batch[batch_key], B, T_obs).unsqueeze(2)
 
-                        # Initialize object detector if not already initialized
-                        if not self._object_detector_initialized:
-                            print("Initializing object detector for inference...")
-                            self.object_detector = ObjectDetector(self.config)
-                            self._object_detector_initialized = True
-                        
                         # Detect objects and get bounding boxes using the shared detector
                         # Extract image for the current frame and camera
                         img_frame_cam = img[:, frame_idx:frame_idx+1, :, :, :]  # (B, 1, 1, C, H, W)
@@ -717,9 +653,11 @@ class FlowMatchingTransformer(nn.Module):
           )       
         
         
-        # Combine observation tokens (fused vision + fused boxes + state)
-        #context_parts = [tokens for tokens in [state_box_tokens,state_vision_tokens, box_vision_tokens] if tokens.shape[1] > 0]
-        context_parts = [tokens for tokens in [state_tokens_flat, bbox_tokens_combined, vision_tokens_flat] if tokens.shape[1] > 0]
+        # Combine observation tokens using cross-attended (fused) representations:
+        # - state_box_tokens: robot state grounded in object positions
+        # - state_vision_tokens: robot state grounded in visual context
+        # - box_vision_tokens: object locations grounded in visual context
+        context_parts = [tokens for tokens in [state_box_tokens, state_vision_tokens, box_vision_tokens] if tokens.shape[1] > 0]
         
         # Apply transformer encoder to process context parts
         combined_context = torch.cat(context_parts, dim=1)  # (B, total_seq_len, d_model)
