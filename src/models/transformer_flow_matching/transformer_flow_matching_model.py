@@ -516,17 +516,20 @@ class FlowMatchingTransformer(nn.Module):
         if "observation.box" in batch:
             box_data = batch["observation.box"]  # (B, T_obs, 6, 6)
 
-            # BoxEncoder returns a single combined token sequence:
-            #   [distance tokens] then [box tokens]
-            bbox_tokens_flat, coordinates_normalized = self.box_encoder.encode_tokens_train(
-                box_data, batch
-            )
-            spatial_outputs["coordinates_normalized"] = coordinates_normalized
+            # Skip box encoding if all coordinates are zero (no detections in entire batch)
+            box_coords = box_data[..., :4]  # (B, T_obs, 6, 4)
+            if box_coords.abs().sum() > 0:
+                # BoxEncoder returns a single combined token sequence:
+                #   [distance tokens] then [box tokens]
+                bbox_tokens_flat, coordinates_normalized = self.box_encoder.encode_tokens_train(
+                    box_data, batch
+                )
+                spatial_outputs["coordinates_normalized"] = coordinates_normalized
 
-            # Apply positional encoding once over the combined sequence
-            bbox_tokens_flat = self.box_positional_encoding(bbox_tokens_flat)
+                # Apply positional encoding once over the combined sequence
+                bbox_tokens_flat = self.box_positional_encoding(bbox_tokens_flat)
 
-            all_bbox_tokens.append(bbox_tokens_flat)
+                all_bbox_tokens.append(bbox_tokens_flat)
 
         else:
             # observation.box is missing usually mean it is in inference, process each camera with the shared object detector
@@ -626,43 +629,58 @@ class FlowMatchingTransformer(nn.Module):
         # print(f"bbox_tokens_combined norm: {bbox_tokens_combined.norm():.6f}, max: {bbox_tokens_combined.abs().max():.6f}")
         # print(f"state_tokens_flat norm: {state_tokens_flat.norm():.6f}, max: {state_tokens_flat.abs().max():.6f}")
         
-        # Apply self-attention between box and vision tokens to create fused tokens
-        box_vision_tokens = bbox_tokens_combined
-        for layer in self.box_to_vision_cross_attn:
-          box_vision_tokens = layer(
-              query=box_vision_tokens,
-              key=vision_tokens_flat,
-              value=vision_tokens_flat
-          )
-          
-          
-        state_vision_tokens = state_tokens_flat
-        for layer in self.state_to_vision_cross_attn:
-          state_vision_tokens = layer(
-              query=state_vision_tokens,
-              key=vision_tokens_flat,
-              value=vision_tokens_flat
-          )
-        
-        state_box_tokens = state_tokens_flat
-        for layer in self.state_to_box_cross_attn:
-          state_box_tokens = layer(
-              query=state_box_tokens,
-              key=bbox_tokens_combined,
-              value=bbox_tokens_combined
-          )       
-        
-        
+        # Cross-attention fusion — only run when the key/value sequence is non-empty.
+        # PyTorch MultiheadAttention with 0-length keys produces NaN.
+
+        # boxes attending to vision (skip if no boxes or no vision)
+        has_boxes = bbox_tokens_combined.shape[1] > 0
+        has_vision = vision_tokens_flat.shape[1] > 0
+
+        if has_boxes and has_vision:
+            box_vision_tokens = bbox_tokens_combined
+            for layer in self.box_to_vision_cross_attn:
+                box_vision_tokens = layer(
+                    query=box_vision_tokens,
+                    key=vision_tokens_flat,
+                    value=vision_tokens_flat,
+                )
+        else:
+            box_vision_tokens = bbox_tokens_combined  # empty or unchanged
+
+        # state attending to vision (skip if no vision)
+        if has_vision:
+            state_vision_tokens = state_tokens_flat
+            for layer in self.state_to_vision_cross_attn:
+                state_vision_tokens = layer(
+                    query=state_vision_tokens,
+                    key=vision_tokens_flat,
+                    value=vision_tokens_flat,
+                )
+        else:
+            state_vision_tokens = state_tokens_flat  # unchanged
+
+        # state attending to boxes (skip if no boxes)
+        if has_boxes:
+            state_box_tokens = state_tokens_flat
+            for layer in self.state_to_box_cross_attn:
+                state_box_tokens = layer(
+                    query=state_box_tokens,
+                    key=bbox_tokens_combined,
+                    value=bbox_tokens_combined,
+                )
+        else:
+            state_box_tokens = state_tokens_flat  # unchanged
+
         # Combine observation tokens:
         # Include RAW tokens alongside cross-attended versions so each encoder has
         # a direct gradient path (cross-attention queries alone vanish when dominated
         # by vision value vectors).
         context_parts = [tokens for tokens in [
             state_tokens_flat,      # direct gradient to state encoder
-            bbox_tokens_combined,   # direct gradient to box encoder
-            state_box_tokens,       # state enriched with object positions
-            state_vision_tokens,    # state enriched with visual context
-            box_vision_tokens,      # objects enriched with visual context
+            bbox_tokens_combined,   # direct gradient to box encoder (empty → filtered)
+            state_box_tokens,       # state enriched with object positions (or unchanged)
+            state_vision_tokens,    # state enriched with visual context (or unchanged)
+            box_vision_tokens,      # objects enriched with visual context (empty → filtered)
         ] if tokens.shape[1] > 0]
         
         # Apply transformer encoder to process context parts

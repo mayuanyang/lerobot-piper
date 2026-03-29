@@ -66,12 +66,12 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     num_inference_steps: int = 20
         
     # Training presets
-    optimizer_lr: float = 1e-4
+    optimizer_lr: float = 3e-4        # Scaled for batch_size=96 (linear scaling rule: 1e-4 × 96/32)
     optimizer_betas: tuple = (0.95, 0.999)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-6
     scheduler_name: str = "cosine"
-    scheduler_warmup_steps: int = 500
+    scheduler_warmup_steps: int = 1500  # Scaled 3× for batch_size=96
 
     
     def validate_features(self) -> None:
@@ -99,9 +99,9 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     def get_scheduler_preset(self) -> CosineDecayWithWarmupSchedulerConfig:
         return CosineDecayWithWarmupSchedulerConfig(
             num_warmup_steps=self.scheduler_warmup_steps,
-            num_decay_steps=10000,  # Default value
+            num_decay_steps=90000,  # Span full training budget (100k - 1.5k warmup ≈ 98.5k)
             peak_lr=self.optimizer_lr,
-            decay_lr=self.optimizer_lr * 0.1
+            decay_lr=self.optimizer_lr * 0.01  # 3e-6 floor for final convergence
         )
 
     @property

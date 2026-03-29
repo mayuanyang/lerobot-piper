@@ -166,35 +166,43 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         trainable_params = [p for p in policy.model.parameters() if p.requires_grad]
         
         # Print optimizer information
-        print(f"Initializing optimizer with learning rate: 5e-5")
+        resume_lr = policy.config.optimizer_lr if hasattr(policy.config, 'optimizer_lr') else 3e-4
+        resume_warmup = policy.config.scheduler_warmup_steps if hasattr(policy.config, 'scheduler_warmup_steps') else 1500
+        print(f"Initializing optimizer with learning rate: {resume_lr}")
         total_trainable_params = sum(p.numel() for p in trainable_params)
         print(f"Number of trainable parameters: {total_trainable_params}")
         
-        
-        optimizer = torch.optim.Adam(trainable_params, lr=5e-5, weight_decay=1e-4)
+        optimizer = torch.optim.Adam(trainable_params, lr=resume_lr, weight_decay=1e-6)
         
         # Print learning rate groups
         print(f"Optimizer parameter groups: {len(optimizer.param_groups)}")
         for i, group in enumerate(optimizer.param_groups):
             group_param_count = sum(p.numel() for p in group['params'])
             print(f"  Group {i}: lr={group['lr']}, params={group_param_count}")
-        # Cosine scheduler with warmup
-        warmup_steps = 1000
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer, 
-            num_warmup_steps=warmup_steps, 
-            num_training_steps=training_steps
-        )
-        
-        # Load optimizer state
+
+        # Load optimizer state (keep Adam momentum/variance but reset LR to new config value)
         if not resume_from_checkpoint.startswith("http") and not resume_from_checkpoint.startswith("huggingface.co"):
             checkpoint_path = Path(resume_from_checkpoint)
             optimizer_state_path = checkpoint_path / "optimizer_state.pth"
             if optimizer_state_path.exists():
                 optimizer.load_state_dict(torch.load(optimizer_state_path, map_location=device))
-                print(f"Optimizer state loaded.")
-            
-            # Extract step
+                # Override the stale LR from the checkpoint with the new config value
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = resume_lr
+                    param_group['initial_lr'] = resume_lr
+                print(f"Optimizer state loaded. LR reset to {resume_lr}")
+
+        # Fresh cosine scheduler (always recreated so warmup restarts correctly)
+        warmup_steps = resume_warmup
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=training_steps
+        )
+
+        # Extract step counter from checkpoint directory name
+        if not resume_from_checkpoint.startswith("http") and not resume_from_checkpoint.startswith("huggingface.co"):
+            checkpoint_path = Path(resume_from_checkpoint)
             if checkpoint_path.name.startswith("checkpoint-"):
                 step = int(checkpoint_path.name.split("-")[1])
             else:
@@ -224,7 +232,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         
 
         trainable_params = [p for p in policy.parameters() if p.requires_grad]
-        optimizer = torch.optim.Adam(trainable_params, lr=1e-4)
+        fresh_lr = cfg.optimizer_lr
+        fresh_warmup = cfg.scheduler_warmup_steps
+        optimizer = torch.optim.Adam(trainable_params, lr=fresh_lr, weight_decay=cfg.optimizer_weight_decay)
         
         # Print learning rate groups
         print(f"Optimizer parameter groups: {len(optimizer.param_groups)}")
@@ -233,7 +243,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             print(f"  Group {i}: lr={group['lr']}, params={group_param_count}")
         
         # Cosine scheduler with warmup
-        warmup_steps = 500
+        warmup_steps = fresh_warmup
         scheduler = get_cosine_schedule_with_warmup(
             optimizer, 
             num_warmup_steps=warmup_steps, 
