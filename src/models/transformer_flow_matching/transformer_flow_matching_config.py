@@ -36,6 +36,11 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     
     # Vision encoder parameters
     num_cameras: int = 3
+
+    # Zero-shot object detection (YOLOWorld inference)
+    # Set these to the names of the objects your robot needs to pick and place
+    detection_classes: list = field(default_factory=lambda: ["cube", "container"])
+    detection_conf: float = 0.1  # Confidence threshold (lower = more recalls, higher = fewer false positives)
     
     # Selective camera processing - list of camera keys to use for vision-state token concatenation
     # Empty list means use all cameras

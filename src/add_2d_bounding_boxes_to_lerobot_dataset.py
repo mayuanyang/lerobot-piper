@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Script to add 2D bounding box information to an existing LeRobot dataset using the LeRobotDataset class.
-This script loads a dataset using LeRobotDataset, processes each frame to detect objects using Qwen3-VL,
-and adds the bounding box information to the dataset.
+This script loads a dataset using LeRobotDataset, processes each frame to detect objects using YOLOWorld
+(zero-shot open-vocabulary detection), and adds the bounding box information to the dataset.
+
+Install dependency: pip install ultralytics
 """
 
 import json
 import torch
-import cv2
 import numpy as np
 from pathlib import Path
 import argparse
@@ -17,198 +18,116 @@ from PIL import Image
 import torchvision.transforms as T
 import traceback
 import sys
-import os
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 import pyarrow as pa
 import pyarrow.parquet as pq
 from huggingface_hub import HfApi
 
-# Conditional import of transformers to handle cases where it might not be available
-try:
-    from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
-    TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    TRANSFORMERS_AVAILABLE = False
-    print("Transformers library not available. Object detection will not work.")
-
 
 class LeRobot2DBoundingBoxAdder:
-    """Class to add 2D bounding box information to LeRobot datasets using LeRobotDataset class."""
-    
-    def __init__(self, device="cuda" if torch.cuda.is_available() else "cpu"):
+    """Add 2D bounding box information to LeRobot datasets using YOLOWorld zero-shot detection.
+
+    YOLOWorld uses CLIP-based text–image matching so you can detect arbitrary object
+    classes by name without any fine-tuning.  Typical throughput: ~25 ms/image on GPU.
+
+    Args:
+        detection_classes: List of class names to detect, e.g. ["cube", "container"].
+        detection_conf:    Confidence threshold in [0, 1].  Lower = more recalls.
+        device:            "cuda" or "cpu".
+    """
+
+    def __init__(
+        self,
+        detection_classes: list[str] | None = None,
+        detection_conf: float = 0.1,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    ):
         self.device = device
+        self.detection_classes = detection_classes or ["cube", "container"]
+        self.detection_conf = detection_conf
         print(f"Using device: {self.device}")
-        
-        if not TRANSFORMERS_AVAILABLE:
-            print("WARNING: Transformers library not available. Object detection will not work.")
-            self.model = None
-            self.processor = None
-            return
-        
-        # Load Qwen3-VL model and processor
-        print("Loading Qwen3-VL-4B-Instruct model for object detection...")
-        try:
-            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
-                "Qwen/Qwen3-VL-4B-Instruct",
-                torch_dtype="auto",
-                device_map="auto",
-                attn_implementation="sdpa"
-            )
-            self.processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-4B-Instruct")
-        except Exception as e:
-            print(f"Error loading Qwen3-VL model: {e}")
-            self.model = None
-            self.processor = None
-            return
-        
-        # System prompt for 2D bounding box detection
-        self.system_prompt_2d = "You are a precise 2D object detector. For each object, provide its 2D bounding box in JSON format with 'bbox_2d' field containing [x1, y1, x2, y2] where (x1, y1) is the top-left corner and (x2, y2) is the bottom-right corner. Also provide a 'label' field indicating the object category, a 'confidence' field with a value between 0.0 and 1.0 indicating your confidence in the detection"
-        
-        # Default user prompt for 2D detection
-        self.user_prompt_2d = 'locate every instance that belongs to the following categories: "cube, container"'
-        
-        # Image transformations (only convert to tensor, no resizing)
-        self.transform = T.ToTensor()
-        
-        print("LeRobot 2D bounding box adder initialized successfully!")
+        print(f"Detection classes: {self.detection_classes}  conf≥{self.detection_conf}")
 
-    def detect_objects_and_get_2d_bounding_boxes(self, image_tensor, user_prompt=None):
-        """
-        Use Qwen3-VL to detect objects in the image and extract 2D bounding boxes.
-        
+        try:
+            from ultralytics import YOLO
+        except ImportError:
+            raise ImportError("ultralytics is required: pip install ultralytics")
+
+        print("Loading YOLOWorld model (yolov8x-worldv2.pt)…")
+        self.model = YOLO("yolov8x-worldv2.pt")
+        self.model.set_classes(self.detection_classes)
+        print("YOLOWorld model ready.")
+
+        # Label → category_id mapping (matches the training pipeline)
+        self.label_to_id: dict[str, int] = {
+            label: idx for idx, label in enumerate(self.detection_classes)
+        }
+
+    # ------------------------------------------------------------------
+    # Core detection API (returns same dict format as the old Qwen code)
+    # ------------------------------------------------------------------
+
+    def detect_objects_and_get_2d_bounding_boxes(
+        self, image_tensor: torch.Tensor, user_prompt: str | None = None
+    ) -> list[list[dict]]:
+        """Detect objects in a batch of images using YOLOWorld.
+
         Args:
-            image_tensor: (B, C, H, W) tensor of images
-            user_prompt: Optional override for the user prompt
-            
+            image_tensor: (B, C, H, W) float tensor in [0, 1] or uint8 [0, 255].
+            user_prompt:  Ignored (kept for API compatibility).
+
         Returns:
-            bounding_boxes: List of lists of dictionaries with 'bbox_2d' and 'label' fields
-        """
-        if self.model is None or self.processor is None:
-            # Return empty results if model is not available
-            B = image_tensor.shape[0]
-            return [[] for _ in range(B)]
-        
-        # Use provided user prompt or fall back to instance default
-        actual_user_prompt = user_prompt or self.user_prompt_2d
-        
-        B, C, H, W = image_tensor.shape
-        bounding_boxes_list = []
-        
-        # Process each image in the batch
-        for i in range(B):
-            # Convert tensor to PIL Image for Qwen3-VL processing
-            img = image_tensor[i].detach().cpu()
-            # Convert from [-1, 1] to [0, 1] if needed
-            if img.min() < 0:
-                img = (img + 1) / 2  # Convert from [-1, 1] to [0, 1]
-            
-            # Convert to PIL Image
-            pil_transform = T.ToPILImage()
-            pil_image = pil_transform(img)
-            
-            # Prepare messages for Qwen3-VL with system and user roles for 2D detection
-            messages = [
+            List of length B.  Each element is a list of dicts::
+
                 {
-                    "role": "system",
-                    "content": [{"type": "text", "text": self.system_prompt_2d}]
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "image": pil_image,
-                        },
-                        {"type": "text", "text": actual_user_prompt},
-                    ],
+                    "bbox_2d":     [x1, y1, x2, y2],   # absolute pixel coords
+                    "label":       str,
+                    "confidence":  float,
+                    "category_id": int,
                 }
-            ]
-            
-            # Apply chat template
-            inputs = self.processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt"
-            )
-            inputs = inputs.to(self.model.device)
-            
-            # Generate response
-            generated_ids = self.model.generate(**inputs, max_new_tokens=512)
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            output_text = self.processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )
-            
-            # Parse 2D bounding boxes from output text
-            bounding_boxes = self._parse_2d_bounding_boxes_from_text(output_text[0])
-            bounding_boxes_list.append(bounding_boxes)
-        
-        return bounding_boxes_list
+        """
+        B, C, H, W = image_tensor.shape
 
-    def _parse_2d_bounding_boxes_from_text(self, text):
-        """
-        Parse 2D bounding boxes and object types from Qwen3-VL JSON text output.
-        
-        Args:
-            text: String output from Qwen3-VL
-            
-        Returns:
-            List of dictionaries with 'bbox_2d', 'label', 'confidence' fields
-        """
+        # Convert to list of HWC uint8 numpy arrays
+        img_cpu = image_tensor.detach().cpu()
+        if img_cpu.max() <= 1.0 + 1e-3:
+            img_cpu = (img_cpu * 255).clamp(0, 255)
+        img_cpu = img_cpu.byte()
+
+        imgs_np = [img_cpu[i].permute(1, 2, 0).numpy() for i in range(B)]
+
         try:
-            # Find JSON content
-            if "```json" in text:
-                start_idx = text.find("```json")
-                end_idx = text.find("```", start_idx + 7)
-                if end_idx != -1:
-                    json_str = text[start_idx + 7:end_idx].strip()
-                else:
-                    json_str = text[start_idx + 7:].strip()
-            else:
-                # Find first [ and last ]
-                start_idx = text.find('[')
-                end_idx = text.rfind(']')
-                if start_idx != -1 and end_idx != -1:
-                    json_str = text[start_idx:end_idx + 1]
-                else:
-                    return []
-            
-            # Parse JSON
-            bbox_data = json.loads(json_str)
-            
-            
-            # Normalize to list format
-            if isinstance(bbox_data, list):
-                # Validate each item in the list has required fields
-                validated_data = []
-                for item in bbox_data:
-                    if isinstance(item, dict) and 'bbox_2d' in item and 'label' in item:
-                        # Ensure bbox_2d has 4 coordinates
-                        if len(item['bbox_2d']) == 4:
-                            # Add default values for confidence and category_id if not present
-                            if 'confidence' not in item:
-                                item['confidence'] = 1.0  # Default confidence
-                            if 'category_id' not in item:
-                                # Map label to category_id (0 for cube, 1 for container, -1 for others)
-                                label = item['label'].lower()
-                                if 'cube' in label:
-                                    item['category_id'] = 0
-                                elif 'container' in label or 'box' in label:
-                                    item['category_id'] = 1
-                                else:
-                                    item['category_id'] = -1  # Unknown category
-                            validated_data.append(item)
-                return validated_data
-            else:
-                return []
-                
-        except (json.JSONDecodeError, IndexError, KeyError, TypeError) as e:
-            print(f"Error parsing 2D bounding boxes: {e}")
-            return []
+            results = self.model(imgs_np, conf=self.detection_conf, verbose=False)
+        except Exception as e:
+            print(f"YOLOWorld inference error: {e}")
+            return [[] for _ in range(B)]
+
+        bounding_boxes_list: list[list[dict]] = []
+        for result in results:
+            dets: list[dict] = []
+            boxes = result.boxes
+            if boxes is not None and len(boxes) > 0:
+                xyxy = boxes.xyxy.cpu()          # absolute pixel coords
+                confs = boxes.conf.cpu()
+                cls_ids = boxes.cls.cpu().long()
+                for j in range(len(xyxy)):
+                    x1, y1, x2, y2 = xyxy[j].tolist()
+                    conf = float(confs[j].item())
+                    cls_id = int(cls_ids[j].item())
+                    label = (
+                        self.detection_classes[cls_id]
+                        if cls_id < len(self.detection_classes)
+                        else "unknown"
+                    )
+                    dets.append({
+                        "bbox_2d":     [x1, y1, x2, y2],
+                        "label":       label,
+                        "confidence":  conf,
+                        "category_id": self.label_to_id.get(label, -1),
+                    })
+            bounding_boxes_list.append(dets)
+
+        return bounding_boxes_list
 
     def process_lerobot_dataset(self, repo_id, user_prompt=None, output_path=None, max_samples=None, revision="main", push_to_hub=False, hf_token=None):
         """
@@ -814,32 +733,39 @@ class LeRobot2DBoundingBoxAdder:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Add 2D bounding box information to LeRobot dataset")
-    parser.add_argument("--repo_id", type=str, required=True, help="Repository ID for the LeRobot dataset (e.g., ISDept/piper_arm)")
-    parser.add_argument("--user_prompt", type=str, 
-                       default='locate every instance that belongs to the following categories: "plate/dish, scallop, wine bottle, tv, bowl, spoon, air conditioner, coconut drink, cup, chopsticks, person". Report bbox coordinates in JSON format.',
-                       help="User prompt to guide object detection")
+    parser = argparse.ArgumentParser(description="Add 2D bounding box information to LeRobot dataset (using YOLOWorld)")
+    parser.add_argument("--repo_id", type=str, required=True, help="Repository ID for the LeRobot dataset (e.g., ISdept/piper_arm)")
+    parser.add_argument(
+        "--detection_classes", type=str, nargs="+", default=["cube", "container"],
+        help="Object class names to detect, e.g. --detection_classes cube container tray",
+    )
+    parser.add_argument(
+        "--detection_conf", type=float, default=0.1,
+        help="YOLOWorld confidence threshold (default: 0.1)",
+    )
     parser.add_argument("--output_path", type=str, help="Output path for the bounding box data")
     parser.add_argument("--max_samples", type=int, help="Maximum number of samples to process (for testing)")
     parser.add_argument("--revision", type=str, default="main", help="Revision of the dataset to load")
     parser.add_argument("--push_to_hub", action="store_true", help="Push updates to HuggingFace Hub")
     parser.add_argument("--hf_token", type=str, help="HuggingFace token for authentication")
-    
+
     args = parser.parse_args()
-    
-    # Initialize the adder
-    adder = LeRobot2DBoundingBoxAdder()
-    
+
+    # Initialize the adder with YOLOWorld
+    adder = LeRobot2DBoundingBoxAdder(
+        detection_classes=args.detection_classes,
+        detection_conf=args.detection_conf,
+    )
+
     # Process the dataset
     try:
         bounding_boxes_data = adder.process_lerobot_dataset(
             repo_id=args.repo_id,
-            user_prompt=args.user_prompt,
             output_path=args.output_path,
             max_samples=args.max_samples,
             revision=args.revision,
             push_to_hub=args.push_to_hub,
-            hf_token=args.hf_token
+            hf_token=args.hf_token,
         )
         print("2D bounding box information added to dataset successfully!")
         print(f"Processed {len(bounding_boxes_data)} samples with bounding box data")

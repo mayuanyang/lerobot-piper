@@ -548,31 +548,23 @@ class FlowMatchingTransformer(nn.Module):
                         img_frame_cam = img[:, frame_idx:frame_idx+1, :, :, :]  # (B, 1, 1, C, H, W)
                         B_v, T_v, N_v, C_v, H_v, W_v = img_frame_cam.shape
                         img_reshaped = img_frame_cam.view(B_v * T_v * N_v, C_v, H_v, W_v)  # (B*1*1, C, H, W)
+                        # YOLOWorld returns (N, 4) with coords already normalised to [0, 1]
                         bounding_boxes, object_types = self.object_detector.detect_objects_and_get_bounding_boxes(img_reshaped)
                         
-                        # Ensure exactly 2 bounding boxes per camera by padding with zeros if needed
+                        # Ensure exactly 2 bounding boxes per camera by padding/trimming
                         if bounding_boxes is None or bounding_boxes.numel() == 0:
-                            # No detections, create 2 empty boxes with 4 coordinates each for 2D bounding boxes
                             bounding_boxes = torch.zeros((2, 4), device=img_reshaped.device, dtype=torch.float32)
                             object_types = ['unknown', 'unknown']
                         else:
-                            # Pad or trim to exactly 2 boxes
                             current_num_boxes = bounding_boxes.shape[0]
                             if current_num_boxes < 2:
-                                # Pad with zeros (4 coordinates for 2D bounding boxes)
                                 padding = torch.zeros((2 - current_num_boxes, 4), device=bounding_boxes.device, dtype=bounding_boxes.dtype)
                                 bounding_boxes = torch.cat([bounding_boxes, padding], dim=0)
-                                # Pad object types with 'unknown'
-                                object_types.extend(['unknown'] * (2 - current_num_boxes))
+                                object_types = list(object_types) + ['unknown'] * (2 - current_num_boxes)
                             elif current_num_boxes > 2:
-                                # Trim to 2 boxes
                                 bounding_boxes = bounding_boxes[:2]
-                                object_types = object_types[:2]
-                        
-                        
-                        # Normalize bounding box coordinates during inference to match training
-                        bounding_boxes[:, 0::2] /= W_v
-                        bounding_boxes[:, 1::2] /= H_v
+                                object_types = list(object_types)[:2]
+                        # Coordinates are already normalised to [0, 1] by YOLOWorld (xyxyn)
                         
                         bbox_tokens_flat = self.box_encoder.encode_tokens_inference(
                             bounding_boxes=bounding_boxes,
