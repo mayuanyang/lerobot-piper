@@ -431,12 +431,12 @@ def main():
     parser = argparse.ArgumentParser(description="Add 2D bounding box information to LeRobot dataset (using YOLOWorld)")
     parser.add_argument("--repo_id", type=str, required=True, help="Repository ID for the LeRobot dataset (e.g., ISdept/piper_arm)")
     parser.add_argument(
-        "--detection_classes", type=str, nargs="+", default=["cube", "container"],
+        "--detection_classes", type=str, nargs="+", default=["blue cube", "pink box"],
         help="Object class names to detect, e.g. --detection_classes cube container tray",
     )
     parser.add_argument(
-        "--detection_conf", type=float, default=0.1,
-        help="YOLOWorld confidence threshold (default: 0.1)",
+        "--detection_conf", type=float, default=0.05,
+        help="YOLOWorld confidence threshold (default: 0.05)",
     )
     parser.add_argument("--output_path", type=str, help="Output path for the bounding box data")
     parser.add_argument("--max_samples", type=int, help="Maximum number of samples to process (for testing)")

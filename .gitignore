@@ -212,3 +212,5 @@ model_output/
 data/
 input/
 temp/
+
+*.pt
