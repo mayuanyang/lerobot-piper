@@ -110,7 +110,7 @@ class ObjectDetector:
             boxes = result.boxes
             if boxes is None or len(boxes) == 0:
                 continue
-            xyxy = boxes.xyxyn.cpu()  # normalised [x1, y1, x2, y2] in [0, 1]
+            xyxy = boxes.xyxy.cpu()  # absolute pixel coords [x1, y1, x2, y2]
             cls_ids = boxes.cls.cpu().long()
             for j in range(len(xyxy)):
                 all_boxes.append(xyxy[j].tolist())

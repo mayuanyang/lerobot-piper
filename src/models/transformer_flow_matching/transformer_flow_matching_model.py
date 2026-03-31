@@ -548,7 +548,7 @@ class FlowMatchingTransformer(nn.Module):
                         img_frame_cam = img[:, frame_idx:frame_idx+1, :, :, :]  # (B, 1, 1, C, H, W)
                         B_v, T_v, N_v, C_v, H_v, W_v = img_frame_cam.shape
                         img_reshaped = img_frame_cam.view(B_v * T_v * N_v, C_v, H_v, W_v)  # (B*1*1, C, H, W)
-                        # YOLOWorld returns (N, 4) with coords already normalised to [0, 1]
+                        # YOLOWorld returns (N, 4) absolute pixel coords [x1, y1, x2, y2]
                         bounding_boxes, object_types = self.object_detector.detect_objects_and_get_bounding_boxes(img_reshaped)
                         
                         # Ensure exactly 2 bounding boxes per camera by padding/trimming
@@ -564,7 +564,15 @@ class FlowMatchingTransformer(nn.Module):
                             elif current_num_boxes > 2:
                                 bounding_boxes = bounding_boxes[:2]
                                 object_types = list(object_types)[:2]
-                        # Coordinates are already normalised to [0, 1] by YOLOWorld (xyxyn)
+
+                        # Normalise absolute pixel coords to [0, 1] to match the training
+                        # format expected by encode_boxes_inference (which computes features
+                        # like distance_to_right = 1 - x2 and center_x - 0.5).
+                        norm_factors = torch.tensor(
+                            [W_v, H_v, W_v, H_v],
+                            device=bounding_boxes.device, dtype=bounding_boxes.dtype
+                        )
+                        bounding_boxes = bounding_boxes / norm_factors.clamp(min=1.0)
                         
                         bbox_tokens_flat = self.box_encoder.encode_tokens_inference(
                             bounding_boxes=bounding_boxes,
