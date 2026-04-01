@@ -1,4 +1,5 @@
 import warnings
+import contextlib
 
 import torch
 from torch import Tensor, nn
@@ -65,6 +66,21 @@ class SmolVLAVisionTokenizer(nn.Module):
             torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
         )
 
+        # ── Text encoding (task description) ──────────────────────────────────
+        # We reuse the LM's embed_tokens layer (frozen) and add a small trainable
+        # projection to map from LM hidden size → d_model.
+        self.processor = AutoProcessor.from_pretrained(
+            self.model_id, trust_remote_code=True
+        )
+        lm_hidden_size = self.vision_model.config.text_config.hidden_size
+        # embed_tokens: (vocab_size, lm_hidden_size)
+        self.text_embed_tokens = self.vision_model.model.embed_tokens
+        # Trainable projection: lm_hidden_size → d_model
+        self.text_proj = nn.Linear(lm_hidden_size, config.d_model)
+        torch.nn.init.xavier_uniform_(self.text_proj.weight)
+        torch.nn.init.constant_(self.text_proj.bias, 0)
+        # ──────────────────────────────────────────────────────────────────────
+
         if self.freeze_backbone:
             self._freeze_vision_encoder()
 
@@ -74,12 +90,15 @@ class SmolVLAVisionTokenizer(nn.Module):
             torch.nn.init.constant_(self.proj.bias, 0)
 
     def _freeze_vision_encoder(self):
-        """Freeze vision encoder and connector parameters (both are pretrained)."""
+        """Freeze vision encoder, connector, and text embed_tokens (all are pretrained)."""
         self.vision_encoder.eval()
         for param in self.vision_encoder.parameters():
             param.requires_grad = False
         self.connector.eval()
         for param in self.connector.parameters():
+            param.requires_grad = False
+        # Freeze the LM embed_tokens; only text_proj remains trainable
+        for param in self.text_embed_tokens.parameters():
             param.requires_grad = False
 
     def train(self, mode: bool = True):
@@ -87,6 +106,7 @@ class SmolVLAVisionTokenizer(nn.Module):
         if self.freeze_backbone:
             self.vision_encoder.eval()
             self.connector.eval()
+            self.text_embed_tokens.eval()
         return self
 
     def _preprocess_images(self, images: torch.Tensor) -> torch.Tensor:
@@ -107,6 +127,37 @@ class SmolVLAVisionTokenizer(nn.Module):
         )
         images = images.clamp(0.0, 1.0)
         return (images - self.imagenet_mean) / self.imagenet_std
+
+    def encode_text(self, descriptions: list[str]) -> torch.Tensor:
+        """Encode task description strings → (B, L, d_model) tokens.
+
+        Uses the pre-trained LM embed_tokens layer (frozen) followed by a small
+        trainable linear projection.  All tokens (up to max_length=64) are kept
+        so the action decoder can attend to the full instruction.
+
+        Args:
+            descriptions: list of B strings, one per sample.
+
+        Returns:
+            (B, L, d_model) float tensor on the same device as the vision encoder.
+        """
+        device = next(self.vision_encoder.parameters()).device
+
+        encoded = self.processor.tokenizer(
+            descriptions,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=64,
+        ).to(device)
+
+        ctx = torch.no_grad() if self.freeze_backbone else contextlib.nullcontext()
+        with ctx:
+            # (B, L, lm_hidden_size)
+            text_embeds = self.text_embed_tokens(encoded["input_ids"]).float()
+
+        # (B, L, d_model)
+        return self.text_proj(text_embeds)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """Encode images into patch tokens using SmolVLM backbone (all layers, all tokens).
@@ -241,7 +292,9 @@ class FlowMatchingTransformer(nn.Module):
         self.box_scale = nn.Parameter(torch.tensor(1.0))     # Learnable scaling for box tokens
         self.time_embedding_scale = nn.Parameter(torch.tensor(0.2))  # Learnable scaling for time embedding
         
-        self.modality_embedding = nn.Embedding(3, config.d_model)
+        # modality IDs: 0=state, 1=vision, 2=box, 3=text
+        self.modality_embedding = nn.Embedding(4, config.d_model)
+        self.text_scale = nn.Parameter(torch.tensor(1.0))
 
         # ------------------------------
         # 1. Single shared Object Detector for all cameras
@@ -500,7 +553,15 @@ class FlowMatchingTransformer(nn.Module):
         state_tokens_flat = state_tokens  # (B, T_obs, d_model)
 
         # ------------------------------
-        # 2. Lightweight vision token encoding
+        # 2. Task description text tokens (if provided)
+        # ------------------------------
+        text_tokens_flat = None
+        if "task_description" in batch and batch["task_description"]:
+            descriptions = batch["task_description"]  # list[str] of length B
+            text_tokens_flat = self.vision_encoder.encode_text(descriptions)  # (B, L, d_model)
+
+        # ------------------------------
+        # 2b. Lightweight vision token encoding
         # ------------------------------
         vision_tokens_flat = self._encode_vision_tokens(batch, B, T_obs)
         
@@ -607,22 +668,29 @@ class FlowMatchingTransformer(nn.Module):
             bbox_tokens_combined = torch.empty(B, 0, self.config.d_model, device=batch["observation.state"].device)
         
         # Apply modality embeddings to each token type
+        dev = batch["observation.state"].device
         if state_tokens_flat.shape[1] > 0:
-            state_modality_emb = self.modality_embedding(torch.tensor(0, device=state_tokens_flat.device)).unsqueeze(0).unsqueeze(0)
+            state_modality_emb = self.modality_embedding(torch.tensor(0, device=dev)).unsqueeze(0).unsqueeze(0)
             state_tokens_flat = state_tokens_flat + state_modality_emb.expand_as(state_tokens_flat)
-        
+
         if vision_tokens_flat.shape[1] > 0:
-            vision_modality_emb = self.modality_embedding(torch.tensor(1, device=vision_tokens_flat.device)).unsqueeze(0).unsqueeze(0)
+            vision_modality_emb = self.modality_embedding(torch.tensor(1, device=dev)).unsqueeze(0).unsqueeze(0)
             vision_tokens_flat = vision_tokens_flat + vision_modality_emb.expand_as(vision_tokens_flat)
-            
+
         if bbox_tokens_combined.shape[1] > 0:
-            box_modality_emb = self.modality_embedding(torch.tensor(2, device=bbox_tokens_combined.device)).unsqueeze(0).unsqueeze(0)
+            box_modality_emb = self.modality_embedding(torch.tensor(2, device=dev)).unsqueeze(0).unsqueeze(0)
             bbox_tokens_combined = bbox_tokens_combined + box_modality_emb.expand_as(bbox_tokens_combined)
+
+        if text_tokens_flat is not None and text_tokens_flat.shape[1] > 0:
+            text_modality_emb = self.modality_embedding(torch.tensor(3, device=dev)).unsqueeze(0).unsqueeze(0)
+            text_tokens_flat = text_tokens_flat + text_modality_emb.expand_as(text_tokens_flat)
 
         # Apply scaling after modality embeddings
         vision_tokens_flat = vision_tokens_flat * self.vision_scale
         bbox_tokens_combined = bbox_tokens_combined * self.box_scale
         state_tokens_flat = state_tokens_flat * self.state_scale
+        if text_tokens_flat is not None:
+            text_tokens_flat = text_tokens_flat * self.text_scale
 
         
         # print(f"vision_tokens_flat norm: {vision_tokens_flat.norm():.6f}, max: {vision_tokens_flat.abs().max():.6f}")
@@ -681,7 +749,8 @@ class FlowMatchingTransformer(nn.Module):
             state_box_tokens,       # state enriched with object positions (or unchanged)
             state_vision_tokens,    # state enriched with visual context (or unchanged)
             box_vision_tokens,      # objects enriched with visual context (empty → filtered)
-        ] if tokens.shape[1] > 0]
+            text_tokens_flat,       # task description tokens (None → filtered)
+        ] if tokens is not None and tokens.shape[1] > 0]
         
         # Apply transformer encoder to process context parts
         combined_context = torch.cat(context_parts, dim=1)  # (B, total_seq_len, d_model)
@@ -749,6 +818,7 @@ class FlowMatchingTransformer(nn.Module):
             "state_scale": self.state_scale.item(),
             "vision_scale": self.vision_scale.item(),
             "box_scale": self.box_scale.item(),
+            "text_scale": self.text_scale.item(),
             "time_embedding_scale": self.time_embedding_scale.item(),
             "box_token_scale": self.box_encoder.box_token_scale.item(),
         }

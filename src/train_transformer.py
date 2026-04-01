@@ -1,5 +1,6 @@
 from pathlib import Path
 import torch
+import pandas as pd
 from tqdm import tqdm
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
@@ -282,6 +283,26 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         print(f"Trying local dataset at {local_dataset_path}...")
         dataset = LeRobotDataset(local_dataset_path, delta_timestamps=delta_timestamps, force_cache_sync=True, tolerance_s=0.005)  # Tighter timestamp alignment
 
+    # Build task_index → description mapping from tasks.parquet
+    task_idx_to_description: dict[int, str] = {}
+    try:
+        tasks_parquet_path = dataset.root / "meta" / "tasks.parquet"
+        if tasks_parquet_path.exists():
+            tasks_df = pd.read_parquet(tasks_parquet_path)
+            # tasks.parquet uses task strings as the index and task_index as a column
+            if "task_index" in tasks_df.columns:
+                task_idx_to_description = {
+                    int(row["task_index"]): str(idx)
+                    for idx, row in tasks_df.iterrows()
+                }
+            print(f"Loaded {len(task_idx_to_description)} task descriptions from tasks.parquet:")
+            for idx, desc in task_idx_to_description.items():
+                print(f"  [{idx}] {desc}")
+        else:
+            print("tasks.parquet not found; task_description will not be added to batches.")
+    except Exception as e:
+        print(f"Warning: could not load tasks.parquet: {e}")
+
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=8,
@@ -295,7 +316,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     #visualizer = SpatialSoftmaxVisualizer(Path(output_dir) / "spatial_softmax_visualizations")
 
     episode_ids = np.array(dataset.hf_dataset["episode_index"])
-    valid_indices = np.where(episode_ids <= 36)[0]  # first 40 episodes
+    valid_indices = np.where(episode_ids <= 400)[0]  # first 40 episodes
 
     dataset = Subset(dataset, valid_indices)
     print('The partial dataset length', len(dataset))
@@ -312,6 +333,16 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             for key in batch:
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].to(device, non_blocking=True)
+
+            # Enrich batch with task description strings (looked up from tasks.parquet mapping)
+            if task_idx_to_description and "task_index" in batch:
+                task_indices = batch["task_index"]  # (B,) or (B, T)
+                # Use the first element's task_index for each sample
+                if task_indices.dim() > 1:
+                    task_indices = task_indices[:, 0]
+                batch["task_description"] = [
+                    task_idx_to_description.get(int(ti.item()), "") for ti in task_indices
+                ]
 
             # Apply joint data augmentation
             batch = apply_joint_augmentations(batch)
