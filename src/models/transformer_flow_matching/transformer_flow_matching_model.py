@@ -74,7 +74,7 @@ class SmolVLAVisionTokenizer(nn.Module):
         )
         lm_hidden_size = self.vision_model.config.text_config.hidden_size
         # embed_tokens: (vocab_size, lm_hidden_size)
-        self.text_embed_tokens = self.vision_model.model.embed_tokens
+        self.text_embed_tokens = self.vision_model.text_model.embed_tokens
         # Trainable projection: lm_hidden_size → d_model
         self.text_proj = nn.Linear(lm_hidden_size, config.d_model)
         torch.nn.init.xavier_uniform_(self.text_proj.weight)
@@ -363,6 +363,38 @@ class FlowMatchingTransformer(nn.Module):
                 dim_feedforward=config.dim_feedforward
             )
             for _ in range(2)  # e.g. 2–4
+        ])
+
+        # Cross-attention where text is the query and each modality is key/value.
+        # This produces context-grounded text representations (text reads from the scene).
+        self.text_to_state_cross_attn = nn.ModuleList([
+            CrossAttentionBlock(
+                d_model=config.d_model,
+                nhead=config.nhead,
+                dropout=0.1,
+                dim_feedforward=config.dim_feedforward
+            )
+            for _ in range(2)
+        ])
+
+        self.text_to_vision_cross_attn = nn.ModuleList([
+            CrossAttentionBlock(
+                d_model=config.d_model,
+                nhead=config.nhead,
+                dropout=0.1,
+                dim_feedforward=config.dim_feedforward
+            )
+            for _ in range(2)
+        ])
+
+        self.text_to_box_cross_attn = nn.ModuleList([
+            CrossAttentionBlock(
+                d_model=config.d_model,
+                nhead=config.nhead,
+                dropout=0.1,
+                dim_feedforward=config.dim_feedforward
+            )
+            for _ in range(2)
         ])
 
         # Transformer encoder for processing context parts
@@ -739,6 +771,49 @@ class FlowMatchingTransformer(nn.Module):
         else:
             state_box_tokens = state_tokens_flat  # unchanged
 
+        # text attending to each modality — text is query, modality is key/value.
+        # Produces scene-grounded text representations that capture what the task
+        # description means *given the current robot state and visual observations*.
+        has_text = text_tokens_flat is not None and text_tokens_flat.shape[1] > 0
+
+        if has_text:
+            # text reads from state: grounds instruction with joint positions/velocity
+            text_state_tokens = text_tokens_flat
+            for layer in self.text_to_state_cross_attn:
+                text_state_tokens = layer(
+                    query=text_state_tokens,
+                    key=state_tokens_flat,
+                    value=state_tokens_flat,
+                )
+
+            # text reads from vision: grounds instruction with visual observations
+            if has_vision:
+                text_vision_tokens = text_tokens_flat
+                for layer in self.text_to_vision_cross_attn:
+                    text_vision_tokens = layer(
+                        query=text_vision_tokens,
+                        key=vision_tokens_flat,
+                        value=vision_tokens_flat,
+                    )
+            else:
+                text_vision_tokens = None
+
+            # text reads from boxes: grounds instruction with detected object positions
+            if has_boxes:
+                text_box_tokens = text_tokens_flat
+                for layer in self.text_to_box_cross_attn:
+                    text_box_tokens = layer(
+                        query=text_box_tokens,
+                        key=bbox_tokens_combined,
+                        value=bbox_tokens_combined,
+                    )
+            else:
+                text_box_tokens = None
+        else:
+            text_state_tokens = None
+            text_vision_tokens = None
+            text_box_tokens = None
+
         # Combine observation tokens:
         # Include RAW tokens alongside cross-attended versions so each encoder has
         # a direct gradient path (cross-attention queries alone vanish when dominated
@@ -750,6 +825,9 @@ class FlowMatchingTransformer(nn.Module):
             state_vision_tokens,    # state enriched with visual context (or unchanged)
             box_vision_tokens,      # objects enriched with visual context (empty → filtered)
             text_tokens_flat,       # task description tokens (None → filtered)
+            text_state_tokens,      # text grounded by robot state (None → filtered)
+            text_vision_tokens,     # text grounded by visual observations (None → filtered)
+            text_box_tokens,        # text grounded by object positions (None → filtered)
         ] if tokens is not None and tokens.shape[1] > 0]
         
         # Apply transformer encoder to process context parts
