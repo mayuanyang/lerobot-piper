@@ -33,6 +33,7 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     vision_input_size: int = 256  # Must be divisible by patch_size*scale_factor=16*4=64; 256/16=16 patches → 16×16=256 → 64 tokens after connector
     vision_token_rows: int = 2
     vision_token_cols: int = 2
+    vision_num_layers: int = 16  # Number of SigLIP ViT encoder layers to use (None = all layers)
     
     # Vision encoder parameters
     num_cameras: int = 3

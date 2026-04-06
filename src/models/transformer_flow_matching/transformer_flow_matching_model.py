@@ -16,7 +16,7 @@ from .box_encoder import BoxEncoder
 
 class SmolVLAVisionTokenizer(nn.Module):
     """Vision tokenizer using SmolVLM backbone, mirroring the original SmolVLA approach:
-    - Uses the pretrained SigLIP ViT vision encoder (all layers, last_hidden_state)
+    - Uses the pretrained SigLIP ViT vision encoder (configurable layers via vision_num_layers, last_hidden_state)
     - Uses the pretrained SmolVLM connector (pixel-shuffle + MLP resampler)
     - Keeps all patch tokens (no spatial pooling/collapsing)
     - Scales embeddings by sqrt(hidden_dim) before downstream use
@@ -42,6 +42,12 @@ class SmolVLAVisionTokenizer(nn.Module):
             self.vision_encoder = self.vision_model.vision_model
         else:
             self.vision_encoder = self.vision_model
+
+        # Optionally truncate to first N transformer layers
+        vision_num_layers = getattr(config, "vision_num_layers", None)
+        if vision_num_layers is not None:
+            self.vision_encoder.encoder.layers = self.vision_encoder.encoder.layers[:vision_num_layers]
+            print(f"Truncated SigLIP ViT to first {vision_num_layers} layers")
 
         # Use the pretrained SmolVLM connector (pixel-shuffle + MLP resampler)
         # This projects from vision hidden size → VLM text hidden size
