@@ -348,7 +348,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             batch = apply_joint_augmentations(batch)
             
             # Apply state dropout
-            batch = apply_state_dropout(batch)
+            # NOTE: Disabled - was running before normalization, causing spurious gradients in state encoder
+            # batch = apply_state_dropout(batch)
             
             # Apply camera dropout
             #batch = apply_camera_dropout(batch)
