@@ -214,10 +214,13 @@ class SmolVLAVisionTokenizer(nn.Module):
         else:
             features = self.connector(patch_tokens)  # (B*T, num_tokens, connector_out_dim)
 
-        # Step 3: Scale by sqrt(hidden_dim), matching SmolVLA's embed_prefix normalization
+        # Step 3: Cast back to float32 for the trainable projection layers
+        features = features.float()
+
+        # Step 4: Scale by sqrt(hidden_dim), matching SmolVLA's embed_prefix normalization
         features = features * math.sqrt(features.shape[-1])
 
-        # Step 4: Project to d_model
+        # Step 5: Project to d_model
         tokens = self.proj(features)  # (B*T, num_tokens, d_model)
 
         num_tokens_per_frame = tokens.shape[1]
