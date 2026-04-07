@@ -34,7 +34,7 @@ class SmolVLAVisionTokenizer(nn.Module):
         self.vision_model = AutoModel.from_pretrained(
             self.model_id,
             trust_remote_code=True,
-            torch_dtype=torch.float32
+            torch_dtype=torch.bfloat16
         )
 
         # Extract SigLIP ViT vision encoder
@@ -81,6 +81,11 @@ class SmolVLAVisionTokenizer(nn.Module):
         lm_hidden_size = self.vision_model.config.text_config.hidden_size
         # embed_tokens: (vocab_size, lm_hidden_size)
         self.text_embed_tokens = self.vision_model.text_model.embed_tokens
+
+        # Free the full VLM — only the extracted submodules above are needed.
+        # This releases the LLM transformer layers (~1.8 GB fp32) from GPU memory.
+        del self.vision_model
+
         # Trainable projection: lm_hidden_size → d_model
         self.text_proj = nn.Linear(lm_hidden_size, config.d_model)
         torch.nn.init.xavier_uniform_(self.text_proj.weight)

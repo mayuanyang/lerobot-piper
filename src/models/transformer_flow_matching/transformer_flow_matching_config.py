@@ -25,14 +25,8 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     )
 
     # Image processing
-    vision_backbone: str = "qwen3_vl_4b_instruct"
-    light_weight_vision_backbone: str = "resnet18"  # Optional smaller backbone for ablations
-    use_vision_tokens: bool = True
-    use_pretrained_vision_backbone: bool = True
     freeze_vision_backbone: bool = True
     vision_input_size: int = 256  # Must be divisible by patch_size*scale_factor=16*4=64; 256/16=16 patches → 16×16=256 → 64 tokens after connector
-    vision_token_rows: int = 2
-    vision_token_cols: int = 2
     vision_num_layers: int = 16  # Number of SigLIP ViT encoder layers to use (None = all layers)
     
     # Vision encoder parameters
@@ -76,7 +70,6 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     optimizer_betas: tuple = (0.95, 0.999)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-6
-    scheduler_name: str = "cosine"
     scheduler_warmup_steps: int = 1500  # Scaled 3× for batch_size=96
 
     
