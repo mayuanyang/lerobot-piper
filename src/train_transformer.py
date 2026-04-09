@@ -135,7 +135,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         n_obs_steps=obs, 
         horizon=horizon, 
         n_action_steps=n_action_steps, 
-        vision_backbone="qwen3_vl_4b_instruct",
         state_dim=7,  # 7 joints (not removing the 4th joint)
         action_dim=7,  # 7 joints (not removing the 4th joint)
         d_model=512,  # Smaller model for better gradient flow
