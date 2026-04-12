@@ -304,8 +304,6 @@ class FlowMatchingTransformer(nn.Module):
         self.state_scale = nn.Parameter(torch.tensor(1.0))  # Learnable scaling for state tokens
         self.vision_scale = nn.Parameter(torch.tensor(1.0))  # Learnable scaling for vision tokens
         self.box_scale = nn.Parameter(torch.tensor(1.0))     # Learnable scaling for box tokens
-        self.time_embedding_scale = nn.Parameter(torch.tensor(0.2))  # Learnable scaling for time embedding
-        
         # modality IDs: 0=state, 1=vision, 2=box, 3=text
         self.modality_embedding = nn.Embedding(4, config.d_model)
         self.text_scale = nn.Parameter(torch.tensor(1.0))
@@ -456,6 +454,15 @@ class FlowMatchingTransformer(nn.Module):
             nn.LayerNorm(config.d_model),
             nn.Linear(config.d_model, config.d_model),
             nn.LayerNorm(config.d_model)
+        )
+
+        # MLP that fuses action embeddings with time embedding (mirrors SmolVLA's action_time_mlp).
+        # Concat [action, time] along last dim → project back to d_model with a nonlinearity,
+        # allowing the model to gate action features based on the current flow timestep.
+        self.action_time_mlp = nn.Sequential(
+            nn.Linear(config.d_model * 2, config.d_model),
+            nn.SiLU(),
+            nn.Linear(config.d_model, config.d_model),
         )
         
         #self.obs_batch_norm = nn.LayerNorm(config.d_model)
@@ -837,38 +844,24 @@ class FlowMatchingTransformer(nn.Module):
         """
         B, T_act, _ = noisy_actions.shape
         
-        # 1. Action & Time Embeddings (enhanced like VLAFlowMatching)
-        action_embeddings = self.action_in_proj(noisy_actions)  # Use dedicated input projection
+        # 1. Action embeddings + positional encoding
+        action_embeddings = self.action_in_proj(noisy_actions)
         action_embeddings = self.action_positional_encoding(action_embeddings)
-        
-        # Time embedding: (B, d_model) -> (B, 1, d_model)
-        time_emb = self.time_embedding_scale * self.time_embedding(timesteps.float()).unsqueeze(1)
-        
-        #print(f"time_emb mean abs: {time_emb.norm():.6f}, max: {time_emb.abs().max():.6f}")
-        
-        
-        # 2. Add time to action tokens
-        # We expand time across the action horizon so that each action token is aware of the flow matching time, which can help the model learn time-dependent velocity fields.
-        tgt = action_embeddings + time_emb.expand(-1, T_act, -1)
-        
-        # 3. The Memory - Concatenate time embedding with observation context
-        # Expand time embedding to match the sequence length of obs_context
-        time_emb_expanded = time_emb.expand(-1, obs_context.shape[1], -1)  # (B, seq_len, d_model)
-        #extended_memory = obs_context + time_emb_expanded
-        extended_memory = torch.cat([obs_context, time_emb_expanded], dim=1)
-                
-        # print(f"action_embeddings mean abs: {torch.norm(action_embeddings, dim=2).mean()}, max: {action_embeddings.abs().max():.6f}")
-        # print(f"time_emb mean abs: {torch.norm(time_emb, dim=2).mean()}, max: {time_emb.abs().max():.6f}")
-        # print(f"extended_memory mean abs: {torch.norm(extended_memory, dim=2).mean()}, max: {extended_memory.abs().max():.6f}")
-        # print(f"tgt mean abs: {torch.norm(tgt, dim=2).mean()}, max: {tgt.abs().max():.6f}")
 
-        # 4. Decoder Pass
-        # Self-attention ensures T_act is a smooth curve.
-        # Cross-attention aligns T_act with your CropConvNet features.
-        # Allow actions to attend to all tokens (time, vision, boxes, state, and time embedding)
+        # 2. Time embedding: (B, d_model), then broadcast to (B, T_act, d_model)
+        time_emb = self.time_embedding(timesteps.float())                        # (B, d_model)
+        time_emb_seq = time_emb.unsqueeze(1).expand(-1, T_act, -1)              # (B, T_act, d_model)
+
+        # 3. MLP fusion: nonlinearly gate action features by the flow timestep.
+        #    Concat along feature dim → project back to d_model (mirrors SmolVLA).
+        tgt = self.action_time_mlp(
+            torch.cat([action_embeddings, time_emb_seq], dim=-1)
+        )                                                                        # (B, T_act, d_model)
+
+        # 4. Decoder pass — memory is the observation context only
         velocity_features = self.actions_expert(
             tgt=tgt,
-            memory=extended_memory
+            memory=obs_context,
         )
         
 
@@ -889,7 +882,6 @@ class FlowMatchingTransformer(nn.Module):
             "vision_scale": self.vision_scale.item(),
             "box_scale": self.box_scale.item(),
             "text_scale": self.text_scale.item(),
-            "time_embedding_scale": self.time_embedding_scale.item(),
             "box_token_scale": self.box_encoder.box_token_scale.item(),
         }
 
