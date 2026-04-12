@@ -411,24 +411,6 @@ class FlowMatchingTransformer(nn.Module):
             for _ in range(2)
         ])
 
-        # Transformer encoder for processing context parts
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.d_model,
-            nhead=config.nhead,
-            dim_feedforward=config.dim_feedforward,
-            dropout=0.1,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True
-        )
-        
-        self.context_transformer_encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=2  # Light encoder for context processing
-        )
-        
-        self.context_encoder_norm = nn.LayerNorm(config.d_model)
-
         # ------------------------------
         # 8. Number of inference steps for flow matching sampling
         # ------------------------------
@@ -844,11 +826,7 @@ class FlowMatchingTransformer(nn.Module):
             text_box_tokens,        # text grounded by object positions (None → filtered)
         ] if tokens is not None and tokens.shape[1] > 0]
         
-        # Apply transformer encoder to process context parts
-        combined_context = torch.cat(context_parts, dim=1)  # (B, total_seq_len, d_model)
-        encoded_context = self.context_transformer_encoder(combined_context)
-        context = self.context_encoder_norm(encoded_context)
-        
+        context = torch.cat(context_parts, dim=1)  # (B, total_seq_len, d_model)
         return context, spatial_outputs
 
 
@@ -897,8 +875,8 @@ class FlowMatchingTransformer(nn.Module):
         #print(f"velocity_features mean abs: {velocity_features.norm():.6f}, max: {velocity_features.abs().max():.6f}")
         
         
-        # Residual connection to preserve gradients
-        #velocity_features = velocity_features + action_embeddings
+        # Residual: direct gradient shortcut from output head → action_in_proj
+        velocity_features = velocity_features + action_embeddings
         
         # 5. Predict the velocity field
         return self.velocity_prediction_head(velocity_features)
