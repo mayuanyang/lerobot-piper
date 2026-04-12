@@ -916,11 +916,8 @@ class FlowMatchingTransformer(nn.Module):
         }
 
     def sample_time(self, bsize, device):
-        # Sample time from a Beta distribution to encourage learning across the entire flow matching trajectory, with more emphasis on mid-range times.
-        beta_dist = torch.distributions.Beta(concentration1=1.5, concentration0=1.0)
-        time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
-        time = time_beta * 0.999 + 0.001
-        return time
+        # Uniform sampling over (0, 1) — standard CFM formulation.
+        return torch.rand(bsize, device=device, dtype=torch.float32).clamp(1e-4, 1 - 1e-4)
 
     def compute_loss(self, batch):
         """Flow Matching Training: Learn to predict the velocity field with improved loss computation."""
@@ -951,11 +948,8 @@ class FlowMatchingTransformer(nn.Module):
         # 6. Compute flow matching loss
         # Target velocity is the difference between data and noise
         target_velocity = actions - noise
-        
-        # Use a weighting scheme that down weight mid-range times to encourage learning at the endpoints of the flow, which can help with stability and convergence.
-        weight = (timesteps[:, None, None] ** 2 + (1 - timesteps[:, None, None]) ** 2)
 
-        loss_steps = weight * F.mse_loss(
+        loss_steps = F.mse_loss(
             pred_velocity,
             target_velocity,
             reduction="none"

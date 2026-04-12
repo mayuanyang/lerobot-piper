@@ -124,7 +124,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     print('output_features:', output_features)
 
     # Auto-detect camera keys and dims from dataset features
-    camera_keys = sorted([key for key, ft in input_features.items() if ft.type is FeatureType.IMAGE])
+    camera_keys = sorted([key for key, ft in input_features.items() if ft.type is FeatureType.VISUAL])
     has_box = "observation.box" in dataset_metadata.features
     state_dim = input_features["observation.state"].shape[-1] if "observation.state" in input_features else 7
     action_dim = next(iter(output_features.values())).shape[-1]
@@ -428,9 +428,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 
                 print("--- End Gradient Analysis ---\n")
             
-            # Calculate gradient norm for monitoring and clip gradients (only for trainable parameters)
+            # Clip gradients and calculate norm (only for trainable parameters)
             trainable_params = [p for p in policy.parameters() if p.requires_grad]
-            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, float('inf'))  # Calculate grad norm without clipping
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             
             
             optimizer.step()
