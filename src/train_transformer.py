@@ -122,27 +122,38 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
     print('input_features:', input_features)
     print('output_features:', output_features)
-    
+
+    # Auto-detect camera keys and dims from dataset features
+    camera_keys = sorted([key for key, ft in input_features.items() if ft.type is FeatureType.IMAGE])
+    has_box = "observation.box" in dataset_metadata.features
+    state_dim = input_features["observation.state"].shape[-1] if "observation.state" in input_features else 7
+    action_dim = next(iter(output_features.values())).shape[-1]
+    print(f"Detected cameras ({len(camera_keys)}): {camera_keys}")
+    print(f"State dim: {state_dim}, Action dim: {action_dim}")
+    if has_box:
+        print("Dataset has observation.box — bounding box encoding enabled")
+
     # Training parameters
     obs = 1
     horizon = 50
     n_action_steps = 8
-    
-    # Create transformer configuration - simplified version with smaller model
+
+    # Create transformer configuration
     cfg = TransformerFlowMatchingConfig(
-        input_features=input_features, 
-        output_features=output_features, 
-        n_obs_steps=obs, 
-        horizon=horizon, 
-        n_action_steps=n_action_steps, 
-        state_dim=7,  # 7 joints (not removing the 4th joint)
-        action_dim=7,  # 7 joints (not removing the 4th joint)
-        d_model=512,  # Smaller model for better gradient flow
+        input_features=input_features,
+        output_features=output_features,
+        n_obs_steps=obs,
+        horizon=horizon,
+        n_action_steps=n_action_steps,
+        state_dim=state_dim,
+        action_dim=action_dim,
+        d_model=512,
         nhead=8,
-        num_decoder_layers=10,  # Configurable denoising transformer layers
-        dim_feedforward=2048,  # Smaller feedforward dimension
+        num_decoder_layers=10,
+        dim_feedforward=2048,
         diffusion_step_embed_dim=512,
-        num_cameras=3,  # Set number of cameras based on input features
+        num_cameras=len(camera_keys),
+        cameras_for_vision_state_concat=camera_keys,
     )
     
     
@@ -265,12 +276,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     action_temporal_window = [i * frame_time for i in range(horizon)]
     
     delta_timestamps = {
-        "observation.images.front": obs_temporal_window,
-        "observation.images.gripper": obs_temporal_window,  
-        "observation.images.right": obs_temporal_window,
         "observation.state": obs_temporal_window,
-        "observation.box": obs_temporal_window,
-        "action": action_temporal_window
+        "action": action_temporal_window,
+        **{key: obs_temporal_window for key in camera_keys},
+        **({"observation.box": obs_temporal_window} if has_box else {}),
     }
 
     # Load dataset
