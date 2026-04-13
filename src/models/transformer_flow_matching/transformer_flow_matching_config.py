@@ -72,7 +72,7 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-6
     scheduler_warmup_steps: int = 1500  # Scaled 3× for batch_size=96
 
-    use_peft: bool = False,
+    use_peft: bool = False
     
     def validate_features(self) -> None:
         if len(self.image_features) == 0 and self.env_state_feature is None:
