@@ -211,15 +211,14 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             num_training_steps=training_steps
         )
 
-        # Extract step counter from checkpoint directory name
-        if not resume_from_checkpoint.startswith("http") and not resume_from_checkpoint.startswith("huggingface.co"):
+        # Read step counter from config (written at save time); fall back to
+        # parsing the directory name for checkpoints saved before this change.
+        step = getattr(policy.config, "training_step", 0)
+        if step == 0 and not resume_from_checkpoint.startswith("http") and not resume_from_checkpoint.startswith("huggingface.co"):
             checkpoint_path = Path(resume_from_checkpoint)
             if checkpoint_path.name.startswith("checkpoint-"):
                 step = int(checkpoint_path.name.split("-")[1])
-            else:
-                step = 0
-        else:
-            step = 0
+        print(f"Resuming from step {step}")
     else:
         # Initialize fresh policy
         policy = TransformerFlowMatchingPolicy(cfg)
@@ -454,6 +453,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             if step > 0 and step % checkpoint_freq == 0:
                 checkpoint_dir = output_directory / f"checkpoint-{step}"
                 checkpoint_dir.mkdir(exist_ok=True)
+                policy.config.training_step = step
                 policy.save_pretrained(checkpoint_dir)
                 preprocessor.save_pretrained(checkpoint_dir)
                 postprocessor.save_pretrained(checkpoint_dir)
@@ -472,6 +472,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     prog_bar.close()
 
     # Final save
+    policy.config.training_step = step
     policy.save_pretrained(output_directory)
     preprocessor.save_pretrained(output_directory)
     postprocessor.save_pretrained(output_directory)

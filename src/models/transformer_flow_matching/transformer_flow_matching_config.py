@@ -73,6 +73,9 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     scheduler_warmup_steps: int = 1500  # Scaled 3× for batch_size=96
 
     use_peft: bool = False
+
+    # Persisted across checkpoints so resume training starts at the correct step.
+    training_step: int = 0
     
     def validate_features(self) -> None:
         if len(self.image_features) == 0 and self.env_state_feature is None:
