@@ -35,17 +35,17 @@ print(f"Using device: {device}")
 
 # Data Augmentation Setup
 def get_augmentations():
-    """Create data augmentations for training."""
-    # Return RGBD-friendly augmentations
+    """Return an image augmentation transform for training.
+
+    ColorJitter is intentionally NOT applied per-camera inside the dataset
+    (which would give each camera independent random params, creating physically
+    inconsistent lighting across views).  Instead this transform is applied in
+    the training loop via apply_image_augmentations(), which stacks all cameras
+    for a given sample and runs the transform once so every camera in that sample
+    receives the same random brightness/contrast/saturation/hue shift.
+    """
     return v2.Compose([
-        # Resize images to 224x224
-        #v2.Resize((224, 224)),
-        # Gentle color jittering for RGB channels
-        v2.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
-        # Mild geometric transforms to preserve physical consistency
-        #v2.RandomAffine(degrees=5, translate=(0.05, 0.05)),
-        # Randomly apply Gaussian noise with 30% probability
-        #v2.RandomApply([v2.GaussianNoise()], p=0.3),
+        v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
     ])
 
 
@@ -91,6 +91,44 @@ def apply_camera_dropout(batch, camera_keys=["observation.images.front", "observ
     return batch
 
 
+def apply_image_augmentations(batch, camera_keys, transform):
+    """Apply the same random color jitter to all cameras within each sample.
+
+    For each sample in the batch, all camera images are stacked into a single
+    tensor and passed through the transform in one call.  torchvision v2 samples
+    random parameters once per forward() call and applies them identically to
+    every image in the tensor — so front/gripper/right cameras always receive
+    the same brightness/contrast/saturation/hue shift, keeping cross-camera
+    color consistency.
+
+    Handles both (C, H, W) and (T, C, H, W) camera tensors.
+    """
+    present_keys = [k for k in camera_keys if k in batch and isinstance(batch[k], torch.Tensor)]
+    if not present_keys:
+        return batch
+
+    B = batch[present_keys[0]].shape[0]
+    for b in range(B):
+        sample_img = batch[present_keys[0]][b]
+        has_time_dim = sample_img.dim() == 4  # (T, C, H, W)
+
+        if has_time_dim:
+            T = sample_img.shape[0]
+            # Cat along time/batch dim: (N_cams * T, C, H, W)
+            stacked = torch.cat([batch[k][b] for k in present_keys], dim=0)
+            stacked_aug = transform(stacked)
+            for i, k in enumerate(present_keys):
+                batch[k][b] = stacked_aug[i * T:(i + 1) * T]
+        else:
+            # Stack cameras: (N_cams, C, H, W)
+            stacked = torch.stack([batch[k][b] for k in present_keys], dim=0)
+            stacked_aug = transform(stacked)
+            for i, k in enumerate(present_keys):
+                batch[k][b] = stacked_aug[i]
+
+    return batch
+
+
 def apply_state_dropout(batch, state_key="observation.state", dropout_prob=0.05):
     state = batch[state_key]
     mask = (torch.rand(state.size(0), 1, 1, device=state.device) > dropout_prob).float()
@@ -104,11 +142,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
 
-    training_steps = 100000 
+    training_steps = 100000
     progress_update_freq = 200  # Single frequency for all progress updates
     checkpoint_freq = 1000
-    
     image_transforms = get_augmentations()
+    
+
 
     # Load dataset metadata
     dataset_metadata = LeRobotDatasetMetadata(dataset_id, force_cache_sync=True, revision="main")
@@ -284,7 +323,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
     # Load dataset
     try:
-        dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, image_transforms=image_transforms, force_cache_sync=True, revision="main", tolerance_s=0.005)  # Tighter timestamp alignment
+        dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, force_cache_sync=True, revision="main", tolerance_s=0.005)
     except Exception as e:
         print(f"Error loading remote dataset: {e}")
         local_dataset_path = "./src/output" 
@@ -350,6 +389,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 batch["task_description"] = [
                     task_idx_to_description.get(int(ti.item()), "") for ti in task_indices
                 ]
+
+            # Apply image augmentation (same random params across all cameras per sample)
+            batch = apply_image_augmentations(batch, camera_keys, image_transforms)
 
             # Apply joint data augmentation
             batch = apply_joint_augmentations(batch)
