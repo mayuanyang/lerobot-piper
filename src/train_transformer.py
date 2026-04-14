@@ -211,14 +211,15 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             num_training_steps=training_steps
         )
 
-        # Read step counter from config (written at save time); fall back to
+        # Read step/epoch counters from config (written at save time); fall back to
         # parsing the directory name for checkpoints saved before this change.
         step = getattr(policy.config, "training_step", 0)
         if step == 0 and not resume_from_checkpoint.startswith("http") and not resume_from_checkpoint.startswith("huggingface.co"):
             checkpoint_path = Path(resume_from_checkpoint)
             if checkpoint_path.name.startswith("checkpoint-"):
                 step = int(checkpoint_path.name.split("-")[1])
-        print(f"Resuming from step {step}")
+        epoch = getattr(policy.config, "training_epoch", 0)
+        print(f"Resuming from step {step}, epoch {epoch}")
     else:
         # Initialize fresh policy
         policy = TransformerFlowMatchingPolicy(cfg)
@@ -239,7 +240,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             grid_overlay_cameras=["front", "right"]  # Front and right cameras (original names)
         )
         step = 0
-        
+        epoch = 0
 
         trainable_params = [p for p in policy.parameters() if p.requires_grad]
         fresh_lr = cfg.optimizer_lr
@@ -331,7 +332,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     # Training loop
     print("Starting training loop...")
     done = False
-    epoch = 0
     prog_bar = tqdm(total=training_steps, desc="Training Progress", initial=step)
     while not done:
         epoch += 1
@@ -454,6 +454,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 checkpoint_dir = output_directory / f"checkpoint-{step}"
                 checkpoint_dir.mkdir(exist_ok=True)
                 policy.config.training_step = step
+                policy.config.training_epoch = epoch
                 policy.save_pretrained(checkpoint_dir)
                 preprocessor.save_pretrained(checkpoint_dir)
                 postprocessor.save_pretrained(checkpoint_dir)
@@ -473,6 +474,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
     # Final save
     policy.config.training_step = step
+    policy.config.training_epoch = epoch
     policy.save_pretrained(output_directory)
     preprocessor.save_pretrained(output_directory)
     postprocessor.save_pretrained(output_directory)
