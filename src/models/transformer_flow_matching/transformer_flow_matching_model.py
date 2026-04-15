@@ -456,11 +456,13 @@ class FlowMatchingTransformer(nn.Module):
             nn.LayerNorm(config.d_model)
         )
 
-        # MLP that fuses action embeddings with time embedding (mirrors SmolVLA's action_time_mlp).
-        # Concat [action, time] along last dim → project back to d_model with a nonlinearity,
-        # allowing the model to gate action features based on the current flow timestep.
+        # MLP that fuses action embeddings with time and state (inspired by π0).
+        # Concat [action, time, state] along last dim → project back to d_model.
+        # State is injected here (not only via cross-attention) so every action token
+        # is directly conditioned on proprioceptive state, giving the state encoder a
+        # gradient path that bypasses the cross-attention softmax competition.
         self.action_time_mlp = nn.Sequential(
-            nn.Linear(config.d_model * 2, config.d_model),
+            nn.Linear(config.d_model * 3, config.d_model),
             nn.SiLU(),
             nn.Linear(config.d_model, config.d_model),
         )
@@ -834,28 +836,33 @@ class FlowMatchingTransformer(nn.Module):
         ] if tokens is not None and tokens.shape[1] > 0]
         
         context = torch.cat(context_parts, dim=1)  # (B, total_seq_len, d_model)
-        return context, spatial_outputs
+        return context, state_tokens_flat, spatial_outputs
 
 
-    def velocity_field(self, noisy_actions, timesteps, obs_context):
+    def velocity_field(self, noisy_actions, timesteps, obs_context, state_tokens):
         """
         Flow Matching step:
         Predicts the velocity field that transports samples from Gaussian to data distribution.
         """
         B, T_act, _ = noisy_actions.shape
-        
+
         # 1. Action embeddings + positional encoding
         action_embeddings = self.action_in_proj(noisy_actions)
         action_embeddings = self.action_positional_encoding(action_embeddings)
 
-        # 2. Time embedding: (B, d_model), then broadcast to (B, T_act, d_model)
+        # 2. Time embedding: (B, d_model), broadcast to (B, T_act, d_model)
         time_emb = self.time_embedding(timesteps.float())                        # (B, d_model)
         time_emb_seq = time_emb.unsqueeze(1).expand(-1, T_act, -1)              # (B, T_act, d_model)
 
-        # 3. MLP fusion: nonlinearly gate action features by the flow timestep.
-        #    Concat along feature dim → project back to d_model (mirrors SmolVLA).
+        # 3. State embedding: pool over obs timesteps → (B, d_model), broadcast to (B, T_act, d_model)
+        #    Using the pre-cross-attention raw state encoding so the gradient path is direct
+        #    (not filtered through the cross-attention softmax over 200 tokens).
+        state_emb = state_tokens.mean(dim=1)                                     # (B, d_model)
+        state_emb_seq = state_emb.unsqueeze(1).expand(-1, T_act, -1)            # (B, T_act, d_model)
+
+        # 4. MLP fusion: [action | time | state] → d_model  (π0-style direct state conditioning)
         tgt = self.action_time_mlp(
-            torch.cat([action_embeddings, time_emb_seq], dim=-1)
+            torch.cat([action_embeddings, time_emb_seq, state_emb_seq], dim=-1)
         )                                                                        # (B, T_act, d_model)
 
         # 4. Decoder pass — memory is the observation context only
@@ -896,24 +903,24 @@ class FlowMatchingTransformer(nn.Module):
         
         B, T_act = actions.shape[:2]
         
-        # 1. Get observation context
-        obs_context, _ = self.get_condition(batch)  # (B, T_obs, d_model)
-                
+        # 1. Get observation context and raw state tokens
+        obs_context, state_tokens, _ = self.get_condition(batch)
+
         # Infer device from model parameters
         device = next(self.parameters()).device
-        
+
         # 2. Sample time using Beta distribution
         timesteps = self.sample_time(B, device)
-        
+
         # 3. Sample Gaussian noise
         noise = torch.randn_like(actions, device=device)
 
         # 4. Construct flow matching targets (straight line coupling)
         # Interpolate between noise and data
         noisy_actions = (1 - timesteps[:, None, None]) * noise + timesteps[:, None, None] * actions
-        
+
         # 5. Predict velocity field
-        pred_velocity = self.velocity_field(noisy_actions, timesteps, obs_context)
+        pred_velocity = self.velocity_field(noisy_actions, timesteps, obs_context, state_tokens)
         
         # 6. Compute flow matching loss
         # Target velocity is the difference between data and noise
@@ -940,28 +947,28 @@ class FlowMatchingTransformer(nn.Module):
         B = batch["observation.state"].shape[0]
         T_act = self.config.horizon
         
-        # Get observation context
-        obs_context, spatial_outputs = self.get_condition(batch)  # (B, T_obs, d_model)
-        
+        # Get observation context and raw state tokens (computed once, reused across ODE steps)
+        obs_context, state_tokens, spatial_outputs = self.get_condition(batch)
+
         # Infer device from model parameters
         device = next(self.parameters()).device
-                
+
         # Start from pure Gaussian noise
         samples = torch.randn((B, T_act, self.config.action_dim), device=device)
-        
+
         # This is RK2 / midpoint solver.
         num_steps = int(self.num_inference_steps.item())
         dt = 1.0 / num_steps
-        
+
         for i in range(num_steps):
             t = torch.full((B,), i / num_steps, device=device)
 
-            v1 = self.velocity_field(samples, t, obs_context)
+            v1 = self.velocity_field(samples, t, obs_context, state_tokens)
 
             midpoint = samples + 0.5 * dt * v1
             t_mid = torch.full((B,), (i + 0.5) / num_steps, device=device)
 
-            v2 = self.velocity_field(midpoint, t_mid, obs_context)
+            v2 = self.velocity_field(midpoint, t_mid, obs_context, state_tokens)
 
             samples = samples + dt * v2
             
