@@ -824,6 +824,7 @@ class FlowMatchingTransformer(nn.Module):
         # a direct gradient path (cross-attention queries alone vanish when dominated
         # by vision value vectors).
         context_parts = [tokens for tokens in [
+            vision_tokens_flat,     # raw vision patches — action decoder attends directly (like SmolVLA)
             state_tokens_flat,      # direct gradient to state encoder
             bbox_tokens_combined,   # direct gradient to box encoder (empty → filtered)
             state_box_tokens,       # state enriched with object positions (or unchanged)

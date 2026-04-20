@@ -173,7 +173,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         print("Dataset has observation.box — bounding box encoding enabled")
 
     # Training parameters
-    obs = 1
+    obs = 2
     horizon = 50
     n_action_steps = 8
 

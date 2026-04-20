@@ -1,7 +1,5 @@
 import torch
 from torch import nn
-import math
-import numpy as np
 from typing import Optional
 
 
@@ -16,7 +14,7 @@ class BoxEncoder(nn.Module):
         super().__init__()
         self.config = config
         self.num_bounding_boxes_per_camera = 2
-        self.box_token_scale = nn.Parameter(torch.tensor(5.0))  # Higher init to ensure box tokens are visible
+        self.box_token_scale = nn.Parameter(torch.tensor(1.0))
         
         # Category embedding for categorical features
         self.category_embedding = nn.Embedding(3, config.d_model)  # Assuming 3 categories
@@ -118,9 +116,7 @@ class BoxEncoder(nn.Module):
         if hasattr(self, 'missing_box_embedding'):
             torch.nn.init.normal_(self.missing_box_embedding, mean=0.0, std=0.02)
 
-    def fuse_tokens(
-        self, tokens_flat: torch.Tensor, src_key_padding_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    def fuse_tokens(self, tokens_flat: torch.Tensor) -> torch.Tensor:
         """Fuse tokens with a 2-layer residual MLP for strong gradient flow.
 
         Args:
@@ -177,7 +173,7 @@ class BoxEncoder(nn.Module):
         coordinates_normalized = coordinates / normalization_factors.view(1, 1, 1, 4)
         
         # Reshape to (B, T_obs, 3 cameras, 2 boxes, 4) to process boxes per camera
-        B, T_obs, N_boxes, N_coords = coordinates_normalized.shape
+        B, T_obs = coordinates_normalized.shape[:2]
         coordinates_normalized = coordinates_normalized.view(B, T_obs, self.config.num_cameras, self.num_bounding_boxes_per_camera, 4)  # (B, T_obs, 3, 2, 4)
         
         # Reshape category_id, confidence
