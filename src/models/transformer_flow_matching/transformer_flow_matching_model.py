@@ -629,8 +629,8 @@ class FlowMatchingTransformer(nn.Module):
 
                 all_bbox_tokens.append(bbox_tokens_flat)
 
-        else:
-            # observation.box is missing usually mean it is in inference, process each camera with the shared object detector
+        elif not self.training:
+            # observation.box is absent during inference — run YOLO object detector
             for frame_idx in range(T_obs):
                 for cam_index, sanitized_cam_key in enumerate(
                     sorted(self._camera_name_mapping.keys())
@@ -738,6 +738,10 @@ class FlowMatchingTransformer(nn.Module):
         # PyTorch MultiheadAttention with 0-length keys produces NaN.
 
         # boxes attending to vision (skip if no boxes or no vision)
+        # Guard against batch-size mismatch: YOLO runs per-image (B=1), so if batch sizes
+        # don't match (e.g. stale __pycache__ loaded old code), discard and treat as empty.
+        if bbox_tokens_combined.shape[0] != B:
+            bbox_tokens_combined = torch.empty(B, 0, self.config.d_model, device=bbox_tokens_combined.device)
         has_boxes = bbox_tokens_combined.shape[1] > 0
         has_vision = vision_tokens_flat.shape[1] > 0
 

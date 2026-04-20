@@ -164,7 +164,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
     # Auto-detect camera keys and dims from dataset features
     camera_keys = sorted([key for key, ft in input_features.items() if ft.type is FeatureType.VISUAL])
-    has_box = "observation.box" in dataset_metadata.features
+    has_box = False  # box encoder disabled — missing detections inject noisy tokens
     state_dim = input_features["observation.state"].shape[-1] if "observation.state" in input_features else 7
     action_dim = next(iter(output_features.values())).shape[-1]
     print(f"Detected cameras ({len(camera_keys)}): {camera_keys}")
