@@ -334,7 +334,7 @@ class FlowMatchingTransformer(nn.Module):
         self.vision_positional_encoding = PositionalEncoding(config.d_model)
 
         self.box_encoder = BoxEncoder(config)
-        self.box_positional_encoding = PositionalEncoding(config.d_model)
+        self.box_positional_encoding = PositionalEncoding(config.d_model, max_len=2000)
 
         # ------------------------------
         self.state_encoder = nn.Sequential(
