@@ -164,13 +164,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
     # Auto-detect camera keys and dims from dataset features
     camera_keys = sorted([key for key, ft in input_features.items() if ft.type is FeatureType.VISUAL])
-    has_box = False  # box encoder disabled — missing detections inject noisy tokens
     state_dim = input_features["observation.state"].shape[-1] if "observation.state" in input_features else 7
     action_dim = next(iter(output_features.values())).shape[-1]
     print(f"Detected cameras ({len(camera_keys)}): {camera_keys}")
     print(f"State dim: {state_dim}, Action dim: {action_dim}")
-    if has_box:
-        print("Dataset has observation.box — bounding box encoding enabled")
 
     # Training parameters
     obs = 2
@@ -188,9 +185,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         action_dim=action_dim,
         d_model=512,
         nhead=8,
-        num_decoder_layers=10,
+        num_decoder_layers=8,
         dim_feedforward=2048,
-        diffusion_step_embed_dim=512,
+        num_vlm_layers=16,
         num_cameras=len(camera_keys),
         cameras_for_vision_state_concat=camera_keys,
     )
@@ -242,14 +239,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                     param_group['initial_lr'] = resume_lr
                 print(f"Optimizer state loaded. LR reset to {resume_lr}")
 
-        # Fresh cosine scheduler (always recreated so warmup restarts correctly)
-        warmup_steps = resume_warmup
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=training_steps
-        )
-
         # Read step/epoch counters from config (written at save time); fall back to
         # parsing the directory name for checkpoints saved before this change.
         step = getattr(policy.config, "training_step", 0)
@@ -259,6 +248,18 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 step = int(checkpoint_path.name.split("-")[1])
         epoch = getattr(policy.config, "training_epoch", 0)
         print(f"Resuming from step {step}, epoch {epoch}")
+
+        # Create cosine scheduler and fast-forward to match saved step.
+        # This ensures LR is correct on resume — not restarting from warmup.
+        warmup_steps = resume_warmup
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=training_steps,
+        )
+        for _ in range(step):
+            scheduler.step()
+        print(f"Scheduler fast-forwarded to step {step}, LR = {optimizer.param_groups[0]['lr']:.2e}")
     else:
         # Initialize fresh policy
         policy = TransformerFlowMatchingPolicy(cfg)
@@ -318,7 +319,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         "observation.state": obs_temporal_window,
         "action": action_temporal_window,
         **{key: obs_temporal_window for key in camera_keys},
-        **({"observation.box": obs_temporal_window} if has_box else {}),
     }
 
     # Load dataset

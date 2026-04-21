@@ -26,11 +26,13 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
 
     # Image processing
     freeze_vision_backbone: bool = True
-    vision_input_size: int = 256  # Must be divisible by patch_size*scale_factor=16*4=64; 256/16=16 patches → 16×16=256 → 64 tokens after connector
-    vision_num_layers: int = 16  # Number of SigLIP ViT encoder layers to use (None = all layers)
-    
-    # Vision encoder parameters
+    vision_input_size: int = 256  # 256/16=16 patches/side → 256 patches → 64 tokens after connector (scale_factor=4)
+
+    # VLM backbone configuration
     num_cameras: int = 3
+    # Number of VLM text layers to use (SmolVLM2-500M has 32 total).
+    # 16 layers balances representation quality vs speed/memory (same as SmolVLA default).
+    num_vlm_layers: int = 16
 
     # Zero-shot object detection (YOLOWorld inference)
     # Set these to the names of the objects your robot needs to pick and place

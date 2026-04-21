@@ -6,64 +6,43 @@ from .transformer_flow_matching_config import TransformerFlowMatchingConfig
 
 class TransformerFlowMatchingPolicy(PreTrainedPolicy):
     """
-    Refactored policy for the Piper 7-DOF robot.
-    Integrates Spatial Softmax vision and token-based state fusion.
+    Flow matching policy for the Piper 7-DOF robot arm.
+
+    Training: calls model.compute_loss(batch) → scalar loss.
+    Inference: calls model.sample_actions(batch) → (B, n_action_steps, action_dim).
     """
-    
+
     config_class = TransformerFlowMatchingConfig
     name = "transformer_diffusion"
-    
+
     def __init__(self, config: TransformerFlowMatchingConfig):
         super().__init__(config)
         self.config = config
-        
-        # Initialize the refactored sophisticated model
         self.model = FlowMatchingTransformer(config)
-        
+
     def get_optim_params(self) -> dict:
-        """Return the policy parameters for optimization."""
         return self.model.parameters()
-    
+
     def reset(self):
-        """Reset the policy. Use if you implement temporal consistency (like RNNs)."""
         pass
-        
+
     def forward(self, batch: dict) -> tuple:
-        """
-        Training forward pass.
-        
-        Returns:
-            tuple: (loss, None)
-        """
-        # LeRobot batches often include metadata; we pass the dict directly 
-        # to the model which extracts the necessary keys.
+        """Training forward pass. Returns (loss, loss_dict)."""
         loss = self.model.compute_loss(batch)
-        
-        return loss, None
-    
+        return loss, {}
+
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict) -> torch.Tensor:
-        """
-        Predict a sequence (chunk) of actions. 
-        Useful for high-frequency control loops.
-        """
+        """Predict a full action chunk (horizon steps). Returns (B, horizon, action_dim)."""
         self.model.eval()
-        predicted_actions, spatial_outputs = self.model(batch)
-        return predicted_actions
-    
+        return self.model.sample_actions(batch)
+
     @torch.no_grad()
     def select_action(self, batch: dict) -> torch.Tensor:
         """
-        Selection logic for real-time inference on the Piper arm.
-        Returns only the first action with squeezed shape [1, 7].
+        Select a single action for real-time control.
+        Returns (B, action_dim) — the first action of the sampled chunk.
         """
         self.model.eval()
-        
-        # Generate the full horizon of actions (e.g., 16 steps)
-        predicted_actions, spatial_outputs = self.model(batch)
-        
-        # Return only the first action and squeeze to shape [1, 7]
-        first_action = predicted_actions[:, :1, :]  # Shape: [B, 1, 7]
-        squeezed_action = first_action.squeeze(1)   # Shape: [B, 7]
-        
-        return squeezed_action
+        actions = self.model.sample_actions(batch)  # (B, n_action_steps, action_dim)
+        return actions[:, 0, :]                      # (B, action_dim)
