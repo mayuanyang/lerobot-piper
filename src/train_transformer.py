@@ -418,6 +418,20 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
             # Forward & Backward
             loss, _ = policy.forward(batch)
+
+            # Diagnostic: print value ranges when loss is unexpectedly large.
+            # This helps distinguish between data outliers, normalization bugs,
+            # and model instability (e.g. exploding context / state tokens).
+            if loss.item() > 100 and step < 2000:
+                act = batch["action"].float()
+                st  = batch["observation.state"].float()
+                print(f"\n[DIAG step={step}] loss={loss.item():.1f}")
+                print(f"  action  : min={act.min():.2f}  max={act.max():.2f}  std={act.std():.3f}")
+                print(f"  state   : min={st.min():.2f}  max={st.max():.2f}  std={st.std():.3f}")
+                pad_key = next((k for k in ("action_is_pad", "actions_id_pad") if k in batch), None)
+                if pad_key is not None:
+                    print(f"  pad frac: {batch[pad_key].float().mean().item():.2%}")
+
             loss.backward()
             
             # Print gradient information for all components (for debugging)

@@ -401,7 +401,7 @@ class FlowMatchingTransformer(nn.Module):
 
         Forward process: x_t = t * noise + (1 - t) * actions
         Target velocity: u_t = noise - actions
-        Loss: MSE(v_theta(x_t, t, context), u_t) — averaged over non-padded steps only.
+        Loss: MSE(v_theta(x_t, t, context), u_t) — MSE over non-padded steps only.
 
         Why masking matters:
           delta_timestamps requests future actions that may go past episode end.
@@ -425,7 +425,7 @@ class FlowMatchingTransformer(nn.Module):
 
         v_t = self.velocity_field(x_t, t, context)
 
-        loss = F.mse_loss(v_t, u_t, reduction="none")   # (B, H, action_dim)
+        loss = F.mse_loss(v_t, u_t, reduction="none")  # (B, H, action_dim)
 
         # Mask out padding — LeRobot uses "action_is_pad" (bool, True = padded).
         # SmolVLA uses "actions_id_pad"; check both for compatibility.
