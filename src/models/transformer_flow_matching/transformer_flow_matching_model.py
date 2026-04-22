@@ -399,8 +399,13 @@ class FlowMatchingTransformer(nn.Module):
         # Residual: preserve action information through MLP
         tgt = fused + action_emb
 
-        # Action expert: decoder attends to VLM context + state
-        output = self.actions_expert(tgt=tgt, memory=context)  # (B, T, d_model)
+        # Action expert: decoder attends to VLM context + state.
+        # Causal mask on SA (action token at step h only attends to steps 0..h) matches
+        # SmolVLA's design: enforces temporal smoothness in the predicted action chunk.
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(
+            T_act, device=noisy_actions.device, dtype=noisy_actions.dtype
+        )
+        output = self.actions_expert(tgt=tgt, memory=context, tgt_mask=causal_mask, tgt_is_causal=True)  # (B, T, d_model)
 
         return self.action_out_proj(output)                   # (B, T, action_dim)
 
