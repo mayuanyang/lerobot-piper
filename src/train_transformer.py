@@ -406,6 +406,16 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             # Preprocess (Normalize)
             batch = preprocessor(batch)
 
+            # One-time diagnostic: confirm action padding mask is present
+            if step == 0:
+                pad_key = next((k for k in ("action_is_pad", "actions_id_pad") if k in batch), None)
+                if pad_key is None:
+                    print("WARNING: no action pad key found in batch — padded episode steps will pollute loss!")
+                    print(f"  Available keys: {[k for k in batch.keys() if 'pad' in k.lower() or 'action' in k.lower()]}")
+                else:
+                    pad_frac = batch[pad_key].float().mean().item()
+                    print(f"Action pad key='{pad_key}', pad fraction in first batch: {pad_frac:.2%}")
+
             # Forward & Backward
             loss, _ = policy.forward(batch)
             loss.backward()

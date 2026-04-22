@@ -397,11 +397,19 @@ class FlowMatchingTransformer(nn.Module):
 
     def compute_loss(self, batch: dict) -> torch.Tensor:
         """
-        Conditional flow matching loss.
+        Conditional flow matching loss with padded-step masking.
 
         Forward process: x_t = t * noise + (1 - t) * actions
         Target velocity: u_t = noise - actions
-        Loss: MSE(v_theta(x_t, t, context), u_t)
+        Loss: MSE(v_theta(x_t, t, context), u_t) — averaged over non-padded steps only.
+
+        Why masking matters:
+          delta_timestamps requests future actions that may go past episode end.
+          LeRobot fills those with zeros. After MEAN_STD normalization with non-zero
+          action mean, padded zeros become (0 - mean)/std ≈ -5 to -8σ in normalized
+          space. Without masking these appear as valid large targets → loss spikes of
+          7M+ → gradient explosions (even though clipping prevents divergence, Adam's
+          momentum accumulates bad signal from these batches).
         """
         actions = batch["action"].float()   # (B, H, action_dim)
         B = actions.shape[0]
@@ -417,7 +425,18 @@ class FlowMatchingTransformer(nn.Module):
 
         v_t = self.velocity_field(x_t, t, context)
 
-        return F.mse_loss(v_t, u_t)
+        loss = F.mse_loss(v_t, u_t, reduction="none")   # (B, H, action_dim)
+
+        # Mask out padding — LeRobot uses "action_is_pad" (bool, True = padded).
+        # SmolVLA uses "actions_id_pad"; check both for compatibility.
+        is_pad = batch.get("action_is_pad", batch.get("actions_id_pad"))
+        if is_pad is not None:
+            valid = ~is_pad.bool()                           # (B, H)
+            loss = loss * valid.unsqueeze(-1).float()        # zero out padded steps
+            n_valid = valid.sum().clamp(min=1) * self.config.action_dim
+            return loss.sum() / n_valid
+
+        return loss.mean()
 
     def forward(self, batch: dict) -> tuple:
         """
