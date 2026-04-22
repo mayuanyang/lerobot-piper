@@ -68,7 +68,7 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     num_inference_steps: int = 20
         
     # Training presets
-    optimizer_lr: float = 3e-4        # Scaled for batch_size=96 (linear scaling rule: 1e-4 × 96/32)
+    optimizer_lr: float = 1e-4        # Conservative for frozen VLM + fresh action expert (SmolVLA uses 1e-4)
     optimizer_betas: tuple = (0.95, 0.999)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-6

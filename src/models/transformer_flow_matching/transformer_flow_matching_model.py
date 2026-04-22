@@ -139,8 +139,12 @@ class FlowMatchingTransformer(nn.Module):
         # Trainable components (~26M params total)
         # ------------------------------------------------------------------
 
-        # 1. Project VLM context to action expert dimension
+        # 1. Project VLM context to action expert dimension + LayerNorm for stability.
+        #    LayerNorm is critical: VLM bfloat16 hidden states can have large per-token
+        #    magnitudes (due to large RMSNorm γ values in the pretrained model).
+        #    Without normalization, context_proj amplifies these and causes gradient explosion.
         self.context_proj = nn.Linear(self.VLM_HIDDEN, config.d_model)
+        self.context_norm = nn.LayerNorm(config.d_model)
 
         # 2. State encoder: (B, T_obs, state_dim) → (B, T_obs, d_model)
         #    Uses n_obs_steps states (2 timesteps = position + velocity info)
@@ -152,7 +156,11 @@ class FlowMatchingTransformer(nn.Module):
 
         # 3. Action projections
         self.action_in_proj = nn.Linear(config.action_dim, config.d_model)
+        # Zero-init action_out_proj so initial velocity predictions are ~0.
+        # This makes initial loss ≈ E[u_t²] ≈ 2 instead of millions.
         self.action_out_proj = nn.Linear(config.d_model, config.action_dim)
+        nn.init.zeros_(self.action_out_proj.weight)
+        nn.init.zeros_(self.action_out_proj.bias)
         self.action_positional_encoding = PositionalEncoding(config.d_model, max_len=config.horizon)
 
         # 4. Time embedding MLP: [action_emb ‖ sinusoidal_time_emb] → d_model (SmolVLA-style)
@@ -273,26 +281,23 @@ class FlowMatchingTransformer(nn.Module):
         # Encode language
         lang_tokens = self._encode_language(batch, B, device)  # (B, L, 960) or None
 
-        # Scale embeddings by sqrt(hidden_size) — matches SmolVLM2 training convention
-        scale = math.sqrt(self.VLM_HIDDEN)
-        vis_tokens = vis_tokens * scale
-
+        # NOTE: Do NOT scale by sqrt(960) here.
+        # SmolVLA applies that scaling in their custom SmolVLMWithExpertModel which
+        # interleaves expert layers inside the VLM. Here we only use the VLM as a
+        # frozen feature extractor — the RMSNorm at each layer already controls scale.
+        # Adding sqrt(960)≈31× scaling would push VLM attention into degenerate regimes.
         prefix_parts = [vis_tokens]
         if lang_tokens is not None:
-            prefix_parts.append(lang_tokens * scale)
+            prefix_parts.append(lang_tokens)
 
         prefix_embs = torch.cat(prefix_parts, dim=1)  # (B, N, 960)
-        seq_len = prefix_embs.shape[1]
 
-        # Attention mask: all-ones (no padding), model applies causal mask internally
-        # The causal pattern is fine — VLM was trained with it, and action expert
-        # cross-attends to ALL positions anyway.
-        attention_mask = torch.ones(B, seq_len, dtype=torch.bool, device=device)
-
-        # Run through truncated VLM text layers (frozen, causal attention)
+        # Run through truncated VLM text layers (frozen, causal attention).
+        # Pass attention_mask=None → model uses its internal causal mask, which is
+        # numerically cleaner than passing an explicit all-ones boolean mask.
         text_out = self.text_model(
             inputs_embeds=prefix_embs,
-            attention_mask=attention_mask,
+            attention_mask=None,
             use_cache=False,
         )
         return text_out.last_hidden_state  # (B, N, 960) bfloat16
@@ -316,9 +321,14 @@ class FlowMatchingTransformer(nn.Module):
         # Frozen VLM context — no gradient through this path
         context_hidden = self.encode_prefix(batch, B, T_obs)  # (B, N, 960) bfloat16
 
-        # Trainable projection: gradient flows from action_expert → context_proj
-        # context_hidden is detached (no_grad), so VLM weights are safe
-        context = self.context_proj(context_hidden.float())  # (B, N, d_model)
+        # Guard: replace any NaN/Inf from bfloat16 VLM forward (rare but possible
+        # with non-standard inputs like our connector tokens without image special tokens)
+        context_hidden = torch.nan_to_num(context_hidden, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        # Trainable projection + LayerNorm.
+        # LayerNorm normalizes away large-scale variation in VLM hidden states
+        # (pretrained RMSNorm γ values can be large), preventing gradient explosion.
+        context = self.context_norm(self.context_proj(context_hidden.float()))  # (B, N, d_model)
 
         # Trainable state encoder: direct gradient path through action_expert → state_encoder
         state = batch["observation.state"].float()      # (B, T_obs, state_dim)
