@@ -147,11 +147,14 @@ class FlowMatchingTransformer(nn.Module):
         self.context_norm = nn.LayerNorm(config.d_model)
 
         # 2. State encoder: (B, T_obs, state_dim) → (B, T_obs, d_model)
-        #    Uses n_obs_steps states (2 timesteps = position + velocity info)
+        #    Uses n_obs_steps states (2 timesteps = position + velocity info).
+        #    LayerNorm matches the treatment of context tokens (context_norm) so both
+        #    inputs to the cross-attention memory have consistent scale.
         self.state_encoder = nn.Sequential(
             nn.Linear(config.state_dim, config.d_model * 2),
             nn.SiLU(),
             nn.Linear(config.d_model * 2, config.d_model),
+            nn.LayerNorm(config.d_model),
         )
 
         # 3. Action projections
@@ -332,10 +335,12 @@ class FlowMatchingTransformer(nn.Module):
 
         # Trainable state encoder: direct gradient path through action_expert → state_encoder
         state = batch["observation.state"].float()      # (B, T_obs, state_dim)
-        # Guard against NaN/Inf that MEAN_STD normalization can produce for zero-variance
-        # state dimensions (e.g. a locked joint with std=0 in the dataset stats causes
-        # (x - mean)/0 = NaN, which then propagates explosively through the linear layer).
-        state = torch.nan_to_num(state, nan=0.0, posinf=10.0, neginf=-10.0)
+        # Guard against large finite values from zero-variance state dimensions.
+        # MEAN_STD normalization computes (x - mean) / (std + eps). For a dimension with
+        # std=0 (e.g. a locked joint), this becomes x / eps giving values in the millions.
+        # These are finite (not NaN/Inf), so nan_to_num won't catch them — use clamp.
+        # Properly normalised dimensions stay within ±5; clamping to ±10 is a safe bound.
+        state = state.nan_to_num(nan=0.0).clamp(-10.0, 10.0)
         state_tokens = self.state_encoder(state)        # (B, T_obs, d_model)
 
         # Combine: VLM context + state tokens
@@ -415,7 +420,7 @@ class FlowMatchingTransformer(nn.Module):
           7M+ → gradient explosions (even though clipping prevents divergence, Adam's
           momentum accumulates bad signal from these batches).
         """
-        actions = batch["action"].float()   # (B, H, action_dim)
+        actions = batch["action"].float().nan_to_num(nan=0.0).clamp(-10.0, 10.0)   # (B, H, action_dim)
         B = actions.shape[0]
 
         context = self.get_condition(batch)
