@@ -350,6 +350,20 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     except Exception as e:
         print(f"Warning: could not load tasks.parquet: {e}")
 
+    # Print normalization stats for state and action to detect near-zero std
+    if dataset_metadata.stats and "observation.state" in dataset_metadata.stats:
+        s = dataset_metadata.stats["observation.state"]
+        print(f"\nNorm stats observation.state:")
+        print(f"  mean={s.get('mean', 'N/A')}")
+        print(f"  std ={s.get('std',  'N/A')}")
+    else:
+        print("WARNING: observation.state not found in dataset_metadata.stats — will not be normalized!")
+    if dataset_metadata.stats and "action" in dataset_metadata.stats:
+        s = dataset_metadata.stats["action"]
+        print(f"Norm stats action:")
+        print(f"  mean={s.get('mean', 'N/A')}")
+        print(f"  std ={s.get('std',  'N/A')}")
+
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=8,
@@ -395,13 +409,18 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
             # Apply joint data augmentation
             batch = apply_joint_augmentations(batch)
-            
+
             # Apply state dropout
             # NOTE: Disabled - was running before normalization, causing spurious gradients in state encoder
             # batch = apply_state_dropout(batch)
-            
+
             # Apply camera dropout
             #batch = apply_camera_dropout(batch)
+
+            # Step-0 diagnostic: print raw state before normalization
+            if step == 0:
+                raw_st = batch["observation.state"].float()
+                print(f"\nRaw (pre-norm) observation.state: min={raw_st.min():.4f}  max={raw_st.max():.4f}  std={raw_st.std():.4f}")
 
             # Preprocess (Normalize)
             batch = preprocessor(batch)

@@ -332,6 +332,10 @@ class FlowMatchingTransformer(nn.Module):
 
         # Trainable state encoder: direct gradient path through action_expert → state_encoder
         state = batch["observation.state"].float()      # (B, T_obs, state_dim)
+        # Guard against NaN/Inf that MEAN_STD normalization can produce for zero-variance
+        # state dimensions (e.g. a locked joint with std=0 in the dataset stats causes
+        # (x - mean)/0 = NaN, which then propagates explosively through the linear layer).
+        state = torch.nan_to_num(state, nan=0.0, posinf=10.0, neginf=-10.0)
         state_tokens = self.state_encoder(state)        # (B, T_obs, d_model)
 
         # Combine: VLM context + state tokens
