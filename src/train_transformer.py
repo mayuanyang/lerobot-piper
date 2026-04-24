@@ -171,7 +171,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
     # Training parameters
     obs = 2
-    horizon = 50
+    horizon = 20
     n_action_steps = 8
 
     # Create transformer configuration
@@ -367,7 +367,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=8,
-        batch_size=128,  # Reduced batch size for better gradient flow
+        batch_size=64,  # Reduced batch size for better gradient flow
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
