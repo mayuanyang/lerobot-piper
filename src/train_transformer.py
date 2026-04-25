@@ -321,7 +321,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     delta_timestamps = {
         "observation.state": obs_temporal_window,
         "action": action_temporal_window,
-        **{key: obs_temporal_window for key in camera_keys},
+        # Cameras only need the current frame — the model always uses imgs[:, -1].
+        # Loading the full obs_temporal_window per camera wastes memory with no benefit.
+        **{key: [0.0] for key in camera_keys},
     }
 
     # Load dataset

@@ -212,8 +212,13 @@ class FlowMatchingTransformer(nn.Module):
         for cam_key in self.config.cameras_for_vision_state_concat:
             if cam_key not in batch:
                 continue
-            imgs = batch[cam_key]  # (B, T_obs, C, H, W)
-            img = imgs[:, -1]      # Use last observation step: (B, C, H, W)
+            imgs = batch[cam_key]
+            # LeRobot omits the time dimension when T_obs=1, giving (B, C, H, W).
+            # With T_obs>1 the shape is (B, T_obs, C, H, W); take the last step.
+            if imgs.dim() == 5:
+                img = imgs[:, -1]  # (B, C, H, W)
+            else:
+                img = imgs         # (B, C, H, W) — already squeezed by dataloader
 
             # Normalize [0, 1] → [-1, 1] for SigLIP
             img = img * 2.0 - 1.0
@@ -334,7 +339,9 @@ class FlowMatchingTransformer(nn.Module):
         context = self.context_norm(self.context_proj(context_hidden.float()))  # (B, N, d_model)
 
         # Trainable state encoder: direct gradient path through action_expert → state_encoder
-        state = batch["observation.state"].float()      # (B, T_obs, state_dim)
+        state = batch["observation.state"].float()      # (B, T_obs, state_dim) or (B, state_dim)
+        if state.dim() == 2:
+            state = state.unsqueeze(1)                  # (B, 1, state_dim)
         # Guard against large finite values from zero-variance state dimensions.
         # MEAN_STD normalization computes (x - mean) / (std + eps). For a dimension with
         # std=0 (e.g. a locked joint), this becomes x / eps giving values in the millions.
