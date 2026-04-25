@@ -142,7 +142,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
 
-    training_steps = 100000
+    training_steps = 200000
     progress_update_freq = 200  # Single frequency for all progress updates
     checkpoint_freq = 1000
     image_transforms = get_augmentations()
@@ -171,7 +171,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
     # Training parameters
     obs = 2
-    horizon = 20
+    horizon = 16
     n_action_steps = 8
 
     # Create transformer configuration
@@ -309,10 +309,13 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     fps = 10
     frame_time = 1 / fps
     
-    # Create observation temporal window
+    # Observation window: last `obs` frames ending at t=0 (current frame).
+    # e.g. obs=2 → [-0.1, 0.0]
     obs_temporal_window = [ -i * frame_time for i in range(obs) ][::-1]
-    
-    # Shift action timestamps by 1 position to prevent overlap with observations
+
+    # Action window: `horizon` steps starting at t=0.
+    # The first action (t=0) corresponds to the current observation — standard LeRobot convention.
+    # e.g. horizon=16 → [0.0, 0.1, ..., 1.5]
     action_temporal_window = [i * frame_time for i in range(horizon)]
     
     delta_timestamps = {
