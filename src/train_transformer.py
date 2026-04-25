@@ -2,6 +2,8 @@ from pathlib import Path
 import torch
 import pandas as pd
 from tqdm import tqdm
+import huggingface_hub
+from safetensors.torch import load_file as load_safetensors
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.utils import dataset_to_policy_features
@@ -170,7 +172,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     print(f"State dim: {state_dim}, Action dim: {action_dim}")
 
     # Training parameters
-    obs = 2
+    obs = 4
     horizon = 16
     n_action_steps = 8
 
@@ -196,10 +198,36 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     # Model loading logic
     if resume_from_checkpoint is not None:
         print(f"Resuming training from checkpoint: {resume_from_checkpoint}")
-        # Load policy with its original configuration
-        policy = TransformerFlowMatchingPolicy.from_pretrained(resume_from_checkpoint, strict=False)
+        # Initialize fresh policy with current config, then load compatible weights.
+        # strict=False alone won't handle size mismatches (PyTorch raises even then),
+        # so we pre-filter to only load keys whose shapes match the current model.
+        policy = TransformerFlowMatchingPolicy(cfg)
         policy.train()
         policy.to(device)
+
+        ckpt_path = Path(resume_from_checkpoint)
+        if ckpt_path.exists():
+            # Local checkpoint — find the safetensors file
+            candidates = list(ckpt_path.glob("*.safetensors"))
+            if not candidates:
+                raise FileNotFoundError(f"No .safetensors file found in {ckpt_path}")
+            model_file = candidates[0]
+        else:
+            # HuggingFace Hub — download full snapshot and find safetensors
+            repo_path = Path(huggingface_hub.snapshot_download(resume_from_checkpoint))
+            candidates = list(repo_path.glob("*.safetensors"))
+            if not candidates:
+                raise FileNotFoundError(f"No .safetensors file found in downloaded repo {repo_path}")
+            model_file = candidates[0]
+        print(f"Loading weights from: {model_file}")
+        ckpt_state = load_safetensors(model_file, device=str(device))
+        cur_state = policy.state_dict()
+        filtered = {k: v for k, v in ckpt_state.items() if k in cur_state and cur_state[k].shape == v.shape}
+        skipped = [k for k in ckpt_state if k not in filtered]
+        if skipped:
+            print(f"Skipped {len(skipped)} mismatched keys: {skipped}")
+        policy.load_state_dict(filtered, strict=False)
+        print(f"Loaded {len(filtered)}/{len(ckpt_state)} keys from checkpoint")
         
         # Use the policy's configuration for creating processors
         preprocessor, postprocessor = make_pre_post_processors(
@@ -239,14 +267,18 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                     param_group['initial_lr'] = resume_lr
                 print(f"Optimizer state loaded. LR reset to {resume_lr}")
 
-        # Read step/epoch counters from config (written at save time); fall back to
-        # parsing the directory name for checkpoints saved before this change.
-        step = getattr(policy.config, "training_step", 0)
-        if step == 0 and not resume_from_checkpoint.startswith("http") and not resume_from_checkpoint.startswith("huggingface.co"):
-            checkpoint_path = Path(resume_from_checkpoint)
-            if checkpoint_path.name.startswith("checkpoint-"):
-                step = int(checkpoint_path.name.split("-")[1])
-        epoch = getattr(policy.config, "training_epoch", 0)
+        # Read step/epoch counters from the checkpoint config (written at save time).
+        # policy.config is cfg (fresh), so load the saved config separately.
+        try:
+            ckpt_config = TransformerFlowMatchingConfig.from_pretrained(resume_from_checkpoint)
+            step = getattr(ckpt_config, "training_step", 0)
+            epoch = getattr(ckpt_config, "training_epoch", 0)
+        except Exception:
+            step = 0
+            epoch = 0
+        # Fall back to parsing the directory name for older checkpoints
+        if step == 0 and ckpt_path.exists() and ckpt_path.name.startswith("checkpoint-"):
+            step = int(ckpt_path.name.split("-")[1])
         print(f"Resuming from step {step}, epoch {epoch}")
 
         # Create cosine scheduler and fast-forward to match saved step.
@@ -372,7 +404,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=8,
-        batch_size=64,  # Reduced batch size for better gradient flow
+        batch_size=128,  # Reduced batch size for better gradient flow
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,

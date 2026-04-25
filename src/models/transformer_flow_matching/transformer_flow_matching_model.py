@@ -147,13 +147,10 @@ class FlowMatchingTransformer(nn.Module):
         self.context_norm = nn.LayerNorm(config.d_model)
 
         # 2. State encoder: (B, T_obs, state_dim) → (B, T_obs, d_model)
-        #    Uses n_obs_steps states (2 timesteps = position + velocity info).
-        #    LayerNorm matches the treatment of context tokens (context_norm) so both
-        #    inputs to the cross-attention memory have consistent scale.
+        #    Single linear + LayerNorm is sufficient for a 7-dim input.
+        #    Temporal relationships across obs steps are handled by the action expert's SA.
         self.state_encoder = nn.Sequential(
-            nn.Linear(config.state_dim, config.d_model * 2),
-            nn.SiLU(),
-            nn.Linear(config.d_model * 2, config.d_model),
+            nn.Linear(config.state_dim, config.d_model),
             nn.LayerNorm(config.d_model),
         )
 
