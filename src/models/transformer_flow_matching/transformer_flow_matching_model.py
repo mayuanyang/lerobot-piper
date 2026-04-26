@@ -445,14 +445,25 @@ class FlowMatchingTransformer(nn.Module):
 
         loss = F.mse_loss(v_t, u_t, reduction="none")  # (B, H, action_dim)
 
+        # Position-decay weights: exp(-lambda * h) — higher weight for early steps.
+        # Early steps are what the robot actually executes; later steps provide temporal
+        # context but matter less for control quality.
+        if self.config.pos_decay_lambda > 0.0:
+            H = loss.shape[1]
+            pos = torch.arange(H, device=loss.device, dtype=loss.dtype)
+            pos_weights = torch.exp(-self.config.pos_decay_lambda * pos)  # (H,)
+            loss = loss * pos_weights[None, :, None]
+
         # Mask out padding — LeRobot uses "action_is_pad" (bool, True = padded).
         # SmolVLA uses "actions_id_pad"; check both for compatibility.
         is_pad = batch.get("action_is_pad", batch.get("actions_id_pad"))
         if is_pad is not None:
             valid = ~is_pad.bool()                           # (B, H)
             loss = loss * valid.unsqueeze(-1).float()        # zero out padded steps
-            n_valid = valid.sum().clamp(min=1) * self.config.action_dim
-            return loss.sum() / n_valid
+            # Normalise by sum of weights over valid steps (not raw count) so that
+            # the loss scale stays comparable regardless of how many steps are padded.
+            pos_w_sum = (pos_weights[None, :] * valid.float()).sum().clamp(min=1e-6)
+            return loss.sum() / (pos_w_sum * self.config.action_dim)
 
         return loss.mean()
 

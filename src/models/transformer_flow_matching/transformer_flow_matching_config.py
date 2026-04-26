@@ -50,7 +50,7 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     
     # State processing
     state_dim: int = 7  # Default for 7-DOF arm
-    
+
     # Action dimensions
     action_dim: int = 7  # Default for 7-DOF arm
     
@@ -66,6 +66,11 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
         
     # Flow matching sampling parameters
     num_inference_steps: int = 20
+
+    # Position-decay loss weight: loss *= exp(-lambda * position).
+    # Higher values concentrate gradient on early steps (those actually executed).
+    # 0.0 = uniform weighting (original behaviour). 0.1 is a reasonable starting point.
+    pos_decay_lambda: float = 0.1
         
     # Training presets
     optimizer_lr: float = 1e-4        # Conservative for frozen VLM + fresh action expert (SmolVLA uses 1e-4)
