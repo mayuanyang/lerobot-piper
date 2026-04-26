@@ -220,8 +220,23 @@ class FlowMatchingTransformer(nn.Module):
             # Normalize [0, 1] → [-1, 1] for SigLIP
             img = img * 2.0 - 1.0
 
-            # Resize to vision_input_size if needed
+            # Pad to square preserving aspect ratio, then resize to vision_input_size.
+            # Without padding, interpolating 640×400 → 384×384 squishes the scene
+            # (16:10 → 1:1), distorting object shapes and positions.
+            # Padding value -1.0 = black in [-1, 1] space (neutral for SigLIP).
             target = self.config.vision_input_size
+            h, w = img.shape[-2], img.shape[-1]
+            if h != w:
+                max_dim = max(h, w)
+                pad_h = max_dim - h
+                pad_w = max_dim - w
+                pad_top    = pad_h // 2
+                pad_bottom = pad_h - pad_top
+                pad_left   = pad_w // 2
+                pad_right  = pad_w - pad_left
+                # F.pad order: (left, right, top, bottom)
+                img = F.pad(img.float(), (pad_left, pad_right, pad_top, pad_bottom), value=-1.0)
+
             if img.shape[-2] != target or img.shape[-1] != target:
                 img = F.interpolate(
                     img.float(), size=(target, target),
