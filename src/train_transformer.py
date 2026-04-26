@@ -207,18 +207,14 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
         ckpt_path = Path(resume_from_checkpoint)
         if ckpt_path.exists():
-            # Local checkpoint — find the safetensors file
-            candidates = list(ckpt_path.glob("*.safetensors"))
-            if not candidates:
-                raise FileNotFoundError(f"No .safetensors file found in {ckpt_path}")
-            model_file = candidates[0]
+            local_ckpt_path = ckpt_path
         else:
-            # HuggingFace Hub — download full snapshot and find safetensors
-            repo_path = Path(huggingface_hub.snapshot_download(resume_from_checkpoint))
-            candidates = list(repo_path.glob("*.safetensors"))
-            if not candidates:
-                raise FileNotFoundError(f"No .safetensors file found in downloaded repo {repo_path}")
-            model_file = candidates[0]
+            # HuggingFace Hub — download full snapshot to local cache
+            local_ckpt_path = Path(huggingface_hub.snapshot_download(resume_from_checkpoint))
+        candidates = list(local_ckpt_path.glob("*.safetensors"))
+        if not candidates:
+            raise FileNotFoundError(f"No .safetensors file found in {local_ckpt_path}")
+        model_file = candidates[0]
         print(f"Loading weights from: {model_file}")
         ckpt_state = load_safetensors(model_file, device=str(device))
         cur_state = policy.state_dict()
@@ -237,18 +233,37 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             grid_overlay_cameras=["front", "right"]  # Front and right cameras (original names)
         )
             
+        # Read step/epoch/lr/warmup from the saved config JSON.
+        # policy.config is cfg (fresh defaults), so read the checkpoint config directly.
+        import json
+        step, epoch = 0, 0
+        saved_cfg_json = {}
+        for config_name in ("config.json", "pretrained_config.json"):
+            config_file = local_ckpt_path / config_name
+            if config_file.exists():
+                with open(config_file) as f:
+                    saved_cfg_json = json.load(f)
+                step = saved_cfg_json.get("training_step", 0)
+                epoch = saved_cfg_json.get("training_epoch", 0)
+                print(f"Read config from {config_file.name}: training_step={step}, training_epoch={epoch}")
+                break
+        # Fall back to parsing the directory name for older checkpoints
+        if step == 0 and local_ckpt_path.name.startswith("checkpoint-"):
+            step = int(local_ckpt_path.name.split("-")[1])
+        print(f"Resuming from step {step}, epoch {epoch}")
+
         # Define trainable parameters
         trainable_params = [p for p in policy.model.parameters() if p.requires_grad]
-        
-        # Print optimizer information
-        resume_lr = policy.config.optimizer_lr if hasattr(policy.config, 'optimizer_lr') else 3e-4
-        resume_warmup = policy.config.scheduler_warmup_steps if hasattr(policy.config, 'scheduler_warmup_steps') else 1500
+
+        # Optimizer — read lr/warmup from saved config, fall back to cfg
+        resume_lr = saved_cfg_json.get("optimizer_lr", cfg.optimizer_lr)
+        resume_warmup = saved_cfg_json.get("scheduler_warmup_steps", cfg.scheduler_warmup_steps)
         print(f"Initializing optimizer with learning rate: {resume_lr}")
         total_trainable_params = sum(p.numel() for p in trainable_params)
         print(f"Number of trainable parameters: {total_trainable_params}")
-        
+
         optimizer = torch.optim.Adam(trainable_params, lr=resume_lr, weight_decay=1e-6)
-        
+
         # Print learning rate groups
         print(f"Optimizer parameter groups: {len(optimizer.param_groups)}")
         for i, group in enumerate(optimizer.param_groups):
@@ -256,30 +271,13 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             print(f"  Group {i}: lr={group['lr']}, params={group_param_count}")
 
         # Load optimizer state (keep Adam momentum/variance but reset LR to new config value)
-        if not resume_from_checkpoint.startswith("http") and not resume_from_checkpoint.startswith("huggingface.co"):
-            checkpoint_path = Path(resume_from_checkpoint)
-            optimizer_state_path = checkpoint_path / "optimizer_state.pth"
-            if optimizer_state_path.exists():
-                optimizer.load_state_dict(torch.load(optimizer_state_path, map_location=device))
-                # Override the stale LR from the checkpoint with the new config value
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = resume_lr
-                    param_group['initial_lr'] = resume_lr
-                print(f"Optimizer state loaded. LR reset to {resume_lr}")
-
-        # Read step/epoch counters from the checkpoint config (written at save time).
-        # policy.config is cfg (fresh), so load the saved config separately.
-        try:
-            ckpt_config = TransformerFlowMatchingConfig.from_pretrained(resume_from_checkpoint)
-            step = getattr(ckpt_config, "training_step", 0)
-            epoch = getattr(ckpt_config, "training_epoch", 0)
-        except Exception:
-            step = 0
-            epoch = 0
-        # Fall back to parsing the directory name for older checkpoints
-        if step == 0 and ckpt_path.exists() and ckpt_path.name.startswith("checkpoint-"):
-            step = int(ckpt_path.name.split("-")[1])
-        print(f"Resuming from step {step}, epoch {epoch}")
+        optimizer_state_path = local_ckpt_path / "optimizer_state.pth"
+        if optimizer_state_path.exists():
+            optimizer.load_state_dict(torch.load(optimizer_state_path, map_location=device))
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = resume_lr
+                param_group['initial_lr'] = resume_lr
+            print(f"Optimizer state loaded. LR reset to {resume_lr}")
 
         # Create cosine scheduler and fast-forward to match saved step.
         # This ensures LR is correct on resume — not restarting from warmup.
