@@ -34,6 +34,12 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     # 16 layers balances representation quality vs speed/memory (same as SmolVLA default).
     num_vlm_layers: int = 16
 
+    # Number of VLM text layers (counting from the end) to unfreeze for fine-tuning.
+    # 0 = fully frozen (original behaviour, no activation storage through VLM).
+    # 2 = last 2 layers train; first 14 are frozen but their activations ARE stored
+    #     for backprop, so expect ~200-400 MB extra GPU memory at typical batch sizes.
+    num_trainable_vlm_layers: int = 2
+
     # Zero-shot object detection (YOLOWorld inference)
     # Set these to the names of the objects your robot needs to pick and place
     detection_classes: list = field(default_factory=lambda: ["cube", "container"])

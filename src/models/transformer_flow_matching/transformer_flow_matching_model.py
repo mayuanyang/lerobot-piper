@@ -126,11 +126,22 @@ class FlowMatchingTransformer(nn.Module):
         print(f"Using first {num_vlm_layers}/{total_layers} VLM text layers")
         self.text_model.layers = self.text_model.layers[:num_vlm_layers]
 
-        # Freeze ALL VLM components — only the action expert trains
+        # Freeze ALL VLM components first, then selectively re-enable
         for component in [self.vision_model, self.connector, self.text_model]:
             for p in component.parameters():
                 p.requires_grad = False
             component.eval()
+
+        # Optionally unfreeze the last N text layers + final norm for fine-tuning.
+        # These layers adapt the VLM representations to task-relevant spatial features.
+        n_trainable = config.num_trainable_vlm_layers
+        if n_trainable > 0:
+            for layer in self.text_model.layers[-n_trainable:]:
+                for p in layer.parameters():
+                    p.requires_grad = True
+            for p in self.text_model.norm.parameters():
+                p.requires_grad = True
+            print(f"Unfreezing last {n_trainable} VLM text layers + norm for fine-tuning")
 
         # Free unused VLM weights (lm_head, etc.) to reduce memory footprint
         del vlm
@@ -188,10 +199,21 @@ class FlowMatchingTransformer(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        # Always keep frozen VLM in eval (prevents BN/dropout from activating)
+        # Vision model and connector are always frozen → always eval
         self.vision_model.eval()
         self.connector.eval()
-        self.text_model.eval()
+        if mode:
+            # In training mode: keep frozen text layers in eval so any dropout/BN
+            # in those layers stays in inference behaviour. Trainable layers (last N)
+            # and norm were set to train() by super().train(mode) above — leave them.
+            n_trainable = self.config.num_trainable_vlm_layers
+            n_frozen = len(self.text_model.layers) - n_trainable
+            for layer in self.text_model.layers[:n_frozen]:
+                layer.eval()
+            self.text_model.embed_tokens.eval()
+        else:
+            # In eval mode: super() already set everything to eval
+            pass
         return self
 
     # ------------------------------------------------------------------
@@ -283,43 +305,50 @@ class FlowMatchingTransformer(nn.Module):
         lang_embs = self.text_model.get_input_embeddings()(input_ids)
         return lang_embs  # bfloat16
 
-    @torch.no_grad()
     def encode_prefix(self, batch: dict, B: int, T_obs: int) -> torch.Tensor:
         """
-        Frozen VLM prefix encoding.
-        images + language → [N VLM text layers] → (B, N, VLM_HIDDEN) bfloat16
+        VLM prefix encoding: images + language → (B, N, VLM_HIDDEN) bfloat16.
 
-        Uses @torch.no_grad() so VLM activations are NOT stored for backward.
-        Gradient flows into context_proj (trainable) but NOT through VLM weights.
-        This gives full VLM representational power at minimal memory cost.
+        When num_trainable_vlm_layers == 0: entire VLM runs under torch.no_grad(),
+        no activations stored, minimal memory cost.
+        When num_trainable_vlm_layers > 0: image/language encoding still runs under
+        no_grad, but the full text_model forward runs with grad enabled so the last N
+        layers' parameters receive gradient signal. All 16 layer activations are stored
+        for backprop — expect ~200-400 MB extra memory depending on batch size.
         """
         device = batch["observation.state"].device
 
-        # Encode images
-        vis_tokens = self._encode_images(batch, B, T_obs)  # (B, V, 960)
+        # Image and language encoding are always frozen — no activations needed
+        with torch.no_grad():
+            vis_tokens = self._encode_images(batch, B, T_obs)  # (B, V, 960)
+            lang_tokens = self._encode_language(batch, B, device)  # (B, L, 960) or None
 
-        # Encode language
-        lang_tokens = self._encode_language(batch, B, device)  # (B, L, 960) or None
+            # NOTE: Do NOT scale by sqrt(960) here.
+            # SmolVLA applies that scaling in their custom SmolVLMWithExpertModel which
+            # interleaves expert layers inside the VLM. Here we only use the VLM as a
+            # frozen feature extractor — the RMSNorm at each layer already controls scale.
+            # Adding sqrt(960)≈31× scaling would push VLM attention into degenerate regimes.
+            prefix_parts = [vis_tokens]
+            if lang_tokens is not None:
+                prefix_parts.append(lang_tokens)
+            prefix_embs = torch.cat(prefix_parts, dim=1)  # (B, N, 960)
 
-        # NOTE: Do NOT scale by sqrt(960) here.
-        # SmolVLA applies that scaling in their custom SmolVLMWithExpertModel which
-        # interleaves expert layers inside the VLM. Here we only use the VLM as a
-        # frozen feature extractor — the RMSNorm at each layer already controls scale.
-        # Adding sqrt(960)≈31× scaling would push VLM attention into degenerate regimes.
-        prefix_parts = [vis_tokens]
-        if lang_tokens is not None:
-            prefix_parts.append(lang_tokens)
-
-        prefix_embs = torch.cat(prefix_parts, dim=1)  # (B, N, 960)
-
-        # Run through truncated VLM text layers (frozen, causal attention).
-        # Pass attention_mask=None → model uses its internal causal mask, which is
-        # numerically cleaner than passing an explicit all-ones boolean mask.
-        text_out = self.text_model(
-            inputs_embeds=prefix_embs,
-            attention_mask=None,
-            use_cache=False,
-        )
+        # Run truncated VLM text layers with causal attention.
+        # When trainable layers > 0 we need grad enabled so the last N layers'
+        # parameters can be updated; otherwise wrap in no_grad to save memory.
+        if self.config.num_trainable_vlm_layers > 0:
+            text_out = self.text_model(
+                inputs_embeds=prefix_embs,
+                attention_mask=None,
+                use_cache=False,
+            )
+        else:
+            with torch.no_grad():
+                text_out = self.text_model(
+                    inputs_embeds=prefix_embs,
+                    attention_mask=None,
+                    use_cache=False,
+                )
         return text_out.last_hidden_state  # (B, N, 960) bfloat16
 
     # ------------------------------------------------------------------
@@ -338,7 +367,6 @@ class FlowMatchingTransformer(nn.Module):
         T_obs = self.config.n_obs_steps
         device = batch["observation.state"].device
 
-        # Frozen VLM context — no gradient through this path
         context_hidden = self.encode_prefix(batch, B, T_obs)  # (B, N, 960) bfloat16
 
         # Guard: replace any NaN/Inf from bfloat16 VLM forward (rare but possible
