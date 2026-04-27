@@ -26,7 +26,7 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
 
     # Image processing
     freeze_vision_backbone: bool = True
-    vision_input_size: int = 384  # 384/16=24 patches/side → 576 patches → 144 tokens after connector (scale_factor=4)
+    vision_input_size: int = 384  # 384px → 128 tokens/camera after SigLIP patch14 + connector (vs 64 at 256px)
 
     # VLM backbone configuration
     num_cameras: int = 3
