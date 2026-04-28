@@ -212,19 +212,31 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         else:
             # HuggingFace Hub — download full snapshot to local cache
             local_ckpt_path = Path(huggingface_hub.snapshot_download(resume_from_checkpoint))
-        candidates = list(local_ckpt_path.glob("*.safetensors"))
-        if not candidates:
-            raise FileNotFoundError(f"No .safetensors file found in {local_ckpt_path}")
-        model_file = candidates[0]
+        # Prefer model.safetensors explicitly — checkpoint dirs also contain
+        # preprocessor/postprocessor safetensors files that would match *.safetensors
+        # but contain no model weights, causing silent zero-match loading.
+        model_file = local_ckpt_path / "model.safetensors"
+        if not model_file.exists():
+            candidates = list(local_ckpt_path.glob("*.safetensors"))
+            if not candidates:
+                raise FileNotFoundError(f"No .safetensors file found in {local_ckpt_path}")
+            model_file = candidates[0]
         print(f"Loading weights from: {model_file}")
         ckpt_state = load_safetensors(model_file, device=str(device))
         cur_state = policy.state_dict()
         filtered = {k: v for k, v in ckpt_state.items() if k in cur_state and cur_state[k].shape == v.shape}
-        skipped = [k for k in ckpt_state if k not in filtered]
-        if skipped:
-            print(f"Skipped {len(skipped)} mismatched keys: {skipped}")
+
+        # Keys in checkpoint not loaded (shape mismatch or key removed from model)
+        skipped_ckpt = [k for k in ckpt_state if k not in filtered]
+        # Keys in current model not in checkpoint (new params — will stay at init values)
+        missing_from_ckpt = [k for k in cur_state if k not in ckpt_state]
+
+        if skipped_ckpt:
+            print(f"Skipped {len(skipped_ckpt)} checkpoint keys (shape mismatch / removed): {skipped_ckpt[:10]}")
+        if missing_from_ckpt:
+            print(f"Missing {len(missing_from_ckpt)} keys not in checkpoint (will use init values): {missing_from_ckpt[:10]}")
         policy.load_state_dict(filtered, strict=False)
-        print(f"Loaded {len(filtered)}/{len(ckpt_state)} keys from checkpoint")
+        print(f"Loaded {len(filtered)}/{len(cur_state)} model keys from checkpoint ({len(ckpt_state)} keys in file)")
         
         # Use the policy's configuration for creating processors
         preprocessor, postprocessor = make_pre_post_processors(
@@ -246,7 +258,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                     saved_cfg_json = json.load(f)
                 step = saved_cfg_json.get("training_step", 0)
                 epoch = saved_cfg_json.get("training_epoch", 0)
-                print(f"Read config from {config_file.name}: training_step={step}, training_epoch={epoch}")
+                # Restore total training steps so the cosine schedule reproduces
+                # the exact same LR curve — a mismatch here causes a 7× LR jump.
+                saved_total = saved_cfg_json.get("training_steps_total", 0)
+                if saved_total > 0:
+                    training_steps = saved_total
+                print(f"Read config from {config_file.name}: step={step}, epoch={epoch}, training_steps_total={training_steps}")
                 break
         # Fall back to parsing the directory name for older checkpoints
         if step == 0 and local_ckpt_path.name.startswith("checkpoint-"):
@@ -611,7 +628,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 policy.config.training_step = step
                 policy.config.training_epoch = epoch
                 policy.config.current_lr = optimizer.param_groups[0]["lr"]
+                policy.config.training_steps_total = training_steps
                 policy.save_pretrained(checkpoint_dir)
+                torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer_state.pth")
                 preprocessor.save_pretrained(checkpoint_dir)
                 postprocessor.save_pretrained(checkpoint_dir)
                 print(f"\nCheckpoint saved at step {step}")
@@ -632,7 +651,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     policy.config.training_step = step
     policy.config.training_epoch = epoch
     policy.config.current_lr = optimizer.param_groups[0]["lr"]
+    policy.config.training_steps_total = training_steps
     policy.save_pretrained(output_directory)
+    torch.save(optimizer.state_dict(), output_directory / "optimizer_state.pth")
     preprocessor.save_pretrained(output_directory)
     postprocessor.save_pretrained(output_directory)
 
