@@ -216,6 +216,24 @@ class FlowMatchingTransformer(nn.Module):
             pass
         return self
 
+    def enable_vlm_training(self, n: int = 2) -> None:
+        """
+        Unfreeze the last n text layers + final norm for fine-tuning.
+        Call this at runtime after the action expert has stabilised.
+        The caller is responsible for adding the newly trainable parameters
+        to the optimizer.
+        """
+        for layer in self.text_model.layers[-n:]:
+            for p in layer.parameters():
+                p.requires_grad = True
+            layer.train()
+        for p in self.text_model.norm.parameters():
+            p.requires_grad = True
+        self.text_model.norm.train()
+        self.config.num_trainable_vlm_layers = n
+        trainable = sum(p.numel() for p in self.text_model.parameters() if p.requires_grad)
+        print(f"[VLM] Last {n} text layers + norm unfrozen ({trainable:,} new trainable params)")
+
     # ------------------------------------------------------------------
     # Frozen prefix encoding (images + language → VLM hidden states)
     # ------------------------------------------------------------------

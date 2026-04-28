@@ -90,6 +90,7 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     # Persisted across checkpoints so resume training starts at the correct step/epoch.
     training_step: int = 0
     training_epoch: int = 0
+    current_lr: float = 0.0  # effective LR at last checkpoint (informational)
     
     def validate_features(self) -> None:
         if len(self.image_features) == 0 and self.env_state_feature is None:

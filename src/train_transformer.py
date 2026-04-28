@@ -192,6 +192,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         num_vlm_layers=16,
         num_cameras=len(camera_keys),
         cameras_for_vision_state_concat=camera_keys,
+        num_trainable_vlm_layers=0,  # VLM layers frozen initially; enabled once loss < 0.05
     )
     
     
@@ -290,6 +291,24 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         for _ in range(step):
             scheduler.step()
         print(f"Scheduler fast-forwarded to step {step}, LR = {optimizer.param_groups[0]['lr']:.2e}")
+
+        # Restore VLM fine-tuning if it was enabled at the checkpoint
+        checkpoint_vlm_layers = saved_cfg_json.get("num_trainable_vlm_layers", 0)
+        if checkpoint_vlm_layers > 0:
+            policy.model.enable_vlm_training(checkpoint_vlm_layers)
+            vlm_params = [p for p in policy.model.text_model.parameters() if p.requires_grad]
+            current_lr = optimizer.param_groups[0]["lr"]
+            optimizer.add_param_group({"params": vlm_params, "lr": current_lr})
+            # Recreate scheduler so it covers the new param group, then fast-forward
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer, num_warmup_steps=warmup_steps, num_training_steps=training_steps
+            )
+            for _ in range(step):
+                scheduler.step()
+            print(f"VLM fine-tuning restored (layers={checkpoint_vlm_layers}), LR={optimizer.param_groups[0]['lr']:.2e}")
+            vlm_unfrozen = True
+        else:
+            vlm_unfrozen = False
     else:
         # Initialize fresh policy
         policy = TransformerFlowMatchingPolicy(cfg)
@@ -326,10 +345,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         # Cosine scheduler with warmup
         warmup_steps = fresh_warmup
         scheduler = get_cosine_schedule_with_warmup(
-            optimizer, 
-            num_warmup_steps=warmup_steps, 
+            optimizer,
+            num_warmup_steps=warmup_steps,
             num_training_steps=training_steps
         )
+        vlm_unfrozen = False
 
     # Ensure preprocessors are on the correct device
     if isinstance(preprocessor, torch.nn.Module):
@@ -487,7 +507,22 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                     print(f"  pad frac: {batch[pad_key].float().mean().item():.2%}")
 
             loss.backward()
-            
+
+            # Enable VLM fine-tuning once loss stabilises below threshold
+            if not vlm_unfrozen and loss.item() < 0.05:
+                policy.model.enable_vlm_training(n=2)
+                vlm_params = [p for p in policy.model.text_model.parameters() if p.requires_grad]
+                current_lr = optimizer.param_groups[0]["lr"]
+                optimizer.add_param_group({"params": vlm_params, "lr": current_lr})
+                # Recreate scheduler to cover the new param group, fast-forward to current step
+                scheduler = get_cosine_schedule_with_warmup(
+                    optimizer, num_warmup_steps=warmup_steps, num_training_steps=training_steps
+                )
+                for _ in range(step):
+                    scheduler.step()
+                vlm_unfrozen = True
+                print(f"\n[Step {step}] Loss {loss.item():.4f} < 0.05 — VLM fine-tuning enabled, LR={optimizer.param_groups[0]['lr']:.2e}")
+
             # Print gradient information for all components (for debugging)
             if step % progress_update_freq == 0:  # Print every 10 progress update intervals
                 print(f"\n--- Gradient Analysis at Step {step} ---")
@@ -575,6 +610,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                 checkpoint_dir.mkdir(exist_ok=True)
                 policy.config.training_step = step
                 policy.config.training_epoch = epoch
+                policy.config.current_lr = optimizer.param_groups[0]["lr"]
                 policy.save_pretrained(checkpoint_dir)
                 preprocessor.save_pretrained(checkpoint_dir)
                 postprocessor.save_pretrained(checkpoint_dir)
@@ -595,6 +631,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     # Final save
     policy.config.training_step = step
     policy.config.training_epoch = epoch
+    policy.config.current_lr = optimizer.param_groups[0]["lr"]
     policy.save_pretrained(output_directory)
     preprocessor.save_pretrained(output_directory)
     postprocessor.save_pretrained(output_directory)
