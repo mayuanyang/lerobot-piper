@@ -244,17 +244,13 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             step = int(local_ckpt_path.name.split("-")[1])
         print(f"Resuming from step {step}, epoch {epoch}")
 
-        # Load checkpoint state dict first so we can inspect key names to detect LoRA,
-        # then apply LoRA to the model BEFORE doing the actual weight loading.
-        # peft wrapping renames keys (adds base_model.model. prefix), so the model
-        # structure must match the checkpoint's structure before state dict loading.
+        # Apply LoRA before loading weights — peft wrapping renames keys
+        # (adds base_model.model. prefix), so structure must match checkpoint.
+        policy.model.enable_lora()
+
+        # Load checkpoint state dict
         print(f"Loading weights from: {model_file}")
         ckpt_state = load_safetensors(model_file, device=str(device))
-        vlm_unfrozen = False
-        if any("lora_" in k for k in ckpt_state):
-            policy.model.enable_lora()
-            vlm_unfrozen = True
-            print("Detected LoRA weights in checkpoint — applied LoRA before weight loading")
 
         policy.train()
         policy.to(device)
@@ -286,19 +282,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         resume_warmup = saved_cfg_json.get("scheduler_warmup_steps", cfg.scheduler_warmup_steps)
         print(f"Initializing optimizer with learning rate: {resume_lr}")
 
-        if vlm_unfrozen:
-            # VLM params already trainable — split into two groups so optimizer state
-            # group indices match what was saved (group 0 = action expert, group 1 = VLM).
-            vlm_param_ids = set(id(p) for p in policy.model.text_model.parameters() if p.requires_grad)
-            expert_params = [p for p in policy.model.parameters() if p.requires_grad and id(p) not in vlm_param_ids]
-            vlm_params = [p for p in policy.model.text_model.parameters() if p.requires_grad]
-            optimizer = torch.optim.Adam(expert_params, lr=resume_lr, weight_decay=1e-6)
-            optimizer.add_param_group({"params": vlm_params, "lr": resume_lr})
-            print(f"Expert params: {sum(p.numel() for p in expert_params):,}  VLM params: {sum(p.numel() for p in vlm_params):,}")
-        else:
-            trainable_params = [p for p in policy.model.parameters() if p.requires_grad]
-            optimizer = torch.optim.Adam(trainable_params, lr=resume_lr, weight_decay=1e-6)
-            print(f"Total trainable parameters: {sum(p.numel() for p in trainable_params):,}")
+        trainable_params = [p for p in policy.model.parameters() if p.requires_grad]
+        optimizer = torch.optim.Adam(trainable_params, lr=resume_lr, weight_decay=1e-6)
+        print(f"Total trainable parameters: {sum(p.numel() for p in trainable_params):,}")
 
         # Print learning rate groups
         print(f"Optimizer parameter groups: {len(optimizer.param_groups)}")
@@ -329,44 +315,31 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     else:
         # Initialize fresh policy
         policy = TransformerFlowMatchingPolicy(cfg)
+        policy.model.enable_lora()
         policy.train()
         policy.to(device)
-        
-        # Print total trainable parameters
-        total_params = sum(p.numel() for p in policy.model.parameters() if p.requires_grad)
-        print(f"Total trainable parameters: {total_params:,}")
-        # Ensure all submodules are on the correct device
-        if hasattr(policy, 'transformer') and hasattr(policy.transformer, 'feature_projection'):
-            if policy.transformer.feature_projection is not None:
-                policy.transformer.feature_projection = policy.transformer.feature_projection.to(device)
+
         preprocessor, postprocessor = make_pre_post_processors(
-            cfg, 
-            dataset_stats=dataset_metadata.stats, 
+            cfg,
+            dataset_stats=dataset_metadata.stats,
             add_grid_overlay=True,
-            grid_overlay_cameras=["front", "right"]  # Front and right cameras (original names)
+            grid_overlay_cameras=["front", "right"]
         )
         step = 0
         epoch = 0
 
         trainable_params = [p for p in policy.parameters() if p.requires_grad]
+        print(f"Total trainable parameters: {sum(p.numel() for p in trainable_params):,}")
         fresh_lr = cfg.optimizer_lr
         fresh_warmup = cfg.scheduler_warmup_steps
         optimizer = torch.optim.Adam(trainable_params, lr=fresh_lr, weight_decay=cfg.optimizer_weight_decay)
-        
-        # Print learning rate groups
-        print(f"Optimizer parameter groups: {len(optimizer.param_groups)}")
-        for i, group in enumerate(optimizer.param_groups):
-            group_param_count = sum(p.numel() for p in group['params'])
-            print(f"  Group {i}: lr={group['lr']}, params={group_param_count}")
-        
-        # Cosine scheduler with warmup
+
         warmup_steps = fresh_warmup
         scheduler = get_cosine_schedule_with_warmup(
             optimizer,
             num_warmup_steps=warmup_steps,
             num_training_steps=training_steps
         )
-        vlm_unfrozen = False
 
     # Ensure preprocessors are on the correct device
     if isinstance(preprocessor, torch.nn.Module):
@@ -524,21 +497,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                     print(f"  pad frac: {batch[pad_key].float().mean().item():.2%}")
 
             loss.backward()
-
-            # Enable VLM LoRA once loss stabilises below threshold
-            if not vlm_unfrozen and loss.item() < 0.05:
-                policy.model.enable_lora()
-                vlm_params = [p for p in policy.model.text_model.parameters() if p.requires_grad]
-                current_lr = optimizer.param_groups[0]["lr"]
-                optimizer.add_param_group({"params": vlm_params, "lr": current_lr})
-                # Recreate scheduler to cover the new param group, fast-forward to current step
-                scheduler = get_cosine_schedule_with_warmup(
-                    optimizer, num_warmup_steps=warmup_steps, num_training_steps=training_steps
-                )
-                for _ in range(step):
-                    scheduler.step()
-                vlm_unfrozen = True
-                print(f"\n[Step {step}] Loss {loss.item():.4f} < 0.05 — VLM fine-tuning enabled, LR={optimizer.param_groups[0]['lr']:.2e}")
 
             # Print gradient information for all components (for debugging)
             if step % progress_update_freq == 0:  # Print every 10 progress update intervals

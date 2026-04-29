@@ -1,7 +1,27 @@
-# Requirements for LeRobot inference
-torch>=1.10.0
+# Core ML — torch and torchvision are pre-installed in Colab, listed here for reference
+# torch>=2.0.0
+# torchvision>=0.15.0
+
+# Version constraint required by LeRobot
 numpy<2.0.0
-opencv-python>=4.5.0
-lerobot>=0.1.0
-transformers>=4.35.0
+
+# HuggingFace stack
+transformers>=4.45.0
+safetensors>=0.4.0
+huggingface_hub>=0.24.0
+datasets>=2.19.0
+
+# LoRA fine-tuning
 peft>=0.9.0
+torchao>=0.16.0
+
+# LeRobot framework (install separately — see colab_setup.sh)
+# pip install git+https://github.com/huggingface/lerobot.git
+
+# Vision / data
+opencv-python>=4.5.0
+Pillow>=9.0.0
+pyarrow>=14.0.0
+
+# Optional: zero-shot object detection (only needed if using YOLO detector)
+# ultralytics>=8.0.0
