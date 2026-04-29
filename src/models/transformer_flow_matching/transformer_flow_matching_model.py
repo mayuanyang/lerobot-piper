@@ -259,6 +259,10 @@ class FlowMatchingTransformer(nn.Module):
         for p in self.connector.parameters():
             p.requires_grad = True
 
+        # Text model is frozen but gradients flow THROUGH it to reach connector/vision LoRA.
+        # Enable gradient checkpointing so 16 frozen layers don't store activations.
+        self.text_model.gradient_checkpointing_enable()
+
         self._lora_applied = True
         vis_params = sum(p.numel() for p in self.vision_model.parameters() if p.requires_grad) if n_vis > 0 else 0
         conn_params = sum(p.numel() for p in self.connector.parameters())
@@ -382,13 +386,15 @@ class FlowMatchingTransformer(nn.Module):
             prefix_parts.append(lang_tokens)
         prefix_embs = torch.cat(prefix_parts, dim=1)  # (B, N, 960)
 
-        # Text model is always frozen — run under no_grad to save activation memory.
-        with torch.no_grad():
-            text_out = self.text_model(
-                inputs_embeds=prefix_embs,
-                attention_mask=None,
-                use_cache=False,
-            )
+        # Text model params are frozen (requires_grad=False) so they won't accumulate
+        # gradients. But we must NOT use no_grad here — gradients need to flow THROUGH
+        # the text model back to prefix_embs (and from there to the connector / vision LoRA).
+        # Gradient checkpointing (enabled in enable_lora) keeps activation memory in check.
+        text_out = self.text_model(
+            inputs_embeds=prefix_embs,
+            attention_mask=None,
+            use_cache=False,
+        )
         return text_out.last_hidden_state  # (B, N, 960) bfloat16
 
     # ------------------------------------------------------------------
