@@ -1,22 +1,22 @@
 # Core ML — torch and torchvision are pre-installed in Colab, listed here for reference
-# torch>=2.0.0
-# torchvision>=0.15.0
+# torch>=2.2.1,<2.8.0
+# torchvision>=0.21.0,<0.23.0
 
 # Version constraint required by LeRobot
 numpy<2.0.0
 
-# HuggingFace stack
-transformers>=4.45.0
-safetensors>=0.4.0
-huggingface_hub>=0.24.0
-datasets>=2.19.0
+# LeRobot 0.4.0 with SmolVLA support (pulls in transformers, safetensors, huggingface_hub, datasets)
+lerobot[smolvla]==0.4.0
 
-# LoRA fine-tuning
-peft>=0.9.0
+# Pinned to lerobot 0.4.0 constraints
+huggingface_hub[cli,hf-transfer]>=0.34.2,<0.36.0
+datasets>=4.0.0,<4.2.0
+transformers>=4.53.0,<5.0.0
+safetensors>=0.4.3,<1.0.0
+
+# LoRA fine-tuning (peft pulled by lerobot[groot], but we pin torchao explicitly)
+peft>=0.13.0,<1.0.0
 torchao>=0.16.0
-
-# LeRobot framework (install separately — see colab_setup.sh)
-# pip install git+https://github.com/huggingface/lerobot.git
 
 # Vision / data
 opencv-python>=4.5.0
