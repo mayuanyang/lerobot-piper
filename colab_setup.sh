@@ -21,8 +21,9 @@ pip install -q \
   "datasets>=4.0.0,<4.2.0" \
   "safetensors>=0.4.3,<1.0.0"
 
-# 4. LoRA — torchao must be >=0.16.0 or peft raises ImportError
-pip install -q "peft>=0.13.0,<1.0.0" "torchao>=0.16.0"
+# 4. LoRA — torchao must be installed first at >=0.16.0, or peft raises ImportError
+pip install -q "torchao>=0.16.0"
+pip install -q "peft>=0.13.0,<1.0.0"
 
 # 5. Vision / data
 pip install -q "opencv-python>=4.5.0" "Pillow>=9.0.0" "pyarrow>=14.0.0"
