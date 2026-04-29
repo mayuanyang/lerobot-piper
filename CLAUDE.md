@@ -57,7 +57,7 @@ python src/add_2d_bounding_boxes_to_lerobot_dataset.py
 
 ```bash
 pip install -r requirements_inference.txt
-# Note: numpy<2.0.0 is required due to LeRobot compatibility
+# Note: lerobot==0.4.0 has no numpy constraint — use Colab's pre-installed numpy (2.x)
 ```
 
 ## Architecture

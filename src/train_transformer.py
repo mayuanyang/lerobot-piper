@@ -292,14 +292,19 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             group_param_count = sum(p.numel() for p in group['params'])
             print(f"  Group {i}: lr={group['lr']}, params={group_param_count}")
 
-        # Load optimizer state (keep Adam momentum/variance but reset LR to new config value)
+        # Load optimizer state (keep Adam momentum/variance but reset LR to new config value).
+        # Skip if the checkpoint has no LoRA weights — the param count will differ since
+        # LoRA A/B matrices are new params not present in the old optimizer state.
+        ckpt_has_lora = any("lora_" in k for k in ckpt_state)
         optimizer_state_path = local_ckpt_path / "optimizer_state.pth"
-        if optimizer_state_path.exists():
+        if optimizer_state_path.exists() and ckpt_has_lora:
             optimizer.load_state_dict(torch.load(optimizer_state_path, map_location=device))
             for param_group in optimizer.param_groups:
                 param_group['lr'] = resume_lr
                 param_group['initial_lr'] = resume_lr
             print(f"Optimizer state loaded. LR reset to {resume_lr}")
+        elif optimizer_state_path.exists() and not ckpt_has_lora:
+            print("Checkpoint has no LoRA weights — skipping optimizer state (LoRA params are new, moments would be mismatched)")
 
         # Create cosine scheduler and fast-forward to match saved step.
         # This ensures LR is correct on resume — not restarting from warmup.

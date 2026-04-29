@@ -196,6 +196,32 @@ class FlowMatchingTransformer(nn.Module):
         self.connector.eval()
         return self
 
+    @staticmethod
+    def _patch_peft_torchao() -> None:
+        """
+        Peft bug workaround: peft's is_torchao_available() raises ImportError when
+        torchao < 0.16.0 is installed, instead of returning False. This causes
+        get_peft_model to crash even though torchao isn't needed for standard LoRA.
+        Patch it once to return False gracefully so peft falls back to the default
+        Linear dispatcher.
+        """
+        try:
+            import peft.import_utils as _pu
+            import peft.tuners.lora.torchao as _pt
+            if getattr(_pu, '_torchao_patched', False):
+                return
+            _orig = _pu.is_torchao_available
+            def _safe(*args, **kwargs):
+                try:
+                    return _orig(*args, **kwargs)
+                except ImportError:
+                    return False
+            _pu.is_torchao_available = _safe
+            _pt.is_torchao_available = _safe
+            _pu._torchao_patched = True
+        except Exception:
+            pass
+
     def enable_lora(self) -> None:
         """
         Apply LoRA adapters to the text model after the action expert has stabilised.
@@ -203,6 +229,7 @@ class FlowMatchingTransformer(nn.Module):
         base weights stay frozen. Also unfreezes the final norm (~1K params).
         The caller is responsible for adding the newly trainable params to the optimizer.
         """
+        self._patch_peft_torchao()
         from peft import LoraConfig, get_peft_model
         lora_cfg = LoraConfig(
             r=self.config.lora_rank,
