@@ -417,7 +417,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         print(f"  std ={s.get('std',  'N/A')}")
 
     episode_ids = np.array(dataset.hf_dataset["episode_index"])
-    valid_indices = np.where(episode_ids <= 400)[0]
+    valid_indices = np.where(episode_ids <= 400)[0].tolist()
     dataset = Subset(dataset, valid_indices)
     print(f"Dataset subset: {len(dataset)} samples (episodes <= 400)")
 
