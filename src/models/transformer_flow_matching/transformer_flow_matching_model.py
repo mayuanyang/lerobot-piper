@@ -234,7 +234,14 @@ class FlowMatchingTransformer(nn.Module):
         # --- Vision model LoRA (last N layers only) ---
         n_vis = self.config.vision_lora_num_layers
         if n_vis > 0:
-            total_vis_layers = len(self.vision_model.vision_model.encoder.layers)
+            # SmolVLMVisionTransformer exposes encoder directly (no nested vision_model wrapper)
+            if hasattr(self.vision_model, 'encoder'):
+                vis_encoder_layers = self.vision_model.encoder.layers
+            elif hasattr(self.vision_model, 'vision_model'):
+                vis_encoder_layers = self.vision_model.vision_model.encoder.layers
+            else:
+                raise AttributeError(f"Cannot find encoder layers in {type(self.vision_model).__name__}")
+            total_vis_layers = len(vis_encoder_layers)
             vis_layers = list(range(total_vis_layers - n_vis, total_vis_layers))
             vis_lora_cfg = LoraConfig(
                 r=self.config.lora_rank,
