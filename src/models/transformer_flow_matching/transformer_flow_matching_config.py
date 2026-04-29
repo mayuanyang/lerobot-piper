@@ -34,11 +34,6 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     # 16 layers balances representation quality vs speed/memory (same as SmolVLA default).
     num_vlm_layers: int = 16
 
-    # Number of VLM text layers (counting from the end) to unfreeze for fine-tuning.
-    # 0 = fully frozen (original behaviour, no activation storage through VLM).
-    # 2 = last 2 layers train; first 14 are frozen but their activations ARE stored
-    #     for backprop, so expect ~200-400 MB extra GPU memory at typical batch sizes.
-    num_trainable_vlm_layers: int = 2
 
     # Zero-shot object detection (YOLOWorld inference)
     # Set these to the names of the objects your robot needs to pick and place
@@ -85,7 +80,11 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-6
     scheduler_warmup_steps: int = 1500  # Scaled 3× for batch_size=96
 
-    use_peft: bool = False
+    lora_rank: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    # Attention projections to adapt; q_proj + v_proj is standard LoRA practice
+    lora_target_modules: list = field(default_factory=lambda: ["q_proj", "v_proj"])
 
     # Persisted across checkpoints so resume training starts at the correct step/epoch.
     training_step: int = 0

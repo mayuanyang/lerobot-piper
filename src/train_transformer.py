@@ -192,7 +192,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         num_vlm_layers=16,
         num_cameras=len(camera_keys),
         cameras_for_vision_state_concat=camera_keys,
-        num_trainable_vlm_layers=0,  # VLM layers frozen initially; enabled once loss < 0.05
     )
     
     
@@ -203,8 +202,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         # strict=False alone won't handle size mismatches (PyTorch raises even then),
         # so we pre-filter to only load keys whose shapes match the current model.
         policy = TransformerFlowMatchingPolicy(cfg)
-        policy.train()
-        policy.to(device)
 
         ckpt_path = Path(resume_from_checkpoint)
         if ckpt_path.exists():
@@ -212,6 +209,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         else:
             # HuggingFace Hub — download full snapshot to local cache
             local_ckpt_path = Path(huggingface_hub.snapshot_download(resume_from_checkpoint))
+
         # Prefer model.safetensors explicitly — checkpoint dirs also contain
         # preprocessor/postprocessor safetensors files that would match *.safetensors
         # but contain no model weights, causing silent zero-match loading.
@@ -221,33 +219,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             if not candidates:
                 raise FileNotFoundError(f"No .safetensors file found in {local_ckpt_path}")
             model_file = candidates[0]
-        print(f"Loading weights from: {model_file}")
-        ckpt_state = load_safetensors(model_file, device=str(device))
-        cur_state = policy.state_dict()
-        filtered = {k: v for k, v in ckpt_state.items() if k in cur_state and cur_state[k].shape == v.shape}
 
-        # Keys in checkpoint not loaded (shape mismatch or key removed from model)
-        skipped_ckpt = [k for k in ckpt_state if k not in filtered]
-        # Keys in current model not in checkpoint (new params — will stay at init values)
-        missing_from_ckpt = [k for k in cur_state if k not in ckpt_state]
-
-        if skipped_ckpt:
-            print(f"Skipped {len(skipped_ckpt)} checkpoint keys (shape mismatch / removed): {skipped_ckpt[:10]}")
-        if missing_from_ckpt:
-            print(f"Missing {len(missing_from_ckpt)} keys not in checkpoint (will use init values): {missing_from_ckpt[:10]}")
-        policy.load_state_dict(filtered, strict=False)
-        print(f"Loaded {len(filtered)}/{len(cur_state)} model keys from checkpoint ({len(ckpt_state)} keys in file)")
-        
-        # Use the policy's configuration for creating processors
-        preprocessor, postprocessor = make_pre_post_processors(
-            policy.config, 
-            dataset_stats=dataset_metadata.stats, 
-            add_grid_overlay=True,
-            grid_overlay_cameras=["front", "right"]  # Front and right cameras (original names)
-        )
-            
-        # Read step/epoch/lr/warmup from the saved config JSON.
-        # policy.config is cfg (fresh defaults), so read the checkpoint config directly.
+        # Read saved config FIRST — must know if VLM/LoRA was enabled before loading
+        # weights, because LoRA wrapping changes the state dict key names.
         import json
         step, epoch = 0, 0
         saved_cfg_json = {}
@@ -270,17 +244,61 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
             step = int(local_ckpt_path.name.split("-")[1])
         print(f"Resuming from step {step}, epoch {epoch}")
 
-        # Define trainable parameters
-        trainable_params = [p for p in policy.model.parameters() if p.requires_grad]
+        # Load checkpoint state dict first so we can inspect key names to detect LoRA,
+        # then apply LoRA to the model BEFORE doing the actual weight loading.
+        # peft wrapping renames keys (adds base_model.model. prefix), so the model
+        # structure must match the checkpoint's structure before state dict loading.
+        print(f"Loading weights from: {model_file}")
+        ckpt_state = load_safetensors(model_file, device=str(device))
+        vlm_unfrozen = False
+        if any("lora_" in k for k in ckpt_state):
+            policy.model.enable_lora()
+            vlm_unfrozen = True
+            print("Detected LoRA weights in checkpoint — applied LoRA before weight loading")
+
+        policy.train()
+        policy.to(device)
+        cur_state = policy.state_dict()
+        filtered = {k: v for k, v in ckpt_state.items() if k in cur_state and cur_state[k].shape == v.shape}
+
+        # Keys in checkpoint not loaded (shape mismatch or key removed from model)
+        skipped_ckpt = [k for k in ckpt_state if k not in filtered]
+        # Keys in current model not in checkpoint (new params — will stay at init values)
+        missing_from_ckpt = [k for k in cur_state if k not in ckpt_state]
+
+        if skipped_ckpt:
+            print(f"Skipped {len(skipped_ckpt)} checkpoint keys (shape mismatch / removed): {skipped_ckpt[:10]}")
+        if missing_from_ckpt:
+            print(f"Missing {len(missing_from_ckpt)} keys not in checkpoint (will use init values): {missing_from_ckpt[:10]}")
+        policy.load_state_dict(filtered, strict=False)
+        print(f"Loaded {len(filtered)}/{len(cur_state)} model keys from checkpoint ({len(ckpt_state)} keys in file)")
+
+        # Use the policy's configuration for creating processors
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy.config,
+            dataset_stats=dataset_metadata.stats,
+            add_grid_overlay=True,
+            grid_overlay_cameras=["front", "right"]
+        )
 
         # Optimizer — read lr/warmup from saved config, fall back to cfg
         resume_lr = saved_cfg_json.get("optimizer_lr", cfg.optimizer_lr)
         resume_warmup = saved_cfg_json.get("scheduler_warmup_steps", cfg.scheduler_warmup_steps)
         print(f"Initializing optimizer with learning rate: {resume_lr}")
-        total_trainable_params = sum(p.numel() for p in trainable_params)
-        print(f"Number of trainable parameters: {total_trainable_params}")
 
-        optimizer = torch.optim.Adam(trainable_params, lr=resume_lr, weight_decay=1e-6)
+        if vlm_unfrozen:
+            # VLM params already trainable — split into two groups so optimizer state
+            # group indices match what was saved (group 0 = action expert, group 1 = VLM).
+            vlm_param_ids = set(id(p) for p in policy.model.text_model.parameters() if p.requires_grad)
+            expert_params = [p for p in policy.model.parameters() if p.requires_grad and id(p) not in vlm_param_ids]
+            vlm_params = [p for p in policy.model.text_model.parameters() if p.requires_grad]
+            optimizer = torch.optim.Adam(expert_params, lr=resume_lr, weight_decay=1e-6)
+            optimizer.add_param_group({"params": vlm_params, "lr": resume_lr})
+            print(f"Expert params: {sum(p.numel() for p in expert_params):,}  VLM params: {sum(p.numel() for p in vlm_params):,}")
+        else:
+            trainable_params = [p for p in policy.model.parameters() if p.requires_grad]
+            optimizer = torch.optim.Adam(trainable_params, lr=resume_lr, weight_decay=1e-6)
+            print(f"Total trainable parameters: {sum(p.numel() for p in trainable_params):,}")
 
         # Print learning rate groups
         print(f"Optimizer parameter groups: {len(optimizer.param_groups)}")
@@ -308,24 +326,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         for _ in range(step):
             scheduler.step()
         print(f"Scheduler fast-forwarded to step {step}, LR = {optimizer.param_groups[0]['lr']:.2e}")
-
-        # Restore VLM fine-tuning if it was enabled at the checkpoint
-        checkpoint_vlm_layers = saved_cfg_json.get("num_trainable_vlm_layers", 0)
-        if checkpoint_vlm_layers > 0:
-            policy.model.enable_vlm_training(checkpoint_vlm_layers)
-            vlm_params = [p for p in policy.model.text_model.parameters() if p.requires_grad]
-            current_lr = optimizer.param_groups[0]["lr"]
-            optimizer.add_param_group({"params": vlm_params, "lr": current_lr})
-            # Recreate scheduler so it covers the new param group, then fast-forward
-            scheduler = get_cosine_schedule_with_warmup(
-                optimizer, num_warmup_steps=warmup_steps, num_training_steps=training_steps
-            )
-            for _ in range(step):
-                scheduler.step()
-            print(f"VLM fine-tuning restored (layers={checkpoint_vlm_layers}), LR={optimizer.param_groups[0]['lr']:.2e}")
-            vlm_unfrozen = True
-        else:
-            vlm_unfrozen = False
     else:
         # Initialize fresh policy
         policy = TransformerFlowMatchingPolicy(cfg)
@@ -525,9 +525,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
 
             loss.backward()
 
-            # Enable VLM fine-tuning once loss stabilises below threshold
+            # Enable VLM LoRA once loss stabilises below threshold
             if not vlm_unfrozen and loss.item() < 0.05:
-                policy.model.enable_vlm_training(n=2)
+                policy.model.enable_lora()
                 vlm_params = [p for p in policy.model.text_model.parameters() if p.requires_grad]
                 current_lr = optimizer.param_groups[0]["lr"]
                 optimizer.add_param_group({"params": vlm_params, "lr": current_lr})

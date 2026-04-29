@@ -132,17 +132,6 @@ class FlowMatchingTransformer(nn.Module):
                 p.requires_grad = False
             component.eval()
 
-        # Optionally unfreeze the last N text layers + final norm for fine-tuning.
-        # These layers adapt the VLM representations to task-relevant spatial features.
-        n_trainable = config.num_trainable_vlm_layers
-        if n_trainable > 0:
-            for layer in self.text_model.layers[-n_trainable:]:
-                for p in layer.parameters():
-                    p.requires_grad = True
-            for p in self.text_model.norm.parameters():
-                p.requires_grad = True
-            print(f"Unfreezing last {n_trainable} VLM text layers + norm for fine-tuning")
-
         # Free unused VLM weights (lm_head, etc.) to reduce memory footprint
         del vlm
 
@@ -192,6 +181,7 @@ class FlowMatchingTransformer(nn.Module):
         )
 
         self._lang_max_len = 48
+        self._lora_applied = False
 
     # ------------------------------------------------------------------
     # Override train() to keep frozen VLM components in eval mode
@@ -199,40 +189,35 @@ class FlowMatchingTransformer(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        # Vision model and connector are always frozen → always eval
+        # Vision model and connector are always frozen → always eval.
+        # SmolLM2 base has no dropout so frozen text layers need no explicit eval() —
+        # peft handles LoRA dropout correctly via the module's own training flag.
         self.vision_model.eval()
         self.connector.eval()
-        if mode:
-            # In training mode: keep frozen text layers in eval so any dropout/BN
-            # in those layers stays in inference behaviour. Trainable layers (last N)
-            # and norm were set to train() by super().train(mode) above — leave them.
-            n_trainable = self.config.num_trainable_vlm_layers
-            n_frozen = len(self.text_model.layers) - n_trainable
-            for layer in self.text_model.layers[:n_frozen]:
-                layer.eval()
-            self.text_model.embed_tokens.eval()
-        else:
-            # In eval mode: super() already set everything to eval
-            pass
         return self
 
-    def enable_vlm_training(self, n: int = 2) -> None:
+    def enable_lora(self) -> None:
         """
-        Unfreeze the last n text layers + final norm for fine-tuning.
-        Call this at runtime after the action expert has stabilised.
-        The caller is responsible for adding the newly trainable parameters
-        to the optimizer.
+        Apply LoRA adapters to the text model after the action expert has stabilised.
+        Wraps q_proj and v_proj in all text layers with low-rank A/B matrices;
+        base weights stay frozen. Also unfreezes the final norm (~1K params).
+        The caller is responsible for adding the newly trainable params to the optimizer.
         """
-        for layer in self.text_model.layers[-n:]:
-            for p in layer.parameters():
-                p.requires_grad = True
-            layer.train()
-        for p in self.text_model.norm.parameters():
+        from peft import LoraConfig, get_peft_model
+        lora_cfg = LoraConfig(
+            r=self.config.lora_rank,
+            lora_alpha=self.config.lora_alpha,
+            target_modules=self.config.lora_target_modules,
+            lora_dropout=self.config.lora_dropout,
+            bias="none",
+        )
+        self.text_model = get_peft_model(self.text_model, lora_cfg)
+        self._lora_applied = True
+        # Final norm: small but helps output scale calibration
+        for p in self.text_model.base_model.model.norm.parameters():
             p.requires_grad = True
-        self.text_model.norm.train()
-        self.config.num_trainable_vlm_layers = n
         trainable = sum(p.numel() for p in self.text_model.parameters() if p.requires_grad)
-        print(f"[VLM] Last {n} text layers + norm unfrozen ({trainable:,} new trainable params)")
+        print(f"[VLM] LoRA r={self.config.lora_rank} on {self.config.lora_target_modules} enabled ({trainable:,} trainable params)")
 
     # ------------------------------------------------------------------
     # Frozen prefix encoding (images + language → VLM hidden states)
@@ -327,12 +312,11 @@ class FlowMatchingTransformer(nn.Module):
         """
         VLM prefix encoding: images + language → (B, N, VLM_HIDDEN) bfloat16.
 
-        When num_trainable_vlm_layers == 0: entire VLM runs under torch.no_grad(),
-        no activations stored, minimal memory cost.
-        When num_trainable_vlm_layers > 0: image/language encoding still runs under
-        no_grad, but the full text_model forward runs with grad enabled so the last N
-        layers' parameters receive gradient signal. All 16 layer activations are stored
-        for backprop — expect ~200-400 MB extra memory depending on batch size.
+        Before LoRA is enabled: runs entirely under torch.no_grad(), no activations stored.
+        After enable_lora(): image/language encoding still runs under no_grad, but the
+        text_model forward runs with grad enabled so LoRA A/B matrices receive gradient
+        signal. All 16 layer activations are stored for backprop — expect ~200-400 MB
+        extra memory depending on batch size.
         """
         device = batch["observation.state"].device
 
@@ -352,9 +336,9 @@ class FlowMatchingTransformer(nn.Module):
             prefix_embs = torch.cat(prefix_parts, dim=1)  # (B, N, 960)
 
         # Run truncated VLM text layers with causal attention.
-        # When trainable layers > 0 we need grad enabled so the last N layers'
-        # parameters can be updated; otherwise wrap in no_grad to save memory.
-        if self.config.num_trainable_vlm_layers > 0:
+        # When LoRA is active we need grad enabled so the adapters receive gradient signal;
+        # otherwise wrap in no_grad to save activation memory.
+        if self._lora_applied:
             text_out = self.text_model(
                 inputs_embeds=prefix_embs,
                 attention_mask=None,
