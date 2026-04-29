@@ -224,27 +224,38 @@ class FlowMatchingTransformer(nn.Module):
 
     def enable_lora(self) -> None:
         """
-        Apply LoRA adapters to the text model after the action expert has stabilised.
-        Wraps q_proj and v_proj in all text layers with low-rank A/B matrices;
-        base weights stay frozen. Also unfreezes the final norm (~1K params).
+        Apply LoRA to the last vision_lora_num_layers of the SigLIP ViT and unfreeze the
+        connector. Text model stays fully frozen (single-task: language is constant).
         The caller is responsible for adding the newly trainable params to the optimizer.
         """
         self._patch_peft_torchao()
         from peft import LoraConfig, get_peft_model
-        lora_cfg = LoraConfig(
-            r=self.config.lora_rank,
-            lora_alpha=self.config.lora_alpha,
-            target_modules=self.config.lora_target_modules,
-            lora_dropout=self.config.lora_dropout,
-            bias="none",
-        )
-        self.text_model = get_peft_model(self.text_model, lora_cfg)
-        self._lora_applied = True
-        # Final norm: small but helps output scale calibration
-        for p in self.text_model.base_model.model.norm.parameters():
+
+        # --- Vision model LoRA (last N layers only) ---
+        n_vis = self.config.vision_lora_num_layers
+        if n_vis > 0:
+            total_vis_layers = len(self.vision_model.vision_model.encoder.layers)
+            vis_layers = list(range(total_vis_layers - n_vis, total_vis_layers))
+            vis_lora_cfg = LoraConfig(
+                r=self.config.lora_rank,
+                lora_alpha=self.config.lora_alpha,
+                target_modules=self.config.lora_target_modules,
+                lora_dropout=self.config.lora_dropout,
+                bias="none",
+                layers_to_transform=vis_layers,
+            )
+            self.vision_model = get_peft_model(self.vision_model, vis_lora_cfg)
+            self.vision_model.enable_input_require_grads()
+            self.vision_model.gradient_checkpointing_enable()
+
+        # --- Connector: full unfreeze (small MLP, natural adaptation point) ---
+        for p in self.connector.parameters():
             p.requires_grad = True
-        trainable = sum(p.numel() for p in self.text_model.parameters() if p.requires_grad)
-        print(f"[VLM] LoRA r={self.config.lora_rank} on {self.config.lora_target_modules} enabled ({trainable:,} trainable params)")
+
+        self._lora_applied = True
+        vis_params = sum(p.numel() for p in self.vision_model.parameters() if p.requires_grad) if n_vis > 0 else 0
+        conn_params = sum(p.numel() for p in self.connector.parameters())
+        print(f"[VLM] vision LoRA last {n_vis} layers ({vis_params:,}) + connector ({conn_params:,}) trainable")
 
     # ------------------------------------------------------------------
     # Frozen prefix encoding (images + language → VLM hidden states)
@@ -339,45 +350,38 @@ class FlowMatchingTransformer(nn.Module):
         """
         VLM prefix encoding: images + language → (B, N, VLM_HIDDEN) bfloat16.
 
-        Before LoRA is enabled: runs entirely under torch.no_grad(), no activations stored.
-        After enable_lora(): image/language encoding still runs under no_grad, but the
-        text_model forward runs with grad enabled so LoRA A/B matrices receive gradient
-        signal. All 16 layer activations are stored for backprop — expect ~200-400 MB
-        extra memory depending on batch size.
+        Before LoRA: entirely under no_grad, no activations stored.
+        After enable_lora(): vision encoding runs with grad if vision_lora_num_layers > 0
+        (gradient checkpointing keeps memory in check); text model always runs with grad
+        when LoRA is active (gradient checkpointing enabled there too).
         """
         device = batch["observation.state"].device
+        vision_lora_active = self._lora_applied and self.config.vision_lora_num_layers > 0
 
-        # Image and language encoding are always frozen — no activations needed
+        # Vision encoding: run under no_grad when vision is fully frozen,
+        # otherwise keep grad enabled for vision LoRA backprop.
+        if vision_lora_active:
+            vis_tokens = self._encode_images(batch, B, T_obs)
+        else:
+            with torch.no_grad():
+                vis_tokens = self._encode_images(batch, B, T_obs)
+
+        # Language encoding is always frozen
         with torch.no_grad():
-            vis_tokens = self._encode_images(batch, B, T_obs)  # (B, V, 960)
-            lang_tokens = self._encode_language(batch, B, device)  # (B, L, 960) or None
+            lang_tokens = self._encode_language(batch, B, device)
 
-            # NOTE: Do NOT scale by sqrt(960) here.
-            # SmolVLA applies that scaling in their custom SmolVLMWithExpertModel which
-            # interleaves expert layers inside the VLM. Here we only use the VLM as a
-            # frozen feature extractor — the RMSNorm at each layer already controls scale.
-            # Adding sqrt(960)≈31× scaling would push VLM attention into degenerate regimes.
-            prefix_parts = [vis_tokens]
-            if lang_tokens is not None:
-                prefix_parts.append(lang_tokens)
-            prefix_embs = torch.cat(prefix_parts, dim=1)  # (B, N, 960)
+        prefix_parts = [vis_tokens]
+        if lang_tokens is not None:
+            prefix_parts.append(lang_tokens)
+        prefix_embs = torch.cat(prefix_parts, dim=1)  # (B, N, 960)
 
-        # Run truncated VLM text layers with causal attention.
-        # When LoRA is active we need grad enabled so the adapters receive gradient signal;
-        # otherwise wrap in no_grad to save activation memory.
-        if self._lora_applied:
+        # Text model is always frozen — run under no_grad to save activation memory.
+        with torch.no_grad():
             text_out = self.text_model(
                 inputs_embeds=prefix_embs,
                 attention_mask=None,
                 use_cache=False,
             )
-        else:
-            with torch.no_grad():
-                text_out = self.text_model(
-                    inputs_embeds=prefix_embs,
-                    attention_mask=None,
-                    use_cache=False,
-                )
         return text_out.last_hidden_state  # (B, N, 960) bfloat16
 
     # ------------------------------------------------------------------

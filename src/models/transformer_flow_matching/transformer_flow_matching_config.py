@@ -80,11 +80,15 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-6
     scheduler_warmup_steps: int = 1500  # Scaled 3× for batch_size=96
 
+    # LoRA config for vision model adaptation (text model stays frozen — single task)
     lora_rank: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
-    # Attention projections to adapt; q_proj + v_proj is standard LoRA practice
     lora_target_modules: list = field(default_factory=lambda: ["q_proj", "v_proj"])
+    # Number of vision model (SigLIP ViT) layers from the END to apply LoRA to.
+    # 0 = vision LoRA disabled. Later layers capture high-level semantics worth adapting;
+    # early layers capture low-level features that transfer well without fine-tuning.
+    vision_lora_num_layers: int = 8
 
     # Persisted across checkpoints so resume training starts at the correct step/epoch.
     training_step: int = 0

@@ -16,8 +16,10 @@ from models.transformer_flow_matching.transformer_flow_matching_config import Tr
 from models.transformer_flow_matching.transformer_flow_matching_policy import TransformerFlowMatchingPolicy
 from models.transformer_flow_matching.processor_transformer_flow_matching import make_pre_post_processors
 
-# Import visualization utilities
-from spatial_softmax_visualizer import SpatialSoftmaxVisualizer
+try:
+    from spatial_softmax_visualizer import SpatialSoftmaxVisualizer
+except ImportError:
+    SpatialSoftmaxVisualizer = None
 
 # Import torchvision for augmentation
 from torchvision.transforms import v2
@@ -139,7 +141,7 @@ def apply_state_dropout(batch, state_key="observation.state", dropout_prob=0.05)
 
 
 
-def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_from_checkpoint=None, visualize_every_n_batches=1000):
+def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None):
     """Train the TransformerFlowMatching model."""
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -414,23 +416,19 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
         print(f"  mean={s.get('mean', 'N/A')}")
         print(f"  std ={s.get('std',  'N/A')}")
 
+    episode_ids = np.array(dataset.hf_dataset["episode_index"])
+    valid_indices = np.where(episode_ids <= 400)[0]
+    dataset = Subset(dataset, valid_indices)
+    print(f"Dataset subset: {len(dataset)} samples (episodes <= 400)")
+
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=8,
-        batch_size=128,  # Reduced batch size for better gradient flow
+        batch_size=128,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,
     )
-
-    # Create visualizer
-    #visualizer = SpatialSoftmaxVisualizer(Path(output_dir) / "spatial_softmax_visualizations")
-
-    episode_ids = np.array(dataset.hf_dataset["episode_index"])
-    valid_indices = np.where(episode_ids <= 400)[0]  # first 40 episodes
-
-    dataset = Subset(dataset, valid_indices)
-    print('The partial dataset length', len(dataset))
 
     # Training loop
     print("Starting training loop...")
@@ -438,7 +436,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
     prog_bar = tqdm(total=training_steps, desc="Training Progress", initial=step)
     while not done:
         epoch += 1
-        for batch_idx, batch in enumerate(dataloader):
+        for batch in dataloader:
             # Move to device
             for key in batch:
                 if isinstance(batch[key], torch.Tensor):
@@ -518,47 +516,22 @@ def train(output_dir, dataset_id="ISdept/piper_arm", push_to_hub=False, resume_f
                         total_state_grad += grad_mean * param_count
                         total_state_params += param_count
                 
-                # Box encoder gradients (individual components)
-                total_box_grad = 0.0
-                total_box_params = 0
-                box_component_names = ['box_encoder']
-                for name, param in policy.model.named_parameters():
-                    if param.requires_grad and any(comp_name in name for comp_name in box_component_names) and param.grad is not None:
-                        grad_mean = param.grad.abs().mean().item()
-                        param_count = param.numel()
-                        total_box_grad += grad_mean * param_count
-                        total_box_params += param_count
-                        
-                # Vision encoder gradients
-                total_vision_grad = 0.0
-                total_vision_params = 0
-                for name, param in policy.model.named_parameters():
-                    if param.requires_grad and 'vision_encoder' in name and param.grad is not None:
-                        grad_mean = param.grad.abs().mean().item()
-                        param_count = param.numel()
-                        total_vision_grad += grad_mean * param_count
-                        total_vision_params += param_count
-                        
-                # actions expert gradients
-                total_action_expert_grad = 0.0
-                total_action_expert_params = 0
-                for name, param in policy.model.named_parameters():
-                    if param.requires_grad and 'actions_expert' in name and param.grad is not None:
-                        grad_mean = param.grad.abs().mean().item()
-                        param_count = param.numel()
-                        total_action_expert_grad += grad_mean * param_count
-                        total_action_expert_params += param_count
-                
-                print(f"State Encoder - Avg Abs Grad: {total_state_grad / total_state_params:.6f} (Total Params: {total_state_params})")
-                if total_box_params > 0:
-                    print(f"Box Encoder - Avg Abs Grad: {total_box_grad / total_box_params:.6f} (Total Params: {total_box_params})")
-                else:
-                    print(f"Box Encoder - Avg Abs Grad: N/A (Total Params: {total_box_params})")
-                if total_vision_params > 0:
-                    print(f"Vision Encoder - Avg Abs Grad: {total_vision_grad / total_vision_params:.6f} (Total Params: {total_vision_params})")
-                else:
-                    print(f"Vision Encoder - Avg Abs Grad: N/A (Total Params: {total_vision_params})")
-                print(f"Actions Expert - Avg Abs Grad: {total_action_expert_grad / total_action_expert_params:.6f} (Total Params: {total_action_expert_params})")
+                def _grad_stats(prefix):
+                    total, count = 0.0, 0
+                    for name, param in policy.model.named_parameters():
+                        if param.requires_grad and prefix in name and param.grad is not None:
+                            total += param.grad.abs().mean().item() * param.numel()
+                            count += param.numel()
+                    return total / count if count > 0 else None, count
+
+                vision_grad, vision_n   = _grad_stats('vision_model')
+                connector_grad, conn_n  = _grad_stats('connector')
+                action_grad, action_n   = _grad_stats('actions_expert')
+
+                print(f"State Encoder  - Avg Abs Grad: {total_state_grad / total_state_params:.6f} ({total_state_params} params)")
+                print(f"Vision LoRA    - Avg Abs Grad: {vision_grad:.6f} ({vision_n} params)" if vision_grad is not None else "Vision LoRA    - no grad")
+                print(f"Connector      - Avg Abs Grad: {connector_grad:.6f} ({conn_n} params)" if connector_grad is not None else "Connector      - no grad")
+                print(f"Actions Expert - Avg Abs Grad: {action_grad:.6f} ({action_n} params)" if action_grad is not None else "Actions Expert - no grad")
                 
                 print("--- End Gradient Analysis ---\n")
             
@@ -626,8 +599,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--dataset_id", type=str, default="ISdept/piper_arm")
-    parser.add_argument("--push_to_hub", action="store_true")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     args = parser.parse_args()
-    
     train(**vars(args))
