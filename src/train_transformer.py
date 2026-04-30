@@ -141,7 +141,7 @@ def apply_state_dropout(batch, state_key="observation.state", dropout_prob=0.05)
 
 
 
-def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None):
+def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None, freeze_connector=False):
     """Train the TransformerFlowMatching model."""
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -248,7 +248,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
 
         # Apply LoRA before loading weights — peft wrapping renames keys
         # (adds base_model.model. prefix), so structure must match checkpoint.
-        policy.model.enable_lora()
+        policy.model.enable_lora(freeze_connector=freeze_connector)
 
         # Load checkpoint state dict
         print(f"Loading weights from: {model_file}")
@@ -322,7 +322,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     else:
         # Initialize fresh policy
         policy = TransformerFlowMatchingPolicy(cfg)
-        policy.model.enable_lora()
+        policy.model.enable_lora(freeze_connector=freeze_connector)
         policy.train()
         policy.to(device)
 
@@ -503,7 +503,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
 
             # Print gradient information for all components (for debugging)
             if step % progress_update_freq == 0:  # Print every 10 progress update intervals
-                print(f"\n--- Gradient Analysis at Step {step} ---")
+                print(f"\n--- Gradient Analysis at Step {step} ---\n")
                 
                 
                 # State encoder gradients
@@ -600,5 +600,6 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--dataset_id", type=str, default="ISdept/piper_arm")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument("--freeze_connector", action="store_true")
     args = parser.parse_args()
     train(**vars(args))

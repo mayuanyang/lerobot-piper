@@ -189,11 +189,14 @@ class FlowMatchingTransformer(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        # Vision model and connector are always frozen → always eval.
-        # SmolLM2 base has no dropout so frozen text layers need no explicit eval() —
-        # peft handles LoRA dropout correctly via the module's own training flag.
-        self.vision_model.eval()
-        self.connector.eval()
+        if mode and self._lora_applied:
+            # Vision LoRA active: keep vision_model in train mode so LoRA dropout
+            # and gradient checkpointing work. Connector is trainable — leave in train.
+            pass
+        else:
+            # Vision fully frozen: keep in eval (no dropout, no grad storage needed)
+            self.vision_model.eval()
+            self.connector.eval()
         return self
 
     @staticmethod
@@ -222,10 +225,10 @@ class FlowMatchingTransformer(nn.Module):
         except Exception:
             pass
 
-    def enable_lora(self) -> None:
+    def enable_lora(self, freeze_connector: bool = False) -> None:
         """
-        Apply LoRA to the last vision_lora_num_layers of the SigLIP ViT and unfreeze the
-        connector. Text model stays fully frozen (single-task: language is constant).
+        Apply LoRA to the last vision_lora_num_layers of the SigLIP ViT and optionally
+        unfreeze the connector. Text model stays fully frozen (single-task: language is constant).
         The caller is responsible for adding the newly trainable params to the optimizer.
         """
         self._patch_peft_torchao()
@@ -255,9 +258,10 @@ class FlowMatchingTransformer(nn.Module):
             self.vision_model.enable_input_require_grads()
             self.vision_model.gradient_checkpointing_enable()
 
-        # --- Connector: full unfreeze (small MLP, natural adaptation point) ---
-        for p in self.connector.parameters():
-            p.requires_grad = True
+        # --- Connector: optionally unfreeze ---
+        if not freeze_connector:
+            for p in self.connector.parameters():
+                p.requires_grad = True
 
         # Text model is frozen but gradients flow THROUGH it to reach connector/vision LoRA.
         # Enable gradient checkpointing so 16 frozen layers don't store activations.
@@ -265,8 +269,8 @@ class FlowMatchingTransformer(nn.Module):
 
         self._lora_applied = True
         vis_params = sum(p.numel() for p in self.vision_model.parameters() if p.requires_grad) if n_vis > 0 else 0
-        conn_params = sum(p.numel() for p in self.connector.parameters())
-        print(f"[VLM] vision LoRA last {n_vis} layers ({vis_params:,}) + connector ({conn_params:,}) trainable")
+        conn_params = sum(p.numel() for p in self.connector.parameters() if p.requires_grad)
+        print(f"[VLM] vision LoRA last {n_vis} layers ({vis_params:,}) + connector ({'frozen' if freeze_connector else f'{conn_params:,} trainable'})")
 
     # ------------------------------------------------------------------
     # Frozen prefix encoding (images + language → VLM hidden states)
