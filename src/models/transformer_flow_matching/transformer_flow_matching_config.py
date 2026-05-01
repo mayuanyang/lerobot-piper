@@ -69,9 +69,14 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     num_inference_steps: int = 20
 
     # Position-decay loss weight: loss *= exp(-lambda * position).
-    # Higher values concentrate gradient on early steps (those actually executed).
-    # 0.0 = uniform weighting (original behaviour). 0.1 is a reasonable starting point.
+    # Applied within each tier (executed and future steps separately).
+    # 0.0 = uniform weighting within each tier.
     pos_decay_lambda: float = 0.1
+
+    # Weight applied to future steps (n_action_steps..horizon-1) relative to executed
+    # steps (0..n_action_steps-1). 1.0 = equal weight, 0.0 = ignore future steps entirely.
+    # 0.1 keeps some gradient signal from future steps for trajectory smoothness.
+    future_steps_weight: float = 0.0
         
     # Training presets
     optimizer_lr: float = 1e-4        # Conservative for frozen VLM + fresh action expert (SmolVLA uses 1e-4)

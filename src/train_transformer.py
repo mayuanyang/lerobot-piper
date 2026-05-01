@@ -174,9 +174,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     print(f"State dim: {state_dim}, Action dim: {action_dim}")
 
     # Training parameters
-    obs = 4
-    horizon = 16
-    n_action_steps = 8
+    obs = 2
+    horizon = 4
+    n_action_steps = 4
 
     # Create transformer configuration
     cfg = TransformerFlowMatchingConfig(

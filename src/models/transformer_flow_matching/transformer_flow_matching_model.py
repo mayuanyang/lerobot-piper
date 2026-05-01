@@ -522,14 +522,19 @@ class FlowMatchingTransformer(nn.Module):
 
         loss = F.mse_loss(v_t, u_t, reduction="none")  # (B, H, action_dim)
 
-        # Position-decay weights: exp(-lambda * h) — higher weight for early steps.
-        # Early steps are what the robot actually executes; later steps provide temporal
-        # context but matter less for control quality.
+        # Two-tier step weighting:
+        #   Steps 0..n_action_steps-1 (executed): weight = 1.0
+        #   Steps n_action_steps..H-1 (future):   weight = future_steps_weight
+        # Within each tier, optional exponential decay exp(-lambda * h) further
+        # concentrates gradient on earlier steps.
+        H = loss.shape[1]
+        n_exec = self.config.n_action_steps
+        pos_weights = torch.ones(H, device=loss.device, dtype=loss.dtype)
+        pos_weights[n_exec:] = self.config.future_steps_weight
         if self.config.pos_decay_lambda > 0.0:
-            H = loss.shape[1]
             pos = torch.arange(H, device=loss.device, dtype=loss.dtype)
-            pos_weights = torch.exp(-self.config.pos_decay_lambda * pos)  # (H,)
-            loss = loss * pos_weights[None, :, None]
+            pos_weights = pos_weights * torch.exp(-self.config.pos_decay_lambda * pos)
+        loss = loss * pos_weights[None, :, None]
 
         # Mask out padding — LeRobot uses "action_is_pad" (bool, True = padded).
         # SmolVLA uses "actions_id_pad"; check both for compatibility.
