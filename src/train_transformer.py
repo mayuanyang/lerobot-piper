@@ -525,13 +525,15 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                             count += param.numel()
                     return total / count if count > 0 else None, count
 
-                vision_grad, vision_n   = _grad_stats('vision_model')
-                connector_grad, conn_n  = _grad_stats('connector')
-                action_grad, action_n   = _grad_stats('actions_expert')
+                vision_grad, vision_n      = _grad_stats('vision_model')
+                connector_grad, conn_n     = _grad_stats('connector')
+                robot_enc_grad, robot_enc_n = _grad_stats('robot_visual_encoder')
+                action_grad, action_n      = _grad_stats('actions_expert')
 
                 print(f"State Encoder  - Avg Abs Grad: {total_state_grad / total_state_params:.6f} ({total_state_params} params)")
                 print(f"Vision LoRA    - Avg Abs Grad: {vision_grad:.6f} ({vision_n} params)" if vision_grad is not None else "Vision LoRA    - no grad")
                 print(f"Connector      - Avg Abs Grad: {connector_grad:.6f} ({conn_n} params)" if connector_grad is not None else "Connector      - no grad")
+                print(f"Robot CNN      - Avg Abs Grad: {robot_enc_grad:.6f} ({robot_enc_n} params)" if robot_enc_grad is not None else "Robot CNN      - no grad")
                 print(f"Actions Expert - Avg Abs Grad: {action_grad:.6f} ({action_n} params)" if action_grad is not None else "Actions Expert - no grad")
                 
                 print("--- End Gradient Analysis ---\n")

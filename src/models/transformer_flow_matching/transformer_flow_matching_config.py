@@ -34,6 +34,13 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     # 16 layers balances representation quality vs speed/memory (same as SmolVLA default).
     num_vlm_layers: int = 16
 
+    # VLM text layer indices to extract and concatenate for multi-scale context.
+    # Index 0 = token embeddings, index N = output of layer N.
+    # Concatenated along the feature dim then projected to d_model — context length unchanged.
+    # Captures spatial detail from early layers + semantics from late layers (like SmolVLA interleaving).
+    # Set to [16] to use only the final layer (original single-scale behaviour).
+    extract_vlm_layers: list = field(default_factory=lambda: [4, 8, 12, 16])
+
 
     # Zero-shot object detection (YOLOWorld inference)
     # Set these to the names of the objects your robot needs to pick and place
@@ -84,6 +91,13 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-6
     scheduler_warmup_steps: int = 1500  # Scaled 3× for batch_size=96
+
+    # Small trainable CNN running in parallel with the frozen SigLIP ViT.
+    # Learns robot-specific spatial features (gripper state, object distance, contact)
+    # that general internet-image VLM pretraining misses.
+    # out_tokens must be a perfect square (4, 9, 16, 25, ...).
+    robot_encoder_tokens: int = 16   # spatial tokens per camera (must be perfect square)
+    robot_encoder_input_size: int = 224  # ResNet-18 native resolution
 
     # LoRA config for vision model adaptation (text model stays frozen — single task)
     lora_rank: int = 16

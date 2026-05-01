@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 from .transformer_flow_matching_config import TransformerFlowMatchingConfig
+from .robot_visual_encoder import RobotVisualEncoder
 
 
 # ---------------------------------------------------------------------------
@@ -140,10 +141,11 @@ class FlowMatchingTransformer(nn.Module):
         # ------------------------------------------------------------------
 
         # 1. Project VLM context to action expert dimension + LayerNorm for stability.
-        #    LayerNorm is critical: VLM bfloat16 hidden states can have large per-token
-        #    magnitudes (due to large RMSNorm γ values in the pretrained model).
-        #    Without normalization, context_proj amplifies these and causes gradient explosion.
-        self.context_proj = nn.Linear(self.VLM_HIDDEN, config.d_model)
+        #    Multi-scale: concatenates extract_vlm_layers intermediate outputs along the feature
+        #    dim, giving the action expert access to spatial detail (early layers) + semantics
+        #    (late layers) in a single projection. Context token count stays unchanged.
+        n_scales = len(config.extract_vlm_layers)
+        self.context_proj = nn.Linear(self.VLM_HIDDEN * n_scales, config.d_model)
         self.context_norm = nn.LayerNorm(config.d_model)
 
         # 2. State encoder: (B, T_obs, state_dim) → (B, T_obs, d_model)
@@ -154,7 +156,15 @@ class FlowMatchingTransformer(nn.Module):
             nn.LayerNorm(config.d_model),
         )
 
-        # 3. Action projections
+        # 3. Robot-specific visual encoder — small trainable CNN in parallel with frozen SigLIP.
+        #    Learns gripper state, object distance, contact cues that VLM pretraining misses.
+        self.robot_visual_encoder = RobotVisualEncoder(
+            input_size=config.robot_encoder_input_size,
+            out_tokens=config.robot_encoder_tokens,
+            out_dim=config.d_model,
+        )
+
+        # 4. Action projections
         self.action_in_proj = nn.Linear(config.action_dim, config.d_model)
         # Zero-init action_out_proj so initial velocity predictions are ~0.
         # This makes initial loss ≈ E[u_t²] ≈ 2 instead of millions.
@@ -358,15 +368,13 @@ class FlowMatchingTransformer(nn.Module):
 
     def encode_prefix(self, batch: dict, B: int, T_obs: int) -> torch.Tensor:
         """
-        VLM prefix encoding: images + language → (B, N, VLM_HIDDEN) bfloat16.
+        VLM prefix encoding: images + language → (B, N, n_scales * VLM_HIDDEN) float32.
 
-        Before LoRA: entirely under no_grad, no activations stored.
-        After enable_lora(): vision encoding runs with grad if vision_lora_num_layers > 0
-        (gradient checkpointing keeps memory in check); text model always runs with grad
-        when LoRA is active (gradient checkpointing enabled there too).
+        Extracts hidden states from extract_vlm_layers and concatenates along the feature
+        dimension. Early layers carry spatial/positional detail; later layers carry semantic
+        meaning. The action expert receives all scales in a single token sequence.
         """
         device = batch["observation.state"].device
-        # All VLM components frozen — no activations needed
         with torch.no_grad():
             vis_tokens = self._encode_images(batch, B, T_obs)
             lang_tokens = self._encode_language(batch, B, device)
@@ -376,14 +384,22 @@ class FlowMatchingTransformer(nn.Module):
             prefix_parts.append(lang_tokens)
         prefix_embs = torch.cat(prefix_parts, dim=1)  # (B, N, 960)
 
-        # All VLM components frozen — run under no_grad, no activations stored
         with torch.no_grad():
             text_out = self.text_model(
                 inputs_embeds=prefix_embs,
                 attention_mask=None,
                 use_cache=False,
+                output_hidden_states=True,
             )
-        return text_out.last_hidden_state  # (B, N, 960) bfloat16
+
+        # hidden_states[0] = embeddings, hidden_states[i] = output of layer i
+        hidden_states = text_out.hidden_states
+        max_idx = len(hidden_states) - 1
+        selected = [
+            hidden_states[min(i, max_idx)].float()
+            for i in self.config.extract_vlm_layers
+        ]
+        return torch.cat(selected, dim=-1)  # (B, N, n_scales * 960)
 
     # ------------------------------------------------------------------
     # Context assembly (trainable projections on top of frozen VLM output)
@@ -401,7 +417,7 @@ class FlowMatchingTransformer(nn.Module):
         T_obs = self.config.n_obs_steps
         device = batch["observation.state"].device
 
-        context_hidden = self.encode_prefix(batch, B, T_obs)  # (B, N, 960) bfloat16
+        context_hidden = self.encode_prefix(batch, B, T_obs)  # (B, N, n_scales*960) float32
 
         # Guard: replace any NaN/Inf from bfloat16 VLM forward (rare but possible
         # with non-standard inputs like our connector tokens without image special tokens)
@@ -410,7 +426,7 @@ class FlowMatchingTransformer(nn.Module):
         # Trainable projection + LayerNorm.
         # LayerNorm normalizes away large-scale variation in VLM hidden states
         # (pretrained RMSNorm γ values can be large), preventing gradient explosion.
-        context = self.context_norm(self.context_proj(context_hidden.float()))  # (B, N, d_model)
+        context = self.context_norm(self.context_proj(context_hidden))  # (B, N, d_model)
 
         # Trainable state encoder: direct gradient path through action_expert → state_encoder
         state = batch["observation.state"].float()      # (B, T_obs, state_dim) or (B, state_dim)
@@ -424,8 +440,18 @@ class FlowMatchingTransformer(nn.Module):
         state = state.nan_to_num(nan=0.0).clamp(-10.0, 10.0)
         state_tokens = self.state_encoder(state)        # (B, T_obs, d_model)
 
-        # Combine: VLM context + state tokens
-        return torch.cat([context, state_tokens], dim=1)  # (B, N+T_obs, d_model)
+        # Robot-specific CNN tokens — one shared encoder applied to each camera
+        robot_tokens_list = []
+        for cam_key in self.config.cameras_for_vision_state_concat:
+            if cam_key not in batch:
+                continue
+            img = batch[cam_key]
+            if img.dim() == 5:
+                img = img[:, -1]   # (B, C, H, W) — take last obs step
+            robot_tokens_list.append(self.robot_visual_encoder(img.float()))
+        # Combine: VLM context + robot CNN tokens + state tokens
+        parts = [context] + robot_tokens_list + [state_tokens]
+        return torch.cat(parts, dim=1)
 
     # ------------------------------------------------------------------
     # Flow matching core
