@@ -189,14 +189,9 @@ class FlowMatchingTransformer(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        if mode and self._lora_applied:
-            # Vision LoRA active: keep vision_model in train mode so LoRA dropout
-            # and gradient checkpointing work. Connector is trainable — leave in train.
-            pass
-        else:
-            # Vision fully frozen: keep in eval (no dropout, no grad storage needed)
-            self.vision_model.eval()
-            self.connector.eval()
+        # Vision model and connector are always frozen — keep in eval
+        self.vision_model.eval()
+        self.connector.eval()
         return self
 
     @staticmethod
@@ -371,18 +366,9 @@ class FlowMatchingTransformer(nn.Module):
         when LoRA is active (gradient checkpointing enabled there too).
         """
         device = batch["observation.state"].device
-        vision_lora_active = self._lora_applied and self.config.vision_lora_num_layers > 0
-
-        # Vision encoding: run under no_grad when vision is fully frozen,
-        # otherwise keep grad enabled for vision LoRA backprop.
-        if vision_lora_active:
-            vis_tokens = self._encode_images(batch, B, T_obs)
-        else:
-            with torch.no_grad():
-                vis_tokens = self._encode_images(batch, B, T_obs)
-
-        # Language encoding is always frozen
+        # All VLM components frozen — no activations needed
         with torch.no_grad():
+            vis_tokens = self._encode_images(batch, B, T_obs)
             lang_tokens = self._encode_language(batch, B, device)
 
         prefix_parts = [vis_tokens]
@@ -390,15 +376,13 @@ class FlowMatchingTransformer(nn.Module):
             prefix_parts.append(lang_tokens)
         prefix_embs = torch.cat(prefix_parts, dim=1)  # (B, N, 960)
 
-        # Text model params are frozen (requires_grad=False) so they won't accumulate
-        # gradients. But we must NOT use no_grad here — gradients need to flow THROUGH
-        # the text model back to prefix_embs (and from there to the connector / vision LoRA).
-        # Gradient checkpointing (enabled in enable_lora) keeps activation memory in check.
-        text_out = self.text_model(
-            inputs_embeds=prefix_embs,
-            attention_mask=None,
-            use_cache=False,
-        )
+        # All VLM components frozen — run under no_grad, no activations stored
+        with torch.no_grad():
+            text_out = self.text_model(
+                inputs_embeds=prefix_embs,
+                attention_mask=None,
+                use_cache=False,
+            )
         return text_out.last_hidden_state  # (B, N, 960) bfloat16
 
     # ------------------------------------------------------------------

@@ -141,7 +141,7 @@ def apply_state_dropout(batch, state_key="observation.state", dropout_prob=0.05)
 
 
 
-def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None, freeze_connector=False):
+def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None):
     """Train the TransformerFlowMatching model."""
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -248,7 +248,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
 
         # Apply LoRA before loading weights — peft wrapping renames keys
         # (adds base_model.model. prefix), so structure must match checkpoint.
-        policy.model.enable_lora(freeze_connector=freeze_connector)
+        pass  # LoRA disabled — VLM fully frozen for faster training
 
         # Load checkpoint state dict
         print(f"Loading weights from: {model_file}")
@@ -298,15 +298,16 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         # Skip if the checkpoint has no LoRA weights — the param count will differ since
         # LoRA A/B matrices are new params not present in the old optimizer state.
         ckpt_has_lora = any("lora_" in k for k in ckpt_state)
+        model_has_lora = policy.model._lora_applied
         optimizer_state_path = local_ckpt_path / "optimizer_state.pth"
-        if optimizer_state_path.exists() and ckpt_has_lora:
+        if optimizer_state_path.exists() and (ckpt_has_lora == model_has_lora):
             optimizer.load_state_dict(torch.load(optimizer_state_path, map_location=device))
             for param_group in optimizer.param_groups:
                 param_group['lr'] = resume_lr
                 param_group['initial_lr'] = resume_lr
             print(f"Optimizer state loaded. LR reset to {resume_lr}")
-        elif optimizer_state_path.exists() and not ckpt_has_lora:
-            print("Checkpoint has no LoRA weights — skipping optimizer state (LoRA params are new, moments would be mismatched)")
+        elif optimizer_state_path.exists():
+            print(f"Skipping optimizer state — LoRA mismatch (checkpoint={'yes' if ckpt_has_lora else 'no'}, model={'yes' if model_has_lora else 'no'})")
 
         # Create cosine scheduler and fast-forward to match saved step.
         # This ensures LR is correct on resume — not restarting from warmup.
@@ -322,7 +323,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     else:
         # Initialize fresh policy
         policy = TransformerFlowMatchingPolicy(cfg)
-        policy.model.enable_lora(freeze_connector=freeze_connector)
+        pass  # LoRA disabled — VLM fully frozen for faster training
         policy.train()
         policy.to(device)
 
@@ -600,6 +601,5 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--dataset_id", type=str, default="ISdept/piper_arm")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
-    parser.add_argument("--freeze_connector", action="store_true")
     args = parser.parse_args()
     train(**vars(args))
