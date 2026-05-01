@@ -297,17 +297,16 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         # Load optimizer state (keep Adam momentum/variance but reset LR to new config value).
         # Skip if the checkpoint has no LoRA weights — the param count will differ since
         # LoRA A/B matrices are new params not present in the old optimizer state.
-        ckpt_has_lora = any("lora_" in k for k in ckpt_state)
-        model_has_lora = policy.model._lora_applied
         optimizer_state_path = local_ckpt_path / "optimizer_state.pth"
-        if optimizer_state_path.exists() and (ckpt_has_lora == model_has_lora):
-            optimizer.load_state_dict(torch.load(optimizer_state_path, map_location=device))
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = resume_lr
-                param_group['initial_lr'] = resume_lr
-            print(f"Optimizer state loaded. LR reset to {resume_lr}")
-        elif optimizer_state_path.exists():
-            print(f"Skipping optimizer state — LoRA mismatch (checkpoint={'yes' if ckpt_has_lora else 'no'}, model={'yes' if model_has_lora else 'no'})")
+        if optimizer_state_path.exists():
+            try:
+                optimizer.load_state_dict(torch.load(optimizer_state_path, map_location=device))
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = resume_lr
+                    param_group['initial_lr'] = resume_lr
+                print(f"Optimizer state loaded. LR reset to {resume_lr}")
+            except ValueError as e:
+                print(f"Skipping optimizer state — architecture mismatch ({e})")
 
         # Create cosine scheduler and fast-forward to match saved step.
         # This ensures LR is correct on resume — not restarting from warmup.
