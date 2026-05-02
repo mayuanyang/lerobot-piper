@@ -457,6 +457,26 @@ class FlowMatchingTransformer(nn.Module):
     # Flow matching core
     # ------------------------------------------------------------------
 
+    def sample_noise(self, shape: tuple, device: torch.device) -> torch.Tensor:
+        """
+        Sample source noise with optional temporal correlation along the horizon dim.
+
+        With noise_temporal_correlation=0: standard white Gaussian N(0,1).
+        With rho>0: AR(1) process — noise_t = rho*noise_{t-1} + sqrt(1-rho²)*eps_t.
+        Variance stays 1.0 per step; temporal structure matches robot trajectory smoothness,
+        creating straighter flow paths from source to target.
+
+        shape: (B, H, action_dim)
+        """
+        rho = self.config.noise_temporal_correlation
+        noise = torch.randn(shape, device=device)
+        if rho == 0.0 or shape[1] == 1:
+            return noise
+        scale = math.sqrt(1.0 - rho * rho)
+        for t in range(1, shape[1]):
+            noise[:, t] = rho * noise[:, t - 1] + scale * noise[:, t]
+        return noise
+
     def sample_time(self, B: int, device: torch.device) -> torch.Tensor:
         """
         Sample flow-matching timestep t ~ Beta(1.5, 1.0) clipped to (0.001, 1.0).
@@ -537,7 +557,7 @@ class FlowMatchingTransformer(nn.Module):
 
         context = self.get_condition(batch)
 
-        noise = torch.randn_like(actions)
+        noise = self.sample_noise(actions.shape, actions.device)
         t = self.sample_time(B, actions.device)
         t_exp = t[:, None, None]
 
@@ -603,10 +623,10 @@ class FlowMatchingTransformer(nn.Module):
 
         context = self.get_condition(batch)
 
-        # Start from pure noise at t=1
-        x_t = torch.randn(
-            B, self.config.horizon, self.config.action_dim,
-            device=device, dtype=torch.float32,
+        # Start from correlated noise at t=1 (matches training source distribution)
+        x_t = self.sample_noise(
+            (B, self.config.horizon, self.config.action_dim),
+            device=device,
         )
 
         num_steps = self.config.num_inference_steps

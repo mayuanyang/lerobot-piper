@@ -75,6 +75,13 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     # Flow matching sampling parameters
     num_inference_steps: int = 20
 
+    # Temporal correlation of source noise along the horizon dimension.
+    # AR(1): noise_t = rho * noise_{t-1} + sqrt(1-rho²) * epsilon_t
+    # 0.0 = white Gaussian (original), 0.9 = strongly correlated.
+    # Robot trajectories are highly temporally correlated — correlated noise
+    # creates straighter flow paths and a smoother velocity field to learn.
+    noise_temporal_correlation: float = 0.9
+
     # Position-decay loss weight: loss *= exp(-lambda * position).
     # Applied within each tier (executed and future steps separately).
     # 0.0 = uniform weighting within each tier.
