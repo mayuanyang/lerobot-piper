@@ -194,6 +194,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         num_vlm_layers=16,
         num_cameras=len(camera_keys),
         cameras_for_vision_state_concat=camera_keys,
+        # Joint 4 (index 3) is always 0 (locked) — zero weight avoids training on pure noise.
+        # Gripper (index 6) is critical for pick vs place — upweighted 3× to prevent skipping.
+        action_dim_weights=[1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 3.0],
     )
     
     
@@ -424,7 +427,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=8,
-        batch_size=128,
+        batch_size=160,
         shuffle=True,
         pin_memory=device.type != "cpu",
         drop_last=True,

@@ -82,6 +82,11 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     # creates straighter flow paths and a smoother velocity field to learn.
     noise_temporal_correlation: float = 0.9
 
+    # Per-dimension loss weights (one per action_dim). Empty list = uniform weighting.
+    # Useful for upweighting the gripper dimension which has small range but is
+    # critical for task success (pick vs place phase).
+    action_dim_weights: list = field(default_factory=list)
+
     # Position-decay loss weight: loss *= exp(-lambda * position).
     # Applied within each tier (executed and future steps separately).
     # 0.0 = uniform weighting within each tier.

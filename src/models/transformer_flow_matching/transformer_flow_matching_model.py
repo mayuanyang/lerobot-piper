@@ -568,6 +568,13 @@ class FlowMatchingTransformer(nn.Module):
 
         loss = F.mse_loss(v_t, u_t, reduction="none")  # (B, H, action_dim)
 
+        # Per-dimension weights — upweight gripper and other critical joints
+        if self.config.action_dim_weights:
+            dim_weights = torch.tensor(
+                self.config.action_dim_weights, device=loss.device, dtype=loss.dtype
+            )
+            loss = loss * dim_weights[None, None, :]
+
         # Two-tier step weighting:
         #   Steps 0..n_action_steps-1 (executed): weight = 1.0
         #   Steps n_action_steps..H-1 (future):   weight = future_steps_weight
