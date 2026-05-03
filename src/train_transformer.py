@@ -530,7 +530,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                 vision_grad, vision_n      = _grad_stats('vision_model')
                 connector_grad, conn_n     = _grad_stats('connector')
                 robot_enc_grad, robot_enc_n = _grad_stats('robot_visual_encoder')
-                action_grad, action_n      = _grad_stats('actions_expert')
+                action_grad, action_n      = _grad_stats('action_expert')
 
                 print(f"State Encoder  - Avg Abs Grad: {total_state_grad / total_state_params:.6f} ({total_state_params} params)")
                 print(f"Vision LoRA    - Avg Abs Grad: {vision_grad:.6f} ({vision_n} params)" if vision_grad is not None else "Vision LoRA    - no grad")

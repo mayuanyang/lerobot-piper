@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Read(//Users/eddyma/.cache/huggingface/**)"
+      "Read(//Users/eddyma/.cache/huggingface/**)",
+      "Bash(curl -s https://raw.githubusercontent.com/huggingface/lerobot/main/src/lerobot/policies/smolvla/smolvlm_with_expert.py)"
     ]
   }
 }
