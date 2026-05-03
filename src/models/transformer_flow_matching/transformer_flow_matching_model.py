@@ -140,12 +140,9 @@ class FlowMatchingTransformer(nn.Module):
         # Trainable components (~26M params total)
         # ------------------------------------------------------------------
 
-        # 1. Project VLM context to action expert dimension + LayerNorm for stability.
-        #    Multi-scale: concatenates extract_vlm_layers intermediate outputs along the feature
-        #    dim, giving the action expert access to spatial detail (early layers) + semantics
-        #    (late layers) in a single projection. Context token count stays unchanged.
-        n_scales = len(config.extract_vlm_layers)
-        self.context_proj = nn.Linear(self.VLM_HIDDEN * n_scales, config.d_model)
+        # 1. Shared VLM context projection — each decoder layer uses this to project its
+        #    corresponding VLM layer output from VLM_HIDDEN (960) to d_model (512).
+        self.context_proj = nn.Linear(self.VLM_HIDDEN, config.d_model)
         self.context_norm = nn.LayerNorm(config.d_model)
 
         # 2. State encoder: (B, T_obs, state_dim) → (B, T_obs, d_model)
@@ -177,18 +174,20 @@ class FlowMatchingTransformer(nn.Module):
         self.action_time_mlp_in = nn.Linear(config.d_model * 2, config.d_model)
         self.action_time_mlp_out = nn.Linear(config.d_model, config.d_model)
 
-        # 5. Action expert: transformer decoder, cross-attends to VLM context + state
-        expert_layer = nn.TransformerDecoderLayer(
-            d_model=config.d_model,
-            nhead=config.nhead,
-            dim_feedforward=config.dim_feedforward,
-            batch_first=True,
-            dropout=0.0,
-            norm_first=True,  # Pre-LayerNorm: more stable training
-        )
-        self.actions_expert = nn.TransformerDecoder(
-            expert_layer, num_layers=config.num_decoder_layers
-        )
+        # 5. Action expert: interleaved decoder layers, each cross-attending to its
+        #    corresponding VLM layer output (like SmolVLA) + causal SA on action tokens.
+        self.action_expert_layers = nn.ModuleList([
+            nn.TransformerDecoderLayer(
+                d_model=config.d_model,
+                nhead=config.nhead,
+                dim_feedforward=config.dim_feedforward,
+                batch_first=True,
+                dropout=0.0,
+                norm_first=True,
+            )
+            for _ in range(config.num_decoder_layers)
+        ])
+        self.action_expert_norm = nn.LayerNorm(config.d_model)
 
         self._lang_max_len = 48
         self._lora_applied = False
@@ -366,13 +365,13 @@ class FlowMatchingTransformer(nn.Module):
         lang_embs = self.text_model.get_input_embeddings()(input_ids)
         return lang_embs  # bfloat16
 
-    def encode_prefix(self, batch: dict, B: int, T_obs: int) -> torch.Tensor:
+    def encode_prefix(self, batch: dict, B: int, T_obs: int) -> list:
         """
-        VLM prefix encoding: images + language → (B, N, n_scales * VLM_HIDDEN) float32.
+        VLM prefix encoding: images + language → list of (B, N, VLM_HIDDEN) float32.
 
-        Extracts hidden states from extract_vlm_layers and concatenates along the feature
-        dimension. Early layers carry spatial/positional detail; later layers carry semantic
-        meaning. The action expert receives all scales in a single token sequence.
+        Returns one tensor per VLM text layer (hidden_states[1..num_vlm_layers]).
+        Each decoder layer cross-attends to its corresponding VLM layer output,
+        giving early decoder layers low-level spatial features and late ones semantics.
         """
         device = batch["observation.state"].device
         with torch.no_grad():
@@ -392,66 +391,65 @@ class FlowMatchingTransformer(nn.Module):
                 output_hidden_states=True,
             )
 
-        # hidden_states[0] = embeddings, hidden_states[i] = output of layer i
-        hidden_states = text_out.hidden_states
-        max_idx = len(hidden_states) - 1
-        selected = [
-            hidden_states[min(i, max_idx)].float()
-            for i in self.config.extract_vlm_layers
-        ]
-        return torch.cat(selected, dim=-1)  # (B, N, n_scales * 960)
+        # hidden_states[0]=embeddings, [1..num_vlm_layers]=layer outputs
+        # Return all layer outputs as float32 for cross-attention
+        return [h.float() for h in text_out.hidden_states[1:]]
 
     # ------------------------------------------------------------------
     # Context assembly (trainable projections on top of frozen VLM output)
     # ------------------------------------------------------------------
 
-    def get_condition(self, batch: dict) -> torch.Tensor:
+    def get_condition(self, batch: dict) -> list:
         """
-        Build full context tensor for the action expert.
+        Build per-layer context for interleaved cross-attention.
 
-        Returns: (B, N + T_obs, d_model) float32
-          - First N tokens: VLM context (images + language)
-          - Last T_obs tokens: state tokens (current + prev timestep for velocity)
+        Returns a list of (B, M, d_model) tensors, one per decoder layer.
+        Each tensor = projected VLM layer i output + ResNet tokens + state tokens.
+        Decoder layer i cross-attends to context i, giving early layers low-level
+        visual features and late layers semantic features (mirrors SmolVLA interleaving).
         """
         B = batch["observation.state"].shape[0]
         T_obs = self.config.n_obs_steps
         device = batch["observation.state"].device
 
-        context_hidden = self.encode_prefix(batch, B, T_obs)  # (B, N, n_scales*960) float32
+        # All VLM layer hidden states: list of num_vlm_layers × (B, N, VLM_HIDDEN)
+        vlm_layers = self.encode_prefix(batch, B, T_obs)
+        n_vlm = len(vlm_layers)
 
-        # Guard: replace any NaN/Inf from bfloat16 VLM forward (rare but possible
-        # with non-standard inputs like our connector tokens without image special tokens)
-        context_hidden = torch.nan_to_num(context_hidden, nan=0.0, posinf=1.0, neginf=-1.0)
-
-        # Trainable projection + LayerNorm.
-        # LayerNorm normalizes away large-scale variation in VLM hidden states
-        # (pretrained RMSNorm γ values can be large), preventing gradient explosion.
-        context = self.context_norm(self.context_proj(context_hidden))  # (B, N, d_model)
-
-        # Trainable state encoder: direct gradient path through action_expert → state_encoder
-        state = batch["observation.state"].float()      # (B, T_obs, state_dim) or (B, state_dim)
+        # State tokens (same for all decoder layers)
+        state = batch["observation.state"].float()
         if state.dim() == 2:
-            state = state.unsqueeze(1)                  # (B, 1, state_dim)
-        # Guard against large finite values from zero-variance state dimensions.
-        # MEAN_STD normalization computes (x - mean) / (std + eps). For a dimension with
-        # std=0 (e.g. a locked joint), this becomes x / eps giving values in the millions.
-        # These are finite (not NaN/Inf), so nan_to_num won't catch them — use clamp.
-        # Properly normalised dimensions stay within ±5; clamping to ±10 is a safe bound.
+            state = state.unsqueeze(1)
         state = state.nan_to_num(nan=0.0).clamp(-10.0, 10.0)
-        state_tokens = self.state_encoder(state)        # (B, T_obs, d_model)
+        state_tokens = self.state_encoder(state)  # (B, T_obs, d_model)
 
-        # Robot-specific CNN tokens — one shared encoder applied to each camera
+        # ResNet tokens (same for all decoder layers)
         robot_tokens_list = []
         for cam_key in self.config.cameras_for_vision_state_concat:
             if cam_key not in batch:
                 continue
             img = batch[cam_key]
             if img.dim() == 5:
-                img = img[:, -1]   # (B, C, H, W) — take last obs step
+                img = img[:, -1]
             robot_tokens_list.append(self.robot_visual_encoder(img.float()))
-        # Combine: VLM context + robot CNN tokens + state tokens
-        parts = [context] + robot_tokens_list + [state_tokens]
-        return torch.cat(parts, dim=1)
+        robot_tokens = torch.cat(robot_tokens_list, dim=1) if robot_tokens_list else None
+
+        # Build one context tensor per decoder layer, mapped to the corresponding VLM layer
+        n_dec = self.config.num_decoder_layers
+        per_layer_contexts = []
+        for i in range(n_dec):
+            # Stride-based mapping: decoder layer 0 → VLM layer 0,
+            #                       decoder layer n_dec-1 → VLM layer n_vlm-1
+            vlm_i = i * (n_vlm - 1) // max(n_dec - 1, 1)
+            h = torch.nan_to_num(vlm_layers[vlm_i], nan=0.0, posinf=1.0, neginf=-1.0)
+            ctx = self.context_norm(self.context_proj(h))  # (B, N, d_model)
+            parts = [ctx]
+            if robot_tokens is not None:
+                parts.append(robot_tokens)
+            parts.append(state_tokens)
+            per_layer_contexts.append(torch.cat(parts, dim=1))
+
+        return per_layer_contexts
 
     # ------------------------------------------------------------------
     # Flow matching core
@@ -494,47 +492,44 @@ class FlowMatchingTransformer(nn.Module):
         self,
         noisy_actions: torch.Tensor,
         timesteps: torch.Tensor,
-        context: torch.Tensor,
+        per_layer_contexts: list,
     ) -> torch.Tensor:
         """
         Predict the velocity field v(x_t, t) ≈ noise - actions.
 
         Args:
-            noisy_actions: (B, H, action_dim) noisy action sequence at time t
-            timesteps:     (B,) flow matching timesteps in [0, 1]
-            context:       (B, N, d_model) VLM context + state tokens
+            noisy_actions:      (B, H, action_dim) noisy action sequence at time t
+            timesteps:          (B,) flow matching timesteps in [0, 1]
+            per_layer_contexts: list of (B, M, d_model) — one context per decoder layer,
+                                each corresponding to a different VLM layer depth.
         Returns:
             velocity: (B, H, action_dim)
         """
         B, T_act, _ = noisy_actions.shape
 
-        # Project and positionally encode action tokens
-        action_emb = self.action_in_proj(noisy_actions)      # (B, T, d_model)
+        action_emb = self.action_in_proj(noisy_actions)
         action_emb = self.action_positional_encoding(action_emb)
 
-        # Sinusoidal time embedding (more expressive than learned for continuous t)
         time_emb = create_sinusoidal_pos_embedding(
             timesteps, self.config.d_model
-        ).to(noisy_actions.dtype)                             # (B, d_model)
-        time_emb = time_emb.unsqueeze(1).expand(-1, T_act, -1)  # (B, T, d_model)
+        ).to(noisy_actions.dtype)
+        time_emb = time_emb.unsqueeze(1).expand(-1, T_act, -1)
 
-        # MLP fusion: concat [action | time] → single token (SmolVLA-style)
-        fused = torch.cat([action_emb, time_emb], dim=-1)    # (B, T, d_model*2)
+        fused = torch.cat([action_emb, time_emb], dim=-1)
         fused = F.silu(self.action_time_mlp_in(fused))
-        fused = self.action_time_mlp_out(fused)               # (B, T, d_model)
-
-        # Residual: preserve action information through MLP
+        fused = self.action_time_mlp_out(fused)
         tgt = fused + action_emb
 
-        # Action expert: decoder attends to VLM context + state.
-        # Causal mask on SA (action token at step h only attends to steps 0..h) matches
-        # SmolVLA's design: enforces temporal smoothness in the predicted action chunk.
         causal_mask = nn.Transformer.generate_square_subsequent_mask(
             T_act, device=noisy_actions.device, dtype=noisy_actions.dtype
         )
-        output = self.actions_expert(tgt=tgt, memory=context, tgt_mask=causal_mask, tgt_is_causal=True)  # (B, T, d_model)
 
-        return self.action_out_proj(output)                   # (B, T, action_dim)
+        # Interleaved cross-attention: each layer attends to its VLM layer's context
+        for layer, ctx in zip(self.action_expert_layers, per_layer_contexts):
+            tgt = layer(tgt=tgt, memory=ctx, tgt_mask=causal_mask, tgt_is_causal=True)
+
+        tgt = self.action_expert_norm(tgt)
+        return self.action_out_proj(tgt)
 
     def compute_loss(self, batch: dict) -> torch.Tensor:
         """
@@ -555,7 +550,7 @@ class FlowMatchingTransformer(nn.Module):
         actions = batch["action"].float().nan_to_num(nan=0.0).clamp(-10.0, 10.0)   # (B, H, action_dim)
         B = actions.shape[0]
 
-        context = self.get_condition(batch)
+        per_layer_contexts = self.get_condition(batch)
 
         noise = self.sample_noise(actions.shape, actions.device)
         t = self.sample_time(B, actions.device)
@@ -564,7 +559,7 @@ class FlowMatchingTransformer(nn.Module):
         x_t = t_exp * noise + (1.0 - t_exp) * actions   # noisy sample
         u_t = noise - actions                             # target velocity
 
-        v_t = self.velocity_field(x_t, t, context)
+        v_t = self.velocity_field(x_t, t, per_layer_contexts)
 
         loss = F.mse_loss(v_t, u_t, reduction="none")  # (B, H, action_dim)
 
@@ -628,7 +623,7 @@ class FlowMatchingTransformer(nn.Module):
         B = batch["observation.state"].shape[0]
         device = batch["observation.state"].device
 
-        context = self.get_condition(batch)
+        per_layer_contexts = self.get_condition(batch)
 
         # Start from correlated noise at t=1 (matches training source distribution)
         x_t = self.sample_noise(
@@ -641,7 +636,7 @@ class FlowMatchingTransformer(nn.Module):
         t = torch.ones(B, device=device, dtype=torch.float32)
 
         for _ in range(num_steps):
-            v_t = self.velocity_field(x_t, t, context)
+            v_t = self.velocity_field(x_t, t, per_layer_contexts)
             x_t = x_t + dt * v_t
             t = t + dt
 

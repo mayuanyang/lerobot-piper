@@ -189,7 +189,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         action_dim=action_dim,
         d_model=512,
         nhead=8,
-        num_decoder_layers=8,
+        num_decoder_layers=16,
         dim_feedforward=2048,
         num_vlm_layers=16,
         num_cameras=len(camera_keys),
@@ -312,7 +312,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                 print(f"Skipping optimizer state — architecture mismatch ({e})")
 
         # Create cosine scheduler and fast-forward to match saved step.
-        # This ensures LR is correct on resume — not restarting from warmup.
+        # resume_lr is already the exact LR at checkpoint (saved as optimizer_lr).
         warmup_steps = resume_warmup
         scheduler = get_cosine_schedule_with_warmup(
             optimizer,
@@ -568,6 +568,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                 checkpoint_dir.mkdir(exist_ok=True)
                 policy.config.training_step = step
                 policy.config.training_epoch = epoch
+                policy.config.optimizer_lr = optimizer.param_groups[0]["lr"]
                 policy.config.current_lr = optimizer.param_groups[0]["lr"]
                 policy.config.training_steps_total = training_steps
                 policy.save_pretrained(checkpoint_dir)
@@ -591,6 +592,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     # Final save
     policy.config.training_step = step
     policy.config.training_epoch = epoch
+    policy.config.optimizer_lr = optimizer.param_groups[0]["lr"]
     policy.config.current_lr = optimizer.param_groups[0]["lr"]
     policy.config.training_steps_total = training_steps
     policy.save_pretrained(output_directory)
