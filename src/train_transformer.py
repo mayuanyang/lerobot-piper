@@ -373,23 +373,15 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     # e.g. horizon=16 → [0.0, 0.1, ..., 1.5]
     action_temporal_window = [i * frame_time for i in range(horizon)]
     
-    # Per-camera lag compensation: if a camera's hardware capture lags N frames behind
-    # the others, load it N frames ahead so all cameras are temporally aligned.
-    # Positive = camera lags (load ahead to compensate); negative = camera leads.
-    camera_lag_frames = {
-        "observation.images.gripper": 1,  # gripper camera lags 1 frame behind front/right
-    }
-
+    
     delta_timestamps = {
         "observation.state": obs_temporal_window,
         "action": action_temporal_window,
         # Cameras only need the current frame — the model always uses imgs[:, -1].
         # Loading the full obs_temporal_window per camera wastes memory with no benefit.
-        **{key: [camera_lag_frames.get(key, 0) * frame_time] for key in camera_keys},
+        **{key: [0.0] for key in camera_keys},
     }
-    for key, lag in camera_lag_frames.items():
-        if key in camera_keys:
-            print(f"Camera lag compensation: {key} offset by +{lag} frame(s) ({lag * frame_time:.3f}s)")
+    
 
     # Load dataset
     try:
@@ -448,8 +440,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     sampler = EpisodeAwareSampler(
         dataset_from_indices=ep_from,
         dataset_to_indices=ep_to,
-        drop_n_first_frames=2,
-        drop_n_last_frames=2,
+        drop_n_first_frames=5,
+        drop_n_last_frames=5,
         shuffle=True,
     )
     print(f"EpisodeAwareSampler: {len(sampler)} frames after dropping 2 first + 2 last per episode")
