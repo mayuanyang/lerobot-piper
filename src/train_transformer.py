@@ -180,7 +180,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
 
     # Training parameters
     obs = 2
-    horizon = 4
+    horizon = 32
     n_action_steps = 4
 
     # Create transformer configuration
@@ -440,8 +440,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     sampler = EpisodeAwareSampler(
         dataset_from_indices=ep_from,
         dataset_to_indices=ep_to,
-        drop_n_first_frames=5,
-        drop_n_last_frames=5,
+        drop_n_first_frames=0,
+        drop_n_last_frames=0,
         shuffle=True,
     )
     print(f"EpisodeAwareSampler: {len(sampler)} frames after dropping 2 first + 2 last per episode")

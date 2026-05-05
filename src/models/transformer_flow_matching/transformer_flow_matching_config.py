@@ -12,9 +12,9 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     """Long Task Transformer Configuration for long-horizon tasks with transformer-based architecture."""
     
     # Inputs / output structure.
-    n_obs_steps: int = 2  # 2 obs steps gives the model velocity information (position delta)
-    horizon: int = 50
-    n_action_steps: int = 8
+    n_obs_steps: int = 1  # 2 obs steps gives the model velocity information (position delta)
+    horizon: int = 4
+    n_action_steps: int = 4
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -25,7 +25,6 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     )
 
     # Image processing
-    freeze_vision_backbone: bool = True
     vision_input_size: int = 384  # 384px → 128 tokens/camera after SigLIP patch14 + connector (vs 64 at 256px)
 
     # VLM backbone configuration
@@ -33,14 +32,6 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     # Number of VLM text layers to use (SmolVLM2-500M has 32 total).
     # 16 layers balances representation quality vs speed/memory (same as SmolVLA default).
     num_vlm_layers: int = 16
-
-    # VLM text layer indices to extract and concatenate for multi-scale context.
-    # Index 0 = token embeddings, index N = output of layer N.
-    # Concatenated along the feature dim then projected to d_model — context length unchanged.
-    # Captures spatial detail from early layers + semantics from late layers (like SmolVLA interleaving).
-    # Set to [16] to use only the final layer (original single-scale behaviour).
-    extract_vlm_layers: list = field(default_factory=lambda: [4, 8, 12, 16])
-
 
     # Zero-shot object detection (YOLOWorld inference)
     # Set these to the names of the objects your robot needs to pick and place
@@ -68,10 +59,6 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     num_decoder_layers: int = 8   # deeper decoder for richer action generation
     dim_feedforward: int = 2048   # standard 4×d_model feedforward width
     
-    # UNet denoiser parameters
-    diffusion_step_embed_dim: int = 128
-    
-        
     # Flow matching sampling parameters
     num_inference_steps: int = 20
 
