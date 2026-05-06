@@ -130,8 +130,8 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         # Create frame data with observation images for each camera
         # Adjust frame_index to account for skipped frames
         frame_data = {
-            "observation.state": s0,
-            "action": delta if mode == "diff" else s1,  # not too sure why the action comes before the state in lerobot visualization tool, so we manually change the order here to make it more intuitive for visualization
+            "observation.state": s1,
+            "action": delta if mode == "diff" else s0,  # not too sure why the action comes before the state in lerobot visualization tool, so we manually change the order here to make it more intuitive for visualization
             "timestamp": timestamp_base,
             "episode_index": episode_data.episode_index,
             "frame_index": json_data["frames"][i + first_frames_to_chop]["frame_index"] - first_frames_to_chop,  # 局部索引 (0, 1, 2, ...)
@@ -1335,7 +1335,7 @@ def main():
     for episode in all_episodes_data:
         episode_folder = episode.folder
         episode_idx = episode.episode_index
-        last_frames_to_chop = episode.last_frames_to_chop
+        last_frames_to_chop = 7 #episode.last_frames_to_chop
         
         try:
             # Update global index offset before processing
