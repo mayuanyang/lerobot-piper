@@ -201,7 +201,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         cameras_for_vision_state_concat=camera_keys,
         # Joint 4 (index 3) is always 0 (locked) — zero weight avoids training on pure noise.
         # Gripper (index 6) is critical for pick vs place — upweighted 3× to prevent skipping.
-        action_dim_weights=[1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 3.0],
+        action_dim_weights=[1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0],
     )
     
     
