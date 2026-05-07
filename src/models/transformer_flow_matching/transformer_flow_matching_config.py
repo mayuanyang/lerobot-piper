@@ -67,7 +67,7 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     # 0.0 = white Gaussian (original), 0.9 = strongly correlated.
     # Robot trajectories are highly temporally correlated — correlated noise
     # creates straighter flow paths and a smoother velocity field to learn.
-    noise_temporal_correlation: float = 0.9
+    noise_temporal_correlation: float = 0.0
 
     # Per-dimension loss weights (one per action_dim). Empty list = uniform weighting.
     # Useful for upweighting the gripper dimension which has small range but is
@@ -82,7 +82,7 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     # Weight applied to future steps (n_action_steps..horizon-1) relative to executed
     # steps (0..n_action_steps-1). 1.0 = equal weight, 0.0 = ignore future steps entirely.
     # 0.1 keeps some gradient signal from future steps for trajectory smoothness.
-    future_steps_weight: float = 0.0
+    future_steps_weight: float = 0.3
         
     # Training presets
     optimizer_lr: float = 1e-4        # Conservative for frozen VLM + fresh action expert (SmolVLA uses 1e-4)

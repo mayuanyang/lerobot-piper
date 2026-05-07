@@ -6,7 +6,7 @@ Architecture:
     processes images + language into rich context tokens (960-dim).
   - Trainable context_proj (960 → d_model) and state_encoder (state_dim → d_model).
   - Trainable action expert: 8-layer TransformerDecoder cross-attending to context.
-  - Flow matching loss with Beta(1.5, 1.0) time sampling (same as SmolVLA).
+  - Flow matching loss with Uniform time sampling for train-inference consistency.
 
 This design is similar to SmolVLA (encoder-decoder variant):
   SmolVLA uses interleaved VLM+expert layers.
@@ -477,16 +477,12 @@ class FlowMatchingTransformer(nn.Module):
 
     def sample_time(self, B: int, device: torch.device) -> torch.Tensor:
         """
-        Sample flow-matching timestep t ~ Beta(1.5, 1.0) clipped to (0.001, 1.0).
-        Beta(1.5, 1.0) biases toward t=0 (near-clean), improving action accuracy
-        for manipulation tasks (same distribution as SmolVLA).
+        Sample flow-matching timestep t ~ Uniform(0, 1) clamped to (0.001, 0.999).
+        Uniform ensures the model sees all noise levels during training,
+        preventing train-inference mismatch when sampling from pure noise at inference.
         """
-        beta = torch.distributions.Beta(
-            torch.tensor(1.5, device=device),
-            torch.tensor(1.0, device=device),
-        )
-        t = beta.sample((B,))
-        return t * 0.999 + 0.001  # clamp away from exact 0/1
+        t = torch.rand(B, device=device)
+        return t * 0.998 + 0.001  # clamp away from exact 0/1
 
     def velocity_field(
         self,
@@ -616,7 +612,10 @@ class FlowMatchingTransformer(nn.Module):
     @torch.no_grad()
     def sample_actions(self, batch: dict) -> torch.Tensor:
         """
-        Sample actions via Euler ODE integration from t=1 (noise) to t=0 (actions).
+        Sample actions via Heun's 2nd-order ODE integration from t=1 (noise) to t=0 (actions).
+
+        Heun's method reduces global integration error from O(Δt) (Euler) to O(Δt²),
+        making better use of each velocity field evaluation.
 
         Returns: (B, n_action_steps, action_dim)
         """
@@ -625,19 +624,23 @@ class FlowMatchingTransformer(nn.Module):
 
         per_layer_contexts = self.get_condition(batch)
 
-        # Start from correlated noise at t=1 (matches training source distribution)
+        # Start from noise at t=1 (matches training source distribution)
         x_t = self.sample_noise(
             (B, self.config.horizon, self.config.action_dim),
             device=device,
         )
 
         num_steps = self.config.num_inference_steps
-        dt = torch.tensor(-1.0 / num_steps, device=device, dtype=torch.float32)
+        dt = -1.0 / num_steps
         t = torch.ones(B, device=device, dtype=torch.float32)
 
         for _ in range(num_steps):
+            # Heun's 2nd-order method (midpoint)
             v_t = self.velocity_field(x_t, t, per_layer_contexts)
-            x_t = x_t + dt * v_t
+            x_mid = x_t + 0.5 * dt * v_t
+            t_mid = t + 0.5 * dt
+            v_mid = self.velocity_field(x_mid, t_mid, per_layer_contexts)
+            x_t = x_t + dt * v_mid
             t = t + dt
 
         return x_t[:, : self.config.n_action_steps]
