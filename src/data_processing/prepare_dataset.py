@@ -1335,7 +1335,7 @@ def main():
     for episode in all_episodes_data:
         episode_folder = episode.folder
         episode_idx = episode.episode_index
-        last_frames_to_chop = 7 #episode.last_frames_to_chop
+        last_frames_to_chop = 10 #episode.last_frames_to_chop
         
         try:
             # Update global index offset before processing

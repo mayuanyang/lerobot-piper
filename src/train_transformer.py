@@ -283,8 +283,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         preprocessor, postprocessor = make_pre_post_processors(
             policy.config,
             dataset_stats=dataset_metadata.stats,
-            add_grid_overlay=True,
-            grid_overlay_cameras=["front", "right"]
+            # add_grid_overlay=True,
+            # grid_overlay_cameras=["front", "right"]
         )
 
         # Optimizer — read lr/warmup from saved config, fall back to cfg
@@ -337,8 +337,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         preprocessor, postprocessor = make_pre_post_processors(
             cfg,
             dataset_stats=dataset_metadata.stats,
-            add_grid_overlay=True,
-            grid_overlay_cameras=["front", "right"]
+            # add_grid_overlay=True,
+            # grid_overlay_cameras=["front", "right"]
         )
         step = 0
         epoch = 0
