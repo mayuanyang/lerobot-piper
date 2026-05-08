@@ -514,7 +514,10 @@ class FlowMatchingTransformer(nn.Module):
         fused = torch.cat([action_emb, time_emb], dim=-1)
         fused = F.silu(self.action_time_mlp_in(fused))
         fused = self.action_time_mlp_out(fused)
-        tgt = fused + action_emb
+        # t-conditional residual: at high t, action_emb is mostly noise.
+        # Attenuate the residual so the MLP output (which sees time_emb) dominates.
+        alpha_t = (1.0 - timesteps)[:, None, None]  # (B, 1, 1)
+        tgt = fused + alpha_t * action_emb
 
         causal_mask = nn.Transformer.generate_square_subsequent_mask(
             T_act, device=noisy_actions.device, dtype=noisy_actions.dtype
