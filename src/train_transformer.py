@@ -202,6 +202,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         # Joint 4 (index 3) is always 0 (locked) — zero weight avoids training on pure noise.
         # Gripper (index 6) is critical for pick vs place — upweighted 3× to prevent skipping.
         action_dim_weights=[1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0],
+        # n_action_steps == horizon → all predicted steps are executed → no decay needed.
+        # pos_decay_lambda=0.1 was suppressing 69% of gradient signal (step 31 weight=0.04).
+        pos_decay_lambda=0.0,
     )
     
     
@@ -283,8 +286,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         preprocessor, postprocessor = make_pre_post_processors(
             policy.config,
             dataset_stats=dataset_metadata.stats,
-            # add_grid_overlay=True,
-            # grid_overlay_cameras=["front", "right"]
         )
 
         # Optimizer — read lr/warmup from saved config, fall back to cfg
@@ -337,8 +338,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         preprocessor, postprocessor = make_pre_post_processors(
             cfg,
             dataset_stats=dataset_metadata.stats,
-            # add_grid_overlay=True,
-            # grid_overlay_cameras=["front", "right"]
         )
         step = 0
         epoch = 0
@@ -551,15 +550,17 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                             count += param.numel()
                     return total / count if count > 0 else None, count
 
-                vision_grad, vision_n      = _grad_stats('vision_model')
-                connector_grad, conn_n     = _grad_stats('connector')
-                robot_enc_grad, robot_enc_n = _grad_stats('robot_visual_encoder')
-                action_grad, action_n      = _grad_stats('action_expert')
+                vision_grad, vision_n        = _grad_stats('vision_model')
+                connector_grad, conn_n       = _grad_stats('connector')
+                robot_enc_grad, robot_enc_n  = _grad_stats('robot_visual_encoder')
+                robot_proj_grad, robot_proj_n = _grad_stats('robot_layer_projs')
+                action_grad, action_n        = _grad_stats('action_expert')
 
                 print(f"State Encoder  - Avg Abs Grad: {total_state_grad / total_state_params:.6f} ({total_state_params} params)")
                 print(f"Vision LoRA    - Avg Abs Grad: {vision_grad:.6f} ({vision_n} params)" if vision_grad is not None else "Vision LoRA    - no grad")
                 print(f"Connector      - Avg Abs Grad: {connector_grad:.6f} ({conn_n} params)" if connector_grad is not None else "Connector      - no grad")
                 print(f"Robot CNN      - Avg Abs Grad: {robot_enc_grad:.6f} ({robot_enc_n} params)" if robot_enc_grad is not None else "Robot CNN      - no grad")
+                print(f"Robot Proj     - Avg Abs Grad: {robot_proj_grad:.6f} ({robot_proj_n} params)" if robot_proj_grad is not None else "Robot Proj     - no grad")
                 print(f"Actions Expert - Avg Abs Grad: {action_grad:.6f} ({action_n} params)" if action_grad is not None else "Actions Expert - no grad")
                 
                 print("--- End Gradient Analysis ---\n")

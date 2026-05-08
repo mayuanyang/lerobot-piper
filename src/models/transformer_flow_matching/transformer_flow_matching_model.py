@@ -160,6 +160,15 @@ class FlowMatchingTransformer(nn.Module):
             out_tokens=config.robot_encoder_tokens,
             out_dim=config.d_model,
         )
+        # Per-layer projections for robot tokens in cross-attention K/V.
+        # Each decoder layer gets its own linear to specialise the shared base features:
+        #   robot_visual_encoder → one gradient ("produce good base spatial features")
+        #   robot_layer_projs[i] → own gradient ("specialise for layer i's VLM depth")
+        # This eliminates conflicting gradients from the same tokens being in 16 layers.
+        self.robot_layer_projs = nn.ModuleList([
+            nn.Linear(config.d_model, config.d_model, bias=False)
+            for _ in range(config.num_decoder_layers)
+        ])
 
         # 4. Action projections
         self.action_in_proj = nn.Linear(config.action_dim, config.d_model)
@@ -404,13 +413,14 @@ class FlowMatchingTransformer(nn.Module):
         Build per-layer context for interleaved cross-attention.
 
         Returns a list of (B, M, d_model) tensors, one per decoder layer.
-        Each tensor = projected VLM layer i output + ResNet tokens + state tokens.
-        Decoder layer i cross-attends to context i, giving early layers low-level
-        visual features and late layers semantic features (mirrors SmolVLA interleaving).
+        Each = projected VLM layer i output + layer-specific robot tokens + state tokens.
+
+        Robot tokens use per-layer projections (robot_layer_projs) so each decoder layer
+        can specialise the same base spatial features independently, eliminating the
+        gradient conflict that arises from sharing identical tokens across all layers.
         """
         B = batch["observation.state"].shape[0]
         T_obs = self.config.n_obs_steps
-        device = batch["observation.state"].device
 
         # All VLM layer hidden states: list of num_vlm_layers × (B, N, VLM_HIDDEN)
         vlm_layers = self.encode_prefix(batch, B, T_obs)
@@ -423,7 +433,7 @@ class FlowMatchingTransformer(nn.Module):
         state = state.nan_to_num(nan=0.0).clamp(-10.0, 10.0)
         state_tokens = self.state_encoder(state)  # (B, T_obs, d_model)
 
-        # ResNet tokens (same for all decoder layers)
+        # Robot base tokens — computed once, then projected per-layer
         robot_tokens_list = []
         for cam_key in self.config.cameras_for_vision_state_concat:
             if cam_key not in batch:
@@ -434,18 +444,16 @@ class FlowMatchingTransformer(nn.Module):
             robot_tokens_list.append(self.robot_visual_encoder(img.float()))
         robot_tokens = torch.cat(robot_tokens_list, dim=1) if robot_tokens_list else None
 
-        # Build one context tensor per decoder layer, mapped to the corresponding VLM layer
+        # Per-layer context: VLM depth i + layer-specific robot projection + state
         n_dec = self.config.num_decoder_layers
         per_layer_contexts = []
         for i in range(n_dec):
-            # Stride-based mapping: decoder layer 0 → VLM layer 0,
-            #                       decoder layer n_dec-1 → VLM layer n_vlm-1
             vlm_i = i * (n_vlm - 1) // max(n_dec - 1, 1)
             h = torch.nan_to_num(vlm_layers[vlm_i], nan=0.0, posinf=1.0, neginf=-1.0)
-            ctx = self.context_norm(self.context_proj(h))  # (B, N, d_model)
+            ctx = self.context_norm(self.context_proj(h))  # (B, N_vlm, d_model)
             parts = [ctx]
             if robot_tokens is not None:
-                parts.append(robot_tokens)
+                parts.append(self.robot_layer_projs[i](robot_tokens))  # (B, N_robot, d_model)
             parts.append(state_tokens)
             per_layer_contexts.append(torch.cat(parts, dim=1))
 
@@ -496,8 +504,8 @@ class FlowMatchingTransformer(nn.Module):
         Args:
             noisy_actions:      (B, H, action_dim) noisy action sequence at time t
             timesteps:          (B,) flow matching timesteps in [0, 1]
-            per_layer_contexts: list of (B, M, d_model) — one context per decoder layer,
-                                each corresponding to a different VLM layer depth.
+            per_layer_contexts: list of (B, M, d_model) — one context per decoder layer.
+                                Each = VLM layer i + robot_layer_projs[i](robot_tokens) + state.
         Returns:
             velocity: (B, H, action_dim)
         """
@@ -514,8 +522,6 @@ class FlowMatchingTransformer(nn.Module):
         fused = torch.cat([action_emb, time_emb], dim=-1)
         fused = F.silu(self.action_time_mlp_in(fused))
         fused = self.action_time_mlp_out(fused)
-        # t-conditional residual: at high t, action_emb is mostly noise.
-        # Attenuate the residual so the MLP output (which sees time_emb) dominates.
         alpha_t = (1.0 - timesteps)[:, None, None]  # (B, 1, 1)
         tgt = fused + alpha_t * action_emb
 
@@ -524,6 +530,7 @@ class FlowMatchingTransformer(nn.Module):
         )
 
         # Interleaved cross-attention: each layer attends to its VLM layer's context
+        # (which already includes layer-specific robot token projections)
         for layer, ctx in zip(self.action_expert_layers, per_layer_contexts):
             tgt = layer(tgt=tgt, memory=ctx, tgt_mask=causal_mask, tgt_is_causal=True)
 
