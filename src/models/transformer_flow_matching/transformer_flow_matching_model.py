@@ -622,10 +622,7 @@ class FlowMatchingTransformer(nn.Module):
     @torch.no_grad()
     def sample_actions(self, batch: dict) -> torch.Tensor:
         """
-        Sample actions via Heun's 2nd-order ODE integration from t=1 (noise) to t=0 (actions).
-
-        Heun's method reduces global integration error from O(Δt) (Euler) to O(Δt²),
-        making better use of each velocity field evaluation.
+        Sample actions via Euler ODE integration from t=1 (noise) to t=0 (actions).
 
         Returns: (B, n_action_steps, action_dim)
         """
@@ -645,13 +642,9 @@ class FlowMatchingTransformer(nn.Module):
         t = torch.ones(B, device=device, dtype=torch.float32)
 
         for _ in range(num_steps):
-            # Heun's 2nd-order method (midpoint)
             v_t = self.velocity_field(x_t, t, per_layer_contexts)
-            x_mid = x_t + 0.5 * dt * v_t
-            t_mid = t + 0.5 * dt
-            v_mid = self.velocity_field(x_mid, t_mid, per_layer_contexts)
-            x_t = x_t + dt * v_mid
-            t = t + dt
+            x_t = x_t + dt * v_t
+            t   = t + dt
 
         return x_t[:, : self.config.n_action_steps]
 

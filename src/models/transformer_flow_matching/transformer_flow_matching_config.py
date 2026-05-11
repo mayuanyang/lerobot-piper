@@ -60,7 +60,7 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     dim_feedforward: int = 2048   # standard 4×d_model feedforward width
     
     # Flow matching sampling parameters
-    num_inference_steps: int = 20
+    num_inference_steps: int = 10
 
     # Temporal correlation of source noise along the horizon dimension.
     # AR(1): noise_t = rho * noise_{t-1} + sqrt(1-rho²) * epsilon_t
