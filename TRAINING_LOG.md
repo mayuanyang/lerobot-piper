@@ -14,7 +14,7 @@
 | dim_feedforward | 2048 |
 | Robot visual encoder | ResNet-18 (layers 1–3), 16 tokens/camera |
 | Robot layer projections | 16 × Linear(512, 512) per-layer |
-| Cameras | front, gripper (right removed) |
+| Cameras | front, gripper, right (all 3) |
 | State dim | 7 |
 | Action dim | 7 |
 | Horizon | 32 |
@@ -29,8 +29,8 @@
 | Dataset | ISdept/piper_arm (episodes ≤ 400) |
 
 ### Architecture Changes vs Previous Run
-- Right camera removed (poor sight line)
 - Grid overlay removed from preprocessor
+- Right camera kept (all 3 cameras: front, gripper, right)
 - Robot tokens moved from direct concat to per-layer projections (`robot_layer_projs`)
 - Per-layer gradient routing: each decoder layer gets its own Linear(512,512) projection of robot tokens
 - Switched Heun (20 steps) → Euler (10 steps) for 4× inference speedup
