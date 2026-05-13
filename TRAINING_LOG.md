@@ -68,6 +68,7 @@
 | 70400 | 244 | 0.016–0.033 | 3.00e-05 | 0.44 | 1.01e-4 | 1.01e-4 | 1.3e-5 | 6e-6  |
 | 77600 | 269 | 0.021–0.037 | 2.78e-05 | 0.45 | 1.15e-4 | 9.8e-5  | 1.5e-5 | 8e-6  |
 | 77800 | 270 | 0.014–0.037 | 2.78e-05 | 0.39 | 1.02e-4 | 8.9e-5  | 1.3e-5 | 6e-6  |
+| 89400 | 311 | 0.013       | 1.36e-05 | 0.32 | 8.3e-5  | 8.4e-5  | 1.2e-5 | 6e-6  |
 
 ### Loss Floor Milestones
 
@@ -78,7 +79,8 @@
 | ~47k | 0.036 | Temporary 7k-step stall |
 | ~60k | 0.027 | Broke through stall |
 | ~70k | 0.016 | Strong convergence |
-| ~78k | **0.014** | New low — still improving |
+| ~78k | 0.014 | Still improving |
+| ~89k | **0.013** | New low |
 
 ### Previous Run (Old Architecture — archived)
 
