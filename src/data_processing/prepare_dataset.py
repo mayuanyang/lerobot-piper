@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import torch
@@ -23,23 +24,37 @@ import re
 
 
 
-def create_tasks_parquet(root_dir: Path, task_description: str):
-    """
-    Write meta/tasks.parquet in the format LeRobot expects:
-    - DataFrame index = task string(s)
-    - Column 'task_index' = integer index 0..N-1
-    """
-    tasks = [task_description]
+DATASET_CONFIGS = {
+    "pick_and_place": {
+        "tasks": {0: "Pick up the cube and place it into the container."},
+        "get_task_index": lambda ep_idx: 0,
+    },
+    "sorting": {
+        "tasks": {
+            0: "Pick up the cube and place it into the container.",
+            1: "Pick up the cube and place it into the container 1",
+            2: "Pick up the cube and place it into the container 2",
+            3: "Pick up the cube and place it into the container 3",
+        },
+        "get_task_index": lambda ep_idx: 1 if ep_idx <= 19 else (2 if ep_idx <= 39 else 3),
+    },
+}
 
-    # Build DataFrame with task strings as index and task_index as column
-    df = pd.DataFrame({"task_index": list(range(len(tasks)))}, index=tasks)
-    df.index.name = None  # optional, but keeps index as pure strings
 
+def create_tasks_parquet(root_dir: Path, tasks_dict: dict):
+    """
+    Write meta/tasks.parquet in the format LeRobot expects.
+    tasks_dict: {task_index (int): task_description (str)}
+    """
     tasks_dir = root_dir / "meta"
     tasks_dir.mkdir(parents=True, exist_ok=True)
     tasks_parquet_path = tasks_dir / "tasks.parquet"
 
-    # Use pandas to_parquet so the index is preserved in a way pd.read_parquet will restore it
+    df = pd.DataFrame(
+        {"task_index": list(tasks_dict.keys())},
+        index=list(tasks_dict.values()),
+    )
+    df.index.name = None
     df.to_parquet(tasks_parquet_path)
     
 
@@ -138,7 +153,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
             "index": global_index,  # 全局索引 (0, 1, 2, ..., N)
             "next.done": is_done,
             "next.reward": 1.0 if is_done else 0.0,
-            "task_index": 0,
+            "task_index": episode_data.task_index,
             "observation.box": [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0] for _ in range(6)],  # Initialize with zeros: 6 elements, each with 6 values (x1, y1, x2, y2, category_id, confidence)
             #"task_description": episode_data.task_description
         }
@@ -191,7 +206,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     return effective_num_frames
 
 # Modified signature to accept last_frames_to_chop and first_frames_to_chop
-def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: dict, is_first_episode: bool = False, last_frames_to_chop: int = 0, first_frames_to_chop: int = 0):
+def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: dict, is_first_episode: bool = False, last_frames_to_chop: int = 0, first_frames_to_chop: int = 0, tasks_dict: dict = None):
     
     
     # [File path definitions and checks remain the same...]
@@ -218,7 +233,7 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
             "fps": round(episode_data.fps, 2),
             "total_episodes": 1,
             "total_frames": effective_num_frames,
-            "total_tasks": 1,
+            "total_tasks": len(tasks_dict) if tasks_dict else 1,
             "data_path": data_path,
             "video_path": video_path,
             "features": {
@@ -298,7 +313,7 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
     # Create base episodes_jsonl structure
     episodes_jsonl = {
         "episode_index": episode_data.episode_index,
-        "task_index": 0,
+        "task_index": episode_data.task_index,
         "frame_index_offset": 0, # Index offset from the start of the Parquet file (always 0 here)
         "num_frames": effective_num_frames, # 🔴 CORE CHANGE 4: Report effective number of frames
         "dataset_from_index": dataset_from_index,
@@ -321,7 +336,7 @@ def generate_meta_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         f.write(json.dumps(episodes_jsonl) + "\n")
         
     if is_first_episode:
-        create_tasks_parquet(output_dir, episode_data.task_description)
+        create_tasks_parquet(output_dir, tasks_dict or {episode_data.task_index: episode_data.task_description})
     
 
 
@@ -856,10 +871,10 @@ def compute_and_save_dataset_stats(output_dir: Path):
     
     return final_stats
 
-def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episode: bool = False, last_frames_to_chop: int = 10, first_frames_to_chop: int = 15, mode="diff"):
+def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episode: bool = False, last_frames_to_chop: int = 10, first_frames_to_chop: int = 15, mode="diff", tasks_dict: dict = None):
     """
     Main function to process one episode.
-    
+
     last_frames_to_chop (int): The number of final frames to exclude from the dataset.
     first_frames_to_chop (int): The number of initial frames to exclude from the dataset.
     """
@@ -867,12 +882,12 @@ def process_session(episode_data: EpisodeData, output_dir: Path, is_first_episod
     os.makedirs(output_dir / "meta", exist_ok=True)
     os.makedirs(output_dir / "data", exist_ok=True)
     os.makedirs(output_dir / "videos", exist_ok=True)
-           
+
     with open(episode_data.joint_data_json_path, 'r') as f:
         json_data = json.load(f)
 
     # Pass the chop value to meta file generator
-    generate_meta_files(output_dir, episode_data, json_data, is_first_episode, last_frames_to_chop, first_frames_to_chop)
+    generate_meta_files(output_dir, episode_data, json_data, is_first_episode, last_frames_to_chop, first_frames_to_chop, tasks_dict=tasks_dict)
     
     generate_video_files(output_dir, episode_data, json_data, last_frames_to_chop, first_frames_to_chop)
         
@@ -1251,14 +1266,24 @@ def pad_videos(output_dir: Path):
     
     
 def main():
+    parser = argparse.ArgumentParser(description="Prepare a LeRobot-format dataset from raw episode data.")
+    parser.add_argument("--input_dir", type=Path, default=Path("data/piper_training_data/"), help="Root folder containing episode subfolders")
+    parser.add_argument("--dataset_name", type=str, default="pick_and_place", choices=list(DATASET_CONFIGS.keys()), help="Dataset configuration name (determines task index mapping)")
+    args = parser.parse_args()
+
     print('Starting dataset preparation...')
     # --- CONFIGURATION ---
-    ROOT_FOLDER = Path("data/piper_training_data/")  # Root folder containing episode subfolders
+    ROOT_FOLDER = args.input_dir  # Root folder containing episode subfolders
     OUTPUT_FOLDER = Path("output/")  # Output folder for processed dataset
     REPO_ID = "ISDept/piper_arm"  # Your desired Hugging Face repo ID
     AGGREGATE_EPISODES = True  # New flag to control aggregation behavior
     MODE = "full"  # Processing mode: "diff" or "full"
     # ---------------------
+
+    dataset_config = DATASET_CONFIGS[args.dataset_name]
+    tasks_dict = dataset_config["tasks"]
+    get_task_index = dataset_config["get_task_index"]
+    print(f"Dataset: {args.dataset_name}, tasks: {tasks_dict}")
     
     # Find all episode folders
     episode_folders = find_episode_folders(ROOT_FOLDER)
@@ -1307,15 +1332,18 @@ def main():
                         first_frames_to_chop = 0  # First episode has extra lag
                 cameras_list.append(CameraData(video_path=str(video_path), camera=camera_name, first_frames_to_chop=first_frames_to_chop))
             
+            ep_task_index = get_task_index(episode_idx)
+            ep_task_description = tasks_dict[ep_task_index]
             episode_data = EpisodeData(
-                joint_data_json_path=str(json_path), 
-                episode_index=episode_idx, 
-                fps=10, 
+                joint_data_json_path=str(json_path),
+                episode_index=episode_idx,
+                fps=10,
                 global_index_offset=0,  # Will be updated during processing
                 cameras=cameras_list,
-                folder = episode_folder,
-                task_description = "Pick up the cube and place it into the container.",
-                last_frames_to_chop = last_frames_to_chop
+                folder=episode_folder,
+                task_description=ep_task_description,
+                last_frames_to_chop=last_frames_to_chop,
+                task_index=ep_task_index,
             )
             
             all_episodes_data.append(episode_data)
@@ -1343,7 +1371,7 @@ def main():
             
             # Process the first episode differently to create initial files
             is_first_episode = (episode_idx == min(e.episode_index for e in all_episodes_data))
-            num_of_frames = process_session(episode, OUTPUT_FOLDER, is_first_episode, last_frames_to_chop, first_frames_to_chop=0, mode=MODE)
+            num_of_frames = process_session(episode, OUTPUT_FOLDER, is_first_episode, last_frames_to_chop, first_frames_to_chop=0, mode=MODE, tasks_dict=tasks_dict)
             episode.num_of_frames = num_of_frames
             
             # Update global index offset for the next episode

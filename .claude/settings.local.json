@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Read(//Users/eddyma/.cache/huggingface/**)",
-      "Bash(curl -s https://raw.githubusercontent.com/huggingface/lerobot/main/src/lerobot/policies/smolvla/smolvlm_with_expert.py)"
+      "Bash(curl -s https://raw.githubusercontent.com/huggingface/lerobot/main/src/lerobot/policies/smolvla/smolvlm_with_expert.py)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }
