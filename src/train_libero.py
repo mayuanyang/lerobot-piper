@@ -155,8 +155,8 @@ def train(output_dir, dataset_id="lerobot/libero", resume_from_checkpoint=None, 
     print(f"State key: '{state_key}' (dim={state_dim}), Action key: '{action_key}' (dim={action_dim})")
 
     obs = 2
-    horizon = 32
-    n_action_steps = 32
+    horizon = 64
+    n_action_steps = 64
 
     cfg = TransformerFlowMatchingConfig(
         input_features=input_features,
@@ -313,7 +313,7 @@ def train(output_dir, dataset_id="lerobot/libero", resume_from_checkpoint=None, 
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=8,
-        batch_size=64,
+        batch_size=128,
         sampler=sampler,
         pin_memory=device.type != "cpu",
         drop_last=True,
