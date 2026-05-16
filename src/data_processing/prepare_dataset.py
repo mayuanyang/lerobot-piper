@@ -36,7 +36,7 @@ DATASET_CONFIGS = {
             2: "Pick up the cube and place it into the container 2",
             3: "Pick up the cube and place it into the container 3",
         },
-        "get_task_index": lambda ep_idx: 1 if ep_idx <= 19 else (2 if ep_idx <= 39 else 3),
+        "get_task_index": lambda ep_idx: 1 if ep_idx <= 25 else (2 if ep_idx <= 51 else 3),
     },
 }
 
@@ -159,7 +159,7 @@ def generate_data_files(output_dir: Path, episode_data: EpisodeData, json_data: 
         }
                 
         lerobot_frames.append(frame_data)
-        timestamp_base += 0.1
+        timestamp_base += 1.0 / episode_data.fps
         
     # [Rest of the function remains the same, writing to Parquet]
     hf_dataset = Dataset.from_pandas(pd.DataFrame(lerobot_frames))
@@ -1269,6 +1269,7 @@ def main():
     parser = argparse.ArgumentParser(description="Prepare a LeRobot-format dataset from raw episode data.")
     parser.add_argument("--input_dir", type=Path, default=Path("data/piper_training_data/"), help="Root folder containing episode subfolders")
     parser.add_argument("--dataset_name", type=str, default="pick_and_place", choices=list(DATASET_CONFIGS.keys()), help="Dataset configuration name (determines task index mapping)")
+    parser.add_argument("--fps", type=int, default=10, help="Frames per second of the source recordings")
     args = parser.parse_args()
 
     print('Starting dataset preparation...')
@@ -1337,7 +1338,7 @@ def main():
             episode_data = EpisodeData(
                 joint_data_json_path=str(json_path),
                 episode_index=episode_idx,
-                fps=10,
+                fps=args.fps,
                 global_index_offset=0,  # Will be updated during processing
                 cameras=cameras_list,
                 folder=episode_folder,
