@@ -9,6 +9,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetad
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import dataset_to_policy_features
 import numpy as np
+from torch.utils.data import Subset
 
 from models.transformer_flow_matching.transformer_flow_matching_config import TransformerFlowMatchingConfig
 from models.transformer_flow_matching.transformer_flow_matching_policy import TransformerFlowMatchingPolicy
@@ -38,11 +39,11 @@ def get_augmentations():
     ])
 
 
-def apply_joint_augmentations(batch):
+def apply_joint_augmentations(batch, state_key):
     if torch.rand(1).item() > 0.5:
-        if "observation.state" in batch:
-            noise = torch.randn_like(batch["observation.state"]) * 0.01
-            batch["observation.state"] = batch["observation.state"] + noise
+        if state_key in batch:
+            noise = torch.randn_like(batch[state_key]) * 0.01
+            batch[state_key] = batch[state_key] + noise
     return batch
 
 
@@ -71,8 +72,51 @@ def apply_image_augmentations(batch, camera_keys, transform):
     return batch
 
 
-def train(output_dir, dataset_id="physical-intelligence/libero", resume_from_checkpoint=None):
-    """Train the TransformerFlowMatching model on the Libero dataset."""
+def get_libero_train_episodes(hf_dataset, train_ratio=0.9):
+    """
+    Implement the standard LIBERO benchmark train split:
+    for each task, take the first `train_ratio` fraction of episodes (by episode index order).
+    This matches the 90/10 protocol used in the LIBERO paper and most follow-up work.
+
+    Returns the set of episode indices that belong to the training split,
+    and prints a per-task breakdown for reproducibility auditing.
+    """
+    episode_ids = np.array(hf_dataset["episode_index"])
+    task_ids = np.array(hf_dataset["task_index"])
+
+    # Map each unique episode_index to its task_index (one task per episode)
+    ep_to_task: dict[int, int] = {}
+    for ep_idx, task_idx in zip(episode_ids, task_ids):
+        ep_to_task[int(ep_idx)] = int(task_idx)
+
+    # Group episodes by task
+    task_to_episodes: dict[int, list[int]] = {}
+    for ep_idx, task_idx in ep_to_task.items():
+        task_to_episodes.setdefault(task_idx, []).append(ep_idx)
+
+    train_episodes: set[int] = set()
+    test_episodes: set[int] = set()
+    print(f"\nLIBERO train/test split (train_ratio={train_ratio}):")
+    for task_idx, episodes in sorted(task_to_episodes.items()):
+        episodes = sorted(episodes)
+        n_train = max(1, int(len(episodes) * train_ratio))
+        train_episodes.update(episodes[:n_train])
+        test_episodes.update(episodes[n_train:])
+        print(f"  task {task_idx:3d}: {len(episodes):3d} demos → {n_train} train | {len(episodes)-n_train} test "
+              f"(train ep {episodes[0]}–{episodes[n_train-1]}, "
+              f"test ep {episodes[n_train] if len(episodes) > n_train else 'none'}–{episodes[-1]})")
+
+    print(f"  Total: {len(train_episodes)} train episodes, {len(test_episodes)} test episodes\n")
+    return train_episodes
+
+
+def train(output_dir, dataset_id="physical-intelligence/libero", resume_from_checkpoint=None, train_ratio=0.9):
+    """Train the TransformerFlowMatching model on the LIBERO benchmark dataset.
+
+    Uses the standard LIBERO train/test split: for each task, the first `train_ratio`
+    fraction of episodes (sorted by episode index) are used for training. This matches
+    the protocol in the LIBERO paper (arXiv:2306.03310) and most downstream benchmarks.
+    """
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
 
@@ -88,16 +132,27 @@ def train(output_dir, dataset_id="physical-intelligence/libero", resume_from_che
     input_features = {key: ft for key, ft in features.items() if key not in output_features}
 
     if len(output_features) == 0:
-        raise ValueError("No output features (actions) found! Check your dataset schema.")
+        raise ValueError("No output features (actions) found. Check dataset schema.")
 
-    print('input_features:', input_features)
-    print('output_features:', output_features)
+    print('input_features:', list(input_features.keys()))
+    print('output_features:', list(output_features.keys()))
 
     camera_keys = sorted([key for key, ft in input_features.items() if ft.type is FeatureType.VISUAL])
-    state_dim = input_features["observation.state"].shape[-1] if "observation.state" in input_features else 7
-    action_dim = next(iter(output_features.values())).shape[-1]
     print(f"Detected cameras ({len(camera_keys)}): {camera_keys}")
-    print(f"State dim: {state_dim}, Action dim: {action_dim}")
+
+    # Detect state and action keys robustly — LIBERO uses `state`/`actions`,
+    # while standard LeRobot datasets use `observation.state`/`action`.
+    state_key = next(
+        (k for k in ("observation.state", "state") if k in input_features),
+        None,
+    )
+    action_key = next(iter(output_features.keys()))
+    if state_key is None:
+        raise ValueError(f"No state key found in input_features: {list(input_features.keys())}")
+
+    state_dim = input_features[state_key].shape[-1]
+    action_dim = output_features[action_key].shape[-1]
+    print(f"State key: '{state_key}' (dim={state_dim}), Action key: '{action_key}' (dim={action_dim})")
 
     obs = 2
     horizon = 32
@@ -118,8 +173,7 @@ def train(output_dir, dataset_id="physical-intelligence/libero", resume_from_che
         num_vlm_layers=16,
         num_cameras=len(camera_keys),
         cameras_for_vision_state_concat=camera_keys,
-        # All action dims equal — libero has no locked joints
-        action_dim_weights=[1.0] * action_dim,
+        action_dim_weights=[1.0] * action_dim,  # no locked joints in LIBERO
         pos_decay_lambda=0.0,
     )
 
@@ -128,10 +182,7 @@ def train(output_dir, dataset_id="physical-intelligence/libero", resume_from_che
         policy = TransformerFlowMatchingPolicy(cfg)
 
         ckpt_path = Path(resume_from_checkpoint)
-        if ckpt_path.exists():
-            local_ckpt_path = ckpt_path
-        else:
-            local_ckpt_path = Path(huggingface_hub.snapshot_download(resume_from_checkpoint))
+        local_ckpt_path = ckpt_path if ckpt_path.exists() else Path(huggingface_hub.snapshot_download(resume_from_checkpoint))
 
         model_file = local_ckpt_path / "model.safetensors"
         if not model_file.exists():
@@ -153,59 +204,44 @@ def train(output_dir, dataset_id="physical-intelligence/libero", resume_from_che
                 saved_total = saved_cfg_json.get("training_steps_total", 0)
                 if saved_total > 0:
                     training_steps = saved_total
-                print(f"Read config from {config_file.name}: step={step}, epoch={epoch}, training_steps_total={training_steps}")
+                print(f"Read config from {config_file.name}: step={step}, epoch={epoch}, total={training_steps}")
                 break
         if step == 0 and local_ckpt_path.name.startswith("checkpoint-"):
             step = int(local_ckpt_path.name.split("-")[1])
-        print(f"Resuming from step {step}, epoch {epoch}")
 
-        print(f"Loading weights from: {model_file}")
         ckpt_state = load_safetensors(model_file, device=str(device))
-
         policy.train()
         policy.to(device)
         cur_state = policy.state_dict()
         filtered = {k: v for k, v in ckpt_state.items() if k in cur_state and cur_state[k].shape == v.shape}
-
-        skipped_ckpt = [k for k in ckpt_state if k not in filtered]
-        missing_from_ckpt = [k for k in cur_state if k not in ckpt_state]
-        if skipped_ckpt:
-            print(f"Skipped {len(skipped_ckpt)} checkpoint keys (shape mismatch / removed): {skipped_ckpt[:10]}")
-        if missing_from_ckpt:
-            print(f"Missing {len(missing_from_ckpt)} keys not in checkpoint (will use init values): {missing_from_ckpt[:10]}")
+        skipped = [k for k in ckpt_state if k not in filtered]
+        missing = [k for k in cur_state if k not in ckpt_state]
+        if skipped:
+            print(f"Skipped {len(skipped)} keys (shape mismatch): {skipped[:5]}")
+        if missing:
+            print(f"Missing {len(missing)} keys (will use init values): {missing[:5]}")
         policy.load_state_dict(filtered, strict=False)
-        print(f"Loaded {len(filtered)}/{len(cur_state)} model keys from checkpoint ({len(ckpt_state)} keys in file)")
+        print(f"Loaded {len(filtered)}/{len(cur_state)} model keys")
 
-        preprocessor, postprocessor = make_pre_post_processors(
-            policy.config,
-            dataset_stats=dataset_metadata.stats,
-        )
+        preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
 
         resume_lr = saved_cfg_json.get("optimizer_lr", cfg.optimizer_lr)
-        resume_warmup = saved_cfg_json.get("scheduler_warmup_steps", cfg.scheduler_warmup_steps)
-        print(f"Initializing optimizer with learning rate: {resume_lr}")
-
         trainable_params = [p for p in policy.model.parameters() if p.requires_grad]
         optimizer = torch.optim.Adam(trainable_params, lr=resume_lr, weight_decay=1e-6)
-        print(f"Total trainable parameters: {sum(p.numel() for p in trainable_params):,}")
 
         optimizer_state_path = local_ckpt_path / "optimizer_state.pth"
         if optimizer_state_path.exists():
             try:
                 optimizer.load_state_dict(torch.load(optimizer_state_path, map_location=device))
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = resume_lr
-                    param_group['initial_lr'] = resume_lr
+                for pg in optimizer.param_groups:
+                    pg['lr'] = resume_lr
+                    pg['initial_lr'] = resume_lr
                 print(f"Optimizer state loaded. LR reset to {resume_lr}")
             except ValueError as e:
-                print(f"Skipping optimizer state — architecture mismatch ({e})")
+                print(f"Skipping optimizer state — mismatch ({e})")
 
-        warmup_steps = resume_warmup
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=training_steps,
-        )
+        resume_warmup = saved_cfg_json.get("scheduler_warmup_steps", cfg.scheduler_warmup_steps)
+        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=resume_warmup, num_training_steps=training_steps)
         for _ in range(step):
             scheduler.step()
         print(f"Scheduler fast-forwarded to step {step}, LR = {optimizer.param_groups[0]['lr']:.2e}")
@@ -213,79 +249,59 @@ def train(output_dir, dataset_id="physical-intelligence/libero", resume_from_che
         policy = TransformerFlowMatchingPolicy(cfg)
         policy.train()
         policy.to(device)
-
-        preprocessor, postprocessor = make_pre_post_processors(
-            cfg,
-            dataset_stats=dataset_metadata.stats,
-        )
-        step = 0
-        epoch = 0
+        preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
+        step, epoch = 0, 0
 
         trainable_params = [p for p in policy.parameters() if p.requires_grad]
         print(f"Total trainable parameters: {sum(p.numel() for p in trainable_params):,}")
-        fresh_lr = cfg.optimizer_lr
-        fresh_warmup = cfg.scheduler_warmup_steps
-        optimizer = torch.optim.Adam(trainable_params, lr=fresh_lr, weight_decay=cfg.optimizer_weight_decay)
-
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=fresh_warmup,
-            num_training_steps=training_steps,
-        )
+        optimizer = torch.optim.Adam(trainable_params, lr=cfg.optimizer_lr, weight_decay=cfg.optimizer_weight_decay)
+        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=cfg.scheduler_warmup_steps, num_training_steps=training_steps)
 
     if isinstance(preprocessor, torch.nn.Module):
         preprocessor.to(device)
 
-    # Libero is typically 30 fps
-    fps = dataset_metadata.fps if hasattr(dataset_metadata, "fps") else 30
+    fps = dataset_metadata.fps if hasattr(dataset_metadata, "fps") and dataset_metadata.fps else 30
     frame_time = 1 / fps
+    print(f"Dataset FPS: {fps}")
 
     obs_temporal_window = [-i * frame_time for i in range(obs)][::-1]
     action_temporal_window = [i * frame_time for i in range(horizon)]
 
     delta_timestamps = {
-        "observation.state": obs_temporal_window,
-        "action": action_temporal_window,
+        state_key: obs_temporal_window,
+        action_key: action_temporal_window,
         **{key: [0.0] for key in camera_keys},
     }
 
     dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, force_cache_sync=True, revision="main", tolerance_s=0.1)
     print(f"Dataset loaded: {len(dataset)} total frames")
 
-    # Build task_index → description mapping.
-    # Libero stores per-frame task strings in the `task` column (populated by LeRobot
-    # from tasks.parquet). We also fall back to reading tasks.parquet directly.
+    # Build task description mapping from tasks.parquet (for datasets that have it).
+    # LIBERO may also surface per-frame task strings in batch["task"] directly.
     task_idx_to_description: dict[int, str] = {}
     try:
         tasks_parquet_path = dataset.root / "meta" / "tasks.parquet"
         if tasks_parquet_path.exists():
             tasks_df = pd.read_parquet(tasks_parquet_path)
             if "task_index" in tasks_df.columns:
-                task_idx_to_description = {
-                    int(row["task_index"]): str(idx)
-                    for idx, row in tasks_df.iterrows()
-                }
+                task_idx_to_description = {int(row["task_index"]): str(idx) for idx, row in tasks_df.iterrows()}
             print(f"Loaded {len(task_idx_to_description)} task descriptions from tasks.parquet")
-        else:
-            print("tasks.parquet not found; task_description will come from batch['task'] if present.")
     except Exception as e:
         print(f"Warning: could not load tasks.parquet: {e}")
 
-    if dataset_metadata.stats and "observation.state" in dataset_metadata.stats:
-        s = dataset_metadata.stats["observation.state"]
-        print(f"\nNorm stats observation.state:")
-        print(f"  mean={s.get('mean', 'N/A')}")
-        print(f"  std ={s.get('std',  'N/A')}")
-    if dataset_metadata.stats and "action" in dataset_metadata.stats:
-        s = dataset_metadata.stats["action"]
-        print(f"Norm stats action:")
-        print(f"  mean={s.get('mean', 'N/A')}")
-        print(f"  std ={s.get('std',  'N/A')}")
+    # Apply the standard LIBERO train/test split: first train_ratio episodes per task.
+    # This ensures identical trajectory partitioning to other benchmark results.
+    train_episodes = get_libero_train_episodes(dataset.hf_dataset, train_ratio=train_ratio)
+    all_episode_ids = np.array(dataset.hf_dataset["episode_index"])
+    valid_indices = [i for i, ep in enumerate(all_episode_ids) if int(ep) in train_episodes]
+    dataset = Subset(dataset, valid_indices)
+    print(f"Training subset: {len(dataset)} frames from {len(train_episodes)} episodes")
 
-    episode_ids = np.array(dataset.hf_dataset["episode_index"])
-    ep_changes = np.where(np.diff(episode_ids) != 0)[0] + 1
+    # Build episode boundaries in subset coordinate space for the sampler
+    ep_ids_subset = all_episode_ids[np.array(valid_indices)]
+    ep_changes = np.where(np.diff(ep_ids_subset) != 0)[0] + 1
     ep_from = np.concatenate([[0], ep_changes]).tolist()
-    ep_to = np.concatenate([ep_changes, [len(episode_ids)]]).tolist()
+    ep_to = np.concatenate([ep_changes, [len(valid_indices)]]).tolist()
     sampler = EpisodeAwareSampler(
         dataset_from_indices=ep_from,
         dataset_to_indices=ep_to,
@@ -293,7 +309,6 @@ def train(output_dir, dataset_id="physical-intelligence/libero", resume_from_che
         drop_n_last_frames=0,
         shuffle=True,
     )
-    print(f"EpisodeAwareSampler: {len(sampler)} frames across {len(ep_from)} episodes")
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -314,30 +329,27 @@ def train(output_dir, dataset_id="physical-intelligence/libero", resume_from_che
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].to(device, non_blocking=True)
 
-            # Task descriptions: prefer the `task` column that LeRobot populates
-            # directly on each frame for image-based datasets (like libero).
-            # Fall back to tasks.parquet index lookup.
+            # Task descriptions: prefer the `task` column (per-frame string, populated
+            # by LeRobot for image-based datasets). Fall back to tasks.parquet lookup.
             if "task" in batch and isinstance(batch["task"], (list, tuple)):
                 batch["task_description"] = batch["task"]
             elif task_idx_to_description and "task_index" in batch:
                 task_indices = batch["task_index"]
-                if task_indices.dim() > 1:
+                if isinstance(task_indices, torch.Tensor) and task_indices.dim() > 1:
                     task_indices = task_indices[:, 0]
-                batch["task_description"] = [
-                    task_idx_to_description.get(int(ti.item()), "") for ti in task_indices
-                ]
+                batch["task_description"] = [task_idx_to_description.get(int(ti), "") for ti in task_indices]
 
             batch = apply_image_augmentations(batch, camera_keys, image_transforms)
-            batch = apply_joint_augmentations(batch)
+            batch = apply_joint_augmentations(batch, state_key)
 
             if step == 0:
-                raw_st = batch["observation.state"].float()
-                print(f"\nRaw (pre-norm) observation.state: min={raw_st.min():.4f}  max={raw_st.max():.4f}  std={raw_st.std():.4f}")
+                raw_st = batch[state_key].float()
+                print(f"\nRaw (pre-norm) {state_key}: min={raw_st.min():.4f}  max={raw_st.max():.4f}  std={raw_st.std():.4f}")
 
             batch = preprocessor(batch)
 
             if step == 0:
-                pad_key = next((k for k in ("action_is_pad", "actions_id_pad") if k in batch), None)
+                pad_key = next((k for k in batch if "pad" in k.lower() and "action" in k.lower()), None)
                 if pad_key is None:
                     print("WARNING: no action pad key found in batch")
                 else:
@@ -362,15 +374,11 @@ def train(output_dir, dataset_id="physical-intelligence/libero", resume_from_che
                         if param.requires_grad and prefix in name and param.grad is not None:
                             total += param.grad.abs().mean().item() * param.numel()
                             count += param.numel()
-                    return total / count if count > 0 else None, count
+                    return (total / count, count) if count > 0 else (None, 0)
 
-                vision_grad, vision_n       = _grad_stats('vision_model')
-                connector_grad, conn_n      = _grad_stats('connector')
-                action_grad, action_n       = _grad_stats('action_expert')
-
-                print(f"Vision         - Avg Abs Grad: {vision_grad:.6f} ({vision_n} params)" if vision_grad is not None else "Vision         - no grad")
-                print(f"Connector      - Avg Abs Grad: {connector_grad:.6f} ({conn_n} params)" if connector_grad is not None else "Connector      - no grad")
-                print(f"Actions Expert - Avg Abs Grad: {action_grad:.6f} ({action_n} params)" if action_grad is not None else "Actions Expert - no grad")
+                for label, prefix in [("Vision", "vision_model"), ("Connector", "connector"), ("Action Expert", "action_expert")]:
+                    grad, n = _grad_stats(prefix)
+                    print(f"  {label:14s} - Avg Abs Grad: {grad:.6f} ({n} params)" if grad is not None else f"  {label:14s} - no grad")
                 print("--- End Gradient Analysis ---\n")
 
             trainable_params = [p for p in policy.parameters() if p.requires_grad]
@@ -383,11 +391,7 @@ def train(output_dir, dataset_id="physical-intelligence/libero", resume_from_che
             if step % progress_update_freq == 0:
                 lr = optimizer.param_groups[0]['lr']
                 prog_bar.set_description(f"Epoch {epoch}, Step {step}")
-                prog_bar.set_postfix({
-                    "loss": f"{loss.item():.3f}",
-                    "lr": f"{lr:.2e}",
-                    "grad_norm": f"{grad_norm:.2f}",
-                })
+                prog_bar.set_postfix({"loss": f"{loss.item():.3f}", "lr": f"{lr:.2e}", "grad_norm": f"{grad_norm:.2f}"})
 
             if step > 0 and step % checkpoint_freq == 0:
                 checkpoint_dir = output_directory / f"checkpoint-{step}"
@@ -431,5 +435,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--dataset_id", type=str, default="physical-intelligence/libero")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument("--train_ratio", type=float, default=0.9,
+                        help="Fraction of episodes per task used for training (standard LIBERO = 0.9)")
     args = parser.parse_args()
     train(**vars(args))
