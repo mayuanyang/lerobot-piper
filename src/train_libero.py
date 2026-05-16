@@ -110,7 +110,7 @@ def get_libero_train_episodes(hf_dataset, train_ratio=0.9):
     return train_episodes
 
 
-def train(output_dir, dataset_id="physical-intelligence/libero", resume_from_checkpoint=None, train_ratio=0.9):
+def train(output_dir, dataset_id="lerobot/libero", resume_from_checkpoint=None, train_ratio=0.9):
     """Train the TransformerFlowMatching model on the LIBERO benchmark dataset.
 
     Uses the standard LIBERO train/test split: for each task, the first `train_ratio`
@@ -260,7 +260,7 @@ def train(output_dir, dataset_id="physical-intelligence/libero", resume_from_che
     if isinstance(preprocessor, torch.nn.Module):
         preprocessor.to(device)
 
-    fps = dataset_metadata.fps if hasattr(dataset_metadata, "fps") and dataset_metadata.fps else 30
+    fps = dataset_metadata.fps if hasattr(dataset_metadata, "fps") and dataset_metadata.fps else 10
     frame_time = 1 / fps
     print(f"Dataset FPS: {fps}")
 
@@ -273,7 +273,7 @@ def train(output_dir, dataset_id="physical-intelligence/libero", resume_from_che
         **{key: [0.0] for key in camera_keys},
     }
 
-    dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, force_cache_sync=True, revision="main", tolerance_s=0.1)
+    dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps, force_cache_sync=True, revision="main", tolerance_s=0.04)
     print(f"Dataset loaded: {len(dataset)} total frames")
 
     # Build task description mapping from tasks.parquet (for datasets that have it).
@@ -376,7 +376,7 @@ def train(output_dir, dataset_id="physical-intelligence/libero", resume_from_che
                             count += param.numel()
                     return (total / count, count) if count > 0 else (None, 0)
 
-                for label, prefix in [("Vision", "vision_model"), ("Connector", "connector"), ("Action Expert", "action_expert")]:
+                for label, prefix in [("Vision", "vision_model"), ("Connector", "connector"), ("State Enc", "state_encoder"), ("Robot CNN", "robot_visual_encoder"), ("Robot Proj", "robot_layer_projs"), ("Action Expert", "action_expert")]:
                     grad, n = _grad_stats(prefix)
                     print(f"  {label:14s} - Avg Abs Grad: {grad:.6f} ({n} params)" if grad is not None else f"  {label:14s} - no grad")
                 print("--- End Gradient Analysis ---\n")
@@ -433,7 +433,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--dataset_id", type=str, default="physical-intelligence/libero")
+    parser.add_argument("--dataset_id", type=str, default="lerobot/libero")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--train_ratio", type=float, default=0.9,
                         help="Fraction of episodes per task used for training (standard LIBERO = 0.9)")
