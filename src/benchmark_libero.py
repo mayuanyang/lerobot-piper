@@ -59,7 +59,14 @@ def _apply_robosuite_patches():
 # ---------------------------------------------------------------------------
 
 def img_to_tensor(img: np.ndarray) -> torch.Tensor:
-    """(H, W, C) uint8 → (C, H, W) float32 in [0, 1]."""
+    """(H, W, C) uint8 → (C, H, W) float32 in [0, 1].
+
+    Applies a 180° flip (`[::-1, ::-1]`) to match the `lerobot/libero` dataset
+    convention. MuJoCo's offscreen renderer returns frames with Y-axis inverted
+    (OpenGL origin), and the dataset's conversion script flipped them for human
+    readability — without this flip, the policy sees every frame upside-down.
+    """
+    img = img[::-1, ::-1]
     return torch.from_numpy(img.copy()).float().div_(255.0).permute(2, 0, 1)
 
 
@@ -70,14 +77,22 @@ def build_state(obs: dict) -> np.ndarray:
       [0:6]  robot0_joint_pos[:6]   — arm joints (rad)
       [6:8]  robot0_gripper_qpos    — gripper fingers (m)
 
-    joint_pos[3] is sign-flipped: the lerobot/libero dataset was built with an
-    older robosuite that defines joint 4's axis in the opposite direction to
-    robosuite 1.4.1. The raw dataset values are always positive (≈3.67 rad at
-    rest), whereas robosuite 1.4.1 reports ≈ −π. Negating restores alignment.
+    Two coordinate-frame corrections relative to robosuite 1.4.1:
+
+    - joint_pos[3] is sign-flipped: the lerobot/libero dataset was built with
+      an older robosuite that defines joint 4's axis in the opposite direction.
+      Dataset values are always positive (≈+2.97 rad at rest); robosuite 1.4.1
+      reports ≈ −π. Negating restores alignment.
+
+    - joint_pos[5] has a 3π/4 origin offset: dataset values are centered around
+      0 (mean ≈ −0.13, range [−1.84, +1.39]), whereas robosuite 1.4.1 reports
+      ≈ +2.23 at rest. Subtracting 3π/4 shifts the physical wrist-flex range
+      [0.52, 3.75] back into the dataset's recorded frame.
     """
     joint_pos = np.array(obs["robot0_joint_pos"], dtype=np.float64)
     gripper   = np.array(obs["robot0_gripper_qpos"], dtype=np.float64)
     joint_pos[3] = -joint_pos[3]
+    joint_pos[5] = joint_pos[5] - 3 * np.pi / 4
     return np.concatenate([joint_pos[:6], gripper[:2]]).astype(np.float32)
 
 
@@ -86,6 +101,61 @@ def obs_to_frame(obs: dict, cam_key_map: dict[str, str]) -> dict:
     for libero_key, policy_key in cam_key_map.items():
         frame[policy_key] = img_to_tensor(obs[libero_key])
     return frame
+
+
+def _sanity_check_state_distribution(
+    benchmark_dict: dict,
+    suite_name: str,
+    image_size: int,
+    state_mean: torch.Tensor,
+    state_std: torch.Tensor,
+    z_threshold: float = 5.0,
+) -> None:
+    """Reset one LIBERO env and verify build_state lands within the training distribution.
+
+    Raises RuntimeError if any state dim has |z-score| > z_threshold. A large
+    z-score on a single dim is the signature of a silent coordinate-frame flip
+    between the dataset's robosuite version and the live one (e.g. the joint_pos[3]
+    flip already handled in build_state). Catching this here prevents a wasted
+    multi-hour run that ends in 0% success.
+    """
+    from libero.libero.envs import OffScreenRenderEnv
+
+    task_suite = benchmark_dict[suite_name]()
+    env = OffScreenRenderEnv(**{
+        "bddl_file_name": task_suite.get_task_bddl_file_path(0),
+        "camera_heights": image_size,
+        "camera_widths":  image_size,
+    })
+    obs = env.reset()
+    env.close()
+
+    state = build_state(obs)
+    state_t = torch.tensor(state, dtype=torch.float32, device=state_mean.device)
+    z = (state_t - state_mean) / state_std
+
+    mean_cpu = state_mean.cpu().numpy()
+    std_cpu  = state_std.cpu().numpy()
+    z_cpu    = z.cpu().numpy()
+
+    print(f"\nState-distribution sanity check (suite={suite_name}, task 0, reset frame):")
+    print("  dim |   raw       |   mean      |   std     |  z-score")
+    print("  ----+-------------+-------------+-----------+---------")
+    for i in range(len(state)):
+        flag = "  <-- OUT OF RANGE" if abs(z_cpu[i]) > z_threshold else ""
+        print(f"  {i:3d} | {state[i]:+11.4f} | {mean_cpu[i]:+11.4f} | {std_cpu[i]:9.4f} | {z_cpu[i]:+7.2f}{flag}")
+
+    max_abs_z = float(abs(z_cpu).max())
+    if max_abs_z > z_threshold:
+        bad_dims = [i for i, zi in enumerate(z_cpu) if abs(zi) > z_threshold]
+        raise RuntimeError(
+            f"State distribution sanity check FAILED: max |z| = {max_abs_z:.2f} > {z_threshold:.1f} "
+            f"on dim(s) {bad_dims}. This usually means a coordinate-frame mismatch between the "
+            f"training dataset and the live robosuite env (e.g. a sign-flipped joint axis like the "
+            f"joint_pos[3] flip in build_state). Fix build_state or investigate before continuing — "
+            f"the policy will not behave correctly otherwise. Pass --skip_sanity_check to bypass."
+        )
+    print(f"\nSanity check passed (max |z| = {max_abs_z:.2f} ≤ {z_threshold:.1f}).")
 
 
 def build_batch(
@@ -275,6 +345,8 @@ def main():
                         help="Optional path to save results as JSON")
     parser.add_argument("--headless",      action="store_true",
                         help="Start pyvirtualdisplay (requires Xvfb)")
+    parser.add_argument("--skip_sanity_check", action="store_true",
+                        help="Skip the state-distribution sanity check at startup")
     args = parser.parse_args()
 
     # ── Virtual display ───────────────────────────────────────────────────────
@@ -367,6 +439,16 @@ def main():
     # ── LIBERO benchmark ──────────────────────────────────────────────────────
     from libero.libero import benchmark as libero_benchmark
     benchmark_dict = libero_benchmark.get_benchmark_dict()
+
+    # ── Sanity check: state lands inside the training distribution ────────────
+    if not args.skip_sanity_check:
+        _sanity_check_state_distribution(
+            benchmark_dict=benchmark_dict,
+            suite_name=args.suites[0],
+            image_size=args.image_size,
+            state_mean=state_mean,
+            state_std=state_std,
+        )
 
     all_results: dict = {}
     for suite in args.suites:
