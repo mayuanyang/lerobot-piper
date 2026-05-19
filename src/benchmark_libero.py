@@ -465,8 +465,14 @@ def _replay_dataset_episode(
     print(f"Task description: {task_desc!r}")
 
     matched = None
+    skipped: list = []
     for suite_name, suite_cls in benchmark_dict.items():
-        suite = suite_cls()
+        try:
+            suite = suite_cls()
+        except Exception as e:
+            # e.g. `libero_100` is a meta-suite that fails to instantiate
+            skipped.append((suite_name, type(e).__name__))
+            continue
         for tid in range(suite.get_num_tasks()):
             task = suite.get_task(tid)
             if task.language.strip() == task_desc.strip():
@@ -474,6 +480,9 @@ def _replay_dataset_episode(
                 break
         if matched:
             break
+
+    if skipped:
+        print(f"  (skipped un-instantiable suites: {skipped})")
 
     if matched is None:
         raise RuntimeError(
