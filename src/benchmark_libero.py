@@ -199,8 +199,18 @@ def run_episode(
     n_action_steps: int,
     max_steps: int,
     device: torch.device,
+    step_logger=None,
 ) -> bool:
-    """Run one rollout. Returns True on task success."""
+    """Run one rollout. Returns True on task success.
+
+    If `step_logger` is provided, it is called once per environment step *before*
+    `env.step(action)` with the signature:
+
+        step_logger(step_idx, raw_obs, state, action_norm, action_unnorm)
+
+    where state/action_* are 1-D numpy arrays. Used by `--actions_log` and
+    `--inspect_only` to record what the policy actually produced.
+    """
     obs = env.reset()
 
     # Set seed for reproducible initial conditions within the episode
@@ -213,7 +223,7 @@ def run_episode(
     obs_buffer   = deque([first_frame] * n_obs_steps, maxlen=n_obs_steps)
     action_queue: deque = deque()
 
-    for _ in range(max_steps):
+    for step_idx in range(max_steps):
         if not action_queue:
             batch = build_batch(
                 obs_buffer, task_description,
@@ -222,17 +232,118 @@ def run_episode(
             with torch.no_grad():
                 actions_norm = policy.predict_action_chunk(batch)  # (1, horizon, action_dim)
 
-            actions = (actions_norm * action_std + action_mean)[0, :n_action_steps].cpu().numpy()
-            action_queue.extend(actions)
+            a_norm_np   = actions_norm[0, :n_action_steps].cpu().numpy()
+            a_unnorm_np = (actions_norm * action_std + action_mean)[0, :n_action_steps].cpu().numpy()
+            for a_n, a_u in zip(a_norm_np, a_unnorm_np):
+                action_queue.append((a_n, a_u))
 
-        action = action_queue.popleft()
-        obs, _reward, done, _info = env.step(action)
+        a_norm, a_unnorm = action_queue.popleft()
+        if step_logger is not None:
+            step_logger(step_idx, obs, obs_buffer[-1]["state"], a_norm, a_unnorm)
+        obs, _reward, done, _info = env.step(a_unnorm)
         obs_buffer.append(obs_to_frame(obs, cam_key_map))
 
         if done:
             return True
 
     return False
+
+
+# ---------------------------------------------------------------------------
+# Deep-inspect: one rollout, full per-step dump
+# ---------------------------------------------------------------------------
+
+def _run_inspect_episode(
+    benchmark_dict: dict,
+    suite_name: str,
+    task_id: int,
+    seed: int,
+    image_size: int,
+    policy,
+    state_mean: torch.Tensor,
+    state_std: torch.Tensor,
+    action_mean: torch.Tensor,
+    action_std: torch.Tensor,
+    cam_key_map: dict[str, str],
+    n_obs_steps: int,
+    n_action_steps: int,
+    max_steps: int,
+    device: torch.device,
+    output_path: Path,
+) -> None:
+    """Run a single rollout and dump everything we can record per step.
+
+    Captures both camera frames (uint8 HWC, exactly as the env emits them), the
+    8-dim observation state, and the normalized + unnormalized action vectors.
+    Frames are stored raw (no policy-side flip) so the saved file matches what
+    the simulator produced.
+    """
+    from libero.libero.envs import OffScreenRenderEnv
+
+    if suite_name not in benchmark_dict:
+        raise ValueError(f"Unknown suite '{suite_name}'.")
+
+    task_suite = benchmark_dict[suite_name]()
+    task      = task_suite.get_task(task_id)
+    bddl_file = task_suite.get_task_bddl_file_path(task_id)
+    task_desc = task.language
+
+    env = OffScreenRenderEnv(**{
+        "bddl_file_name": bddl_file,
+        "camera_heights": image_size,
+        "camera_widths":  image_size,
+    })
+
+    records: list = []
+
+    def step_logger(step_idx, raw_obs, state, a_norm, a_unnorm):
+        records.append({
+            "step":          step_idx,
+            "state":         np.asarray(state,    dtype=np.float32),
+            "action_norm":   np.asarray(a_norm,   dtype=np.float32),
+            "action_unnorm": np.asarray(a_unnorm, dtype=np.float32),
+            "agentview":     np.asarray(raw_obs["agentview_image"],          dtype=np.uint8),
+            "wrist":         np.asarray(raw_obs["robot0_eye_in_hand_image"], dtype=np.uint8),
+        })
+
+    print(f"\nInspect-only: suite={suite_name} task={task_id} ({task.name}) seed={seed}")
+    success = run_episode(
+        env=env,
+        task_description=task_desc,
+        seed=seed,
+        policy=policy,
+        state_mean=state_mean,
+        state_std=state_std,
+        action_mean=action_mean,
+        action_std=action_std,
+        cam_key_map=cam_key_map,
+        n_obs_steps=n_obs_steps,
+        n_action_steps=n_action_steps,
+        max_steps=max_steps,
+        device=device,
+        step_logger=step_logger,
+    )
+    env.close()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        output_path,
+        suite=np.array(suite_name),
+        task_name=np.array(task.name),
+        task_description=np.array(task_desc),
+        success=np.array(success),
+        seed=np.array(seed),
+        steps=np.array([r["step"] for r in records], dtype=np.int32),
+        states=np.stack([r["state"] for r in records]),
+        actions_norm=np.stack([r["action_norm"] for r in records]),
+        actions_unnorm=np.stack([r["action_unnorm"] for r in records]),
+        agentview=np.stack([r["agentview"] for r in records]),
+        wrist=np.stack([r["wrist"] for r in records]),
+    )
+    print(
+        f"Inspect episode → {output_path}  "
+        f"(success={success}, steps={len(records)})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +365,7 @@ def evaluate_suite(
     n_obs_steps: int,
     n_action_steps: int,
     device: torch.device,
+    actions_log: list | None = None,
 ) -> dict:
     from libero.libero.envs import OffScreenRenderEnv
 
@@ -284,6 +396,22 @@ def evaluate_suite(
 
         successes = 0
         for rollout_idx in range(num_rollouts):
+            step_logger = None
+            if actions_log is not None:
+                def step_logger(
+                    step_idx, _raw_obs, state, a_norm, a_unnorm,
+                    _suite=suite_name, _task=task_id, _roll=rollout_idx,
+                ):
+                    actions_log.append({
+                        "suite":         _suite,
+                        "task_id":       _task,
+                        "rollout":       _roll,
+                        "step":          step_idx,
+                        "state":         np.asarray(state,    dtype=np.float32),
+                        "action_norm":   np.asarray(a_norm,   dtype=np.float32),
+                        "action_unnorm": np.asarray(a_unnorm, dtype=np.float32),
+                    })
+
             success    = run_episode(
                 env=env,
                 task_description=task_desc,
@@ -298,6 +426,7 @@ def evaluate_suite(
                 n_action_steps=n_action_steps,
                 max_steps=max_steps,
                 device=device,
+                step_logger=step_logger,
             )
             successes += int(success)
             running_rate = successes / (rollout_idx + 1) * 100
@@ -347,6 +476,20 @@ def main():
                         help="Start pyvirtualdisplay (requires Xvfb)")
     parser.add_argument("--skip_sanity_check", action="store_true",
                         help="Skip the state-distribution sanity check at startup")
+    parser.add_argument("--actions_log", default=None,
+                        help="If set, every executed action across the run is appended to this "
+                             ".npz file (keys: suites, task_ids, rollouts, steps, states, "
+                             "actions_norm, actions_unnorm). Cheap; safe for full benchmarks.")
+    parser.add_argument("--inspect_only", action="store_true",
+                        help="Skip the full benchmark; run ONE rollout on the first suite/task "
+                             "and dump per-step state, action (norm + unnorm), and both camera "
+                             "frames to --inspect_output. Useful for diagnosing a single failure.")
+    parser.add_argument("--inspect_output", default="inspect_episode.npz",
+                        help="Output .npz path used by --inspect_only.")
+    parser.add_argument("--inspect_task_id", type=int, default=0,
+                        help="Task index within the first suite to use for --inspect_only.")
+    parser.add_argument("--inspect_seed", type=int, default=0,
+                        help="Rollout seed for --inspect_only.")
     args = parser.parse_args()
 
     # ── Virtual display ───────────────────────────────────────────────────────
@@ -450,6 +593,30 @@ def main():
             state_std=state_std,
         )
 
+    # ── Inspect-only mode: one rollout, full per-step dump, then exit ─────────
+    if args.inspect_only:
+        _run_inspect_episode(
+            benchmark_dict=benchmark_dict,
+            suite_name=args.suites[0],
+            task_id=args.inspect_task_id,
+            seed=args.inspect_seed,
+            image_size=args.image_size,
+            policy=policy,
+            state_mean=state_mean,
+            state_std=state_std,
+            action_mean=action_mean,
+            action_std=action_std,
+            cam_key_map=cam_key_map,
+            n_obs_steps=n_obs_steps,
+            n_action_steps=args.n_action_steps,
+            max_steps=args.max_steps,
+            device=device,
+            output_path=Path(args.inspect_output),
+        )
+        return
+
+    actions_log: list | None = [] if args.actions_log else None
+
     all_results: dict = {}
     for suite in args.suites:
         try:
@@ -468,6 +635,7 @@ def main():
                 n_obs_steps=n_obs_steps,
                 n_action_steps=args.n_action_steps,
                 device=device,
+                actions_log=actions_log,
             )
         except Exception as e:
             print(f"\nSkipped {suite}: {e}")
@@ -508,6 +676,21 @@ def main():
         with open(out, "w") as f:
             json.dump(all_results, f, indent=2)
         print(f"\nResults saved → {args.output_json}")
+
+    if args.actions_log and actions_log is not None and len(actions_log) > 0:
+        out = Path(args.actions_log)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            out,
+            suites=np.array([r["suite"]   for r in actions_log]),
+            task_ids=np.array([r["task_id"] for r in actions_log], dtype=np.int32),
+            rollouts=np.array([r["rollout"] for r in actions_log], dtype=np.int32),
+            steps=np.array([r["step"]    for r in actions_log], dtype=np.int32),
+            states=np.stack([r["state"]         for r in actions_log]),
+            actions_norm=np.stack([r["action_norm"]   for r in actions_log]),
+            actions_unnorm=np.stack([r["action_unnorm"] for r in actions_log]),
+        )
+        print(f"Actions log saved → {args.actions_log}  ({len(actions_log)} steps)")
 
 
 if __name__ == "__main__":
