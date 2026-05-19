@@ -444,24 +444,47 @@ def _replay_dataset_episode(
 
     actions:    list = []
     rec_states: list = []
-    task_idx = None
+    task_idx  = None
+    task_desc = None
     for i in range(from_idx, to_idx):
         s = ds[i]
         a = s["action"]; st = s["observation.state"]
         actions.append(a.numpy()    if hasattr(a,  "numpy") else np.asarray(a))
         rec_states.append(st.numpy() if hasattr(st, "numpy") else np.asarray(st))
-        if task_idx is None:
+        if task_idx is None and "task_index" in s:
             task_idx = int(s["task_index"])
+        if task_desc is None:
+            # lerobot 0.4.x samples typically carry the description string under "task"
+            for key in ("task", "language_instruction", "task_description", "language"):
+                if key in s and isinstance(s[key], str) and s[key]:
+                    task_desc = s[key]
+                    break
     actions    = np.stack(actions).astype(np.float32)
     rec_states = np.stack(rec_states).astype(np.float32)
 
-    task_entry = _meta_row(ds.meta.tasks, task_idx)
-    task_desc  = (
-        task_entry.get("task")
-        or task_entry.get("description")
-        or task_entry.get("language_instruction")
-        or str(task_entry)
-    )
+    # Fall back to scanning meta.tasks if the sample didn't include the description
+    if task_desc is None and task_idx is not None:
+        try:
+            task_entry = _meta_row(ds.meta.tasks, task_idx)
+        except Exception:
+            task_entry = {}
+        for key in ("task", "description", "language_instruction", "language", "instruction"):
+            v = task_entry.get(key)
+            if isinstance(v, str) and v:
+                task_desc = v
+                break
+        if task_desc is None:
+            for v in task_entry.values():
+                if isinstance(v, str) and v:
+                    task_desc = v
+                    break
+
+    if not isinstance(task_desc, str) or not task_desc:
+        raise RuntimeError(
+            f"Could not resolve task description for episode {episode_index} "
+            f"(task_index={task_idx}). Sample keys seen: "
+            f"{list(ds[from_idx].keys()) if from_idx < to_idx else 'none'}"
+        )
     print(f"Task description: {task_desc!r}")
 
     matched = None
