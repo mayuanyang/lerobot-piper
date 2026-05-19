@@ -352,6 +352,128 @@ def _run_inspect_episode(
 
 
 # ---------------------------------------------------------------------------
+# Dataset-replay: step recorded teleop actions through the live env (no policy)
+# ---------------------------------------------------------------------------
+
+def _replay_dataset_episode(
+    benchmark_dict: dict,
+    dataset_id: str,
+    episode_index: int,
+    image_size: int,
+    output_path: Path,
+) -> None:
+    """Replay one recorded episode through the live env, bypassing the policy.
+
+    Isolates env / action-space / coordinate-frame mismatches from policy bugs:
+    if a known-good teleop trajectory fails to reproduce the recorded states
+    here, the issue is the env, not the model. The dump includes both the
+    dataset's `recorded_states` and the live env's `live_states` at each step
+    so divergence is plottable.
+    """
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from libero.libero.envs import OffScreenRenderEnv
+
+    print(f"\nLoading dataset {dataset_id} for replay …")
+    ds = LeRobotDataset(dataset_id, revision="main")
+
+    from_idx = int(ds.episode_data_index["from"][episode_index])
+    to_idx   = int(ds.episode_data_index["to"][episode_index])
+    n_frames = to_idx - from_idx
+    print(f"Episode {episode_index}: frames [{from_idx}, {to_idx}), length={n_frames}")
+
+    actions:    list = []
+    rec_states: list = []
+    task_idx = None
+    for i in range(from_idx, to_idx):
+        s = ds[i]
+        a = s["action"]; st = s["observation.state"]
+        actions.append(a.numpy()    if hasattr(a,  "numpy") else np.asarray(a))
+        rec_states.append(st.numpy() if hasattr(st, "numpy") else np.asarray(st))
+        if task_idx is None:
+            task_idx = int(s["task_index"])
+    actions    = np.stack(actions).astype(np.float32)
+    rec_states = np.stack(rec_states).astype(np.float32)
+
+    task_entry = ds.meta.tasks[task_idx]
+    if isinstance(task_entry, dict):
+        task_desc = task_entry.get("task") or task_entry.get("description") or str(task_entry)
+    else:
+        task_desc = str(task_entry)
+    print(f"Task description: {task_desc!r}")
+
+    matched = None
+    for suite_name, suite_cls in benchmark_dict.items():
+        suite = suite_cls()
+        for tid in range(suite.get_num_tasks()):
+            task = suite.get_task(tid)
+            if task.language.strip() == task_desc.strip():
+                matched = (suite_name, tid, suite, task)
+                break
+        if matched:
+            break
+
+    if matched is None:
+        raise RuntimeError(
+            f"Could not find suite/task matching description: {task_desc!r}. "
+            f"Available suites: {list(benchmark_dict.keys())}"
+        )
+
+    suite_name, tid, task_suite, task = matched
+    print(f"Matched: suite={suite_name} task_id={tid} ({task.name})")
+
+    env = OffScreenRenderEnv(**{
+        "bddl_file_name": task_suite.get_task_bddl_file_path(tid),
+        "camera_heights": image_size,
+        "camera_widths":  image_size,
+    })
+    obs = env.reset()
+
+    live_states:      list = []
+    agentview_frames: list = []
+    wrist_frames:     list = []
+    success_at = None
+
+    for step_idx in range(len(actions)):
+        live_states.append(build_state(obs))
+        agentview_frames.append(np.asarray(obs["agentview_image"],          dtype=np.uint8)[::-1, ::-1].copy())
+        wrist_frames.append(    np.asarray(obs["robot0_eye_in_hand_image"], dtype=np.uint8)[::-1, ::-1].copy())
+
+        obs, _r, done, _info = env.step(actions[step_idx])
+        if done:
+            success_at = step_idx + 1
+            break
+
+    env.close()
+
+    live_states_np  = np.stack(live_states)
+    agentview_np    = np.stack(agentview_frames)
+    wrist_np        = np.stack(wrist_frames)
+    actions_used    = actions[:len(live_states_np)]
+    rec_states_used = rec_states[:len(live_states_np)]
+
+    success = success_at is not None
+    print(f"Replay finished: success={success}, env steps={len(live_states_np)}")
+    if success:
+        print(f"  succeeded at step {success_at}/{len(actions)}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        output_path,
+        suite=np.array(suite_name),
+        task_name=np.array(task.name),
+        task_description=np.array(task_desc),
+        episode_index=np.array(episode_index),
+        success=np.array(success),
+        actions=actions_used,
+        recorded_states=rec_states_used,
+        live_states=live_states_np,
+        agentview=agentview_np,
+        wrist=wrist_np,
+    )
+    print(f"Replay → {output_path}")
+
+
+# ---------------------------------------------------------------------------
 # Suite evaluation
 # ---------------------------------------------------------------------------
 
@@ -495,6 +617,13 @@ def main():
                         help="Task index within the first suite to use for --inspect_only.")
     parser.add_argument("--inspect_seed", type=int, default=0,
                         help="Rollout seed for --inspect_only.")
+    parser.add_argument("--replay_episode", type=int, default=None,
+                        help="Replay this episode's recorded teleop actions through the live "
+                             "env (bypassing the policy entirely). Use to isolate env/coord-"
+                             "frame/action-space mismatches: if the recorded actions don't "
+                             "reproduce the recorded states, the env is wrong — not the policy.")
+    parser.add_argument("--replay_output", default="replay_episode.npz",
+                        help="Output .npz path used by --replay_episode.")
     args = parser.parse_args()
 
     # ── Virtual display ───────────────────────────────────────────────────────
@@ -518,6 +647,18 @@ def main():
 
     # ── Robosuite patches ─────────────────────────────────────────────────────
     _apply_robosuite_patches()
+
+    # ── Replay mode: skip the policy entirely and run recorded actions ───────
+    if args.replay_episode is not None:
+        from libero.libero import benchmark as libero_benchmark
+        _replay_dataset_episode(
+            benchmark_dict=libero_benchmark.get_benchmark_dict(),
+            dataset_id=args.dataset_id,
+            episode_index=args.replay_episode,
+            image_size=args.image_size,
+            output_path=Path(args.replay_output),
+        )
+        return
 
     # ── Load policy ───────────────────────────────────────────────────────────
     import huggingface_hub
