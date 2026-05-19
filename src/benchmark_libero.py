@@ -355,6 +355,30 @@ def _run_inspect_episode(
 # Dataset-replay: step recorded teleop actions through the live env (no policy)
 # ---------------------------------------------------------------------------
 
+def _meta_row(meta_obj, index: int) -> dict:
+    """Fetch row `index` from a lerobot meta container as a plain dict.
+
+    lerobot 0.4.x stores `meta.episodes` and `meta.tasks` as pandas DataFrames
+    (indexed by episode_index / task_index). Earlier versions used dicts or
+    lists of dicts. This helper papers over the three shapes.
+    """
+    # pandas DataFrame
+    if hasattr(meta_obj, "loc") and hasattr(meta_obj, "iloc"):
+        try:
+            row = meta_obj.loc[index]
+        except (KeyError, TypeError):
+            row = meta_obj.iloc[index]
+        return row.to_dict() if hasattr(row, "to_dict") else dict(row)
+    # dict (int- or str-keyed)
+    if isinstance(meta_obj, dict):
+        entry = meta_obj.get(index, meta_obj.get(str(index)))
+        if entry is None:
+            raise KeyError(index)
+        return dict(entry) if not isinstance(entry, dict) else entry
+    # list / sequence
+    return dict(meta_obj[index])
+
+
 def _episode_frame_range(ds, episode_index: int) -> tuple[int, int]:
     """Return [from, to) global frame indices for an episode.
 
@@ -364,20 +388,11 @@ def _episode_frame_range(ds, episode_index: int) -> tuple[int, int]:
     """
     try:
         episodes_meta = ds.meta.episodes
-        def _ep_length(i: int) -> int:
-            if isinstance(episodes_meta, dict):
-                e = episodes_meta.get(i, episodes_meta.get(str(i)))
-                if e is None:
-                    raise KeyError(i)
-            else:
-                e = episodes_meta[i]
-            return int(e["length"])
-
         n_eps = len(episodes_meta)
         if not 0 <= episode_index < n_eps:
             raise IndexError(f"episode_index={episode_index} not in [0, {n_eps})")
-        from_idx = sum(_ep_length(i) for i in range(episode_index))
-        to_idx   = from_idx + _ep_length(episode_index)
+        from_idx = sum(int(_meta_row(episodes_meta, i)["length"]) for i in range(episode_index))
+        to_idx   = from_idx + int(_meta_row(episodes_meta, episode_index)["length"])
         return from_idx, to_idx
     except (AttributeError, KeyError, IndexError, TypeError) as e:
         print(f"  meta.episodes lookup failed ({e}); scanning hf_dataset…")
@@ -440,11 +455,13 @@ def _replay_dataset_episode(
     actions    = np.stack(actions).astype(np.float32)
     rec_states = np.stack(rec_states).astype(np.float32)
 
-    task_entry = ds.meta.tasks[task_idx]
-    if isinstance(task_entry, dict):
-        task_desc = task_entry.get("task") or task_entry.get("description") or str(task_entry)
-    else:
-        task_desc = str(task_entry)
+    task_entry = _meta_row(ds.meta.tasks, task_idx)
+    task_desc  = (
+        task_entry.get("task")
+        or task_entry.get("description")
+        or task_entry.get("language_instruction")
+        or str(task_entry)
+    )
     print(f"Task description: {task_desc!r}")
 
     matched = None
