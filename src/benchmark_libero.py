@@ -273,10 +273,11 @@ def _run_inspect_episode(
 ) -> None:
     """Run a single rollout and dump everything we can record per step.
 
-    Captures both camera frames (uint8 HWC, exactly as the env emits them), the
-    8-dim observation state, and the normalized + unnormalized action vectors.
-    Frames are stored raw (no policy-side flip) so the saved file matches what
-    the simulator produced.
+    Captures both camera frames (uint8 HWC), the 8-dim observation state, and
+    the normalized + unnormalized action vectors. Frames are saved with the
+    same 180° flip `img_to_tensor` applies before feeding the policy — i.e. in
+    the lerobot/libero dataset's right-side-up convention. This means the saved
+    arrays match *what the policy saw*, not raw MuJoCo OpenGL output.
     """
     from libero.libero.envs import OffScreenRenderEnv
 
@@ -297,13 +298,17 @@ def _run_inspect_episode(
     records: list = []
 
     def step_logger(step_idx, raw_obs, state, a_norm, a_unnorm):
+        # Match the 180° flip img_to_tensor applies before feeding the policy,
+        # so the saved frames are in the same orientation the policy reasons over.
+        agent = np.asarray(raw_obs["agentview_image"],          dtype=np.uint8)[::-1, ::-1].copy()
+        wrist = np.asarray(raw_obs["robot0_eye_in_hand_image"], dtype=np.uint8)[::-1, ::-1].copy()
         records.append({
             "step":          step_idx,
             "state":         np.asarray(state,    dtype=np.float32),
             "action_norm":   np.asarray(a_norm,   dtype=np.float32),
             "action_unnorm": np.asarray(a_unnorm, dtype=np.float32),
-            "agentview":     np.asarray(raw_obs["agentview_image"],          dtype=np.uint8),
-            "wrist":         np.asarray(raw_obs["robot0_eye_in_hand_image"], dtype=np.uint8),
+            "agentview":     agent,
+            "wrist":         wrist,
         })
 
     print(f"\nInspect-only: suite={suite_name} task={task_id} ({task.name}) seed={seed}")
