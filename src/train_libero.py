@@ -72,6 +72,28 @@ def apply_image_augmentations(batch, camera_keys, transform):
     return batch
 
 
+def _print_lora_status(policy, cfg) -> None:
+    """Print a clearly delimited banner confirming LoRA is wired in.
+
+    Reports the live count of trainable LoRA params from policy.named_parameters
+    (rather than what the config asked for) so a misconfiguration shows up as 0.
+    """
+    lora_params = sum(
+        p.numel()
+        for n, p in policy.named_parameters()
+        if p.requires_grad and "lora_" in n
+    )
+    print("=" * 60)
+    print(
+        f"[LoRA] ENABLED  rank={cfg.lora_rank}  alpha={cfg.lora_alpha}  "
+        f"targets={cfg.lora_target_modules}  vision_layers={cfg.vision_lora_num_layers}"
+    )
+    print(f"[LoRA] Trainable LoRA params: {lora_params:,}")
+    if lora_params == 0:
+        print("[LoRA] WARNING: enable_lora() ran but zero trainable LoRA params detected.")
+    print("=" * 60)
+
+
 def get_libero_train_episodes(hf_dataset, train_ratio=0.9):
     """
     Implement the standard LIBERO benchmark train split:
@@ -175,6 +197,10 @@ def train(output_dir, dataset_id="lerobot/libero", resume_from_checkpoint=None, 
         cameras_for_vision_state_concat=camera_keys,
         action_dim_weights=[1.0] * action_dim,  # no locked joints in LIBERO
         pos_decay_lambda=0.0,
+        # LoRA disabled: vision LoRA with gradient checkpointing pushed us past
+        # the Colab GPU memory budget at batch_size=256. Set to 8 to re-enable
+        # once we either drop batch_size or move to a beefier GPU.
+        vision_lora_num_layers=0,
     )
 
     if resume_from_checkpoint is not None:
@@ -210,6 +236,37 @@ def train(output_dir, dataset_id="lerobot/libero", resume_from_checkpoint=None, 
             step = int(local_ckpt_path.name.split("-")[1])
 
         ckpt_state = load_safetensors(model_file, device=str(device))
+
+        # Migration: an older `context_proj` was a single Linear; it's now a
+        # Sequential(Linear, GELU, Linear). Rename the old keys so the first
+        # Linear inherits the trained mapping. The second Linear stays at its
+        # fresh init — close enough to identity in expectation that the model's
+        # behavior at resume step 0 is similar to before, with a small ramp.
+        remapped = {}
+        n_migrated = 0
+        for k, v in ckpt_state.items():
+            if k.endswith("context_proj.weight"):
+                remapped[k.replace("context_proj.weight", "context_proj.0.weight")] = v
+                n_migrated += 1
+            elif k.endswith("context_proj.bias"):
+                remapped[k.replace("context_proj.bias", "context_proj.0.bias")] = v
+                n_migrated += 1
+            else:
+                remapped[k] = v
+        if n_migrated > 0:
+            print(f"Migrated {n_migrated} context_proj keys to Sequential MLP layout")
+        ckpt_state = remapped
+
+        # Wrap vision_model with LoRA *before* loading the state dict only if the
+        # checkpoint was itself trained with LoRA — otherwise the PEFT key prefix
+        # ("base_model.model.…base_layer.") won't match the un-wrapped keys saved
+        # by a pre-LoRA run, and load_state_dict would skip every vision weight.
+        has_lora_in_ckpt = any("lora_" in k for k in ckpt_state)
+        if has_lora_in_ckpt and cfg.vision_lora_num_layers > 0:
+            print(f"Checkpoint has LoRA weights — enabling LoRA (rank={cfg.lora_rank}) before load")
+            policy.model.enable_lora(freeze_connector=True)
+            _print_lora_status(policy, cfg)
+
         policy.train()
         policy.to(device)
         cur_state = policy.state_dict()
@@ -222,6 +279,16 @@ def train(output_dir, dataset_id="lerobot/libero", resume_from_checkpoint=None, 
             print(f"Missing {len(missing)} keys (will use init values): {missing[:5]}")
         policy.load_state_dict(filtered, strict=False)
         print(f"Loaded {len(filtered)}/{len(cur_state)} model keys")
+
+        # If the checkpoint pre-dates LoRA but we want LoRA from now on, add fresh
+        # adapters after loading the base weights. PEFT's B matrix is zero-init so
+        # the first forward pass behaves identically to the pre-LoRA checkpoint.
+        if not has_lora_in_ckpt and cfg.vision_lora_num_layers > 0:
+            print(f"Pre-LoRA checkpoint — adding fresh LoRA (rank={cfg.lora_rank}) "
+                  f"to last {cfg.vision_lora_num_layers} vision layers")
+            policy.model.enable_lora(freeze_connector=True)
+            policy.to(device)
+            _print_lora_status(policy, cfg)
 
         preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
 
@@ -249,6 +316,11 @@ def train(output_dir, dataset_id="lerobot/libero", resume_from_checkpoint=None, 
         policy = TransformerFlowMatchingPolicy(cfg)
         policy.train()
         policy.to(device)
+        if cfg.vision_lora_num_layers > 0:
+            print(f"Enabling LoRA (rank={cfg.lora_rank}) on last {cfg.vision_lora_num_layers} vision layers")
+            policy.model.enable_lora(freeze_connector=True)
+            policy.to(device)
+            _print_lora_status(policy, cfg)
         preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=dataset_metadata.stats)
         step, epoch = 0, 0
 
@@ -313,7 +385,7 @@ def train(output_dir, dataset_id="lerobot/libero", resume_from_checkpoint=None, 
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=8,
-        batch_size=128,
+        batch_size=256,
         sampler=sampler,
         pin_memory=device.type != "cpu",
         drop_last=True,
@@ -376,7 +448,7 @@ def train(output_dir, dataset_id="lerobot/libero", resume_from_checkpoint=None, 
                             count += param.numel()
                     return (total / count, count) if count > 0 else (None, 0)
 
-                for label, prefix in [("Vision", "vision_model"), ("Connector", "connector"), ("State Enc", "state_encoder"), ("Robot CNN", "robot_visual_encoder"), ("Robot Proj", "robot_layer_projs"), ("Action Expert", "action_expert")]:
+                for label, prefix in [("Vision", "vision_model"), ("Vision LoRA", "lora_"), ("Connector", "connector"), ("State Enc", "state_encoder"), ("Robot CNN", "robot_visual_encoder"), ("Robot Proj", "robot_layer_projs"), ("Action Expert", "action_expert")]:
                     grad, n = _grad_stats(prefix)
                     print(f"  {label:14s} - Avg Abs Grad: {grad:.6f} ({n} params)" if grad is not None else f"  {label:14s} - no grad")
                 print("--- End Gradient Analysis ---\n")

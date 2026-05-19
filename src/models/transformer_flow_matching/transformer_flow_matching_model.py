@@ -140,9 +140,18 @@ class FlowMatchingTransformer(nn.Module):
         # Trainable components (~26M params total)
         # ------------------------------------------------------------------
 
-        # 1. Shared VLM context projection — each decoder layer uses this to project its
-        #    corresponding VLM layer output from VLM_HIDDEN (960) to d_model (512).
-        self.context_proj = nn.Linear(self.VLM_HIDDEN, config.d_model)
+        # 1. Shared VLM context projection — a 2-layer MLP (Linear → GELU → Linear)
+        #    in place of a single Linear. The extra non-linear hop gives the adapter
+        #    capacity to translate frozen VLM features into action-relevant semantics
+        #    (e.g. disambiguate "on the cookie box" from "next to the cookie box")
+        #    that a pure linear projection can't represent. Net cost ~263K params on
+        #    top of the original ~492K — small relative to the ~67M action expert.
+        #    The trailing LayerNorm keeps activation scale stable across decoder layers.
+        self.context_proj = nn.Sequential(
+            nn.Linear(self.VLM_HIDDEN, config.d_model),
+            nn.GELU(),
+            nn.Linear(config.d_model, config.d_model),
+        )
         self.context_norm = nn.LayerNorm(config.d_model)
 
         # 2. State encoder: (B, T_obs, state_dim) → (B, T_obs, d_model)
@@ -381,9 +390,18 @@ class FlowMatchingTransformer(nn.Module):
         Returns one tensor per VLM text layer (hidden_states[1..num_vlm_layers]).
         Each decoder layer cross-attends to its corresponding VLM layer output,
         giving early decoder layers low-level spatial features and late ones semantics.
+
+        When LoRA is applied to vision_model, gradients MUST flow through both the
+        vision encoder and the text model — the latter because backprop needs to
+        traverse it to reach the vision LoRA adapters even though no text-model
+        params themselves are trainable. Running these blocks under `no_grad()`
+        when LoRA is on is the classic "trainable params but .grad stays None"
+        footgun. Gradient checkpointing (enabled inside `enable_lora`) caps the
+        memory cost.
         """
         device = batch["observation.state"].device
-        with torch.no_grad():
+        grad_ctx = torch.enable_grad if self._lora_applied else torch.no_grad
+        with grad_ctx():
             vis_tokens = self._encode_images(batch, B, T_obs)
             lang_tokens = self._encode_language(batch, B, device)
 
@@ -392,7 +410,7 @@ class FlowMatchingTransformer(nn.Module):
             prefix_parts.append(lang_tokens)
         prefix_embs = torch.cat(prefix_parts, dim=1)  # (B, N, 960)
 
-        with torch.no_grad():
+        with grad_ctx():
             text_out = self.text_model(
                 inputs_embeds=prefix_embs,
                 attention_mask=None,
