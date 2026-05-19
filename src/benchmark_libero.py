@@ -355,6 +355,53 @@ def _run_inspect_episode(
 # Dataset-replay: step recorded teleop actions through the live env (no policy)
 # ---------------------------------------------------------------------------
 
+def _episode_frame_range(ds, episode_index: int) -> tuple[int, int]:
+    """Return [from, to) global frame indices for an episode.
+
+    Tries `ds.meta.episodes` (lerobot 0.4.x), falling back to a scan of the
+    underlying HF dataset's `episode_index` column. The older
+    `ds.episode_data_index` attribute is gone in 0.4.x.
+    """
+    try:
+        episodes_meta = ds.meta.episodes
+        def _ep_length(i: int) -> int:
+            if isinstance(episodes_meta, dict):
+                e = episodes_meta.get(i, episodes_meta.get(str(i)))
+                if e is None:
+                    raise KeyError(i)
+            else:
+                e = episodes_meta[i]
+            return int(e["length"])
+
+        n_eps = len(episodes_meta)
+        if not 0 <= episode_index < n_eps:
+            raise IndexError(f"episode_index={episode_index} not in [0, {n_eps})")
+        from_idx = sum(_ep_length(i) for i in range(episode_index))
+        to_idx   = from_idx + _ep_length(episode_index)
+        return from_idx, to_idx
+    except (AttributeError, KeyError, IndexError, TypeError) as e:
+        print(f"  meta.episodes lookup failed ({e}); scanning hf_dataset…")
+        hf_ds = getattr(ds, "hf_dataset", None) or getattr(ds, "dataset", None)
+        if hf_ds is None:
+            raise RuntimeError(
+                "Could not find episode boundaries: no `meta.episodes` and no "
+                "`hf_dataset`/`dataset` attribute on the LeRobotDataset."
+            )
+        ep_col = np.asarray(hf_ds["episode_index"])
+        mask = ep_col == episode_index
+        if not mask.any():
+            raise RuntimeError(
+                f"Episode {episode_index} not found in dataset "
+                f"(available: 0..{int(ep_col.max())})."
+            )
+        idxs = np.where(mask)[0]
+        return int(idxs[0]), int(idxs[-1]) + 1
+
+
+# ---------------------------------------------------------------------------
+# Dataset-replay implementation
+# ---------------------------------------------------------------------------
+
 def _replay_dataset_episode(
     benchmark_dict: dict,
     dataset_id: str,
@@ -376,8 +423,7 @@ def _replay_dataset_episode(
     print(f"\nLoading dataset {dataset_id} for replay …")
     ds = LeRobotDataset(dataset_id, revision="main")
 
-    from_idx = int(ds.episode_data_index["from"][episode_index])
-    to_idx   = int(ds.episode_data_index["to"][episode_index])
+    from_idx, to_idx = _episode_frame_range(ds, episode_index)
     n_frames = to_idx - from_idx
     print(f"Episode {episode_index}: frames [{from_idx}, {to_idx}), length={n_frames}")
 
