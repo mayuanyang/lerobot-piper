@@ -110,7 +110,7 @@ def get_libero_train_episodes(hf_dataset, train_ratio=0.9):
     return train_episodes
 
 
-def train(output_dir, dataset_id="lerobot/libero", resume_from_checkpoint=None, train_ratio=0.9):
+def train(output_dir, dataset_id="lerobot/libero", resume_from_checkpoint=None, train_ratio=1.0):
     """Train the TransformerFlowMatching model on the LIBERO benchmark dataset.
 
     Uses the standard LIBERO train/test split: for each task, the first `train_ratio`
