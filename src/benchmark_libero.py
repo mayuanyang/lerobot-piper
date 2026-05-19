@@ -109,6 +109,7 @@ def _sanity_check_state_distribution(
     image_size: int,
     state_mean: torch.Tensor,
     state_std: torch.Tensor,
+    control_freq: int = 10,
     z_threshold: float = 5.0,
 ) -> None:
     """Reset one LIBERO env and verify build_state lands within the training distribution.
@@ -126,6 +127,7 @@ def _sanity_check_state_distribution(
         "bddl_file_name": task_suite.get_task_bddl_file_path(0),
         "camera_heights": image_size,
         "camera_widths":  image_size,
+        "control_freq":   control_freq,
     })
     obs = env.reset()
     env.close()
@@ -270,6 +272,7 @@ def _run_inspect_episode(
     max_steps: int,
     device: torch.device,
     output_path: Path,
+    control_freq: int = 10,
 ) -> None:
     """Run a single rollout and dump everything we can record per step.
 
@@ -293,6 +296,7 @@ def _run_inspect_episode(
         "bddl_file_name": bddl_file,
         "camera_heights": image_size,
         "camera_widths":  image_size,
+        "control_freq":   control_freq,
     })
 
     records: list = []
@@ -423,6 +427,8 @@ def _replay_dataset_episode(
     episode_index: int,
     image_size: int,
     output_path: Path,
+    control_freq: int = 10,
+    action_repeat: int = 1,
 ) -> None:
     """Replay one recorded episode through the live env, bypassing the policy.
 
@@ -520,8 +526,10 @@ def _replay_dataset_episode(
         "bddl_file_name": task_suite.get_task_bddl_file_path(tid),
         "camera_heights": image_size,
         "camera_widths":  image_size,
+        "control_freq":   control_freq,
     })
     obs = env.reset()
+    print(f"Replay: control_freq={control_freq} Hz, action_repeat={action_repeat}")
 
     live_states:      list = []
     agentview_frames: list = []
@@ -533,7 +541,11 @@ def _replay_dataset_episode(
         agentview_frames.append(np.asarray(obs["agentview_image"],          dtype=np.uint8)[::-1, ::-1].copy())
         wrist_frames.append(    np.asarray(obs["robot0_eye_in_hand_image"], dtype=np.uint8)[::-1, ::-1].copy())
 
-        obs, _r, done, _info = env.step(actions[step_idx])
+        done = False
+        for _ in range(action_repeat):
+            obs, _r, done, _info = env.step(actions[step_idx])
+            if done:
+                break
         if done:
             success_at = step_idx + 1
             break
@@ -588,6 +600,7 @@ def evaluate_suite(
     n_action_steps: int,
     device: torch.device,
     actions_log: list | None = None,
+    control_freq: int = 10,
 ) -> dict:
     from libero.libero.envs import OffScreenRenderEnv
 
@@ -614,6 +627,7 @@ def evaluate_suite(
             "bddl_file_name": bddl_file,
             "camera_heights": image_size,
             "camera_widths":  image_size,
+            "control_freq":   control_freq,
         })
 
         successes = 0
@@ -719,6 +733,15 @@ def main():
                              "reproduce the recorded states, the env is wrong — not the policy.")
     parser.add_argument("--replay_output", default="replay_episode.npz",
                         help="Output .npz path used by --replay_episode.")
+    parser.add_argument("--replay_action_repeat", type=int, default=1,
+                        help="Apply each recorded action this many env steps in --replay_episode. "
+                             "Useful as a fallback if --control_freq isn't honored: e.g. setting "
+                             "this to 2 mimics running a 10 Hz dataset against a 20 Hz env.")
+    parser.add_argument("--control_freq", type=int, default=10,
+                        help="Control frequency (Hz) for robosuite envs. Defaults to 10 to match "
+                             "the lerobot/libero dataset's recording rate. Robosuite's default of "
+                             "20 makes the env apply each action for only half the intended sim "
+                             "time, which silently breaks both replay and policy rollouts.")
     args = parser.parse_args()
 
     # ── Virtual display ───────────────────────────────────────────────────────
@@ -752,6 +775,8 @@ def main():
             episode_index=args.replay_episode,
             image_size=args.image_size,
             output_path=Path(args.replay_output),
+            control_freq=args.control_freq,
+            action_repeat=args.replay_action_repeat,
         )
         return
 
@@ -832,6 +857,7 @@ def main():
             image_size=args.image_size,
             state_mean=state_mean,
             state_std=state_std,
+            control_freq=args.control_freq,
         )
 
     # ── Inspect-only mode: one rollout, full per-step dump, then exit ─────────
@@ -853,6 +879,7 @@ def main():
             max_steps=args.max_steps,
             device=device,
             output_path=Path(args.inspect_output),
+            control_freq=args.control_freq,
         )
         return
 
@@ -877,6 +904,7 @@ def main():
                 n_action_steps=args.n_action_steps,
                 device=device,
                 actions_log=actions_log,
+                control_freq=args.control_freq,
             )
         except Exception as e:
             print(f"\nSkipped {suite}: {e}")
