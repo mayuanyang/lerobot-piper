@@ -213,4 +213,6 @@ data/
 input/
 temp/
 
+notes/
+.claude/
 *.pt
