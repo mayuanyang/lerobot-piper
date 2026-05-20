@@ -448,9 +448,25 @@ def train(output_dir, dataset_id="lerobot/libero", resume_from_checkpoint=None, 
                             count += param.numel()
                     return (total / count, count) if count > 0 else (None, 0)
 
-                for label, prefix in [("Vision", "vision_model"), ("Vision LoRA", "lora_"), ("Connector", "connector"), ("State Enc", "state_encoder"), ("Robot CNN", "robot_visual_encoder"), ("Robot Proj", "robot_layer_projs"), ("Action Expert", "action_expert")]:
+                for label, prefix in [("Vision", "vision_model"), ("Vision LoRA", "lora_"), ("Connector", "connector"), ("State Enc", "state_encoder"), ("Robot CNN", "robot_visual_encoder"), ("Robot Proj", "robot_layer_projs"), ("Action Expert", "action_expert"), ("Latent Tokens", "latent_embs")]:
                     grad, n = _grad_stats(prefix)
                     print(f"  {label:14s} - Avg Abs Grad: {grad:.6f} ({n} params)" if grad is not None else f"  {label:14s} - no grad")
+
+                # Extra latent-token diagnostics: per-token grad norm + pairwise
+                # cosine similarity. If similarities stay near 1.0 the K tokens
+                # collapsed to a single direction (degenerate); if grad norm
+                # stays ~0 the latents aren't being driven by the loss.
+                if hasattr(policy.model, "latent_embs"):
+                    lat = policy.model.latent_embs.detach()  # (1, K, d_model)
+                    if lat.shape[1] > 0:
+                        normed = torch.nn.functional.normalize(lat[0], dim=-1)
+                        cos = (normed @ normed.t())                  # (K, K)
+                        off_diag = cos[~torch.eye(cos.shape[0], dtype=torch.bool, device=cos.device)]
+                        grad_param = policy.model.latent_embs.grad
+                        grad_norm_l = grad_param.norm().item() if grad_param is not None else float("nan")
+                        print(f"  Latent stats   - grad_norm: {grad_norm_l:.4e}  "
+                              f"mean |cos|: {off_diag.abs().mean().item():.3f}  "
+                              f"max |cos|: {off_diag.abs().max().item():.3f}")
                 print("--- End Gradient Analysis ---\n")
 
             trainable_params = [p for p in policy.parameters() if p.requires_grad]
