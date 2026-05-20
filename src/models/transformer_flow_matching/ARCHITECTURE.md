@@ -4,7 +4,7 @@
 
 Flow-matching policy for the Piper 7-DOF robot arm.  
 Frozen SmolVLM2-500M encodes images + language into per-layer VLM hidden states.  
-A trainable action expert (8-layer TransformerDecoder) cross-attends to those states and predicts a velocity field over a horizon of actions.
+A trainable action expert (16-layer TransformerDecoder) cross-attends to those states and predicts a velocity field over a horizon of actions.
 
 ---
 
@@ -88,10 +88,12 @@ A trainable action expert (8-layer TransformerDecoder) cross-attends to those st
 
   CONTEXT ASSEMBLY  [trainable projections]
 
-  For each decoder layer i ∈ [0..7]:
+  For each decoder layer i ∈ [0..15]:
 
-    vlm_i = vlm_layers[i × (15/7)]          # sample VLM depth uniformly
-    ctx   = LayerNorm(Linear(vlm_i))         # (B, N, 512)   context_proj+norm
+    vlm_i = vlm_layers[i]                    # 1:1 mapping (n_dec == n_vlm == 16)
+    ctx   = LayerNorm(MLP(vlm_i))            # (B, N, 512)   [MLP shared across layers]
+           # context_proj = Linear(960→512) → GELU → Linear(512→512)
+           # context_norm = LayerNorm(512)
 
     robot_ctx_i = robot_layer_projs[i](robot_tokens)  # (B, 48, 512)
                                                        # per-layer Linear, no bias
@@ -158,7 +160,7 @@ A trainable action expert (8-layer TransformerDecoder) cross-attends to those st
         │
         ▼
   ┌────────────────────────────────────────────────────────────────┐
-  │  8 × TransformerDecoderLayer  (Pre-LN, d=512, nhead=8, ff=2048)│
+  │  16 × TransformerDecoderLayer (Pre-LN, d=512, nhead=8, ff=2048)│
   │                                                                │
   │  Layer i:                                                      │
   │    ┌─────────────────────────────────────────────────────┐     │
@@ -207,17 +209,17 @@ A trainable action expert (8-layer TransformerDecoder) cross-attends to those st
 | SigLIP ViT | `vision_model` (SmolVLM2) | ~300M | ✅ (LoRA opt-in: last 8 layers) |
 | Connector (pixel-shuffle MLP) | `connector` | ~5M | ✅ (opt-in unfreeze) |
 | SmolLM2 text transformer | `text_model` (16 of 32 layers) | ~240M | ✅ always |
-| context_proj + context_norm | `Linear(960→512) + LN` | 0.5M | ❌ |
+| context_proj + context_norm | `Linear(960→512) → GELU → Linear(512→512) + LN` | 0.76M | ❌ |
 | state_encoder | `Linear(7→512) + LN` | 0.3M | ❌ |
 | RobotVisualEncoder (×3 cams) | ResNet-18 stem+L1-3 + proj | ~11M | ❌ |
-| robot_layer_projs (8 layers) | `Linear(512→512)` × 8 | 2M | ❌ |
+| robot_layer_projs (16 layers) | `Linear(512→512)` × 16 (no bias) | 4.2M | ❌ |
 | action_in_proj | `Linear(7→512)` | 4K | ❌ |
 | action_time_mlp | `Linear(1024→512) + Linear(512→512)` | 0.8M | ❌ |
 | PositionalEncoding | sinusoidal buffer | 0 | — |
-| ActionExpert (8 layers) | `TransformerDecoderLayer` × 8 | ~12M | ❌ |
+| ActionExpert (16 layers) | `TransformerDecoderLayer` × 16 | ~67M | ❌ |
 | action_expert_norm | `LayerNorm(512)` | 1K | ❌ |
 | action_out_proj | `Linear(512→7)` (zero-init) | 4K | ❌ |
-| **Total trainable** | | **~26M** | |
+| **Total trainable** | | **~83M** | |
 | **Total frozen** | | **~545M** | |
 
 ---
@@ -237,7 +239,7 @@ horizon H        = 4        → action sequence length
 n_action_steps   = 4        → steps executed per inference call
 d_model          = 512
 nhead            = 8        → 64-dim per head
-num_decoder_layers = 8
+num_decoder_layers = 16     → 1:1 with num_vlm_layers
 dim_feedforward  = 2048
 
 robot_encoder_tokens = 16   → 4×4 spatial grid per camera
@@ -250,15 +252,21 @@ per_layer_context size = 594 (VLM) + 48 (robot) + 1 (state) = 643 tokens
 
 ## Key Design Decisions
 
-**Interleaved VLM-depth cross-attention** — each of the 8 decoder layers
-cross-attends to a different VLM text layer output (uniformly sampled across
-the 16 layers). Early decoder layers see low-level visual features; later ones
-see high-level semantics. Mirrors the SmolVLA architecture.
+**Interleaved VLM-depth cross-attention** — each of the 16 decoder layers
+cross-attends to its corresponding VLM text layer output (1:1 mapping now that
+`num_decoder_layers == num_vlm_layers == 16`). Early decoder layers see
+low-level visual features; later ones see high-level semantics. Mirrors the
+SmolVLA architecture.
 
 **Per-layer robot token projections** (`robot_layer_projs`) — the same
 ResNet base features are projected by a dedicated `Linear` for each decoder
 layer. This eliminates conflicting gradients that would arise from sharing
-identical robot tokens across all 8 cross-attention operations.
+identical robot tokens across all 16 cross-attention operations.
+
+**Shared VLM context projection** (`context_proj`) — by contrast, the VLM
+adapter is a *single* MLP used by all 16 layers. The input differs each
+iteration (different VLM depth), so the shared MLP still produces different
+outputs per layer, while saving ~11M params versus a per-layer variant.
 
 **Zero-init action_out_proj** — initial velocity predictions are ~0, so the
 initial loss ≈ E[||u_t||²] ≈ 2 (not millions), preventing early training

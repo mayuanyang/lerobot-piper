@@ -56,7 +56,7 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     # Transformer architecture
     d_model: int = 512       # 512-dim model; each attention head is 64-dim (standard)
     nhead: int = 8
-    num_decoder_layers: int = 8   # deeper decoder for richer action generation
+    num_decoder_layers: int = 16   # deeper decoder for richer action generation
     dim_feedforward: int = 2048   # standard 4×d_model feedforward width
     
     # Flow matching sampling parameters
