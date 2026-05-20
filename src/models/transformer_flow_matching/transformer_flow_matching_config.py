@@ -58,6 +58,10 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     nhead: int = 8
     num_decoder_layers: int = 16   # deeper decoder for richer action generation
     dim_feedforward: int = 2048   # standard 4×d_model feedforward width
+    # Dropout in the action expert (self-attn, cross-attn, FFN, residuals).
+    # Was 0.0 — adding 0.1 to combat late-training overfit to demo trajectories
+    # (symptom: training loss kept falling but benchmark success regressed).
+    dropout: float = 0.1
     
     # Flow matching sampling parameters
     num_inference_steps: int = 10

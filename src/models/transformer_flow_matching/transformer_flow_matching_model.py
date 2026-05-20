@@ -200,7 +200,7 @@ class FlowMatchingTransformer(nn.Module):
                 nhead=config.nhead,
                 dim_feedforward=config.dim_feedforward,
                 batch_first=True,
-                dropout=0.0,
+                dropout=config.dropout,
                 norm_first=True,
             )
             for _ in range(config.num_decoder_layers)
