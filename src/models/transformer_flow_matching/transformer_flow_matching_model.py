@@ -207,6 +207,17 @@ class FlowMatchingTransformer(nn.Module):
         ])
         self.action_expert_norm = nn.LayerNorm(config.d_model)
 
+        # 6. Latent "thought" tokens — learnable embeddings prepended to the action
+        #    expert input. Self-attend to each other and cross-attend to context;
+        #    cannot see noisy action tokens (causal block in mask). Action tokens
+        #    can then read from these refined latents. Disabled when set to 0.
+        self.num_latent_tokens = config.num_latent_tokens
+        if self.num_latent_tokens > 0:
+            self.latent_embs = nn.Parameter(
+                torch.zeros(1, self.num_latent_tokens, config.d_model)
+            )
+            nn.init.normal_(self.latent_embs, std=0.02)
+
         self._lang_max_len = 48
         self._lora_applied = False
 
@@ -541,18 +552,47 @@ class FlowMatchingTransformer(nn.Module):
         fused = F.silu(self.action_time_mlp_in(fused))
         fused = self.action_time_mlp_out(fused)
         alpha_t = (1.0 - timesteps)[:, None, None]  # (B, 1, 1)
-        tgt = fused + alpha_t * action_emb
+        action_tgt = fused + alpha_t * action_emb
 
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(
-            T_act, device=noisy_actions.device, dtype=noisy_actions.dtype
-        )
+        # Prepend latent "thought" tokens if enabled. They share the decoder stack
+        # with action tokens; mask below enforces information flow direction.
+        K = self.num_latent_tokens
+        if K > 0:
+            latent_tgt = self.latent_embs.expand(B, -1, -1).to(action_tgt.dtype)
+            tgt = torch.cat([latent_tgt, action_tgt], dim=1)  # (B, K+T_act, d_model)
+        else:
+            tgt = action_tgt
+
+        total = K + T_act
+        if K > 0:
+            # Mask shape (total, total). Convention: -inf blocks attention.
+            #   latent → latent : visible
+            #   latent → action : blocked (latents must not see noisy actions)
+            #   action → latent : visible (actions read refined thoughts)
+            #   action → action : causal within action segment
+            mask = torch.zeros(
+                total, total,
+                device=noisy_actions.device, dtype=noisy_actions.dtype,
+            )
+            mask[:K, K:] = float("-inf")
+            action_causal = nn.Transformer.generate_square_subsequent_mask(
+                T_act, device=noisy_actions.device, dtype=noisy_actions.dtype,
+            )
+            mask[K:, K:] = action_causal
+            is_causal = False
+        else:
+            mask = nn.Transformer.generate_square_subsequent_mask(
+                T_act, device=noisy_actions.device, dtype=noisy_actions.dtype,
+            )
+            is_causal = True
 
         # Interleaved cross-attention: each layer attends to its VLM layer's context
         # (which already includes layer-specific robot token projections)
         for layer, ctx in zip(self.action_expert_layers, per_layer_contexts):
-            tgt = layer(tgt=tgt, memory=ctx, tgt_mask=causal_mask, tgt_is_causal=True)
+            tgt = layer(tgt=tgt, memory=ctx, tgt_mask=mask, tgt_is_causal=is_causal)
 
-        tgt = self.action_expert_norm(tgt)
+        # Strip latent positions before output projection — they're internal scratch
+        tgt = self.action_expert_norm(tgt[:, K:])
         return self.action_out_proj(tgt)
 
     def compute_loss(self, batch: dict) -> torch.Tensor:
