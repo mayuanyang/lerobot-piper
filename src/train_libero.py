@@ -34,15 +34,33 @@ if device.type == "cuda":
 
 
 def get_augmentations():
-    return v2.Compose([
-        v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
-    ])
+    # Spatial: small translate + zoom only.
+    #   - No rotation (breaks gravity assumption, distorts "on the X" semantics)
+    #   - No horizontal flip (would invert left/right in task descriptions)
+    #   - Crop ranges kept small so small objects (ramekin, cookie box) stay
+    #     in frame — otherwise grounding would fail by construction.
+    spatial = v2.RandomAffine(
+        degrees=0,
+        translate=(0.03, 0.03),   # ≤3% of image width
+        scale=(0.95, 1.05),       # ≤5% zoom in/out
+        fill=0,
+    )
+    # Color jitter slightly stronger than before. Hue stays modest because
+    # LIBERO objects are colour-distinguished (black bowl vs white plate).
+    color = v2.ColorJitter(
+        brightness=0.3, contrast=0.3, saturation=0.3, hue=0.08,
+    )
+    # Gaussian blur 30% of the time — robustness to motion blur during rollout.
+    blur = v2.RandomApply([v2.GaussianBlur(kernel_size=5, sigma=(0.1, 1.0))], p=0.3)
+    return v2.Compose([spatial, color, blur])
 
 
 def apply_joint_augmentations(batch, state_key):
     if torch.rand(1).item() > 0.5:
         if state_key in batch:
-            noise = torch.randn_like(batch[state_key]) * 0.01
+            # std=0.02 ≈ 1.1° joint-angle perturbation (was 0.01 / 0.6°).
+            # LIBERO init states vary by more than this in practice.
+            noise = torch.randn_like(batch[state_key]) * 0.02
             batch[state_key] = batch[state_key] + noise
     return batch
 
