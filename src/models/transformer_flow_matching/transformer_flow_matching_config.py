@@ -83,7 +83,16 @@ class TransformerFlowMatchingConfig(PreTrainedConfig):
     # steps (0..n_action_steps-1). 1.0 = equal weight, 0.0 = ignore future steps entirely.
     # 0.1 keeps some gradient signal from future steps for trajectory smoothness.
     future_steps_weight: float = 0.3
-        
+
+    # Latent "thought" tokens prepended to the action expert input.
+    # Inspired by LaST-R1 latent CoT: K learnable tokens "think" about the scene
+    # before action tokens predict the velocity. They self-attend among themselves
+    # and to context (vision/text/state) via cross-attention, but cannot see the
+    # noisy action tokens (would be a leak). Action tokens then read from the
+    # refined latent representations.
+    # 0 disables the feature; 8 is a reasonable starting point.
+    num_latent_tokens: int = 8
+
     # Training presets
     optimizer_lr: float = 1e-4        # Conservative for frozen VLM + fresh action expert (SmolVLA uses 1e-4)
     optimizer_betas: tuple = (0.95, 0.999)
