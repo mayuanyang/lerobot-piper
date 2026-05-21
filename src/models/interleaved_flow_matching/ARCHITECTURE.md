@@ -348,6 +348,20 @@ but at significant complexity cost.
 benefit of being part of the trainable side (their effective Q/K/V come from
 expert weights), but are still visible to VLM tokens via the joint softmax.
 
+**Robot CNN tokens always live on the expert side.** Expert sequence layout
+is `[robot, latent, action]` (when `use_robot_cnn=True`) or `[latent, action]`
+(when False). ResNet output goes through trainable expert Q/K/V/FFN — fully
+trainable end-to-end path from ResNet through to action output, matching the
+design intent of "ResNet learns *new* visual features that VLM can't provide".
+The mask blocks robot → action (perception shouldn't see noisy future actions,
+same rationale as latent → action block).
+
+**`use_robot_cnn` config flag for ablation** (default `True`). When `False`,
+the RobotVisualEncoder isn't instantiated and the expert sequence is just
+`[latent, action]`. Useful for measuring whether the CNN actually contributes
+anything beyond what SmolVLM2 already provides — run two trainings with
+`use_robot_cnn=True` and `False`, compare benchmark.
+
 **Zero-init o_proj and mlp.down_proj.** Expert starts as identity in the
 residual stream — initial loss ≈ E[||u_t||²] ≈ 2, not millions. Optional
 warm-start via [transfer_pretrained_weights.py](../../transfer_pretrained_weights.py)

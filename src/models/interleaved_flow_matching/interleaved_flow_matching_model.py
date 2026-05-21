@@ -171,13 +171,17 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         ])
 
         # ------------------------------------------------------------------
-        # 3. Robot CNN and state encoders — outputs in VLM hidden dim
+        # 3. Robot CNN (optional, ablation flag) and state encoder
         # ------------------------------------------------------------------
-        self.robot_visual_encoder = RobotVisualEncoder(
-            input_size=config.robot_encoder_input_size,
-            out_tokens=config.robot_encoder_tokens,
-            out_dim=self.hidden_size,
-        )
+        if config.use_robot_cnn:
+            self.robot_visual_encoder = RobotVisualEncoder(
+                input_size=config.robot_encoder_input_size,
+                out_tokens=config.robot_encoder_tokens,
+                out_dim=self.hidden_size,
+            )
+        else:
+            self.robot_visual_encoder = None
+            print("[interleaved] use_robot_cnn=False — RobotVisualEncoder disabled (ablation mode)")
         self.state_encoder = nn.Sequential(
             nn.Linear(config.state_dim, self.hidden_size),
             RMSNorm(self.hidden_size, eps=self.rms_norm_eps),
@@ -284,6 +288,7 @@ class InterleavedFlowMatchingTransformer(nn.Module):
     def _build_joint_mask(
         self,
         L_vlm: int,
+        R: int,
         K: int,
         H: int,
         device: torch.device,
@@ -293,21 +298,29 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         (L_total, L_total) additive mask. -inf blocks attention.
 
         Layout:
-          rows/cols [0..L_vlm)         = VLM tokens (vision + lang + robot + state)
-          rows/cols [L_vlm..L_vlm+K)   = latent tokens
-          rows/cols [L_vlm+K..end)     = noisy action tokens
+          rows/cols [0..L_vlm)                 = VLM tokens (vision + lang + state, + robot if VLM-side)
+          rows/cols [L_vlm..L_vlm+R)           = robot tokens (if expert-side, else R=0 here)
+          rows/cols [L_vlm+R..L_vlm+R+K)       = latent tokens
+          rows/cols [L_vlm+R+K..L_total)       = noisy action tokens
         """
-        L_total = L_vlm + K + H
+        L_total = L_vlm + R + K + H
         mask = torch.zeros(L_total, L_total, device=device, dtype=dtype)
-        a_start = L_vlm + K
+        a_start = L_vlm + R + K
+        l_start = L_vlm + R
+        r_start = L_vlm
+
+        # Robot on expert side must not see noisy actions (perception is about
+        # the world, not about what action we plan to take next).
+        if R > 0:
+            mask[r_start:r_start + R, a_start:] = float("-inf")
 
         # Latents must never see noisy actions (keeps them as "pure thoughts").
         if K > 0:
-            mask[L_vlm:L_vlm + K, a_start:] = float("-inf")
+            mask[l_start:l_start + K, a_start:] = float("-inf")
 
-        # Optionally block VLM → action (gate behind config flag).
+        # Optionally block VLM → expert (gate behind config flag).
         if not self.config.vlm_attends_to_expert:
-            mask[:L_vlm, L_vlm:] = float("-inf")     # block VLM → latent + action
+            mask[:L_vlm, L_vlm:] = float("-inf")
 
         # Causal among actions.
         if H > 1:
@@ -414,9 +427,14 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         self,
         noisy_actions: torch.Tensor,
         timesteps: torch.Tensor,
+        robot_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Latent + (action_emb + time_emb) → (B, K + H, hidden_size)
+        Build the expert-side sequence.
+        Layout when robot_tokens given (expert-side mode):
+            [robot, latent, action]   (B, R + K + H, hidden_size)
+        Layout when robot_tokens is None (default VLM-side mode):
+            [latent, action]          (B, K + H, hidden_size)
         """
         B, H, _ = noisy_actions.shape
 
@@ -432,24 +450,26 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         alpha = (1.0 - timesteps)[:, None, None]
         action_tgt = fused + alpha * action_emb
 
+        parts = []
+        if robot_tokens is not None:
+            parts.append(robot_tokens.to(action_tgt.dtype))
         if self.num_latent_tokens > 0:
-            latent_tgt = self.latent_embs.expand(B, -1, -1).to(action_tgt.dtype)
-            return torch.cat([latent_tgt, action_tgt], dim=1)
-        return action_tgt
+            parts.append(self.latent_embs.expand(B, -1, -1).to(action_tgt.dtype))
+        parts.append(action_tgt)
+        return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
 
     # =====================================================================
-    # Build VLM-side sequence (frozen tokens + trainable robot/state tokens)
+    # Compute robot CNN tokens once (used by either VLM or expert side)
     # =====================================================================
 
-    def _build_vlm_seq(self, batch: dict) -> torch.Tensor:
-        B = batch["observation.state"].shape[0]
-        device = batch["observation.state"].device
-
-        with torch.no_grad():
-            vis_tokens = self._encode_images(batch, B)
-            lang_tokens = self._encode_language(batch, device)
-
-        # Robot CNN tokens (trainable, in hidden_size dim)
+    def _compute_robot_tokens(self, batch: dict) -> Optional[torch.Tensor]:
+        """
+        Run RobotVisualEncoder per camera, concat to (B, R, hidden_size).
+        Returns None if the encoder is disabled (use_robot_cnn=False) or no
+        cameras are present in the batch.
+        """
+        if self.robot_visual_encoder is None:
+            return None
         robot_tokens_list = []
         for cam_key in self.config.cameras_for_vision_state_concat:
             if cam_key not in batch:
@@ -458,11 +478,23 @@ class InterleavedFlowMatchingTransformer(nn.Module):
             if img.dim() == 5:
                 img = img[:, -1]
             robot_tokens_list.append(self.robot_visual_encoder(img.float()))
-        robot_tokens = (
-            torch.cat(robot_tokens_list, dim=1).to(vis_tokens.dtype)
-            if robot_tokens_list else
-            torch.zeros(B, 0, self.hidden_size, device=device, dtype=vis_tokens.dtype)
-        )
+        if not robot_tokens_list:
+            return None
+        return torch.cat(robot_tokens_list, dim=1)
+
+    # =====================================================================
+    # Build VLM-side sequence: frozen vision + language + (trainable) state
+    # Robot CNN tokens always go to the expert side, not here.
+    # =====================================================================
+
+    def _build_vlm_seq(self, batch: dict) -> torch.Tensor:
+        """Build [vision, language, state]. Robot tokens belong on expert side."""
+        B = batch["observation.state"].shape[0]
+        device = batch["observation.state"].device
+
+        with torch.no_grad():
+            vis_tokens = self._encode_images(batch, B)
+            lang_tokens = self._encode_language(batch, device)
 
         # State token
         state = batch["observation.state"].float()
@@ -474,7 +506,7 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         parts = [vis_tokens]
         if lang_tokens is not None:
             parts.append(lang_tokens)
-        parts.extend([robot_tokens, state_tokens])
+        parts.append(state_tokens)
         return torch.cat(parts, dim=1)  # (B, L_vlm, hidden)
 
     # =====================================================================
@@ -486,17 +518,27 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         noisy_actions: torch.Tensor,
         timesteps: torch.Tensor,
         vlm_seq: torch.Tensor,
+        robot_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """
+        Run joint attention stack and read off action positions.
+
+        If robot_tokens is passed (expert-side mode), expert sequence layout is
+        [robot, latent, action] and we skip R+K positions for readout.
+        Otherwise (default VLM-side mode), expert sequence is [latent, action]
+        and we skip K positions for readout.
+        """
         B, H, _ = noisy_actions.shape
         K = self.num_latent_tokens
+        R = robot_tokens.size(1) if robot_tokens is not None else 0
         L_vlm = vlm_seq.size(1)
 
-        exp_seq = self._build_expert_seq(noisy_actions, timesteps).to(vlm_seq.dtype)
+        exp_seq = self._build_expert_seq(noisy_actions, timesteps, robot_tokens).to(vlm_seq.dtype)
 
-        L_total = L_vlm + K + H
+        L_total = L_vlm + R + K + H
         cos, sin = _build_rope_cache(L_total, self.head_dim, self.rope_theta,
                                        vlm_seq.device, vlm_seq.dtype)
-        attn_mask = self._build_joint_mask(L_vlm, K, H, vlm_seq.device, vlm_seq.dtype)
+        attn_mask = self._build_joint_mask(L_vlm, R, K, H, vlm_seq.device, vlm_seq.dtype)
 
         # Run all joint layers
         for i in range(len(self.expert_layers)):
@@ -505,8 +547,8 @@ class InterleavedFlowMatchingTransformer(nn.Module):
                 cos=cos, sin=sin, attn_mask=attn_mask,
             )
 
-        # Read out the action positions (skip latent prefix)
-        action_out = self.final_norm(exp_seq[:, K:])
+        # Read out the action positions (skip robot + latent prefix)
+        action_out = self.final_norm(exp_seq[:, R + K:])
         return self.action_out_proj(action_out)
 
     # =====================================================================
@@ -531,6 +573,10 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         actions = batch["action"].float().nan_to_num(0.0).clamp(-10.0, 10.0)
         B = actions.shape[0]
 
+        # Robot tokens always go to the expert side (or are absent entirely
+        # if use_robot_cnn=False). VLM side never carries robot tokens.
+        robot_tokens = self._compute_robot_tokens(batch)
+
         vlm_seq = self._build_vlm_seq(batch).float()  # joint attention runs in fp32 for stability
         # cast vlm_seq to bfloat16 in the loop if memory-bound; for now leave as is.
 
@@ -540,7 +586,7 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         x_t = t_exp * noise + (1.0 - t_exp) * actions
         u_t = noise - actions
 
-        v_t = self.velocity_field(x_t, t, vlm_seq.to(x_t.dtype))
+        v_t = self.velocity_field(x_t, t, vlm_seq.to(x_t.dtype), robot_tokens=robot_tokens)
 
         loss = F.mse_loss(v_t, u_t, reduction="none")
         if self.config.action_dim_weights:
@@ -574,6 +620,8 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         B = batch["observation.state"].shape[0]
         device = batch["observation.state"].device
 
+        # Same routing as compute_loss: robot tokens (if any) go to expert side.
+        robot_tokens = self._compute_robot_tokens(batch)
         vlm_seq = self._build_vlm_seq(batch).float()
 
         x_t = self.sample_noise(
@@ -584,7 +632,7 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         t = torch.ones(B, device=device, dtype=torch.float32)
 
         for _ in range(N):
-            v_t = self.velocity_field(x_t, t, vlm_seq.to(x_t.dtype))
+            v_t = self.velocity_field(x_t, t, vlm_seq.to(x_t.dtype), robot_tokens=robot_tokens)
             x_t = x_t + dt * v_t
             t = t + dt
 

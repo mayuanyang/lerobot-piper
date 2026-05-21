@@ -98,6 +98,14 @@ class InterleavedFlowMatchingConfig(PreTrainedConfig):
     # -------- Robot visual encoder (parallel ResNet-18) --------
     robot_encoder_tokens: int = 16
     robot_encoder_input_size: int = 224
+    # Enable / disable the parallel ResNet visual encoder entirely.
+    # True (default): create RobotVisualEncoder and route its tokens through
+    #                 the expert side of joint attention. Layout becomes
+    #                 [robot, latent, action] on the expert side (~ +48 tokens).
+    # False:          no ResNet, no robot tokens. For ablation experiments to
+    #                 measure whether the CNN actually contributes anything
+    #                 beyond what SmolVLM2 already provides.
+    use_robot_cnn: bool = True
 
     # -------- Latent "thought" tokens --------
     # Prepended to the expert sequence. 0 disables.
