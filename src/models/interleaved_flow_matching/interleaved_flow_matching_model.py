@@ -32,6 +32,7 @@ Caveats / things to verify when running:
 """
 
 import math
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
@@ -620,21 +621,33 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         B = batch["observation.state"].shape[0]
         device = batch["observation.state"].device
 
-        # Same routing as compute_loss: robot tokens (if any) go to expert side.
-        robot_tokens = self._compute_robot_tokens(batch)
-        vlm_seq = self._build_vlm_seq(batch).float()
-
-        x_t = self.sample_noise(
-            (B, self.config.horizon, self.config.action_dim), device=device,
+        # Wrap inference in bfloat16 autocast to match the training-time
+        # context. The frozen VLM was loaded as bf16 (saves memory) and its
+        # weights stay bf16; without autocast, fp32 inputs to bf16 linear
+        # layers raise "expected mat1 and mat2 to have the same dtype".
+        # Training works because the train script wraps policy.forward in
+        # the same autocast block.
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if device.type == "cuda" else nullcontext()
         )
-        N = self.config.num_inference_steps
-        dt = -1.0 / N
-        t = torch.ones(B, device=device, dtype=torch.float32)
 
-        for _ in range(N):
-            v_t = self.velocity_field(x_t, t, vlm_seq.to(x_t.dtype), robot_tokens=robot_tokens)
-            x_t = x_t + dt * v_t
-            t = t + dt
+        with autocast_ctx:
+            # Same routing as compute_loss: robot tokens (if any) go to expert side.
+            robot_tokens = self._compute_robot_tokens(batch)
+            vlm_seq = self._build_vlm_seq(batch).float()
+
+            x_t = self.sample_noise(
+                (B, self.config.horizon, self.config.action_dim), device=device,
+            )
+            N = self.config.num_inference_steps
+            dt = -1.0 / N
+            t = torch.ones(B, device=device, dtype=torch.float32)
+
+            for _ in range(N):
+                v_t = self.velocity_field(x_t, t, vlm_seq.to(x_t.dtype), robot_tokens=robot_tokens)
+                x_t = x_t + dt * v_t
+                t = t + dt
 
         return x_t[:, : self.config.n_action_steps]
 
