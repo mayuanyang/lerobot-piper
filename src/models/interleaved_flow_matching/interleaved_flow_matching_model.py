@@ -219,6 +219,24 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         # ------------------------------------------------------------------
         self.final_norm = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
 
+        # ------------------------------------------------------------------
+        # 7. Language adaptor — trainable residual projection that lets the
+        #    model shift SmolVLM2's frozen language embeddings towards the
+        #    robot instruction-following domain. Zero-init so training starts
+        #    from the original frozen behaviour and learns gradually.
+        # ------------------------------------------------------------------
+        self.lang_adaptor = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            RMSNorm(self.hidden_size, eps=self.rms_norm_eps),
+        )
+        nn.init.zeros_(self.lang_adaptor[0].weight)
+        nn.init.zeros_(self.lang_adaptor[0].bias)
+
+        # Learnable attention bias that boosts every expert query's attention
+        # to language keys in the joint softmax. Initialised to 0 so the model
+        # starts at "no extra bias" and learns how much language matters.
+        self.lang_attn_bias = nn.Parameter(torch.tensor(0.0))
+
         self._lang_max_len = 48
 
     # =====================================================================
@@ -277,7 +295,7 @@ class InterleavedFlowMatchingTransformer(nn.Module):
             return None
         inputs = self.processor.tokenizer(
             descs, return_tensors="pt", padding=True, truncation=True,
-            max_length=self._lang_max_len, add_special_tokens=False,
+            max_length=self._lang_max_len, add_special_tokens=True,
         )
         input_ids = inputs["input_ids"].to(device)
         return self.text_model.get_input_embeddings()(input_ids)
@@ -294,6 +312,8 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         H: int,
         device: torch.device,
         dtype: torch.dtype,
+        lang_start: int = 0,
+        lang_len: int = 0,
     ) -> torch.Tensor:
         """
         (L_total, L_total) additive mask. -inf blocks attention.
@@ -303,6 +323,10 @@ class InterleavedFlowMatchingTransformer(nn.Module):
           rows/cols [L_vlm..L_vlm+R)           = robot tokens (if expert-side, else R=0 here)
           rows/cols [L_vlm+R..L_vlm+R+K)       = latent tokens
           rows/cols [L_vlm+R+K..L_total)       = noisy action tokens
+
+        lang_start, lang_len: position range of language tokens within the
+            VLM-side sequence, used to apply a learnable attention bias that
+            counters vision's numerical dominance in the joint softmax.
         """
         L_total = L_vlm + R + K + H
         mask = torch.zeros(L_total, L_total, device=device, dtype=dtype)
@@ -330,6 +354,12 @@ class InterleavedFlowMatchingTransformer(nn.Module):
                 diagonal=1,
             )
             mask[a_start:, a_start:] = causal
+
+        # Learnable positive bias on expert→language attention paths.
+        # Vision tokens dominate the joint softmax (~546 vs ≤48 language keys);
+        # a small learnable bias lets the model up-weight language when needed.
+        if lang_len > 0:
+            mask[L_vlm:, lang_start:lang_start + lang_len] += self.lang_attn_bias
 
         return mask
 
@@ -488,14 +518,26 @@ class InterleavedFlowMatchingTransformer(nn.Module):
     # Robot CNN tokens always go to the expert side, not here.
     # =====================================================================
 
-    def _build_vlm_seq(self, batch: dict) -> torch.Tensor:
-        """Build [vision, language, state]. Robot tokens belong on expert side."""
+    def _build_vlm_seq(self, batch: dict) -> tuple[torch.Tensor, int, int]:
+        """Build [vision, language, state] and return (vlm_seq, L_vis, L_lang).
+
+        Robot tokens belong on expert side.
+        Language adaptor (trainable residual) is applied here so the model can
+        learn to shift frozen language embeddings towards the robot domain.
+        """
         B = batch["observation.state"].shape[0]
         device = batch["observation.state"].device
 
         with torch.no_grad():
             vis_tokens = self._encode_images(batch, B)
             lang_tokens = self._encode_language(batch, device)
+
+        L_vis = vis_tokens.shape[1]
+        L_lang = lang_tokens.shape[1] if lang_tokens is not None else 0
+
+        # Apply trainable language adaptor (zero-init residual).
+        if lang_tokens is not None and L_lang > 0:
+            lang_tokens = lang_tokens + self.lang_adaptor(lang_tokens.to(vis_tokens.dtype))
 
         # State token
         state = batch["observation.state"].float()
@@ -508,7 +550,7 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         if lang_tokens is not None:
             parts.append(lang_tokens)
         parts.append(state_tokens)
-        return torch.cat(parts, dim=1)  # (B, L_vlm, hidden)
+        return torch.cat(parts, dim=1), L_vis, L_lang
 
     # =====================================================================
     # Velocity field — runs the joint stack and reads off action positions
@@ -520,6 +562,8 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         timesteps: torch.Tensor,
         vlm_seq: torch.Tensor,
         robot_tokens: Optional[torch.Tensor] = None,
+        lang_start: int = 0,
+        lang_len: int = 0,
     ) -> torch.Tensor:
         """
         Run joint attention stack and read off action positions.
@@ -528,6 +572,9 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         [robot, latent, action] and we skip R+K positions for readout.
         Otherwise (default VLM-side mode), expert sequence is [latent, action]
         and we skip K positions for readout.
+
+        lang_start, lang_len: position range of language tokens within vlm_seq,
+            forwarded to _build_joint_mask for the language attention bias.
         """
         B, H, _ = noisy_actions.shape
         K = self.num_latent_tokens
@@ -539,7 +586,8 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         L_total = L_vlm + R + K + H
         cos, sin = _build_rope_cache(L_total, self.head_dim, self.rope_theta,
                                        vlm_seq.device, vlm_seq.dtype)
-        attn_mask = self._build_joint_mask(L_vlm, R, K, H, vlm_seq.device, vlm_seq.dtype)
+        attn_mask = self._build_joint_mask(L_vlm, R, K, H, vlm_seq.device, vlm_seq.dtype,
+                                           lang_start=lang_start, lang_len=lang_len)
 
         # Run all joint layers
         for i in range(len(self.expert_layers)):
@@ -578,8 +626,8 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         # if use_robot_cnn=False). VLM side never carries robot tokens.
         robot_tokens = self._compute_robot_tokens(batch)
 
-        vlm_seq = self._build_vlm_seq(batch).float()  # joint attention runs in fp32 for stability
-        # cast vlm_seq to bfloat16 in the loop if memory-bound; for now leave as is.
+        vlm_seq, L_vis, L_lang = self._build_vlm_seq(batch)
+        vlm_seq = vlm_seq.float()  # joint attention runs in fp32 for stability
 
         noise = self.sample_noise(actions.shape, actions.device)
         t = self.sample_time(B, actions.device)
@@ -587,7 +635,8 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         x_t = t_exp * noise + (1.0 - t_exp) * actions
         u_t = noise - actions
 
-        v_t = self.velocity_field(x_t, t, vlm_seq.to(x_t.dtype), robot_tokens=robot_tokens)
+        v_t = self.velocity_field(x_t, t, vlm_seq.to(x_t.dtype), robot_tokens=robot_tokens,
+                                  lang_start=L_vis, lang_len=L_lang)
 
         loss = F.mse_loss(v_t, u_t, reduction="none")
         if self.config.action_dim_weights:
@@ -635,7 +684,8 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         with autocast_ctx:
             # Same routing as compute_loss: robot tokens (if any) go to expert side.
             robot_tokens = self._compute_robot_tokens(batch)
-            vlm_seq = self._build_vlm_seq(batch).float()
+            vlm_seq, L_vis, L_lang = self._build_vlm_seq(batch)
+            vlm_seq = vlm_seq.float()
 
             x_t = self.sample_noise(
                 (B, self.config.horizon, self.config.action_dim), device=device,
@@ -645,7 +695,8 @@ class InterleavedFlowMatchingTransformer(nn.Module):
             t = torch.ones(B, device=device, dtype=torch.float32)
 
             for _ in range(N):
-                v_t = self.velocity_field(x_t, t, vlm_seq.to(x_t.dtype), robot_tokens=robot_tokens)
+                v_t = self.velocity_field(x_t, t, vlm_seq.to(x_t.dtype), robot_tokens=robot_tokens,
+                                          lang_start=L_vis, lang_len=L_lang)
                 x_t = x_t + dt * v_t
                 t = t + dt
 

@@ -437,6 +437,7 @@ def train(
                     ("Action In/Out",  "action_"),
                     ("Final Norm",     "final_norm"),
                     ("Latent Tokens",  "latent_embs"),
+                    ("Lang Adaptor",   "lang_adaptor"),
                 ]:
                     grad, n = _grad_stats(prefix)
                     print(f"  {label:14s} - Avg Abs Grad: {grad:.6f} ({n} params)" if grad is not None else f"  {label:14s} - no grad")
@@ -452,6 +453,37 @@ def train(
                         print(f"  Latent stats   - grad_norm: {grad_norm_l:.4e}  "
                               f"mean |cos|: {off_diag.abs().mean().item():.3f}  "
                               f"max |cos|: {off_diag.abs().max().item():.3f}")
+
+                # Language conditioning diagnostics. We added lang_adaptor
+                # (zero-init residual MLP) and lang_attn_bias (scalar) to give
+                # the model a way to amplify language signal. They only matter
+                # if their values move away from initialisation. Watch:
+                #   - lang_attn_bias value:      0 = unused, > 0 = model uses it
+                #   - lang_attn_bias gradient:   should be non-zero if signal flows
+                #   - lang_adaptor norm:         tracks whether the residual MLP
+                #                                has learned a non-trivial transform
+                # If after several thousand steps the value stays ~0 and the
+                # gradient is tiny, the "chicken-and-egg" deadlock is real and
+                # we need more active forcing (vision dropout, contrastive
+                # auxiliary loss, etc.).
+                if hasattr(policy.model, "lang_attn_bias"):
+                    bias_val = policy.model.lang_attn_bias.item()
+                    bias_grad = policy.model.lang_attn_bias.grad
+                    bias_grad_val = bias_grad.item() if bias_grad is not None else float("nan")
+                    print(f"  Lang attn bias - value: {bias_val:+.4f}   grad: {bias_grad_val:+.6f}")
+
+                if hasattr(policy.model, "lang_adaptor"):
+                    adaptor_w_norm = sum(
+                        p.detach().norm().item() ** 2
+                        for p in policy.model.lang_adaptor.parameters()
+                    ) ** 0.5
+                    adaptor_g_norm_sq = 0.0
+                    for p in policy.model.lang_adaptor.parameters():
+                        if p.grad is not None:
+                            adaptor_g_norm_sq += p.grad.norm().item() ** 2
+                    adaptor_g_norm = adaptor_g_norm_sq ** 0.5
+                    print(f"  Lang adaptor   - weight_norm: {adaptor_w_norm:.4e}   grad_norm: {adaptor_g_norm:.4e}")
+
                 print("--- End Gradient Analysis ---\n")
 
             trainable_params = [p for p in policy.parameters() if p.requires_grad]
