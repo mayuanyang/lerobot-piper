@@ -287,10 +287,16 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         return torch.cat(all_vis, dim=1)
 
     def _encode_language(self, batch: dict, device: torch.device) -> Optional[torch.Tensor]:
-        """Frozen embed_tokens of the task description. (B, L, hidden) or None."""
-        if "task_description" not in batch:
-            return None
-        descs = batch["task_description"]
+        """Frozen embed_tokens of the task description. (B, L, hidden) or None.
+
+        Accept either "task_description" (set by some training scripts) or
+        "task" (the raw key produced by LeRobotDataset that survives most
+        preprocessors). Falling back to "task" matters because some
+        preprocessors strip unknown keys before the model sees the batch.
+        """
+        descs = batch.get("task_description")
+        if not descs:
+            descs = batch.get("task")
         if not descs or not any(descs):
             return None
         inputs = self.processor.tokenizer(

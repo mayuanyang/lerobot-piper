@@ -469,8 +469,8 @@ def train(
                 if hasattr(policy.model, "lang_attn_bias"):
                     bias_val = policy.model.lang_attn_bias.item()
                     bias_grad = policy.model.lang_attn_bias.grad
-                    bias_grad_val = bias_grad.item() if bias_grad is not None else float("nan")
-                    print(f"  Lang attn bias - value: {bias_val:+.4f}   grad: {bias_grad_val:+.6f}")
+                    bias_grad_str = f"{bias_grad.item():+.6f}" if bias_grad is not None else "None (not in graph)"
+                    print(f"  Lang attn bias - value: {bias_val:+.4f}   grad: {bias_grad_str}")
 
                 if hasattr(policy.model, "lang_adaptor"):
                     adaptor_w_norm = sum(
