@@ -111,6 +111,17 @@ class InterleavedFlowMatchingConfig(PreTrainedConfig):
     # Prepended to the expert sequence. 0 disables.
     num_latent_tokens: int = 8
 
+    # -------- Vision token dropout (language-forcing regularizer) --------
+    # Per-token Bernoulli dropout on vision tokens during training. Each
+    # vision token (= one SigLIP patch from the connector) is independently
+    # zeroed with this probability. Approximates random spatial erasing /
+    # cutout on the image. The point isn't to make vision unavailable
+    # outright — it's to make the *exact* visual pattern unreliable across
+    # samples, so language (which is stable per task) becomes the only
+    # reliable disambiguating signal and the model is pressured to use it.
+    # 0.0 disables; 0.2-0.4 is a reasonable range.
+    vision_dropout_prob: float = 0.3
+
     # -------- LoRA (vision; text stays frozen — single-task) --------
     lora_rank: int = 16
     lora_alpha: int = 32

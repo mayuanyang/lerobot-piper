@@ -148,6 +148,7 @@ def train(
     resume_from_checkpoint=None,
     train_ratio=1.0,
     batch_size=64,
+    reset_lang_params=False,
 ):
     """Train the InterleavedFlowMatching model on LIBERO."""
     output_directory = Path(output_dir)
@@ -268,6 +269,32 @@ def train(
             print(f"Missing {len(missing)} keys (will use init values): {missing[:5]}")
         policy.load_state_dict(filtered, strict=False)
         print(f"Loaded {len(filtered)}/{len(cur_state)} model keys")
+
+        # Optionally reset language-conditioning params after loading. Use
+        # this when resuming from a checkpoint that learned to suppress
+        # language (negative bias / shrunk adaptor gamma) and you want a
+        # clean baseline to test a new forcing strategy. DO NOT use this
+        # for routine resume (after a crash or to continue same run) —
+        # it will erase any genuine language-conditioning progress.
+        if reset_lang_params:
+            with torch.no_grad():
+                if hasattr(policy.model, "lang_attn_bias"):
+                    old = policy.model.lang_attn_bias.item()
+                    policy.model.lang_attn_bias.zero_()
+                    print(f"Reset lang_attn_bias: {old:+.4f} → 0.0000")
+                if hasattr(policy.model, "lang_adaptor"):
+                    rms_gamma = policy.model.lang_adaptor[1].weight
+                    old_norm = rms_gamma.norm().item()
+                    rms_gamma.fill_(1.0)
+                    print(f"Reset lang_adaptor RMSNorm gamma: norm {old_norm:.3f} → {rms_gamma.norm().item():.3f}")
+        else:
+            # Show current state so you know what you're resuming with.
+            if hasattr(policy.model, "lang_attn_bias"):
+                bias_val = policy.model.lang_attn_bias.item()
+                print(f"lang_attn_bias on resume: {bias_val:+.4f} (use --reset_lang_params to zero)")
+            if hasattr(policy.model, "lang_adaptor"):
+                norm = policy.model.lang_adaptor[1].weight.norm().item()
+                print(f"lang_adaptor RMSNorm gamma norm: {norm:.3f} (init = 30.984)")
 
         preprocessor, postprocessor = make_pre_post_processors(policy.config, dataset_stats=dataset_metadata.stats)
 
@@ -545,5 +572,10 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=64,
                         help="Batch size. Interleaved model is memory-heavy at d_model=960; "
                              "drop to 32 or 16 if you hit OOM on smaller GPUs.")
+    parser.add_argument("--reset_lang_params", action="store_true",
+                        help="Zero out lang_attn_bias and reset lang_adaptor RMSNorm gamma "
+                             "to 1 after loading checkpoint. Use when testing a new language "
+                             "forcing strategy from a checkpoint that learned to suppress "
+                             "language. DO NOT use for routine resume — erases progress.")
     args = parser.parse_args()
     train(**vars(args))

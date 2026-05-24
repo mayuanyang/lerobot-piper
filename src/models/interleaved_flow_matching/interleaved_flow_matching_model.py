@@ -286,13 +286,18 @@ class InterleavedFlowMatchingTransformer(nn.Module):
             return torch.zeros(B, 0, self.hidden_size, device=device, dtype=torch.bfloat16)
         return torch.cat(all_vis, dim=1)
 
-    def _encode_language(self, batch: dict, device: torch.device) -> Optional[torch.Tensor]:
-        """Frozen embed_tokens of the task description. (B, L, hidden) or None.
+    def _encode_language(self, batch: dict, device: torch.device) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Frozen embed_tokens + attention mask for the task description.
 
-        Accept either "task_description" (set by some training scripts) or
-        "task" (the raw key produced by LeRobotDataset that survives most
-        preprocessors). Falling back to "task" matters because some
-        preprocessors strip unknown keys before the model sees the batch.
+        Returns (lang_tokens, lang_mask) or None.
+          lang_tokens: (B, L_max, hidden) — padded to batch max or _lang_max_len
+          lang_mask:   (B, L_max) — bool, True where a real (non-pad) token sits
+
+        The attention mask is critical because most LIBERO task descriptions are
+        3–10 tokens but padding blows them to 48. Without masking, the model
+        sees 80% pad noise and learns to suppress ALL language attention.
+
+        Accepts either "task_description" or "task" keys.
         """
         descs = batch.get("task_description")
         if not descs:
@@ -304,7 +309,9 @@ class InterleavedFlowMatchingTransformer(nn.Module):
             max_length=self._lang_max_len, add_special_tokens=True,
         )
         input_ids = inputs["input_ids"].to(device)
-        return self.text_model.get_input_embeddings()(input_ids)
+        lang_mask = inputs["attention_mask"].bool().to(device)        # (B, L)
+        lang_tokens = self.text_model.get_input_embeddings()(input_ids)
+        return lang_tokens, lang_mask
 
     # =====================================================================
     # Build attention mask for the joint sequence
@@ -320,36 +327,40 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         dtype: torch.dtype,
         lang_start: int = 0,
         lang_len: int = 0,
+        lang_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        (L_total, L_total) additive mask. -inf blocks attention.
+        Build additive attention mask for the joint sequence.
 
-        Layout:
-          rows/cols [0..L_vlm)                 = VLM tokens (vision + lang + state, + robot if VLM-side)
-          rows/cols [L_vlm..L_vlm+R)           = robot tokens (if expert-side, else R=0 here)
-          rows/cols [L_vlm+R..L_vlm+R+K)       = latent tokens
-          rows/cols [L_vlm+R+K..L_total)       = noisy action tokens
+        When lang_mask is provided (B, L_lang), the mask is expanded to
+        (B, L_total, L_total) so pad positions can be blocked per-sample.
+        Otherwise returns a broadcastable (L_total, L_total) mask.
 
-        lang_start, lang_len: position range of language tokens within the
-            VLM-side sequence, used to apply a learnable attention bias that
-            counters vision's numerical dominance in the joint softmax.
+        Pad language tokens are fully blocked:
+          - No query can attend to a pad key.
+          - pad positions as queries see -inf everywhere (they get zero
+            attention weight, their output is irrelevant).
+
+        The lang_attn_bias is applied ONLY to non-pad language positions,
+        and is clamped to ≥ 0 so the model cannot learn to suppress language.
         """
         L_total = L_vlm + R + K + H
-        mask = torch.zeros(L_total, L_total, device=device, dtype=dtype)
         a_start = L_vlm + R + K
         l_start = L_vlm + R
         r_start = L_vlm
 
-        # Robot on expert side must not see noisy actions (perception is about
-        # the world, not about what action we plan to take next).
+        # Start with a shared (L_total, L_total) base mask.
+        mask = torch.zeros(L_total, L_total, device=device, dtype=dtype)
+
+        # Robot on expert side must not see noisy actions.
         if R > 0:
             mask[r_start:r_start + R, a_start:] = float("-inf")
 
-        # Latents must never see noisy actions (keeps them as "pure thoughts").
+        # Latents must never see noisy actions.
         if K > 0:
             mask[l_start:l_start + K, a_start:] = float("-inf")
 
-        # Optionally block VLM → expert (gate behind config flag).
+        # Optionally block VLM → expert.
         if not self.config.vlm_attends_to_expert:
             mask[:L_vlm, L_vlm:] = float("-inf")
 
@@ -361,11 +372,51 @@ class InterleavedFlowMatchingTransformer(nn.Module):
             )
             mask[a_start:, a_start:] = causal
 
-        # Learnable positive bias on expert→language attention paths.
-        # Vision tokens dominate the joint softmax (~546 vs ≤48 language keys);
-        # a small learnable bias lets the model up-weight language when needed.
-        if lang_len > 0:
-            mask[L_vlm:, lang_start:lang_start + lang_len] += self.lang_attn_bias
+        # ---- Per-sample pad blocking + learnable language bias ----
+        if lang_len > 0 and lang_mask is not None:
+            B = lang_mask.shape[0]
+            # Build per-sample mask: (B, L_total, L_total), then insert a
+            # singleton head dim for SDPA: (B, 1, L_total, L_total).
+            mask = mask.unsqueeze(0).expand(B, -1, -1).clone()
+
+            # lang_cols: (B, lang_len) bool — True = pad, needs blocking
+            pad_cols = ~lang_mask.to(device)
+            # lang_positions within VLM: [lang_start, lang_start + lang_len)
+            lang_slice = slice(lang_start, lang_start + lang_len)
+
+            for b in range(B):
+                pad_idx = pad_cols[b].nonzero(as_tuple=True)[0]
+                if pad_idx.numel() == 0:
+                    continue
+                pad_pos = lang_start + pad_idx  # absolute positions in joint seq
+                # Block pad keys: nobody attends to them.
+                mask[b, :, pad_pos] = float("-inf")
+                # Block pad queries: their output is meaningless.
+                mask[b, pad_pos, :] = float("-inf")
+
+            # Apply learnable bias ONLY to non-pad language columns.
+            # Clamp bias to ≥ 0 — the model should never learn to suppress language.
+            # Use softplus instead of clamp to avoid the clamp dead-zone:
+            # clamp(x, min=0) has gradient 0 for x<0, so once Adam momentum
+            # pushes bias slightly negative it gets stuck forever.
+            # softplus(0) ≈ 0.693 gives a small natural boost at init.
+            bias = F.softplus(self.lang_attn_bias)
+            # Build a per-sample bias that is 0 for pad columns.
+            bias_per_col = bias * lang_mask.to(device, dtype)
+            mask[:, L_vlm:, lang_start:lang_start + lang_len] += bias_per_col.unsqueeze(1)
+
+            # Insert head dim for SDPA: (B, L_total, L_total) → (B, 1, L_total, L_total)
+            mask = mask.unsqueeze(1)
+
+        elif lang_len > 0:
+            # No per-sample mask — apply uniformly (backward compat).
+            # (L_total, L_total) broadcasts over batch + heads natively.
+            # Use softplus instead of clamp to avoid the clamp dead-zone:
+            # clamp(x, min=0) has gradient 0 for x<0, so once Adam momentum
+            # pushes bias slightly negative it gets stuck forever.
+            # softplus(0) ≈ 0.693 gives a small natural boost at init.
+            bias = F.softplus(self.lang_attn_bias)
+            mask[L_vlm:, lang_start:lang_start + lang_len] += bias
 
         return mask
 
@@ -504,6 +555,13 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         Run RobotVisualEncoder per camera, concat to (B, R, hidden_size).
         Returns None if the encoder is disabled (use_robot_cnn=False) or no
         cameras are present in the batch.
+
+        Vision dropout is applied here as well, with the same probability as
+        SmolVLM2 vision tokens. This is essential: robot CNN tokens are a
+        second visual stream that would otherwise compensate for dropped
+        SmolVLM2 tokens and let the model continue ignoring language. Both
+        streams must be dropped together for the language-forcing pressure
+        to work.
         """
         if self.robot_visual_encoder is None:
             return None
@@ -517,33 +575,83 @@ class InterleavedFlowMatchingTransformer(nn.Module):
             robot_tokens_list.append(self.robot_visual_encoder(img.float()))
         if not robot_tokens_list:
             return None
-        return torch.cat(robot_tokens_list, dim=1)
+        robot_tokens = torch.cat(robot_tokens_list, dim=1)
+
+        # Per-token vision dropout (same prob as SmolVLM2 vision side).
+        vision_dropout_prob = getattr(self.config, "vision_dropout_prob", 0.0)
+        if self.training and vision_dropout_prob > 0.0:
+            B, R, _ = robot_tokens.shape
+            keep = (torch.rand(B, R, device=robot_tokens.device) > vision_dropout_prob)
+            robot_tokens = robot_tokens * keep.unsqueeze(-1).to(robot_tokens.dtype)
+
+        return robot_tokens
 
     # =====================================================================
     # Build VLM-side sequence: frozen vision + language + (trainable) state
     # Robot CNN tokens always go to the expert side, not here.
     # =====================================================================
 
-    def _build_vlm_seq(self, batch: dict) -> tuple[torch.Tensor, int, int]:
-        """Build [vision, language, state] and return (vlm_seq, L_vis, L_lang).
+    def _build_vlm_seq(self, batch: dict) -> tuple[torch.Tensor, int, Optional[torch.Tensor]]:
+        """Build [vision, language, state] and return (vlm_seq, L_vis, lang_mask).
 
         Robot tokens belong on expert side.
         Language adaptor (trainable residual) is applied here so the model can
         learn to shift frozen language embeddings towards the robot domain.
+
+        Returns:
+          vlm_seq:   (B, L_vis + L_lang + 1, hidden)
+          L_vis:     number of vision tokens
+          lang_mask: (B, L_lang) bool tensor or None. True = real token (not pad).
+                     Used downstream to block pad positions from attention and to
+                     scope the lang_attn_bias to actual language content.
         """
         B = batch["observation.state"].shape[0]
         device = batch["observation.state"].device
 
+        lang_result = self._encode_language(batch, device)
+        lang_mask: Optional[torch.Tensor] = None
+
         with torch.no_grad():
             vis_tokens = self._encode_images(batch, B)
-            lang_tokens = self._encode_language(batch, device)
 
         L_vis = vis_tokens.shape[1]
-        L_lang = lang_tokens.shape[1] if lang_tokens is not None else 0
 
-        # Apply trainable language adaptor (zero-init residual).
-        if lang_tokens is not None and L_lang > 0:
-            lang_tokens = lang_tokens + self.lang_adaptor(lang_tokens.to(vis_tokens.dtype))
+        # Vision token dropout — during training only, independently zero out
+        # each vision token with probability `vision_dropout_prob`. Each token
+        # corresponds to a spatial patch (SigLIP grid), so dropping random
+        # tokens simulates partial occlusion / random erasing.
+        #
+        # Why this forces language: with ~30% of patches missing per sample,
+        # the exact visual context for any given action is unreliable from
+        # step to step. Language (which IS stable across samples of the same
+        # task) becomes the only reliable signal — model is pressured to use
+        # it instead of memorising vision-only mappings.
+        #
+        # No rescaling (unlike nn.Dropout) because we want the model to learn
+        # to function with missing inputs, not to compensate for distribution
+        # shift at inference.
+        vision_dropout_prob = getattr(self.config, "vision_dropout_prob", 0.0)
+        if self.training and vision_dropout_prob > 0.0 and L_vis > 0:
+            keep = (torch.rand(B, L_vis, device=vis_tokens.device) > vision_dropout_prob)
+            vis_tokens = vis_tokens * keep.unsqueeze(-1).to(vis_tokens.dtype)
+
+        if lang_result is not None:
+            lang_tokens, lang_mask = lang_result
+            L_lang = lang_tokens.shape[1]
+
+            # Apply trainable language adaptor (zero-init residual) ONLY to
+            # non-pad positions. Pad tokens retain their frozen embedding
+            # (they'll be blocked from attention anyway).
+            lang_adapted = lang_tokens.to(vis_tokens.dtype) + self.lang_adaptor(lang_tokens.to(vis_tokens.dtype))
+            # Zero out pad positions so they contribute no trainable signal.
+            lang_tokens = torch.where(
+                lang_mask.unsqueeze(-1),
+                lang_adapted,
+                torch.zeros_like(lang_adapted),
+            )
+        else:
+            lang_tokens = None
+            L_lang = 0
 
         # State token
         state = batch["observation.state"].float()
@@ -556,7 +664,7 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         if lang_tokens is not None:
             parts.append(lang_tokens)
         parts.append(state_tokens)
-        return torch.cat(parts, dim=1), L_vis, L_lang
+        return torch.cat(parts, dim=1), L_vis, lang_mask
 
     # =====================================================================
     # Velocity field — runs the joint stack and reads off action positions
@@ -570,17 +678,15 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         robot_tokens: Optional[torch.Tensor] = None,
         lang_start: int = 0,
         lang_len: int = 0,
+        lang_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Run joint attention stack and read off action positions.
 
-        If robot_tokens is passed (expert-side mode), expert sequence layout is
-        [robot, latent, action] and we skip R+K positions for readout.
-        Otherwise (default VLM-side mode), expert sequence is [latent, action]
-        and we skip K positions for readout.
-
-        lang_start, lang_len: position range of language tokens within vlm_seq,
-            forwarded to _build_joint_mask for the language attention bias.
+        lang_start, lang_len: position range of language tokens within vlm_seq.
+        lang_mask: (B, L_lang) bool tensor (True = real token). Forwarded to
+            _build_joint_mask so pad positions are blocked per-sample and the
+            learnable lang_attn_bias only applies to actual text.
         """
         B, H, _ = noisy_actions.shape
         K = self.num_latent_tokens
@@ -593,7 +699,8 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         cos, sin = _build_rope_cache(L_total, self.head_dim, self.rope_theta,
                                        vlm_seq.device, vlm_seq.dtype)
         attn_mask = self._build_joint_mask(L_vlm, R, K, H, vlm_seq.device, vlm_seq.dtype,
-                                           lang_start=lang_start, lang_len=lang_len)
+                                           lang_start=lang_start, lang_len=lang_len,
+                                           lang_mask=lang_mask)
 
         # Run all joint layers
         for i in range(len(self.expert_layers)):
@@ -632,8 +739,9 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         # if use_robot_cnn=False). VLM side never carries robot tokens.
         robot_tokens = self._compute_robot_tokens(batch)
 
-        vlm_seq, L_vis, L_lang = self._build_vlm_seq(batch)
+        vlm_seq, L_vis, lang_mask = self._build_vlm_seq(batch)
         vlm_seq = vlm_seq.float()  # joint attention runs in fp32 for stability
+        L_lang = lang_mask.shape[1] if lang_mask is not None else 0
 
         noise = self.sample_noise(actions.shape, actions.device)
         t = self.sample_time(B, actions.device)
@@ -642,7 +750,7 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         u_t = noise - actions
 
         v_t = self.velocity_field(x_t, t, vlm_seq.to(x_t.dtype), robot_tokens=robot_tokens,
-                                  lang_start=L_vis, lang_len=L_lang)
+                                  lang_start=L_vis, lang_len=L_lang, lang_mask=lang_mask)
 
         loss = F.mse_loss(v_t, u_t, reduction="none")
         if self.config.action_dim_weights:
@@ -690,8 +798,9 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         with autocast_ctx:
             # Same routing as compute_loss: robot tokens (if any) go to expert side.
             robot_tokens = self._compute_robot_tokens(batch)
-            vlm_seq, L_vis, L_lang = self._build_vlm_seq(batch)
+            vlm_seq, L_vis, lang_mask = self._build_vlm_seq(batch)
             vlm_seq = vlm_seq.float()
+            L_lang = lang_mask.shape[1] if lang_mask is not None else 0
 
             x_t = self.sample_noise(
                 (B, self.config.horizon, self.config.action_dim), device=device,
@@ -702,7 +811,7 @@ class InterleavedFlowMatchingTransformer(nn.Module):
 
             for _ in range(N):
                 v_t = self.velocity_field(x_t, t, vlm_seq.to(x_t.dtype), robot_tokens=robot_tokens,
-                                          lang_start=L_vis, lang_len=L_lang)
+                                          lang_start=L_vis, lang_len=L_lang, lang_mask=lang_mask)
                 x_t = x_t + dt * v_t
                 t = t + dt
 
