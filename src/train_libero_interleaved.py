@@ -290,8 +290,11 @@ def train(
         else:
             # Show current state so you know what you're resuming with.
             if hasattr(policy.model, "lang_attn_bias"):
-                bias_val = policy.model.lang_attn_bias.item()
-                print(f"lang_attn_bias on resume: {bias_val:+.4f} (use --reset_lang_params to zero)")
+                bias = policy.model.lang_attn_bias.detach()
+                sp = torch.nn.functional.softplus(bias).cpu()
+                print(f"lang_attn_bias on resume — per-layer softplus: "
+                      f"min={sp.min().item():.3f} max={sp.max().item():.3f} mean={sp.mean().item():.3f} "
+                      f"(use --reset_lang_params to zero)")
             if hasattr(policy.model, "lang_adaptor"):
                 norm = policy.model.lang_adaptor[1].weight.norm().item()
                 print(f"lang_adaptor RMSNorm gamma norm: {norm:.3f} (init = 30.984)")
