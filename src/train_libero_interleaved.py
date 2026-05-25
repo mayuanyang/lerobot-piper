@@ -494,10 +494,21 @@ def train(
                 # we need more active forcing (vision dropout, contrastive
                 # auxiliary loss, etc.).
                 if hasattr(policy.model, "lang_attn_bias"):
-                    bias_val = policy.model.lang_attn_bias.item()
-                    bias_grad = policy.model.lang_attn_bias.grad
-                    bias_grad_str = f"{bias_grad.item():+.6f}" if bias_grad is not None else "None (not in graph)"
-                    print(f"  Lang attn bias - value: {bias_val:+.4f}   grad: {bias_grad_str}")
+                    bias_tensor = policy.model.lang_attn_bias.detach()
+                    softplus_vals = torch.nn.functional.softplus(bias_tensor).cpu()
+                    grad = policy.model.lang_attn_bias.grad
+                    grad_norm_str = f"{grad.norm().item():.4e}" if grad is not None else "None (not in graph)"
+                    # Per-layer values — compact one-line representation.
+                    softplus_str = "[" + " ".join(f"{v:.2f}" for v in softplus_vals.tolist()) + "]"
+                    sp_min = softplus_vals.min().item()
+                    sp_max = softplus_vals.max().item()
+                    sp_mean = softplus_vals.mean().item()
+                    argmin = softplus_vals.argmin().item()
+                    argmax = softplus_vals.argmax().item()
+                    print(f"  Lang attn bias - softplus per-layer: {softplus_str}")
+                    print(f"                   min={sp_min:.3f} (L{argmin})  "
+                          f"max={sp_max:.3f} (L{argmax})  "
+                          f"mean={sp_mean:.3f}  grad_norm: {grad_norm_str}")
 
                 if hasattr(policy.model, "lang_adaptor"):
                     adaptor_w_norm = sum(

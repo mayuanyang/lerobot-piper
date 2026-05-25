@@ -232,10 +232,16 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         nn.init.zeros_(self.lang_adaptor[0].weight)
         nn.init.zeros_(self.lang_adaptor[0].bias)
 
-        # Learnable attention bias that boosts every expert query's attention
-        # to language keys in the joint softmax. Initialised to 0 so the model
-        # starts at "no extra bias" and learns how much language matters.
-        self.lang_attn_bias = nn.Parameter(torch.tensor(0.0))
+        # Per-layer learnable attention bias on expert→language attention.
+        # One scalar per joint layer (matches len(self.text_model.layers)).
+        # Each layer can independently learn whether it needs more or less
+        # language attention — early layers may favour vision (low bias),
+        # mid layers may favour language for disambiguation (high bias),
+        # late layers may settle in between. A single global bias would
+        # average these out and underfit each layer's needs.
+        # softplus() applied at use site keeps effective bias ≥ 0.
+        num_layers = len(self.text_model.layers)
+        self.lang_attn_bias = nn.Parameter(torch.zeros(num_layers))
 
         self._lang_max_len = 48
 
@@ -328,6 +334,7 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         lang_start: int = 0,
         lang_len: int = 0,
         lang_mask: Optional[torch.Tensor] = None,
+        layer_idx: int = 0,
     ) -> torch.Tensor:
         """
         Build additive attention mask for the joint sequence.
@@ -394,13 +401,10 @@ class InterleavedFlowMatchingTransformer(nn.Module):
                 # Block pad queries: their output is meaningless.
                 mask[b, pad_pos, :] = float("-inf")
 
-            # Apply learnable bias ONLY to non-pad language columns.
-            # Clamp bias to ≥ 0 — the model should never learn to suppress language.
-            # Use softplus instead of clamp to avoid the clamp dead-zone:
-            # clamp(x, min=0) has gradient 0 for x<0, so once Adam momentum
-            # pushes bias slightly negative it gets stuck forever.
-            # softplus(0) ≈ 0.693 gives a small natural boost at init.
-            bias = F.softplus(self.lang_attn_bias)
+            # Apply per-layer learnable bias ONLY to non-pad language columns.
+            # softplus keeps it ≥ 0 (avoids clamp dead-zone); per-layer scalar
+            # lets each layer independently learn its language attention weight.
+            bias = F.softplus(self.lang_attn_bias[layer_idx])
             # Build a per-sample bias that is 0 for pad columns.
             bias_per_col = bias * lang_mask.to(device, dtype)
             mask[:, L_vlm:, lang_start:lang_start + lang_len] += bias_per_col.unsqueeze(1)
@@ -410,12 +414,8 @@ class InterleavedFlowMatchingTransformer(nn.Module):
 
         elif lang_len > 0:
             # No per-sample mask — apply uniformly (backward compat).
-            # (L_total, L_total) broadcasts over batch + heads natively.
-            # Use softplus instead of clamp to avoid the clamp dead-zone:
-            # clamp(x, min=0) has gradient 0 for x<0, so once Adam momentum
-            # pushes bias slightly negative it gets stuck forever.
-            # softplus(0) ≈ 0.693 gives a small natural boost at init.
-            bias = F.softplus(self.lang_attn_bias)
+            # Per-layer bias indexed by layer_idx; softplus keeps it ≥ 0.
+            bias = F.softplus(self.lang_attn_bias[layer_idx])
             mask[L_vlm:, lang_start:lang_start + lang_len] += bias
 
         return mask
@@ -550,7 +550,7 @@ class InterleavedFlowMatchingTransformer(nn.Module):
     # Compute robot CNN tokens once (used by either VLM or expert side)
     # =====================================================================
 
-    def _compute_robot_tokens(self, batch: dict) -> Optional[torch.Tensor]:
+    def _compute_robot_tokens(self, batch: dict, full_drop_mask: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
         """
         Run RobotVisualEncoder per camera, concat to (B, R, hidden_size).
         Returns None if the encoder is disabled (use_robot_cnn=False) or no
@@ -578,10 +578,17 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         robot_tokens = torch.cat(robot_tokens_list, dim=1)
 
         # Per-token vision dropout (same prob as SmolVLM2 vision side).
+        # Plus optional full-sample drop synchronized with SmolVLM2 vision
+        # via full_drop_mask (so robot CNN can't compensate for missing
+        # SmolVLM2 vision).
         vision_dropout_prob = getattr(self.config, "vision_dropout_prob", 0.0)
-        if self.training and vision_dropout_prob > 0.0:
+        if self.training:
             B, R, _ = robot_tokens.shape
-            keep = (torch.rand(B, R, device=robot_tokens.device) > vision_dropout_prob)
+            keep = torch.ones(B, R, device=robot_tokens.device, dtype=torch.bool)
+            if vision_dropout_prob > 0.0:
+                keep = keep & (torch.rand(B, R, device=robot_tokens.device) > vision_dropout_prob)
+            if full_drop_mask is not None:
+                keep = keep & ~full_drop_mask[:, None]
             robot_tokens = robot_tokens * keep.unsqueeze(-1).to(robot_tokens.dtype)
 
         return robot_tokens
@@ -591,7 +598,7 @@ class InterleavedFlowMatchingTransformer(nn.Module):
     # Robot CNN tokens always go to the expert side, not here.
     # =====================================================================
 
-    def _build_vlm_seq(self, batch: dict) -> tuple[torch.Tensor, int, Optional[torch.Tensor]]:
+    def _build_vlm_seq(self, batch: dict, full_drop_mask: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, int, Optional[torch.Tensor]]:
         """Build [vision, language, state] and return (vlm_seq, L_vis, lang_mask).
 
         Robot tokens belong on expert side.
@@ -631,8 +638,12 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         # to function with missing inputs, not to compensate for distribution
         # shift at inference.
         vision_dropout_prob = getattr(self.config, "vision_dropout_prob", 0.0)
-        if self.training and vision_dropout_prob > 0.0 and L_vis > 0:
-            keep = (torch.rand(B, L_vis, device=vis_tokens.device) > vision_dropout_prob)
+        if self.training and L_vis > 0:
+            keep = torch.ones(B, L_vis, device=vis_tokens.device, dtype=torch.bool)
+            if vision_dropout_prob > 0.0:
+                keep = keep & (torch.rand(B, L_vis, device=vis_tokens.device) > vision_dropout_prob)
+            if full_drop_mask is not None:
+                keep = keep & ~full_drop_mask[:, None]
             vis_tokens = vis_tokens * keep.unsqueeze(-1).to(vis_tokens.dtype)
 
         if lang_result is not None:
@@ -698,15 +709,22 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         L_total = L_vlm + R + K + H
         cos, sin = _build_rope_cache(L_total, self.head_dim, self.rope_theta,
                                        vlm_seq.device, vlm_seq.dtype)
-        attn_mask = self._build_joint_mask(L_vlm, R, K, H, vlm_seq.device, vlm_seq.dtype,
-                                           lang_start=lang_start, lang_len=lang_len,
-                                           lang_mask=lang_mask)
 
-        # Run all joint layers
+        # Per-layer bias means each layer needs its own mask. We rebuild the
+        # mask once per layer — the expensive part is the per-sample pad
+        # blocking, which is identical across layers; only the bias scalar
+        # differs. Could be optimised by precomputing base+addend, but the
+        # simple per-layer rebuild is correct and avoids autograd hazards
+        # from in-place mutation between SDPA calls.
         for i in range(len(self.expert_layers)):
+            attn_mask_i = self._build_joint_mask(
+                L_vlm, R, K, H, vlm_seq.device, vlm_seq.dtype,
+                lang_start=lang_start, lang_len=lang_len,
+                lang_mask=lang_mask, layer_idx=i,
+            )
             vlm_seq, exp_seq = self._joint_layer(
                 vlm_seq, exp_seq, layer_idx=i,
-                cos=cos, sin=sin, attn_mask=attn_mask,
+                cos=cos, sin=sin, attn_mask=attn_mask_i,
             )
 
         # Read out the action positions (skip robot + latent prefix)
@@ -734,12 +752,24 @@ class InterleavedFlowMatchingTransformer(nn.Module):
     def compute_loss(self, batch: dict) -> torch.Tensor:
         actions = batch["action"].float().nan_to_num(0.0).clamp(-10.0, 10.0)
         B = actions.shape[0]
+        device = actions.device
+
+        # Synchronized full-sample vision drop. For samples in full_drop_mask,
+        # BOTH SmolVLM2 vision and robot CNN tokens are zeroed entirely so the
+        # model has only language + state to work with on those samples. This
+        # is a stronger form of forcing than per-token dropout, used when
+        # per-token alone fails to break the vision-only equilibrium.
+        full_drop_prob = getattr(self.config, "vision_full_drop_prob", 0.0)
+        if self.training and full_drop_prob > 0.0:
+            full_drop_mask = torch.rand(B, device=device) < full_drop_prob
+        else:
+            full_drop_mask = None
 
         # Robot tokens always go to the expert side (or are absent entirely
         # if use_robot_cnn=False). VLM side never carries robot tokens.
-        robot_tokens = self._compute_robot_tokens(batch)
+        robot_tokens = self._compute_robot_tokens(batch, full_drop_mask=full_drop_mask)
 
-        vlm_seq, L_vis, lang_mask = self._build_vlm_seq(batch)
+        vlm_seq, L_vis, lang_mask = self._build_vlm_seq(batch, full_drop_mask=full_drop_mask)
         vlm_seq = vlm_seq.float()  # joint attention runs in fp32 for stability
         L_lang = lang_mask.shape[1] if lang_mask is not None else 0
 

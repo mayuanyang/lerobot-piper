@@ -111,16 +111,32 @@ class InterleavedFlowMatchingConfig(PreTrainedConfig):
     # Prepended to the expert sequence. 0 disables.
     num_latent_tokens: int = 8
 
-    # -------- Vision token dropout (language-forcing regularizer) --------
+    # -------- Vision token dropout (regularizer) --------
     # Per-token Bernoulli dropout on vision tokens during training. Each
     # vision token (= one SigLIP patch from the connector) is independently
     # zeroed with this probability. Approximates random spatial erasing /
-    # cutout on the image. The point isn't to make vision unavailable
-    # outright — it's to make the *exact* visual pattern unreliable across
-    # samples, so language (which is stable per task) becomes the only
-    # reliable disambiguating signal and the model is pressured to use it.
-    # 0.0 disables; 0.2-0.4 is a reasonable range.
-    vision_dropout_prob: float = 0.3
+    # cutout on the image.
+    #
+    # Originally introduced (0.3) as a "language-forcing" mechanism based on
+    # the mistaken belief that the model needed pressure to use language.
+    # The actual cause of language being unused was a data-flow bug (the
+    # preprocessor stripped task_description from the batch); once that was
+    # fixed and per-layer lang_attn_bias was added, language is used
+    # naturally and dropout serves only as a vision regularizer.
+    #
+    # Lowered to 0.15 since per-layer bias now handles language conditioning.
+    # 30% was costing ~5 pts on spatial (precise-placement tasks) for no
+    # additional language benefit. 0.0 disables; 0.1-0.2 is a balanced range.
+    vision_dropout_prob: float = 0.15
+
+    # Per-SAMPLE full vision dropout — independent of per-token dropout.
+    # With this probability, BOTH SmolVLM2 vision and robot CNN tokens for a
+    # given sample are completely zeroed (synchronized across both streams,
+    # so the second stream cannot compensate). Forces the model to predict
+    # purely from language + state on those samples. Use this when per-token
+    # dropout alone fails to force language usage (model just learns to
+    # compensate via remaining tokens). 0.0 disables; 0.2-0.4 is reasonable.
+    vision_full_drop_prob: float = 0.0
 
     # -------- LoRA (vision; text stays frozen — single-task) --------
     lora_rank: int = 16
