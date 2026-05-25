@@ -117,17 +117,20 @@ class InterleavedFlowMatchingConfig(PreTrainedConfig):
     # zeroed with this probability. Approximates random spatial erasing /
     # cutout on the image.
     #
-    # Originally introduced (0.3) as a "language-forcing" mechanism based on
-    # the mistaken belief that the model needed pressure to use language.
-    # The actual cause of language being unused was a data-flow bug (the
-    # preprocessor stripped task_description from the batch); once that was
-    # fixed and per-layer lang_attn_bias was added, language is used
-    # naturally and dropout serves only as a vision regularizer.
-    #
-    # Lowered to 0.15 since per-layer bias now handles language conditioning.
-    # 30% was costing ~5 pts on spatial (precise-placement tasks) for no
-    # additional language benefit. 0.0 disables; 0.1-0.2 is a balanced range.
-    vision_dropout_prob: float = 0.15
+    
+    # With `vision_dropout_curriculum_schedule=True` (default), the effective
+    # probability decays over training — high early to force language pathway
+    # formation, low later to recover spatial precision:
+    #   Phase 1 (0-20%):  1.5× base   — aggressive language forcing
+    #   Phase 2 (20-50%): 1.0× base   — balanced
+    #   Phase 3 (50-80%): 0.6× base   — vision takes over for precision
+    #   Phase 4 (80-100%): 0.3× base  — end-to-end polish
+    vision_dropout_prob: float = 0.3
+
+    # When True, vision_dropout_prob is multiplied by a decay factor based on
+    # training progress (training_step / training_steps_total). When False,
+    # the probability stays constant throughout training.
+    vision_dropout_curriculum_schedule: bool = True
 
     # Per-SAMPLE full vision dropout — independent of per-token dropout.
     # With this probability, BOTH SmolVLM2 vision and robot CNN tokens for a

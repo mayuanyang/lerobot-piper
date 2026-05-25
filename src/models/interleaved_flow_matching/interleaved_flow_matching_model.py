@@ -260,6 +260,27 @@ class InterleavedFlowMatchingTransformer(nn.Module):
     # Encoding helpers
     # =====================================================================
 
+    def _get_vision_dropout_prob(self) -> float:
+        """Return vision dropout prob adjusted by curriculum schedule if enabled."""
+        base = float(getattr(self.config, "vision_dropout_prob", 0.0))
+        if not self.training or base <= 0.0:
+            return 0.0
+        if not getattr(self.config, "vision_dropout_curriculum_schedule", True):
+            return base
+        total = float(getattr(self.config, "training_steps_total", 0))
+        step = float(getattr(self.config, "training_step", 0))
+        if total <= 0:
+            return base
+        progress = min(step / total, 1.0)
+        if progress <= 0.7:
+            return base * 1.5
+        elif progress <= 0.8:
+            return base * 1.0
+        elif progress <= 0.9:
+            return base * 0.6
+        else:
+            return base * 0.3
+
     def _encode_images(self, batch: dict, B: int) -> torch.Tensor:
         """Vision tokens, frozen. (B, V*num_cams, hidden_size) bfloat16."""
         vlm_dtype = next(self.vision_model.parameters()).dtype
@@ -581,7 +602,7 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         # Plus optional full-sample drop synchronized with SmolVLM2 vision
         # via full_drop_mask (so robot CNN can't compensate for missing
         # SmolVLM2 vision).
-        vision_dropout_prob = getattr(self.config, "vision_dropout_prob", 0.0)
+        vision_dropout_prob = self._get_vision_dropout_prob()
         if self.training:
             B, R, _ = robot_tokens.shape
             keep = torch.ones(B, R, device=robot_tokens.device, dtype=torch.bool)
@@ -637,7 +658,7 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         # No rescaling (unlike nn.Dropout) because we want the model to learn
         # to function with missing inputs, not to compensate for distribution
         # shift at inference.
-        vision_dropout_prob = getattr(self.config, "vision_dropout_prob", 0.0)
+        vision_dropout_prob = self._get_vision_dropout_prob()
         if self.training and L_vis > 0:
             keep = torch.ones(B, L_vis, device=vis_tokens.device, dtype=torch.bool)
             if vision_dropout_prob > 0.0:
