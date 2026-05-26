@@ -525,6 +525,22 @@ def train(
                     adaptor_g_norm = adaptor_g_norm_sq ** 0.5
                     print(f"  Lang adaptor   - weight_norm: {adaptor_w_norm:.4e}   grad_norm: {adaptor_g_norm:.4e}")
 
+                # Contrastive loss diagnostics — only print if enabled.
+                # `contrastive` ≈ margin at training start (predictions agree
+                # with wrong lang); should decay toward 0 as model learns to
+                # depend on language. If it stays near margin past 10k steps,
+                # the language pathway is not strengthening — bump weight or
+                # margin.
+                comps = getattr(policy.model, "_last_loss_components", None)
+                cw = getattr(policy.model.config, "contrastive_loss_weight", 0.0)
+                if comps is not None and cw > 0.0:
+                    margin = getattr(policy.model.config, "contrastive_margin", 0.05)
+                    main_v = comps.get("main", float("nan"))
+                    contr_v = comps.get("contrastive", float("nan"))
+                    pct = (contr_v / margin * 100.0) if margin > 0 else float("nan")
+                    print(f"  Contrastive    - main: {main_v:.4f}   contrastive: {contr_v:.4f} "
+                          f"({pct:.0f}% of margin {margin:.3f})   weight: {cw}")
+
                 print("--- End Gradient Analysis ---\n")
 
             trainable_params = [p for p in policy.parameters() if p.requires_grad]

@@ -260,27 +260,6 @@ class InterleavedFlowMatchingTransformer(nn.Module):
     # Encoding helpers
     # =====================================================================
 
-    def _get_vision_dropout_prob(self) -> float:
-        """Return vision dropout prob adjusted by curriculum schedule if enabled."""
-        base = float(getattr(self.config, "vision_dropout_prob", 0.0))
-        if not self.training or base <= 0.0:
-            return 0.0
-        if not getattr(self.config, "vision_dropout_curriculum_schedule", True):
-            return base
-        total = float(getattr(self.config, "training_steps_total", 0))
-        step = float(getattr(self.config, "training_step", 0))
-        if total <= 0:
-            return base
-        progress = min(step / total, 1.0)
-        if progress <= 0.7:
-            return base * 1.5
-        elif progress <= 0.8:
-            return base * 1.0
-        elif progress <= 0.9:
-            return base * 0.6
-        else:
-            return base * 0.3
-
     def _encode_images(self, batch: dict, B: int) -> torch.Tensor:
         """Vision tokens, frozen. (B, V*num_cams, hidden_size) bfloat16."""
         vlm_dtype = next(self.vision_model.parameters()).dtype
@@ -571,18 +550,16 @@ class InterleavedFlowMatchingTransformer(nn.Module):
     # Compute robot CNN tokens once (used by either VLM or expert side)
     # =====================================================================
 
-    def _compute_robot_tokens(self, batch: dict, full_drop_mask: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
+    def _compute_robot_tokens(self, batch: dict) -> Optional[torch.Tensor]:
         """
         Run RobotVisualEncoder per camera, concat to (B, R, hidden_size).
         Returns None if the encoder is disabled (use_robot_cnn=False) or no
         cameras are present in the batch.
 
-        Vision dropout is applied here as well, with the same probability as
-        SmolVLM2 vision tokens. This is essential: robot CNN tokens are a
-        second visual stream that would otherwise compensate for dropped
-        SmolVLM2 tokens and let the model continue ignoring language. Both
-        streams must be dropped together for the language-forcing pressure
-        to work.
+        Per-token vision dropout uses the same probability as the SmolVLM2
+        vision side — the robot CNN is a second visual stream and would
+        otherwise compensate for dropped SmolVLM2 tokens, undermining the
+        regularization.
         """
         if self.robot_visual_encoder is None:
             return None
@@ -598,18 +575,10 @@ class InterleavedFlowMatchingTransformer(nn.Module):
             return None
         robot_tokens = torch.cat(robot_tokens_list, dim=1)
 
-        # Per-token vision dropout (same prob as SmolVLM2 vision side).
-        # Plus optional full-sample drop synchronized with SmolVLM2 vision
-        # via full_drop_mask (so robot CNN can't compensate for missing
-        # SmolVLM2 vision).
-        vision_dropout_prob = self._get_vision_dropout_prob()
-        if self.training:
+        vision_dropout_prob = float(getattr(self.config, "vision_dropout_prob", 0.0)) if self.training else 0.0
+        if self.training and vision_dropout_prob > 0.0:
             B, R, _ = robot_tokens.shape
-            keep = torch.ones(B, R, device=robot_tokens.device, dtype=torch.bool)
-            if vision_dropout_prob > 0.0:
-                keep = keep & (torch.rand(B, R, device=robot_tokens.device) > vision_dropout_prob)
-            if full_drop_mask is not None:
-                keep = keep & ~full_drop_mask[:, None]
+            keep = torch.rand(B, R, device=robot_tokens.device) > vision_dropout_prob
             robot_tokens = robot_tokens * keep.unsqueeze(-1).to(robot_tokens.dtype)
 
         return robot_tokens
@@ -619,7 +588,7 @@ class InterleavedFlowMatchingTransformer(nn.Module):
     # Robot CNN tokens always go to the expert side, not here.
     # =====================================================================
 
-    def _build_vlm_seq(self, batch: dict, full_drop_mask: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, int, Optional[torch.Tensor]]:
+    def _build_vlm_seq(self, batch: dict) -> tuple[torch.Tensor, int, Optional[torch.Tensor]]:
         """Build [vision, language, state] and return (vlm_seq, L_vis, lang_mask).
 
         Robot tokens belong on expert side.
@@ -644,27 +613,12 @@ class InterleavedFlowMatchingTransformer(nn.Module):
 
         L_vis = vis_tokens.shape[1]
 
-        # Vision token dropout — during training only, independently zero out
-        # each vision token with probability `vision_dropout_prob`. Each token
-        # corresponds to a spatial patch (SigLIP grid), so dropping random
-        # tokens simulates partial occlusion / random erasing.
-        #
-        # Why this forces language: with ~30% of patches missing per sample,
-        # the exact visual context for any given action is unreliable from
-        # step to step. Language (which IS stable across samples of the same
-        # task) becomes the only reliable signal — model is pressured to use
-        # it instead of memorising vision-only mappings.
-        #
-        # No rescaling (unlike nn.Dropout) because we want the model to learn
-        # to function with missing inputs, not to compensate for distribution
-        # shift at inference.
-        vision_dropout_prob = self._get_vision_dropout_prob()
-        if self.training and L_vis > 0:
-            keep = torch.ones(B, L_vis, device=vis_tokens.device, dtype=torch.bool)
-            if vision_dropout_prob > 0.0:
-                keep = keep & (torch.rand(B, L_vis, device=vis_tokens.device) > vision_dropout_prob)
-            if full_drop_mask is not None:
-                keep = keep & ~full_drop_mask[:, None]
+        # Per-token vision dropout (regularizer). Each SigLIP patch is
+        # independently zeroed during training. No rescaling — model learns
+        # to function with partial vision, not to compensate at inference.
+        vision_dropout_prob = float(getattr(self.config, "vision_dropout_prob", 0.0)) if self.training else 0.0
+        if self.training and L_vis > 0 and vision_dropout_prob > 0.0:
+            keep = torch.rand(B, L_vis, device=vis_tokens.device) > vision_dropout_prob
             vis_tokens = vis_tokens * keep.unsqueeze(-1).to(vis_tokens.dtype)
 
         if lang_result is not None:
@@ -775,22 +729,11 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         B = actions.shape[0]
         device = actions.device
 
-        # Synchronized full-sample vision drop. For samples in full_drop_mask,
-        # BOTH SmolVLM2 vision and robot CNN tokens are zeroed entirely so the
-        # model has only language + state to work with on those samples. This
-        # is a stronger form of forcing than per-token dropout, used when
-        # per-token alone fails to break the vision-only equilibrium.
-        full_drop_prob = getattr(self.config, "vision_full_drop_prob", 0.0)
-        if self.training and full_drop_prob > 0.0:
-            full_drop_mask = torch.rand(B, device=device) < full_drop_prob
-        else:
-            full_drop_mask = None
-
         # Robot tokens always go to the expert side (or are absent entirely
         # if use_robot_cnn=False). VLM side never carries robot tokens.
-        robot_tokens = self._compute_robot_tokens(batch, full_drop_mask=full_drop_mask)
+        robot_tokens = self._compute_robot_tokens(batch)
 
-        vlm_seq, L_vis, lang_mask = self._build_vlm_seq(batch, full_drop_mask=full_drop_mask)
+        vlm_seq, L_vis, lang_mask = self._build_vlm_seq(batch)
         vlm_seq = vlm_seq.float()  # joint attention runs in fp32 for stability
         L_lang = lang_mask.shape[1] if lang_mask is not None else 0
 
@@ -822,8 +765,82 @@ class InterleavedFlowMatchingTransformer(nn.Module):
             valid = ~is_pad.bool()
             loss = loss * valid.unsqueeze(-1).float()
             pos_w_sum = (pos_w[None, :] * valid.float()).sum().clamp(min=1e-6)
-            return loss.sum() / (pos_w_sum * self.config.action_dim)
-        return loss.mean()
+            main_loss = loss.sum() / (pos_w_sum * self.config.action_dim)
+        else:
+            main_loss = loss.mean()
+
+        # ------------------------------------------------------------------
+        # Auxiliary contrastive loss — force language to affect action.
+        # Re-run velocity_field with shuffled language tokens; penalise the
+        # model when the two predictions agree closely (= language ignored).
+        # ------------------------------------------------------------------
+        contrastive_weight = getattr(self.config, "contrastive_loss_weight", 0.0)
+        contrastive_loss_value = 0.0
+        if (
+            self.training
+            and contrastive_weight > 0.0
+            and lang_mask is not None
+            and L_lang > 0
+            and B >= 2
+        ):
+            # Random derangement-ish: shuffle and roll if any element maps to
+            # itself. Cheap, doesn't need to be perfect — even a couple of
+            # self-mappings only reduce the effective contrastive batch size.
+            perm = torch.randperm(B, device=device)
+            if (perm == torch.arange(B, device=device)).any():
+                perm = torch.roll(perm, shifts=1, dims=0)
+
+            # Exclude pairs whose instruction happens to match the original
+            # (~2-3% of pairs in LIBERO 4-suite training). Contrasting two
+            # identical instructions would push predictions apart for no
+            # semantic reason.
+            descs = batch.get("task")
+            if descs is None:
+                descs = batch.get("task_description")
+            if descs is not None and len(descs) == B:
+                perm_cpu = perm.detach().cpu().tolist()
+                pair_diff = torch.tensor(
+                    [descs[i] != descs[perm_cpu[i]] for i in range(B)],
+                    device=device,
+                    dtype=torch.bool,
+                )
+            else:
+                pair_diff = torch.ones(B, device=device, dtype=torch.bool)
+
+            if pair_diff.any():
+                # Rebuild vlm_seq with shuffled language. Vision and state
+                # parts are reused as-is (no re-encode of the heavy SigLIP
+                # pass); only language tokens move across batch positions.
+                vis_part = vlm_seq[:, :L_vis]
+                lang_part = vlm_seq[:, L_vis:L_vis + L_lang]
+                state_part = vlm_seq[:, L_vis + L_lang:]
+                vlm_seq_wrong = torch.cat(
+                    [vis_part, lang_part[perm], state_part], dim=1,
+                )
+                lang_mask_wrong = lang_mask[perm]
+
+                v_wrong = self.velocity_field(
+                    x_t, t, vlm_seq_wrong.to(x_t.dtype),
+                    robot_tokens=robot_tokens,
+                    lang_start=L_vis, lang_len=L_lang, lang_mask=lang_mask_wrong,
+                )
+
+                # Mean squared distance per sample → margin hinge
+                diff_sq = (v_t - v_wrong).pow(2).mean(dim=[1, 2])  # (B,)
+                margin = float(getattr(self.config, "contrastive_margin", 0.05))
+                hinge = F.relu(margin - diff_sq) * pair_diff.float()
+                n_valid = pair_diff.float().sum().clamp(min=1.0)
+                loss_contrastive = hinge.sum() / n_valid
+                contrastive_loss_value = float(loss_contrastive.detach())
+                main_loss = main_loss + contrastive_weight * loss_contrastive
+
+        # Stash components so the train loop can log them without changing
+        # the (loss, info) return signature of forward().
+        self._last_loss_components = {
+            "main": float(main_loss.detach() - contrastive_weight * contrastive_loss_value),
+            "contrastive": contrastive_loss_value,
+        }
+        return main_loss
 
     def forward(self, batch: dict) -> tuple:
         if self.training:

@@ -117,29 +117,37 @@ class InterleavedFlowMatchingConfig(PreTrainedConfig):
     # zeroed with this probability. Approximates random spatial erasing /
     # cutout on the image.
     #
-    
-    # With `vision_dropout_curriculum_schedule=True` (default), the effective
-    # probability decays over training — high early to force language pathway
-    # formation, low later to recover spatial precision:
-    #   Phase 1 (0-20%):  1.5× base   — aggressive language forcing
-    #   Phase 2 (20-50%): 1.0× base   — balanced
-    #   Phase 3 (50-80%): 0.6× base   — vision takes over for precision
-    #   Phase 4 (80-100%): 0.3× base  — end-to-end polish
-    vision_dropout_prob: float = 0.3
+    # Originally used (0.30) as a "language forcing" mechanism under the
+    # mistaken belief that the model needed pressure to use language. That
+    # job is now handled by `contrastive_loss_weight` below; this knob is
+    # purely a visual regularizer. 0.10-0.15 is the sensible range on
+    # LIBERO; >0.20 starts costing precision on small-object tasks.
+    vision_dropout_prob: float = 0.15
 
-    # When True, vision_dropout_prob is multiplied by a decay factor based on
-    # training progress (training_step / training_steps_total). When False,
-    # the probability stays constant throughout training.
-    vision_dropout_curriculum_schedule: bool = True
+    # -------- Auxiliary contrastive loss (language forcing) --------
+    # Weight on an auxiliary loss that directly rewards action predictions
+    # for depending on language. Mechanism: during training, run
+    # velocity_field a second time with shuffled language tokens (same
+    # vision, same state, same noise) and force the two predictions to
+    # differ by at least `contrastive_margin` (mean squared L2). Pairs
+    # where the shuffled instruction happens to match the original are
+    # excluded.
+    #
+    # 0.0 disables. 0.05-0.20 is the active range; >0.3 risks pushing
+    # predictions apart even when they legitimately should match. Cost:
+    # ~+50-70% step time (one extra velocity_field call per step; vision
+    # encoder is NOT re-run, only the language portion is shuffled).
+    #
+    # Default 0.1 = moderate active. Pushes the model to use language but
+    # leaves the main flow-matching loss dominant. Bump to 0.15-0.20 if
+    # the `contrastive` log line plateaus near margin past 10k steps.
+    contrastive_loss_weight: float = 0.1
 
-    # Per-SAMPLE full vision dropout — independent of per-token dropout.
-    # With this probability, BOTH SmolVLM2 vision and robot CNN tokens for a
-    # given sample are completely zeroed (synchronized across both streams,
-    # so the second stream cannot compensate). Forces the model to predict
-    # purely from language + state on those samples. Use this when per-token
-    # dropout alone fails to force language usage (model just learns to
-    # compensate via remaining tokens). 0.0 disables; 0.2-0.4 is reasonable.
-    vision_full_drop_prob: float = 0.0
+    # Minimum mean-squared L2 distance between correct-lang and wrong-lang
+    # velocity predictions. Loss contribution = relu(margin - mean_sq_diff).
+    # 0.05 is roughly the magnitude of inter-task action differences after
+    # normalization. Once predictions differ by margin, no further pressure.
+    contrastive_margin: float = 0.05
 
     # -------- LoRA (vision; text stays frozen — single-task) --------
     lora_rank: int = 16
