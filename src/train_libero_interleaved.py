@@ -466,23 +466,32 @@ def train(
                     ("Expert Layers",  "expert_layers"),
                     ("Action In/Out",  "action_"),
                     ("Final Norm",     "final_norm"),
-                    ("Latent Tokens",  "latent_embs"),
+                    ("Latent Gen",     "latent_generator"),
                     ("Lang Adaptor",   "lang_adaptor"),
                 ]:
                     grad, n = _grad_stats(prefix)
                     print(f"  {label:14s} - Avg Abs Grad: {grad:.6f} ({n} params)" if grad is not None else f"  {label:14s} - no grad")
 
-                if hasattr(policy.model, "latent_embs"):
-                    lat = policy.model.latent_embs.detach()
-                    if lat.shape[1] > 0:
-                        normed = torch.nn.functional.normalize(lat[0], dim=-1)
-                        cos = (normed @ normed.t())
-                        off_diag = cos[~torch.eye(cos.shape[0], dtype=torch.bool, device=cos.device)]
-                        grad_param = policy.model.latent_embs.grad
-                        grad_norm_l = grad_param.norm().item() if grad_param is not None else float("nan")
-                        print(f"  Latent stats   - grad_norm: {grad_norm_l:.4e}  "
-                              f"mean |cos|: {off_diag.abs().mean().item():.3f}  "
-                              f"max |cos|: {off_diag.abs().max().item():.3f}")
+                # Latent generator stats — replaces the old static `latent_embs`
+                # diagnostic. Track weight magnitude and gradient flow to confirm
+                # the language-conditional MLP is actively learning. Last layer
+                # is zero-init so weight_norm grows from ~0 over training.
+                if hasattr(policy.model, "latent_generator"):
+                    gen = policy.model.latent_generator
+                    w_norm_sq = 0.0
+                    g_norm_sq = 0.0
+                    for p in gen.parameters():
+                        w_norm_sq += p.detach().norm().item() ** 2
+                        if p.grad is not None:
+                            g_norm_sq += p.grad.norm().item() ** 2
+                    w_norm = w_norm_sq ** 0.5
+                    g_norm = g_norm_sq ** 0.5
+                    # Output-layer norm separately — it's zero-init, so its growth
+                    # is the cleanest signal that task-conditional latents are
+                    # actually being produced.
+                    out_layer = gen[-1]
+                    out_w_norm = out_layer.weight.detach().norm().item()
+                    print(f"  Latent gen     - weight_norm: {w_norm:.4e}   grad_norm: {g_norm:.4e}   out_layer_w: {out_w_norm:.4e}")
 
                 # Language conditioning diagnostics. We added lang_adaptor
                 # (zero-init residual MLP) and lang_attn_bias (scalar) to give

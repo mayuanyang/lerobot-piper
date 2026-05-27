@@ -286,7 +286,7 @@ def main():
         stats = vlm_warm_init(policy.model, init_scale=args.init_scale)
         print(f"[vlm_init] Done. Initialised {stats['layers']} expert layers, "
               f"{stats['params_copied']:,} trainable params overwritten.")
-        print("[vlm_init] Note: latent_embs / robot_visual_encoder / action_in_proj / "
+        print("[vlm_init] Note: latent_generator / robot_visual_encoder / action_in_proj / "
               "action_out_proj / state_encoder remain at their constructor defaults.")
     elif args.mode == "smolvla":
         print(f"\n[smolvla] Loading SmolVLA checkpoint from {args.smolvla_id}...")

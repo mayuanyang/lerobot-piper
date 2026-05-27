@@ -207,12 +207,33 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         nn.init.normal_(self.action_pos_emb, std=0.02)
 
         # ------------------------------------------------------------------
-        # 5. Latent "thought" tokens
+        # 5. Latent "thought" tokens — generated from pooled language
+        #
+        # Previously a static `nn.Parameter`, shared across all batch samples.
+        # Ablation (2026-05-26) showed zeroing static latents made spatial
+        # T0 fail 0/10 — i.e. latents were load-bearing but task-agnostic.
+        # That static design made T9 (cabinet) etc. structurally hard to
+        # learn because every task shared one latent prior.
+        #
+        # New design: at every forward, pool the language tokens (masked
+        # mean over non-pad positions) and project to K × hidden via a
+        # small MLP. Latents become task-conditional plans.
+        #
+        # Init: zero-init the output layer so untrained model produces
+        # latents ≈ 0 (matches "no latents" ablation behaviour). All
+        # capability has to be learned from gradients, but the path is
+        # open from step 0.
         # ------------------------------------------------------------------
         self.num_latent_tokens = config.num_latent_tokens
         if self.num_latent_tokens > 0:
-            self.latent_embs = nn.Parameter(torch.zeros(1, self.num_latent_tokens, self.hidden_size))
-            nn.init.normal_(self.latent_embs, std=0.02)
+            hidden_mid = self.hidden_size * 2
+            self.latent_generator = nn.Sequential(
+                nn.Linear(self.hidden_size, hidden_mid),
+                nn.SiLU(),
+                nn.Linear(hidden_mid, self.num_latent_tokens * self.hidden_size),
+            )
+            nn.init.zeros_(self.latent_generator[-1].weight)
+            nn.init.zeros_(self.latent_generator[-1].bias)
 
         # ------------------------------------------------------------------
         # 6. Final norm before action readout
@@ -511,11 +532,45 @@ class InterleavedFlowMatchingTransformer(nn.Module):
     # Build expert sequence for a given timestep
     # =====================================================================
 
+    def _generate_latents(
+        self,
+        lang_tokens: Optional[torch.Tensor],
+        lang_mask: Optional[torch.Tensor],
+        B: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        """
+        Task-conditional latent tokens, generated from masked-mean of the
+        adapted language embeddings.
+
+        lang_tokens: (B, L_lang, hidden) — post-adaptor language part of vlm_seq
+        lang_mask:   (B, L_lang) bool, True = real token
+        Returns:     (B, K, hidden) or None if K == 0.
+
+        Falls back to zero-pooled input when language is absent, keeping the
+        K positions present in the expert sequence so attention shapes match
+        the configured layout.
+        """
+        K = self.num_latent_tokens
+        if K == 0:
+            return None
+        if lang_tokens is None or lang_mask is None:
+            pooled = torch.zeros(B, self.hidden_size, device=device, dtype=dtype)
+        else:
+            mask_f = lang_mask.float().unsqueeze(-1).to(lang_tokens.dtype)
+            denom = mask_f.sum(dim=1).clamp(min=1.0)
+            pooled = (lang_tokens * mask_f).sum(dim=1) / denom
+        # Generator runs in fp32 for stability; output cast back.
+        flat = self.latent_generator(pooled.float())
+        return flat.view(B, K, self.hidden_size).to(dtype)
+
     def _build_expert_seq(
         self,
         noisy_actions: torch.Tensor,
         timesteps: torch.Tensor,
         robot_tokens: Optional[torch.Tensor] = None,
+        latents: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Build the expert-side sequence.
@@ -523,8 +578,12 @@ class InterleavedFlowMatchingTransformer(nn.Module):
             [robot, latent, action]   (B, R + K + H, hidden_size)
         Layout when robot_tokens is None (default VLM-side mode):
             [latent, action]          (B, K + H, hidden_size)
+
+        `latents` is now generated upstream (in velocity_field) from pooled
+        language. Pass None to skip latent positions entirely (only valid if
+        config.num_latent_tokens == 0).
         """
-        B, H, _ = noisy_actions.shape
+        H = noisy_actions.shape[1]
 
         action_emb = self.action_in_proj(noisy_actions)            # (B, H, hidden)
         action_emb = action_emb + self.action_pos_emb[:, :H]       # add positional bias
@@ -541,8 +600,8 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         parts = []
         if robot_tokens is not None:
             parts.append(robot_tokens.to(action_tgt.dtype))
-        if self.num_latent_tokens > 0:
-            parts.append(self.latent_embs.expand(B, -1, -1).to(action_tgt.dtype))
+        if self.num_latent_tokens > 0 and latents is not None:
+            parts.append(latents.to(action_tgt.dtype))
         parts.append(action_tgt)
         return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
 
@@ -679,7 +738,21 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         R = robot_tokens.size(1) if robot_tokens is not None else 0
         L_vlm = vlm_seq.size(1)
 
-        exp_seq = self._build_expert_seq(noisy_actions, timesteps, robot_tokens).to(vlm_seq.dtype)
+        # Generate task-conditional latents from the adapted language portion
+        # of vlm_seq. Using vlm_seq (rather than the raw language tokens) means
+        # the generator sees the same post-lang_adaptor representation the rest
+        # of the network attends to.
+        lang_part = (
+            vlm_seq[:, lang_start : lang_start + lang_len]
+            if (lang_len > 0 and lang_mask is not None) else None
+        )
+        latents = self._generate_latents(
+            lang_part, lang_mask, B, vlm_seq.device, vlm_seq.dtype,
+        )
+
+        exp_seq = self._build_expert_seq(
+            noisy_actions, timesteps, robot_tokens, latents,
+        ).to(vlm_seq.dtype)
 
         L_total = L_vlm + R + K + H
         cos, sin = _build_rope_cache(L_total, self.head_dim, self.rope_theta,
