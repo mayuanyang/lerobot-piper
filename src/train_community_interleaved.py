@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import argparse
 from pathlib import Path
 from typing import Optional, Union
@@ -36,11 +37,11 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, ConcatDataset, DataLoader
 from tqdm import tqdm
 import huggingface_hub
-from huggingface_hub import list_repo_tree, hf_hub_download
+from huggingface_hub import list_repo_files, snapshot_download
 from safetensors.torch import load_file as load_safetensors
 
 from lerobot.configs.types import FeatureType
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import dataset_to_policy_features
 
@@ -68,8 +69,27 @@ if device.type == "cuda":
 
 # ---------------------------------------------------------------------------
 # Community dataset hub
+#
+# `HuggingFaceVLA/community_dataset_v3` is a SINGLE HF dataset repo that nests
+# many LeRobot datasets inside it:
+#
+#   community_dataset_v3/                 ← the repo
+#   ├── <contributor>/
+#   │   ├── <dataset_name>/               ← a LeRobot dataset root
+#   │   │   ├── data/   episode_*.parquet
+#   │   │   ├── videos/ episode_*.mp4
+#   │   │   └── meta/   info.json, stats, tasks, episodes
+#   │   └── <dataset_name_2>/
+#   └── <contributor_2>/ ...
+#
+# Each `<contributor>/<dataset_name>` directory is an independent dataset. We
+# can NOT load them via separate repo_ids (HF repo_ids are exactly
+# 'namespace/name', two segments). Instead we treat the whole thing as one
+# repo, find every embedded dataset root by its `meta/info.json` marker, and
+# load each with `LeRobotDataset(repo_id, root=<local subdir>)`.
 # ---------------------------------------------------------------------------
-COMMUNITY_DATASET_REPO = "HuggingFaceVLA/community_dataset_v3"
+COMMUNITY_DATASET_REPO = "hxma/RoboTwin-LeRobot-v3.0"
+INFO_MARKER = "meta/info.json"
 
 # Canonical camera names — these must be a subset of what the interleaved model
 # was configured with. Missing cameras in a sub-dataset will be zero-padded.
@@ -129,40 +149,178 @@ def apply_joint_augmentations(batch: dict, state_key: str) -> dict:
 # Discover sub-dataset list from the community hub
 # ---------------------------------------------------------------------------
 def discover_sub_datasets(repo_id: str = COMMUNITY_DATASET_REPO) -> list[str]:
-    """Return the sorted list of sub-dataset directory names under the hub repo."""
-    tree = list_repo_tree(repo_id, repo_type="dataset", recursive=False)
-    sub_dirs: list[str] = []
-    for item in tree:
-        # Each sub-dataset is a top-level directory containing its own
-        # LeRobot-format files (meta/, data/, videos/).
-        if hasattr(item, "type") and item.type == "directory":
-            sub_dirs.append(item.path.rstrip("/"))
-        elif hasattr(item, "path") and not item.path.endswith("/"):
-            # Some entries may be files at the root (README.md, .gitattributes);
-            # we only care about directories, so ignore them.
-            pass
-    # Filter out known non-dataset root entries.
-    excluded = {"README.md", ".gitattributes", ".huggingface"}
-    sub_dirs = [d for d in sub_dirs if d not in excluded and not d.startswith(".")]
-    sub_dirs = sorted(sub_dirs)
-    print(f"Discovered {len(sub_dirs)} sub-datasets in {repo_id}")
-    return sub_dirs
+    """
+    Walk a single HF dataset repo and return the relative paths of every
+    embedded LeRobot dataset root, identified by a `meta/info.json` marker.
+
+    For community_dataset_v3 these look like 'yangfengzzz/pick_place_v1'
+    ('<contributor>/<dataset_name>'), but depth is not assumed — any directory
+    containing 'meta/info.json' is a dataset root. '' means the repo root
+    itself is a dataset.
+
+    Only lists file names (no data download), so it is cheap.
+    """
+    files = list_repo_files(repo_id, repo_type="dataset")
+    roots: set[str] = set()
+    for f in files:
+        if f.endswith(INFO_MARKER):
+            root = f[: -len(INFO_MARKER)].rstrip("/")
+            roots.add(root)            # '' if the marker sits at the repo root
+    roots_sorted = sorted(roots)
+    print(f"[discover] Found {len(roots_sorted)} LeRobot dataset roots in {repo_id} "
+          f"(scanned {len(files)} files)")
+    return roots_sorted
 
 
-def load_sub_dataset_metadata(repo_id: str, sub_dir: str) -> LeRobotDatasetMetadata:
-    """Load the LeRobot metadata for a single sub-dataset within the community repo."""
-    dataset_id = f"{repo_id}/{sub_dir}"
+def classify_dataset_versions(repo_id: str = COMMUNITY_DATASET_REPO) -> dict[str, str]:
+    """
+    Classify every embedded dataset root as 'v3.0', 'v2.1', or 'unknown'
+    using ONLY the repo file listing (one API call, no downloads).
+
+    Markers (the meta-file layout differs between versions):
+      v3.0 → meta/tasks.parquet exists, or a meta/episodes/ subdirectory exists
+      v2.1 → meta/tasks.jsonl or meta/episodes.jsonl exists
+      unknown → neither marker present (corrupt / partial upload)
+
+    Note: the `codebase_version` string inside info.json can be stale/edited
+    (some datasets here carry an info.json.bak), so we trust the actual file
+    layout instead of that field.
+    """
+    files = list_repo_files(repo_id, repo_type="dataset")
+    fileset = set(files)
+
+    # Roots that have a meta/episodes/ subdir (a v3.0 marker) — precomputed.
+    episodes_dir_roots: set[str] = set()
+    for f in files:
+        idx = f.find("/meta/episodes/")
+        if idx != -1:
+            episodes_dir_roots.add(f[:idx])
+        elif f.startswith("meta/episodes/"):
+            episodes_dir_roots.add("")
+
+    result: dict[str, str] = {}
+    for f in files:
+        if not f.endswith(INFO_MARKER):
+            continue
+        root = f[: -len(INFO_MARKER)].rstrip("/")
+        prefix = f"{root}/meta/" if root else "meta/"
+        v3 = (prefix + "tasks.parquet") in fileset or root in episodes_dir_roots
+        v2 = (prefix + "tasks.jsonl") in fileset or (prefix + "episodes.jsonl") in fileset
+        result[root] = "v3.0" if v3 else ("v2.1" if v2 else "unknown")
+    return result
+
+
+def print_version_report(repo_id: str = COMMUNITY_DATASET_REPO) -> dict[str, str]:
+    """Classify all datasets and print a grouped report. Returns the mapping."""
+    versions = classify_dataset_versions(repo_id)
+    by_ver: dict[str, list[str]] = {"v3.0": [], "v2.1": [], "unknown": []}
+    for root, ver in sorted(versions.items()):
+        by_ver.setdefault(ver, []).append(root)
+
+    print(f"\n=== Version report for {repo_id} ===")
+    print(f"  v3.0:    {len(by_ver['v3.0'])}")
+    print(f"  v2.1:    {len(by_ver['v2.1'])}")
+    print(f"  unknown: {len(by_ver['unknown'])}")
+    print(f"  total:   {len(versions)}\n")
+    for ver in ("v3.0", "v2.1", "unknown"):
+        if by_ver[ver]:
+            print(f"--- {ver} ({len(by_ver[ver])}) ---")
+            for root in by_ver[ver]:
+                print(f"  {root}")
+            print()
+    return versions
+
+
+def _download_subdir(
+    repo_id: str, subpath: str, workspace: Path, patterns: Optional[list[str]] = None,
+) -> Path:
+    """
+    Download one embedded dataset's files into a WRITABLE workspace dir and
+    return the local path to that dataset's root.
+
+    Uses `local_dir=workspace` so files are materialised as real files (not
+    HF-cache symlinks). This matters because v2.1→v3.0 conversion rewrites
+    files in place — doing that inside the symlinked HF cache would corrupt
+    the content-addressed blob store.
+
+    `patterns` lets callers fetch only part of the subdir (e.g. just `meta/**`
+    for cheap metadata discovery). When None, the whole subdir is fetched.
+    """
+    if patterns is None:
+        patterns = [f"{subpath}/**"] if subpath else None
+    workspace.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        revision="main",
+        allow_patterns=patterns,
+        local_dir=str(workspace),
+    )
+    return workspace / subpath if subpath else workspace
+
+
+def load_sub_dataset_info(repo_id: str, subpath: str, workspace: Path) -> Optional[dict]:
+    """
+    Read a sub-dataset's raw `meta/info.json` (parsed dict) without going
+    through LeRobotDatasetMetadata — which raises on v2.1 datasets. We only
+    need `features` and `fps` for camera/dim discovery, both of which live in
+    info.json regardless of codebase version.
+
+    Returns the parsed dict, or None on failure.
+    """
     try:
-        meta = LeRobotDatasetMetadata(dataset_id, force_cache_sync=True, revision="main")
-        return meta
+        meta_patterns = [f"{subpath}/meta/info.json"] if subpath else ["meta/info.json"]
+        root = _download_subdir(repo_id, subpath, workspace, patterns=meta_patterns)
+        with open(root / "meta" / "info.json") as f:
+            return json.load(f)
     except Exception as e:
-        print(f"  [WARN] Failed to load metadata for {dataset_id}: {e}")
+        print(f"  [WARN] Failed to read info.json for {repo_id}:{subpath or '<root>'}: {e}")
         return None
+
+
+class _RawMeta:
+    """
+    Minimal stand-in for LeRobotDatasetMetadata exposing just `.features` and
+    `.fps`, parsed straight from info.json. Lets the camera/dim discovery
+    helpers work on v2.1 datasets (which LeRobotDatasetMetadata refuses to
+    load) since they only read `meta.features`.
+    """
+
+    def __init__(self, info: dict):
+        self.features = info.get("features", {})
+        self.fps = info.get("fps", 30)
+        self.codebase_version = str(info.get("codebase_version", "")).lstrip("v")
+
+
+def _ensure_v30(repo_id: str, root: Path, subpath: str) -> Path:
+    """
+    Ensure the dataset at `root` is in v3.0 format, converting in place from
+    v2.1 if needed. Idempotent: a dataset already at v3.0 is left untouched,
+    so re-runs skip the (expensive) conversion.
+
+    Conversion runs fully local (`push_to_hub=False`); since `root` already
+    holds the v2.1 files, convert_dataset skips any hub download.
+    """
+    info_path = root / "meta" / "info.json"
+    with open(info_path) as f:
+        version = str(json.load(f).get("codebase_version", "")).lstrip("v")
+    if not version.startswith("2"):
+        return root  # already v3.0 (or newer) — nothing to do
+
+    from lerobot.datasets.v30.convert_dataset_v21_to_v30 import convert_dataset
+    print(f"  [convert] {subpath}: v{version} → v3.0 (in place, no hub push)...")
+    convert_dataset(
+        repo_id=repo_id,
+        root=root,
+        push_to_hub=False,
+        force_conversion=True,
+    )
+    return root
 
 # ---------------------------------------------------------------------------
 # Camera-name mapping discovery
 # ---------------------------------------------------------------------------
-def discover_all_camera_names(sub_metas: dict[str, LeRobotDatasetMetadata]) -> dict[str, set[str]]:
+def discover_all_camera_names(sub_metas: dict[str, "_RawMeta"]) -> dict[str, set[str]]:
     """
     For every sub-dataset, find the set of VISUAL feature keys.
     Returns {sub_dir: {cam_key, ...}}.
@@ -176,7 +334,7 @@ def discover_all_camera_names(sub_metas: dict[str, LeRobotDatasetMetadata]) -> d
 
 
 def discover_state_action_dims(
-    sub_metas: dict[str, LeRobotDatasetMetadata],
+    sub_metas: dict[str, "_RawMeta"],
 ) -> tuple[dict[str, int], dict[str, int], dict[str, str], dict[str, str]]:
     """
     Returns:
@@ -282,7 +440,29 @@ class DatasetAdapter(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> dict:
-        item = self.dataset[idx]
+        # HF datasets reject numpy integer keys; coerce to a Python int so
+        # this works whether the index comes from a sampler, ConcatDataset,
+        # or np.random.choice.
+        #
+        # Community data has occasional corrupt/undecodable videos (AV1 packets
+        # that torchcodec rejects). A single bad sample must not crash the whole
+        # DataLoader worker — retry with random neighbours, then give up.
+        try:
+            item = self.dataset[int(idx)]
+        except Exception as e:
+            item = None
+            for _ in range(8):
+                alt = random.randint(0, len(self.dataset) - 1)
+                try:
+                    item = self.dataset[alt]
+                    break
+                except Exception:
+                    continue
+            if item is None:
+                raise RuntimeError(
+                    f"{self.sub_dir}: 8 consecutive samples failed to decode "
+                    f"(last error: {e})"
+                ) from e
 
         # ── Camera remapping ──────────────────────────────────────────
         for canon_cam in self._canonical_cams:
@@ -444,29 +624,65 @@ def train(
     reset_lang_params: bool = False,
     sub_datasets_allowlist: Optional[list[str]] = None,
     sub_datasets_denylist: Optional[list[str]] = None,
+    source: str = COMMUNITY_DATASET_REPO,
+    max_datasets: Optional[int] = None,
+    seed: int = 42,
+    version_filter: str = "all",
 ):
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
+
+    # Writable workspace for downloaded + converted sub-datasets. Kept outside
+    # the HF symlink cache so v2.1→v3.0 conversion can rewrite files in place.
+    workspace = output_directory / "_datasets"
+    workspace.mkdir(parents=True, exist_ok=True)
 
     progress_update_freq = 200
     checkpoint_freq = 1000
     image_transforms = get_augmentations()
 
     # ── Discover sub-datasets ───────────────────────────────────────────
-    all_subs = discover_sub_datasets(COMMUNITY_DATASET_REPO)
+    # `all_subs` contains RELATIVE subpaths inside the `source` repo
+    # (e.g. 'yangfengzzz/pick_place_v1'), each marked by meta/info.json.
+    all_subs = discover_sub_datasets(source)
+
+    # Version filter: optionally restrict to v3.0 (skip conversion) or v2.1.
+    # Classification is cheap (one file-listing call, no downloads).
+    if version_filter != "all":
+        want = {"v3": "v3.0", "v2": "v2.1"}[version_filter]
+        versions = classify_dataset_versions(source)
+        kept = [s for s in all_subs if versions.get(s) == want]
+        print(f"[version_filter={version_filter}] kept {len(kept)}/{len(all_subs)} "
+              f"datasets matching {want}")
+        all_subs = kept
+
+    # Allowlist/denylist match by substring on the subpath.
     if sub_datasets_allowlist:
-        all_subs = [s for s in all_subs if s in sub_datasets_allowlist]
+        all_subs = [s for s in all_subs if any(a in s for a in sub_datasets_allowlist)]
     if sub_datasets_denylist:
-        all_subs = [s for s in all_subs if s not in sub_datasets_denylist]
-    print(f"Training on {len(all_subs)} sub-datasets after filtering")
+        all_subs = [s for s in all_subs if not any(d in s for d in sub_datasets_denylist)]
+
+    # Cap the number of datasets (random sample for a representative subset
+    # across contributors, not just the alphabetically-first ones). Seeded
+    # for reproducibility — same seed → same subset.
+    if max_datasets is not None and len(all_subs) > max_datasets:
+        import random
+        rng = random.Random(seed)
+        all_subs = sorted(rng.sample(all_subs, max_datasets))
+        print(f"Sampled {max_datasets} of the discovered datasets (seed={seed})")
+
+    print(f"Training on {len(all_subs)} dataset(s) after filtering")
 
     # ── Load metadata for all sub-datasets ──────────────────────────────
-    sub_metas: dict[str, LeRobotDatasetMetadata] = {}
+    # Keys are relative subpaths inside `source`. Only meta/info.json is read
+    # here (raw JSON, v2.1-safe) for camera/dim discovery; data/ + videos/ are
+    # downloaded — and converted to v3.0 if needed — lazily in the build loop.
+    sub_metas: dict[str, _RawMeta] = {}
     for sub in all_subs:
-        meta = load_sub_dataset_metadata(COMMUNITY_DATASET_REPO, sub)
-        if meta is not None:
-            sub_metas[sub] = meta
-    print(f"Loaded metadata for {len(sub_metas)}/{len(all_subs)} sub-datasets")
+        info = load_sub_dataset_info(source, sub, workspace)
+        if info is not None:
+            sub_metas[sub] = _RawMeta(info)
+    print(f"Loaded metadata for {len(sub_metas)}/{len(all_subs)} datasets")
 
     if len(sub_metas) == 0:
         raise RuntimeError("No sub-dataset metadata could be loaded. Aborting.")
@@ -522,7 +738,6 @@ def train(
     all_ep_boundaries: list[list[tuple[int, int]]] = []
 
     for sub in sub_metas:
-        dataset_id = f"{COMMUNITY_DATASET_REPO}/{sub}"
         meta = sub_metas[sub]
         features = dataset_to_policy_features(meta.features)
 
@@ -537,15 +752,20 @@ def train(
                 delta_ts[k] = action_temporal_window
 
         try:
+            # Download the full subdir (data/ + videos/), convert v2.1→v3.0 in
+            # place if needed, then load locally via `root`. All sub-datasets
+            # share the same repo_id (`source`); `root` disambiguates them.
+            full_root = _download_subdir(source, sub, workspace)
+            full_root = _ensure_v30(source, full_root, sub)
             ds = LeRobotDataset(
-                dataset_id,
+                source,
+                root=full_root,
                 delta_timestamps=delta_ts,
-                force_cache_sync=True,
-                revision="main",
+                force_cache_sync=False,
                 tolerance_s=0.04,
             )
         except Exception as e:
-            print(f"  [SKIP] {sub}: failed to create LeRobotDataset — {e}")
+            print(f"  [SKIP] {sub}: failed to create/convert LeRobotDataset — {e}")
             continue
 
         task_map = load_task_descriptions(ds)
@@ -597,40 +817,21 @@ def train(
     print(f"\nDataLoader: {len(dataloader)} batches/epoch, batch_size={batch_size}")
 
     # ── Build config ────────────────────────────────────────────────────
-    # We need to construct synthetic input/output features matching the
-    # canonical schema for the config + processor.
-    canonical_input_features = {}
-    for cam in used_canonical:
-        canonical_input_features[cam] = FeatureType.VISUAL
-    canonical_input_features["observation.state"] = FeatureType.STATE
-    canonical_output_features = {"action": FeatureType.ACTION}
-
-    # Create a simple Feature spec that the config expects
-    from lerobot.configs.types import FeatureSpec
+    # Construct synthetic input/output features matching the canonical schema.
+    # lerobot 0.4.0 uses `PolicyFeature(type=..., shape=...)` — the same class
+    # `dataset_to_policy_features` returns. (There is no `FeatureSpec`.)
+    from lerobot.configs.types import PolicyFeature
 
     input_feature_specs = {}
-    for k, ft_type in canonical_input_features.items():
-        if ft_type == FeatureType.VISUAL:
-            input_feature_specs[k] = FeatureSpec(
-                name=k,
-                type=ft_type,
-                shape=(3, 384, 384),
-            )
-        elif ft_type == FeatureType.STATE:
-            input_feature_specs[k] = FeatureSpec(
-                name=k,
-                type=ft_type,
-                shape=(CANONICAL_STATE_DIM,),
-            )
+    for cam in used_canonical:
+        input_feature_specs[cam] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 384, 384))
+    input_feature_specs["observation.state"] = PolicyFeature(
+        type=FeatureType.STATE, shape=(CANONICAL_STATE_DIM,),
+    )
 
-    output_feature_specs = {}
-    for k, ft_type in canonical_output_features.items():
-        if ft_type == FeatureType.ACTION:
-            output_feature_specs[k] = FeatureSpec(
-                name=k,
-                type=ft_type,
-                shape=(CANONICAL_ACTION_DIM,),
-            )
+    output_feature_specs = {
+        "action": PolicyFeature(type=FeatureType.ACTION, shape=(CANONICAL_ACTION_DIM,)),
+    }
 
     cfg = InterleavedFlowMatchingConfig(
         input_features=input_feature_specs,
@@ -873,7 +1074,7 @@ def compute_unified_stats(
         n_samples = max(1, int(len(adapter) * sample_ratio))
         indices = np.random.choice(len(adapter), n_samples, replace=False)
         for idx in indices:
-            item = adapter[idx]
+            item = adapter[int(idx)]   # HF dataset rejects numpy.int64 keys
             if "observation.state" in item:
                 s = item["observation.state"]
                 if isinstance(s, torch.Tensor):
@@ -943,7 +1144,7 @@ def _log_gradient_analysis(policy, step: int) -> None:
         ("Expert Layers",  "expert_layers"),
         ("Action In/Out",  "action_"),
         ("Final Norm",     "final_norm"),
-        ("Latent Tokens",  "latent_embs"),
+        ("Latent Gen",     "latent_generator"),
         ("Lang Adaptor",   "lang_adaptor"),
     ]:
         grad, n = _grad_stats(prefix)
@@ -952,16 +1153,21 @@ def _log_gradient_analysis(policy, step: int) -> None:
         else:
             print(f"  {label:14s} - no grad")
 
-    if hasattr(policy.model, "latent_embs"):
-        lat = policy.model.latent_embs.detach()
-        if lat.shape[1] > 0:
-            normed = F.normalize(lat[0], dim=-1)
-            cos = normed @ normed.t()
-            off_diag = cos[~torch.eye(cos.shape[0], dtype=torch.bool, device=cos.device)]
-            grad_norm_l = policy.model.latent_embs.grad.norm().item() if policy.model.latent_embs.grad is not None else float("nan")
-            print(f"  Latent stats   - grad_norm: {grad_norm_l:.4e}  "
-                  f"mean |cos|: {off_diag.abs().mean().item():.3f}  "
-                  f"max |cos|: {off_diag.abs().max().item():.3f}")
+    # Latent generator (task-conditional MLP) — replaces static `latent_embs`.
+    # `out_layer_w` is the cleanest health signal: zero-init at training start,
+    # grows as the model learns to produce non-trivial task-conditional latents.
+    if hasattr(policy.model, "latent_generator"):
+        gen = policy.model.latent_generator
+        w_norm_sq = 0.0
+        g_norm_sq = 0.0
+        for p in gen.parameters():
+            w_norm_sq += p.detach().norm().item() ** 2
+            if p.grad is not None:
+                g_norm_sq += p.grad.norm().item() ** 2
+        out_layer = gen[-1]
+        out_w_norm = out_layer.weight.detach().norm().item()
+        print(f"  Latent gen     - weight_norm: {w_norm_sq ** 0.5:.4e}   "
+              f"grad_norm: {g_norm_sq ** 0.5:.4e}   out_layer_w: {out_w_norm:.4e}")
 
     if hasattr(policy.model, "lang_attn_bias"):
         bias_tensor = policy.model.lang_attn_bias.detach()
@@ -1005,9 +1211,34 @@ if __name__ == "__main__":
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Resume from a checkpoint")
     parser.add_argument("--reset_lang_params", action="store_true",
                         help="Reset language conditioning params after loading checkpoint")
+    parser.add_argument("--source", type=str, default=COMMUNITY_DATASET_REPO,
+                        help="Data source: HF collection slug, org/user name, or single dataset repo_id "
+                             "(default: %(default)s)")
     parser.add_argument("--sub_datasets_allowlist", type=str, nargs="*", default=None,
-                        help="Only train on these sub-datasets (by directory name)")
+                        help="Only train on datasets whose subpath CONTAINS any of these strings "
+                             "(substring match, case-sensitive)")
     parser.add_argument("--sub_datasets_denylist", type=str, nargs="*", default=None,
-                        help="Exclude these sub-datasets from training")
+                        help="Exclude datasets whose subpath CONTAINS any of these strings")
+    parser.add_argument("--max_datasets", type=int, default=None,
+                        help="Cap the number of datasets (random sample across contributors). "
+                             "Useful to limit download size when testing.")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for --max_datasets sampling (reproducible subset)")
+    parser.add_argument("--list_versions", action="store_true",
+                        help="Classify all datasets as v3.0/v2.1/unknown and print the report, "
+                             "then exit (no download, no training).")
+    parser.add_argument("--version_filter", type=str, default="all",
+                        choices=["all", "v3", "v2"],
+                        help="Train only on datasets of this format. 'v3' skips the slow "
+                             "v2.1→v3.0 conversion entirely. (default: all)")
     args = parser.parse_args()
-    train(**vars(args))
+
+    # --list_versions is a standalone inspection mode.
+    if args.list_versions:
+        print_version_report(args.source)
+        raise SystemExit(0)
+
+    # SystemExit-only flag — drop it before calling train().
+    kwargs = vars(args)
+    kwargs.pop("list_versions", None)
+    train(**kwargs)
