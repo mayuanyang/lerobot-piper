@@ -833,14 +833,38 @@ class InterleavedFlowMatchingTransformer(nn.Module):
             pos_w = pos_w * torch.exp(-self.config.pos_decay_lambda * pos)
         loss = loss * pos_w[None, :, None]
 
+        # Build a 3D per-cell validity mask combining:
+        #   • `action_is_pad` — (B, H) per-timestep mask (True = padded timestep)
+        #   • `action_dim_pad` — (B, D) per-dim mask (True = zero-padded dim,
+        #     emitted by heterogeneous multi-dataset adapters for sub-datasets
+        #     whose true action_dim < canonical_action_dim). Excluding padded
+        #     dims is critical: their target u_t = noise - 0 = noise is
+        #     unlearnable, so without the mask we'd train against pure noise.
+        # Either mask may be absent (single-dataset training); we default it
+        # to all-valid, which makes the math collapse to the previous formula.
+        loss_dtype = loss.dtype
+        B, H_, D_ = loss.shape
+
         is_pad = batch.get("action_is_pad", batch.get("actions_id_pad"))
         if is_pad is not None:
-            valid = ~is_pad.bool()
-            loss = loss * valid.unsqueeze(-1).float()
-            pos_w_sum = (pos_w[None, :] * valid.float()).sum().clamp(min=1e-6)
-            main_loss = loss.sum() / (pos_w_sum * self.config.action_dim)
+            valid_t = (~is_pad.bool()).to(loss_dtype)            # (B, H)
         else:
-            main_loss = loss.mean()
+            valid_t = torch.ones(B, H_, device=loss.device, dtype=loss_dtype)
+
+        dim_pad = batch.get("action_dim_pad")
+        if dim_pad is not None:
+            valid_d = (~dim_pad.bool()).to(loss_dtype)           # (B, D)
+        else:
+            valid_d = torch.ones(B, D_, device=loss.device, dtype=loss_dtype)
+
+        valid_cells = valid_t.unsqueeze(-1) * valid_d.unsqueeze(1)  # (B, H, D)
+        loss = loss * valid_cells
+
+        # Denominator is the sum of the same pos_w weighting over valid cells.
+        # When every cell is valid this equals pos_w_sum * action_dim, matching
+        # the old normalisation exactly.
+        denom = (pos_w[None, :, None] * valid_cells).sum().clamp(min=1e-6)
+        main_loss = loss.sum() / denom
 
         # ------------------------------------------------------------------
         # Auxiliary contrastive loss — force language to affect action.

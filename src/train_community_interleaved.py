@@ -88,7 +88,7 @@ if device.type == "cuda":
 # repo, find every embedded dataset root by its `meta/info.json` marker, and
 # load each with `LeRobotDataset(repo_id, root=<local subdir>)`.
 # ---------------------------------------------------------------------------
-COMMUNITY_DATASET_REPO = "hxma/RoboTwin-LeRobot-v3.0"
+COMMUNITY_DATASET_REPO = "ISdept/community_dataset_v3_part1"
 INFO_MARKER = "meta/info.json"
 
 # Canonical camera names — these must be a subset of what the interleaved model
@@ -105,6 +105,67 @@ CANONICAL_CAMERAS = [
 # zero-padded; larger dims are truncated (with a warning).
 CANONICAL_STATE_DIM = 7
 CANONICAL_ACTION_DIM = 7
+
+# Keys the adapter is allowed to pass through to the DataLoader (in addition to
+# the canonical camera keys, which are added per-instance from `camera_map`).
+# Anything else returned by LeRobotDataset — community-specific feature columns
+# like `annotation.human.action.task_description`, environment-state vectors,
+# unused metadata — is stripped before collation so the batch schema is fully
+# controlled by this adapter and uniform across sub-datasets.
+_ALLOWED_ITEM_KEYS = {
+    "observation.state",
+    "action",
+    "action_is_pad",
+    "action_dim_pad",
+    "task",
+    "task_description",
+    "task_index",
+    "episode_index",
+    "frame_index",
+    "timestamp",
+    "index",
+}
+
+# Canonical image size — every sub-dataset's camera tensors are letterbox-padded
+# and bilinear-resized to this H×W *before* collate so DataLoader can stack
+# tensors across sub-datasets whose native resolutions differ (one might decode
+# 480×640, another 256×256). Must match the `shape=(3, H, W)` declared in
+# `input_feature_specs` below. The model's `_encode_images` also resizes to
+# `config.vision_input_size`; aligning the two avoids a second resize.
+CANONICAL_IMAGE_SIZE = 384
+
+
+def _resize_camera_to_canonical(img: torch.Tensor) -> torch.Tensor:
+    """
+    Letterbox-pad (preserves aspect ratio) + bilinear-resize a camera tensor
+    to (CANONICAL_IMAGE_SIZE, CANONICAL_IMAGE_SIZE).
+
+    Input shape:  (T, C, H, W). Values in [0, 1] (LeRobotDataset convention).
+    Pad value: 0.0 — equivalent to -1.0 post-SigLIP-normalisation, matching
+    the model's own letterbox in `_encode_images`.
+
+    No-op if already the right size. Returns the original object unchanged
+    for non-tensor / non-4D inputs.
+    """
+    if not isinstance(img, torch.Tensor) or img.dim() != 4:
+        return img
+    h, w = img.shape[-2], img.shape[-1]
+    if h == CANONICAL_IMAGE_SIZE and w == CANONICAL_IMAGE_SIZE:
+        return img
+    if h != w:
+        max_dim = max(h, w)
+        pad = (
+            (max_dim - w) // 2, max_dim - w - (max_dim - w) // 2,
+            (max_dim - h) // 2, max_dim - h - (max_dim - h) // 2,
+        )
+        img = F.pad(img.float(), pad, value=0.0)
+    if img.shape[-2] != CANONICAL_IMAGE_SIZE or img.shape[-1] != CANONICAL_IMAGE_SIZE:
+        img = F.interpolate(
+            img.float(),
+            size=(CANONICAL_IMAGE_SIZE, CANONICAL_IMAGE_SIZE),
+            mode="bilinear", align_corners=False,
+        )
+    return img
 
 # ---------------------------------------------------------------------------
 # Augmentation (same recipe as train_libero_interleaved.py)
@@ -368,32 +429,51 @@ def build_camera_mapping(
     """
     Build a mapping from canonical_camera → sub_dataset_camera for each sub-dataset.
 
-    Strategy: exact name match first, then case-insensitive match on the last
-    segment (e.g. 'front', 'gripper', 'right', 'top', 'wrist'). If no match,
-    the canonical camera is mapped to None (will be zero-padded).
+    Two-pass strategy:
+      1. Semantic match — exact name, then case-insensitive suffix match on
+         the last segment (e.g. 'front', 'gripper', 'right', 'top', 'wrist').
+      2. Positional fallback — for canonical slots still unmapped after pass 1,
+         assign any remaining (sorted) sub-dataset cameras in order. This is
+         what makes datasets with generic names like 'image', 'image2', 'image3'
+         actually train on their visual streams instead of zero-padded slots.
+
+    Canonical slots with no source camera (after both passes) are mapped to
+    None and zero-padded downstream.
 
     Returns:
       {sub_dir: {canonical_cam: actual_cam_key_or_None}}
     """
     mapping: dict[str, dict[str, Optional[str]]] = {}
     for sub_dir, cams in sub_cameras.items():
-        sub_map: dict[str, Optional[str]] = {}
+        sub_map: dict[str, Optional[str]] = {canon: None for canon in canonical}
+        used_cams: set[str] = set()
         cams_lower = {c.lower(): c for c in cams}
+
+        # ── Pass 1: semantic matching ─────────────────────────────────
         for canon in canonical:
             # Exact match
             if canon in cams:
                 sub_map[canon] = canon
+                used_cams.add(canon)
                 continue
             # Match by last segment (e.g. "observation.images.front" → "front")
             canon_suffix = canon.split(".")[-1].lower()
-            matched = False
             for cam_lower, cam_orig in cams_lower.items():
+                if cam_orig in used_cams:
+                    continue
                 if cam_lower.endswith(canon_suffix):
                     sub_map[canon] = cam_orig
-                    matched = True
+                    used_cams.add(cam_orig)
                     break
-            if not matched:
-                sub_map[canon] = None  # will be zero-padded
+
+        # ── Pass 2: positional fallback for still-unmapped canonical slots ─
+        # Sort so the assignment is deterministic across runs ("image" < "image2"
+        # < "image3" alphabetically, which also matches camera index order).
+        remaining_cams = sorted(c for c in cams if c not in used_cams)
+        for canon in canonical:
+            if sub_map[canon] is None and remaining_cams:
+                sub_map[canon] = remaining_cams.pop(0)
+
         mapping[sub_dir] = sub_map
     return mapping
 
@@ -485,6 +565,23 @@ class DatasetAdapter(Dataset):
                     # Fallback: (1, 3, 384, 384) placeholder
                     item[canon_cam] = torch.zeros(1, 3, 384, 384)
 
+        # Drop any leftover non-canonical camera keys so collate sees a uniform
+        # schema across sub-datasets (e.g. RoboTwin's 'observation.images.image3'
+        # never matched a canonical suffix and would otherwise survive here,
+        # crashing `default_collate` when other items in the batch lack it).
+        canonical_set = set(self._canonical_cams)
+        for k in [k for k in item if k.startswith("observation.images.") and k not in canonical_set]:
+            del item[k]
+
+        # Resize every canonical camera to (CANONICAL_IMAGE_SIZE)². Sub-datasets
+        # decode video at their native resolution, so without this step a batch
+        # that mixes (e.g.) a 480×640 SO-100 episode with a 256×256 Koch episode
+        # crashes `default_collate` with "Trying to resize storage that is not
+        # resizable" — it tries to stack tensors of incompatible shapes.
+        for canon_cam in self._canonical_cams:
+            if canon_cam in item:
+                item[canon_cam] = _resize_camera_to_canonical(item[canon_cam])
+
         # ── State padding / truncation ────────────────────────────────
         if self.state_key in item:
             state = item[self.state_key]
@@ -498,7 +595,12 @@ class DatasetAdapter(Dataset):
                     state = state[..., :self.canonical_state_dim]
                 item[self.state_key] = state
 
-        # ── Action padding / truncation + pad mask ────────────────────
+        # ── Action padding / truncation ────────────────────────────────
+        # Pad/truncate action's last dim to canonical_action_dim, then emit a
+        # `action_dim_pad` (canonical_action_dim,) mask so the model can drop
+        # padded dims from the flow-matching loss. Without this mask, dims
+        # zero-padded here would push the model toward the unlearnable target
+        # u_t = noise - 0 = noise on those slots — pure gradient noise.
         if self.action_key in item:
             action = item[self.action_key]
             if isinstance(action, torch.Tensor):
@@ -507,34 +609,50 @@ class DatasetAdapter(Dataset):
                     pad = torch.zeros(*action.shape[:-1], self.canonical_action_dim - ad,
                                      dtype=action.dtype, device=action.device)
                     action = torch.cat([action, pad], dim=-1)
-                    # Build action_is_pad if needed
-                    existing_pad_key = None
-                    for k in item:
-                        if "pad" in k.lower() and "action" in k.lower():
-                            existing_pad_key = k
-                            break
-                    if existing_pad_key and existing_pad_key in item:
-                        ep = item[existing_pad_key]
-                        if isinstance(ep, torch.Tensor):
-                            # Broadcast existing pad mask to canonical dim
-                            if ep.dim() == 1:
-                                ep = ep.unsqueeze(-1).expand(-1, self.canonical_action_dim)
-                            elif ep.shape[-1] == ad:
-                                ep_pad = torch.ones(*ep.shape[:-1], self.canonical_action_dim - ad,
-                                                   dtype=ep.dtype, device=ep.device)
-                                ep = torch.cat([ep, ep_pad], dim=-1)
-                            elif ep.shape[-1] == self.canonical_action_dim:
-                                pass  # already correct
-                            item[existing_pad_key] = ep
-                    else:
-                        # Create action_is_pad: real dims = 0 (not padded), extra dims = 1
-                        is_pad = torch.zeros(*action.shape[:-1], self.canonical_action_dim,
-                                            dtype=torch.bool)
-                        is_pad[..., ad:] = True
-                        item["action_is_pad"] = is_pad
                 elif ad > self.canonical_action_dim:
                     action = action[..., :self.canonical_action_dim]
                 item[self.action_key] = action
+
+        # Per-dim pad mask: True for dims at index >= original action_dim,
+        # i.e. dims that this adapter zero-padded into existence. The mask is
+        # per-sample (the dataset's true action_dim) but its shape is fixed
+        # so collate stacks fine. Truncated sub-datasets get an all-False mask
+        # (all canonical dims are real, the model only sees the first N of
+        # the sub-dataset's actual dims).
+        action_dim_pad = torch.zeros(self.canonical_action_dim, dtype=torch.bool)
+        if self.action_dim < self.canonical_action_dim:
+            action_dim_pad[self.action_dim:] = True
+        item["action_dim_pad"] = action_dim_pad
+
+        # ── action_is_pad: normalise to (horizon,) bool ──────────────────
+        # LeRobotDataset returns this as a 1D per-timestep mask. Different
+        # sub-datasets may (a) omit it entirely, (b) return it as the canonical
+        # 1D shape, or (c) — from older code paths — return it as 2D
+        # `(horizon, action_dim)`. Collate sees mixed ranks across sub-datasets
+        # → "stack expects each tensor to be equal size". Standardise to 1D.
+        action_ref = item.get(self.action_key, item.get("action"))
+        H_action = (
+            action_ref.shape[0]
+            if isinstance(action_ref, torch.Tensor) and action_ref.dim() >= 1
+            else 0
+        )
+        pad_key = next(
+            (k for k in item if "pad" in k.lower() and "action" in k.lower()),
+            None,
+        )
+        if pad_key is None:
+            if H_action > 0:
+                item["action_is_pad"] = torch.zeros(H_action, dtype=torch.bool)
+        else:
+            ep = item[pad_key]
+            if isinstance(ep, torch.Tensor):
+                if ep.dim() == 2:
+                    ep = ep.any(dim=-1)              # collapse stale per-dim axis
+                elif ep.dim() == 0 and H_action > 0:
+                    ep = ep.unsqueeze(0).expand(H_action).clone()
+                item[pad_key] = ep.bool()
+            if pad_key != "action_is_pad":
+                item["action_is_pad"] = item.pop(pad_key)
 
         # ── Rename action key to canonical "action" if needed ─────────
         if self.action_key != "action" and self.action_key in item:
@@ -554,18 +672,72 @@ class DatasetAdapter(Dataset):
                 desc = self.task_idx_to_desc.get(ti, "")
                 item["task_description"] = desc
 
+        # ── Human-annotation language fallback ────────────────────────
+        # Community uploads (esp. OXE-derived datasets) often carry richer
+        # per-frame descriptions in `annotation.human.*.task_description`
+        # columns than the per-episode `task` label. When the standard
+        # task/task_description pipeline above produced nothing useful,
+        # promote the first non-empty annotation string into the canonical
+        # task_description key — runs BEFORE the allowlist filter strips
+        # the original `annotation.*` keys.
+        def _is_blank(v) -> bool:
+            return v is None or (isinstance(v, str) and not v.strip())
+
+        if _is_blank(item.get("task_description")) and _is_blank(item.get("task")):
+            for k in list(item.keys()):
+                if not k.startswith("annotation."):
+                    continue
+                if "task_description" not in k:
+                    continue
+                v = item[k]
+                # Some uploads store annotations as a list of strings (multiple
+                # annotators) — take the first non-empty entry.
+                if isinstance(v, (list, tuple)):
+                    v = next((x for x in v if isinstance(x, str) and x.strip()), None)
+                if isinstance(v, str) and v.strip():
+                    item["task_description"] = v
+                    break
+
+        # ── Schema allowlist ──────────────────────────────────────────
+        # Sub-datasets occasionally carry custom feature columns (e.g.
+        # `annotation.human.action.task_description` from OXE-style uploads,
+        # `observation.environment_state`, etc.). When some items in a batch
+        # have these and others don't, `default_collate` crashes with
+        # KeyError. Strip everything we don't actually feed into the model
+        # so the batch schema is determined entirely by this adapter.
+        keep = _ALLOWED_ITEM_KEYS | set(self._canonical_cams)
+        for k in list(item.keys()):
+            if k not in keep:
+                del item[k]
+
         return item
 
 
 def load_task_descriptions(dataset: LeRobotDataset) -> dict[int, str]:
-    """Try to load task_index → task_description from tasks.parquet."""
+    """Try to load task_index → task_description from tasks.parquet.
+
+    Two layouts are observed in the wild:
+      (a) LIBERO-style: the description string IS the dataframe index, with
+          a single `task_index` column carrying the integer id.
+      (b) Standard LeRobot-v3: explicit `task_index` + `task` columns.
+    We try (b) first because it's unambiguous; (a) is the fallback.
+    """
     task_map: dict[int, str] = {}
     try:
         tasks_path = dataset.root / "meta" / "tasks.parquet"
-        if tasks_path.exists():
-            df = pd.read_parquet(tasks_path)
-            if "task_index" in df.columns:
-                task_map = {int(row["task_index"]): str(idx) for idx, row in df.iterrows()}
+        if not tasks_path.exists():
+            return task_map
+        df = pd.read_parquet(tasks_path)
+        if "task_index" not in df.columns:
+            return task_map
+        if "task" in df.columns:
+            # Layout (b): description lives in the `task` column.
+            for _, row in df.iterrows():
+                task_map[int(row["task_index"])] = str(row["task"])
+        else:
+            # Layout (a): description is the dataframe index (LIBERO).
+            for idx, row in df.iterrows():
+                task_map[int(row["task_index"])] = str(idx)
     except Exception:
         pass
     return task_map
@@ -976,10 +1148,18 @@ def train(
             if "observation.state" in batch:
                 batch = apply_joint_augmentations(batch, "observation.state")
 
-            # Ensure action_is_pad exists
+            # Ensure pad masks exist. The adapter emits both, but a stray path
+            # (e.g. a sub-dataset that the adapter passed through untouched)
+            # could miss either — default to "no padding" so loss masking is
+            # a no-op rather than a KeyError downstream.
             if "action_is_pad" not in batch:
                 batch["action_is_pad"] = torch.zeros(
                     batch["action"].shape[0], batch["action"].shape[1],
+                    dtype=torch.bool, device=batch["action"].device,
+                )
+            if "action_dim_pad" not in batch:
+                batch["action_dim_pad"] = torch.zeros(
+                    batch["action"].shape[0], batch["action"].shape[2],
                     dtype=torch.bool, device=batch["action"].device,
                 )
 
