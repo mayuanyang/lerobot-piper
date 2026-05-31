@@ -219,8 +219,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         ckpt_path = Path(resume_from_checkpoint)
         if ckpt_path.exists():
             local_ckpt_path = ckpt_path
+            print(f"Using local checkpoint: {local_ckpt_path}")
         else:
             # HuggingFace Hub — download full snapshot to local cache
+            print(f"Local path not found, downloading from HuggingFace Hub: {resume_from_checkpoint}")
             local_ckpt_path = Path(huggingface_hub.snapshot_download(resume_from_checkpoint))
 
         # Prefer model.safetensors explicitly — checkpoint dirs also contain

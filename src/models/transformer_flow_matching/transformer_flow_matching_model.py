@@ -374,14 +374,14 @@ class FlowMatchingTransformer(nn.Module):
         Tokenize task descriptions and embed through frozen embed_tokens.
         Returns: (B, L, VLM_HIDDEN) bfloat16, or None if no descriptions.
         """
-        if "task_description" not in batch:
-            return None
-        descriptions = batch["task_description"]
-        if not descriptions or not any(descriptions):
+        descs = batch.get("task_description")
+        if not descs:
+            descs = batch.get("task")
+        if not descs or not any(descs):
             return None
 
         inputs = self.processor.tokenizer(
-            descriptions,
+            descs,
             return_tensors="pt",
             padding=True,
             truncation=True,
