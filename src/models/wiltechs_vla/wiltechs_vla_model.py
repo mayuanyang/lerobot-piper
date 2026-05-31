@@ -416,6 +416,11 @@ class WiltechsVLATransformer(nn.Module):
 
         self._lang_max_len = 48
 
+        # Activation checkpointing toggle for the DiT layers. The VLM runs in
+        # @torch.no_grad and would not benefit from checkpointing; only the
+        # trainable DiT decoder stack stores activations for backward.
+        self.gradient_checkpointing = False
+
     # =========================================================================
     # Keep frozen components in eval mode
     # =========================================================================
@@ -424,6 +429,36 @@ class WiltechsVLATransformer(nn.Module):
         self.visual.eval()
         self.language_model.eval()
         return self
+
+    def gradient_checkpointing_enable(self):
+        """Recompute DiT layer activations during backward instead of storing
+        them. Trades extra forward compute for ~5-10× lower activation memory
+        across the {self.num_dit_layers}-layer DiT stack. Frozen VLM is
+        unaffected (it already runs in no_grad)."""
+        self.gradient_checkpointing = True
+        print(f"[wiltechs_vla] DiT gradient checkpointing ENABLED "
+              f"({self.num_dit_layers} layers will be recomputed in backward)")
+
+    def gradient_checkpointing_disable(self):
+        self.gradient_checkpointing = False
+
+    # =========================================================================
+    # Helpers for locating the Qwen3-VL spatial merger
+    # =========================================================================
+    def _find_visual_merger(self):
+        """Locate the spatial-merger submodule on the vision tower.
+
+        Qwen2/3-VL family names this differently across releases; we look at
+        the most common attribute names on both `self.visual` and on
+        `self.vlm_model` (sometimes vendored higher up). Returns None if no
+        suitable submodule is found.
+        """
+        for owner in (self.visual, self.vlm_model):
+            for attr in ("merger", "patch_merger", "visual_merger", "merger_module"):
+                candidate = getattr(owner, attr, None)
+                if candidate is not None:
+                    return candidate
+        return None
 
     # =========================================================================
     # Vision / language encoding (no gradient, frozen VLM components)
@@ -445,10 +480,71 @@ class WiltechsVLATransformer(nn.Module):
                 proc_out = self.processor.image_processor(images=pil_images, return_tensors="pt")
                 pixel_values = proc_out["pixel_values"].to(device=device)
                 image_grid_thw = proc_out["image_grid_thw"].to(device=device)
-                vis_features = self.vlm_model.get_image_features(
-                    pixel_values=pixel_values, image_grid_thw=image_grid_thw,
-                )
-                vis_tokens = getattr(vis_features, "last_hidden_state", vis_features)
+                # Call the vision tower directly. `Qwen3VLVisionTransformer`
+                # already includes the spatial merger that projects vision
+                # features (vision_hidden, e.g. 1024) → text_hidden (2560),
+                # AND collapses 2×2 spatial neighbours into one token.
+                # `vlm_model.get_image_features` in the FP8 release returns
+                # the PRE-merger vision-tower output instead (different last
+                # dim, 4× more tokens), so we bypass it here.
+                try:
+                    vis_tokens = self.visual(
+                        pixel_values, grid_thw=image_grid_thw,
+                    )
+                except TypeError:
+                    vis_tokens = self.visual(
+                        pixel_values, image_grid_thw=image_grid_thw,
+                    )
+                vis_tokens = getattr(vis_tokens, "last_hidden_state", vis_tokens)
+
+                # Qwen3-VL's vision tower outputs pre-merger features in
+                # vision_hidden (e.g. 1024) with `spatial_merge_size**2`× more
+                # tokens than the LLM consumes. The merger then:
+                #   1. group 2×2 spatial neighbours into one slot
+                #   2. project (vision_hidden × 4) → text_hidden
+                # In Qwen2-VL the merger fires inside `visual.__call__`; in
+                # Qwen3-VL (incl. the FP8 build) it is a SEPARATE submodule
+                # we must call explicitly.
+                if vis_tokens.shape[-1] != self.hidden_size:
+                    merger = self._find_visual_merger()
+                    if merger is None:
+                        raise RuntimeError(
+                            f"vis_tokens hidden dim {vis_tokens.shape[-1]} != "
+                            f"text hidden {self.hidden_size} and no merger / "
+                            f"patch_merger submodule found on self.visual or "
+                            f"self.vlm_model. Inspect the model's child modules."
+                        )
+                    try:
+                        vis_tokens = merger(vis_tokens)
+                    except TypeError:
+                        # Some variants take (features, grid_thw)
+                        vis_tokens = merger(vis_tokens, image_grid_thw)
+                    vis_tokens = getattr(vis_tokens, "last_hidden_state", vis_tokens)
+
+            # Qwen3-VL packs dynamic-resolution vision features as a flat
+            # (sum_tokens_across_batch, text_hidden) tensor — each image's
+            # tokens are concatenated along the leading dim, not a per-batch
+            # axis. At fixed CANONICAL_IMAGE_SIZE every image yields the
+            # same N_per_image, so a single reshape recovers the
+            # (B, N, hidden) layout the rest of the pipeline expects. If a
+            # future API returns (B, N, hidden) directly we keep that branch
+            # untouched.
+            if vis_tokens.dim() == 2:
+                if vis_tokens.shape[-1] != self.hidden_size:
+                    raise RuntimeError(
+                        f"vis_tokens hidden dim {vis_tokens.shape[-1]} != "
+                        f"text hidden {self.hidden_size} after merger. "
+                        f"Merger output dim is unexpected — print "
+                        f"`{type(self._find_visual_merger()).__name__}` "
+                        f"to debug."
+                    )
+                if vis_tokens.shape[0] % B != 0:
+                    raise RuntimeError(
+                        f"Cannot unpack vis_tokens of shape {tuple(vis_tokens.shape)} "
+                        f"into per-batch tokens: leading dim {vis_tokens.shape[0]} "
+                        f"is not divisible by B={B}. Are images of mixed resolution?"
+                    )
+                vis_tokens = vis_tokens.reshape(B, -1, self.hidden_size)
             all_vis.append(vis_tokens)
             grid_thw_list.append(image_grid_thw[0].detach())
         if not all_vis:
@@ -699,16 +795,26 @@ class WiltechsVLATransformer(nn.Module):
         L_dit = dit_seq.shape[1]
         causal_mask = self._build_dit_self_attn_mask(L_dit, device, dtype)
 
-        # Run DiT layers, each cross-attending to its paired VLM cache
+        # Run DiT layers, each cross-attending to its paired VLM cache.
+        # When `gradient_checkpointing` is on we recompute the layer in
+        # backward instead of storing its activations — the VLM K/V tensors
+        # are already detached, so checkpointing only re-runs DiT compute.
         x = dit_seq
+        use_ckpt = self.gradient_checkpointing and self.training
         for i, layer in enumerate(self.dit_layers):
             vlm_k, vlm_v = kv_cache[i]
-            x = layer(
-                x, t_emb=t_emb,
-                vlm_k=vlm_k, vlm_v=vlm_v,
-                vlm_kv_pad_mask=vlm_kv_pad_mask,
-                self_attn_mask=causal_mask,
-            )
+            if use_ckpt:
+                x = torch.utils.checkpoint.checkpoint(
+                    layer, x, t_emb, vlm_k, vlm_v, vlm_kv_pad_mask, causal_mask,
+                    use_reentrant=False,
+                )
+            else:
+                x = layer(
+                    x, t_emb=t_emb,
+                    vlm_k=vlm_k, vlm_v=vlm_v,
+                    vlm_kv_pad_mask=vlm_kv_pad_mask,
+                    self_attn_mask=causal_mask,
+                )
 
         action_out = self.final_norm(x[:, action_start_idx:])
         return self.action_out_proj(action_out)

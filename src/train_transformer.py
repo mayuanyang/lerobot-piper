@@ -466,15 +466,14 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].to(device, non_blocking=True)
 
-            # Enrich batch with task description strings (looked up from tasks.parquet mapping)
-            if task_idx_to_description and "task_index" in batch:
-                task_indices = batch["task_index"]  # (B,) or (B, T)
-                # Use the first element's task_index for each sample
-                if task_indices.dim() > 1:
+            # Enrich batch with task description strings (looked up from tasks.parquet mapping)            
+            if "task" in batch and isinstance(batch["task"], (list, tuple)):
+                batch["task_description"] = batch["task"]
+            elif task_idx_to_description and "task_index" in batch:
+                task_indices = batch["task_index"]
+                if isinstance(task_indices, torch.Tensor) and task_indices.dim() > 1:
                     task_indices = task_indices[:, 0]
-                batch["task_description"] = [
-                    task_idx_to_description.get(int(ti.item()), "") for ti in task_indices
-                ]
+                batch["task_description"] = [task_idx_to_description.get(int(ti), "") for ti in task_indices]
 
             # Apply image augmentation (same random params across all cameras per sample)
             batch = apply_image_augmentations(batch, camera_keys, image_transforms)

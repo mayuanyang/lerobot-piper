@@ -150,6 +150,70 @@ def get_per_task_train_episodes(hf_dataset, train_ratio=0.9):
 
 
 # ---------------------------------------------------------------------------
+# Optimizer factory — opts into bitsandbytes Adam8bit when requested.
+#
+# Why this matters here: the trainable DiT stack is ~3.2B params (16 layers
+# × ~192M each + auxiliaries). At fp32, Adam's (exp_avg, exp_avg_sq) state
+# alone is 2 × 4 × 3.2B ≈ 25.6 GB — i.e. larger than many GPUs' total VRAM
+# *before* you've loaded weights, gradients, or activations. Adam8bit stores
+# both moments in 8-bit blockwise-quantized form, dropping that to ~6.4 GB
+# at a negligible quality cost for vision/diffusion-style training.
+# ---------------------------------------------------------------------------
+def _make_adam(trainable_params, lr, weight_decay, use_8bit_adam):
+    if use_8bit_adam:
+        try:
+            import bitsandbytes as bnb
+        except ImportError as e:
+            raise RuntimeError(
+                "--use_8bit_adam requires `pip install bitsandbytes` "
+                "(and a CUDA build of it)."
+            ) from e
+        print("Using bitsandbytes Adam8bit — optimizer state in 8-bit "
+              "(~4× smaller than fp32 Adam state).")
+        return bnb.optim.Adam8bit(
+            trainable_params, lr=lr, weight_decay=weight_decay,
+        )
+    return torch.optim.Adam(trainable_params, lr=lr, weight_decay=weight_decay)
+
+
+# ---------------------------------------------------------------------------
+# DiT weight bf16 cast — orthogonal to the bf16 autocast already in the
+# training loop. Autocast only changes op-input dtype; this changes the
+# actual *storage* dtype of params (and therefore grads), halving both.
+#
+# What's cast:
+#   policy.model.dit_layers  (~3.07B params — 96% of trainable)
+#
+# What's NOT cast:
+#   state_encoder, action_in_proj, action_out_proj, time_embedder,
+#   latent_generator, robot_visual_encoder, sink_token, action_pos_emb,
+#   final_norm. These either have explicit `.float()` calls on their
+#   forward inputs (documenting a precision intent) or are <200M params
+#   combined — keeping them fp32 costs <1 GB and preserves the numerical
+#   contract the model code assumes.
+#
+# Why pair with --use_8bit_adam:
+#   torch.optim.Adam allocates `exp_avg` / `exp_avg_sq` with
+#   `torch.zeros_like(param)`, so bf16 params → bf16 Adam moments. With
+#   bf16 moments at LR=1e-4, small updates fall below bf16's 7-bit
+#   mantissa precision and silently truncate, causing training stalls.
+#   bitsandbytes Adam8bit stores moments 8-bit blockwise but dequantizes
+#   to fp32 for the actual update math — the standard "bf16 model + 8-bit
+#   optimizer" recipe.
+# ---------------------------------------------------------------------------
+def _cast_dit_to_bf16(policy, use_8bit_adam):
+    policy.model.dit_layers.to(torch.bfloat16)
+    n = sum(p.numel() for p in policy.model.dit_layers.parameters())
+    print(f"[wiltechs_vla] DiT layers cast to bf16 ({n:,} params, "
+          f"~{n * 2 / 1e9:.1f} GB params + ~{n * 2 / 1e9:.1f} GB grads)")
+    if not use_8bit_adam:
+        print("WARNING: --bf16_dit without --use_8bit_adam keeps Adam moments "
+              "in bf16, which loses precision on small LR updates (param "
+              "won't move when |lr * update| is below bf16 precision at the "
+              "param's magnitude). Strongly recommend adding --use_8bit_adam.")
+
+
+# ---------------------------------------------------------------------------
 # Helper used by gradient analysis logging.
 # ---------------------------------------------------------------------------
 def _grad_stats(policy, prefix):
@@ -231,6 +295,8 @@ def train(
     training_steps=30000,
     reset_lang_params=False,
     camera_map=None,
+    use_8bit_adam=False,
+    bf16_dit=False,
 ):
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -352,6 +418,11 @@ def train(
         pos_decay_lambda=0.0,
         vision_lora_num_layers=0,
         num_latent_tokens=8,
+        # Disable the auxiliary contrastive loss for fine-tuning — it runs a
+        # SECOND DiT forward per step (with shuffled-language KV), roughly
+        # doubling DiT activation memory whenever batch_size >= 2. At
+        # batch_size=1 it's a no-op anyway. Re-enable in pretraining.
+        contrastive_loss_weight=0.0,
         # Fine-tuning LR/warmup defaults; can be overridden via CLI.
         optimizer_lr=learning_rate,
         scheduler_warmup_steps=warmup_steps,
@@ -392,6 +463,14 @@ def train(
     if resume_from_checkpoint is not None:
         print(f"Fine-tuning from pretrained checkpoint: {resume_from_checkpoint}")
         policy = WiltechsVLAPolicy(cfg)
+        # Trade extra forward compute for ~5-10× lower DiT activation memory.
+        # Essential at batch_size=1 on a single 24-40GB GPU; cheap at any size.
+        policy.model.gradient_checkpointing_enable()
+        # Halve DiT param + gradient memory (3.07B fp32 → bf16). Done BEFORE
+        # .to(device) and load_state_dict so the load auto-casts incoming
+        # fp32 checkpoint weights into the now-bf16 modules.
+        if bf16_dit:
+            _cast_dit_to_bf16(policy, use_8bit_adam)
 
         ckpt_path = Path(resume_from_checkpoint)
         local_ckpt_path = ckpt_path if ckpt_path.exists() else Path(
@@ -468,7 +547,10 @@ def train(
             )
 
         trainable_params = [p for p in policy.model.parameters() if p.requires_grad]
-        optimizer = torch.optim.Adam(trainable_params, lr=learning_rate, weight_decay=1e-6)
+        optimizer = _make_adam(
+            trainable_params, lr=learning_rate, weight_decay=1e-6,
+            use_8bit_adam=use_8bit_adam,
+        )
 
         # ── Optimizer state: load only if zero model-key mismatches ──────
         # Otherwise Adam's stored (exp_avg, exp_avg_sq) tensors no longer
@@ -503,6 +585,10 @@ def train(
         # `dataset_metadata.stats` (native-keyed, dim-mismatched).
         print("No --resume_from_checkpoint given; training from scratch.")
         policy = WiltechsVLAPolicy(cfg)
+        # Same memory trade-off as the resume branch.
+        policy.model.gradient_checkpointing_enable()
+        if bf16_dit:
+            _cast_dit_to_bf16(policy, use_8bit_adam)
         policy.train()
         policy.to(device)
         stats = compute_unified_stats(
@@ -518,7 +604,10 @@ def train(
         n_trainable = sum(p.numel() for p in trainable_params)
         n_frozen = sum(p.numel() for p in policy.parameters() if not p.requires_grad)
         print(f"Total trainable parameters: {n_trainable:,}  (frozen: {n_frozen:,})")
-        optimizer = torch.optim.Adam(trainable_params, lr=learning_rate, weight_decay=1e-6)
+        optimizer = _make_adam(
+            trainable_params, lr=learning_rate, weight_decay=1e-6,
+            use_8bit_adam=use_8bit_adam,
+        )
         scheduler = get_cosine_schedule_with_warmup(
             optimizer, num_warmup_steps=warmup_steps, num_training_steps=training_steps
         )
@@ -750,6 +839,21 @@ if __name__ == "__main__":
                         help="NO-OP on encoder-decoder WiltechsVLA — kept for CLI parity "
                              "with train_finetune_interleaved.py. Will print a warning "
                              "if set.")
+    parser.add_argument("--use_8bit_adam", action="store_true",
+                        help="Use bitsandbytes Adam8bit instead of fp32 Adam. "
+                             "Cuts optimizer state ~4× (e.g. ~25.6 GB → ~6.4 GB "
+                             "for the 3.2B-param DiT). Requires `pip install "
+                             "bitsandbytes`. Recommended when OOM-ing on a "
+                             "<= 40 GB GPU.")
+    parser.add_argument("--bf16_dit", action="store_true",
+                        help="Cast the DiT layer stack (3.07B / 96%% of "
+                             "trainable params) to bf16. Halves DiT param + "
+                             "gradient memory (~12.3 GB → ~6.15 GB each). "
+                             "MUST be paired with --use_8bit_adam — plain "
+                             "fp32 Adam would otherwise allocate bf16 Adam "
+                             "moments and lose precision on small LR "
+                             "updates. Aux modules (time_embedder, "
+                             "latent_generator, robot CNN, etc.) stay fp32.")
     parser.add_argument("--camera_map", type=str, default=None,
                         help="Manual native→canonical camera mapping, comma-separated "
                              "pairs of the form 'native_short:canonical_short'. "
