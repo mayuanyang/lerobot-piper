@@ -1,22 +1,37 @@
 """
-WiltechsVLATransformer — Qwen3-VL-based interleaved flow matching policy.
+WiltechsVLATransformer — Qwen3-VL-based encoder-decoder flow matching policy.
 
-Architecture mirrors `interleaved_flow_matching_model.py` (SmolVLA-style joint
-attention every layer) with the backbone swapped to Qwen/Qwen3-VL-4B-Instruct-FP8.
+Architecture (Xiaomi-Robotics-0 / pi0-style MoT, NOT SmolVLA interleaved):
 
-Key adaptations for Qwen3-VL:
-  - Vision encoder path uses `Qwen3VLForConditionalGeneration.get_image_features`
-    instead of raw SigLIP + connector tensors.
-  - Text model is `language_model` (Qwen3VLTextModel) instead of `text_model`.
-  - Image preprocessing goes through the Qwen3-VL image processor on-the-fly
-    (PIL conversion). This is slower than the SmolVLM2 raw-tensor path.
-  - hidden_size = 2560, num_heads = 32, num_kv_heads = 8, intermediate = 9728.
+  Stage A (run ONCE per inference): VLM encoder
+    Input:   [vision tokens, language tokens]
+    Run:     all 36 Qwen3-VL text layers, frozen
+    Capture: K, V tensors from the LAST `num_dit_layers` layers
+             (these become the cross-attention memory for the DiT)
 
-Mask semantics (unchanged):
-                 VLM    Latent  Action
-    VLM          full   ✓       ✓ (gated by `vlm_attends_to_expert`)
-    Latent       ✓      ✓       ✗ (never see noisy actions)
-    Action       ✓      ✓       causal (only earlier actions)
+  Stage B (run num_inference_steps times during denoising): DiT decoder
+    Input:   [SINK, state, robot_cnn_tokens, latent_tokens, action_tokens(t)]
+    Each layer:
+       1. Self-attention with full causal mask
+       2. Cross-attention to ONE captured VLM KV pair (Q from DiT, K/V from cache)
+       3. SwiGLU FFN
+       all three sublayers modulated by adaLN-Zero from the flow-matching time t
+
+  Properties:
+    - VLM never sees action / state / robot tokens — it stays in pure VL mode,
+      preserving Qwen3-VL's pretrained vision-language capabilities.
+    - VLM runs once per inference (10× speedup vs interleaved at N=10 steps).
+    - All 36 VLM layers are used (not truncated) — DiT only reads from the
+      last N as KV memory, but earlier layers still refine those features.
+    - DiT cross-attention has no RoPE on Q; the VLM K already carries
+      M-RoPE rotation, which is sufficient for positional alignment.
+
+  Mask semantics (DiT self-attention):
+    Full left-to-right causal mask over [SINK, state, robot, latent, action_0..T-1].
+    Every position can only attend to itself and earlier positions. Action
+    tokens get an action_pos_emb so they can distinguish their position.
+
+  Replaces the previous interleaved (joint attention every layer) implementation.
 """
 
 import math
@@ -31,12 +46,12 @@ import torch.nn.functional as F
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
 from .wiltechs_vla_config import WiltechsVLAConfig
-from ..interleaved_flow_matching.expert_layer import ExpertProjections, RMSNorm
+from ..interleaved_flow_matching.expert_layer import RMSNorm, SwiGLU
 from ..transformer_flow_matching.robot_visual_encoder import RobotVisualEncoder
 
 
 # ---------------------------------------------------------------------------
-# Sinusoidal time embedding
+# Sinusoidal time embedding (flow matching)
 # ---------------------------------------------------------------------------
 
 def create_sinusoidal_pos_embedding(
@@ -56,16 +71,7 @@ def create_sinusoidal_pos_embedding(
 
 
 # ---------------------------------------------------------------------------
-# M-RoPE helpers
-#
-# Qwen3-VL uses Multimodal RoPE with interleaved sections (config.rope_scaling
-# = {mrope_interleaved: True, mrope_section: [24, 20, 20]}). The frozen
-# q/k/v projections were trained against this positional scheme, so giving
-# them plain 1D RoPE would corrupt their representations. Instead of
-# re-implementing the interleaved M-RoPE math, we reuse the loaded VLM's own
-# `language_model.rotary_emb` module — it already encapsulates the correct
-# `(t, h, w) → cos/sin` mapping. We only need to construct the right
-# position_ids of shape (3, B, L_total) for our joint sequence.
+# RoPE helpers (used inside the VLM forward only; DiT does not use RoPE)
 # ---------------------------------------------------------------------------
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -74,10 +80,9 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def _apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply rotary embedding. `cos`/`sin` shape: (B, L, head_dim) — already
-    in interleaved-M-RoPE layout when produced by Qwen3VLTextRotaryEmbedding.
-    `q`/`k` shape: (B, num_heads, L, head_dim)."""
-    cos = cos.unsqueeze(1)  # broadcast over heads
+    """Apply Qwen3-VL interleaved-M-RoPE cos/sin (already collapsed to (B, L, head_dim))
+    onto multi-head Q, K of shape (B, num_heads, L, head_dim)."""
+    cos = cos.unsqueeze(1)
     sin = sin.unsqueeze(1)
     q_rot = (q * cos) + (_rotate_half(q) * sin)
     k_rot = (k * cos) + (_rotate_half(k) * sin)
@@ -86,67 +91,177 @@ def _apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.
 
 def _build_mrope_position_ids(
     image_grid_thw_list: list[torch.Tensor],
-    L_non_vis: int,
+    L_lang: int,
     B: int,
     spatial_merge_size: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Construct (3, B, L_total) position_ids for [vision … | non_vision].
+    """(3, B, L_vlm) M-RoPE position_ids for [vision … | language].
 
-    Mirrors HF Qwen3VL's get_vision_position_ids / get_rope_index:
-      - Each camera's vision tokens get (t_idx, h_idx, w_idx) at the LLM grid
-        resolution (post spatial merge by `spatial_merge_size`).
-      - The temporal channel for camera n starts at the post-merge max
-        position of camera n-1 + 1 (to keep all three channels collision-
-        free across images).
-      - After the last vision token, non-vision tokens (lang, state, robot,
-        latent, action) receive a monotonic position with all three channels
-        equal — this degenerates M-RoPE back to plain 1D RoPE on those
-        tokens, matching how text tokens are positionally encoded by
-        Qwen3-VL during pretraining.
-
-    Assumes uniform batch (every batch element has the same image grid),
-    which holds because DatasetAdapter resizes every camera to a fixed
-    canonical resolution before collation.
+    Mirrors HF Qwen3VL.get_vision_position_ids: each camera's vision tokens
+    get (t, h, w) at the LLM-grid resolution (post spatial_merge_size). After
+    all vision, language tokens get a monotonic temporal arange replicated
+    across the three channels.
     """
     pos_pieces: list[torch.Tensor] = []
     cur_start = 0
-
     for grid_thw in image_grid_thw_list:
         t = int(grid_thw[0].item())
         h = int(grid_thw[1].item()) // spatial_merge_size
         w = int(grid_thw[2].item()) // spatial_merge_size
 
-        # Row-major (t, h, w) enumeration matching Qwen3-VL's vision encoder
-        # output order. `position_height/width/temporal` follow the exact
-        # repeat pattern from HF's get_vision_position_ids.
         pos_t = torch.arange(t, device=device).repeat_interleave(h * w) + cur_start
-        pos_h = (
-            torch.arange(h, device=device).repeat_interleave(w).repeat(t)
-            + cur_start
-        )
+        pos_h = torch.arange(h, device=device).repeat_interleave(w).repeat(t) + cur_start
         pos_w = torch.arange(w, device=device).repeat(t * h) + cur_start
-        pos_pieces.append(torch.stack([pos_t, pos_h, pos_w], dim=0))  # (3, t*h*w)
-        # Advance temporal channel by max(t, h, w) so subsequent cameras
-        # don't share any of the three position channels.
+        pos_pieces.append(torch.stack([pos_t, pos_h, pos_w], dim=0))
         cur_start += max(t, h, w)
 
     if pos_pieces:
-        vis_pos = torch.cat(pos_pieces, dim=1)              # (3, L_vis)
+        vis_pos = torch.cat(pos_pieces, dim=1)
         next_pos = int(vis_pos.max().item()) + 1
     else:
         vis_pos = torch.zeros(3, 0, dtype=torch.long, device=device)
         next_pos = 0
 
-    # Non-vision: monotonic, replicated across the three channels.
-    non_vis = (
-        torch.arange(next_pos, next_pos + L_non_vis, device=device)
-        .unsqueeze(0)
-        .expand(3, -1)
+    lang_pos = (
+        torch.arange(next_pos, next_pos + L_lang, device=device)
+        .unsqueeze(0).expand(3, -1)
     )
-
-    full = torch.cat([vis_pos, non_vis], dim=1)             # (3, L_total)
+    full = torch.cat([vis_pos, lang_pos], dim=1)
     return full.unsqueeze(1).expand(3, B, -1).contiguous()
+
+
+# ---------------------------------------------------------------------------
+# adaLN-Zero modulation (DiT-style)
+# ---------------------------------------------------------------------------
+
+def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """x: (B, L, D) — shift/scale: (B, D). Broadcasts over L."""
+    return x * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+# ---------------------------------------------------------------------------
+# DiT layer: self-attn + cross-attn(to VLM KV) + FFN, modulated by adaLN-Zero
+# ---------------------------------------------------------------------------
+
+class DiTLayer(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        intermediate_size: int,
+        rms_norm_eps: float = 1e-5,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+
+        # ── Self-attention (over DiT sequence) ──────────────────────────
+        self.sa_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.sa_q = nn.Linear(hidden_size, num_heads * head_dim, bias=False)
+        self.sa_k = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=False)
+        self.sa_v = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=False)
+        self.sa_o = nn.Linear(num_heads * head_dim, hidden_size, bias=False)
+        self.sa_drop = nn.Dropout(dropout)
+
+        # ── Cross-attention (Q from DiT, K/V from VLM KV cache) ─────────
+        # Only Q has trainable projection; K, V are the cached VLM tensors.
+        self.ca_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.ca_q = nn.Linear(hidden_size, num_heads * head_dim, bias=False)
+        self.ca_o = nn.Linear(num_heads * head_dim, hidden_size, bias=False)
+        self.ca_drop = nn.Dropout(dropout)
+
+        # ── FFN ─────────────────────────────────────────────────────────
+        self.ffn_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.ffn = SwiGLU(hidden_size, intermediate_size)
+        self.ffn_drop = nn.Dropout(dropout)
+
+        # ── adaLN-Zero: produces 9 modulation vectors from t_emb ────────
+        # 3 sublayers × {shift, scale, gate} = 9 × hidden_size
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 9 * hidden_size, bias=True),
+        )
+        nn.init.zeros_(self.adaLN_modulation[1].weight)
+        nn.init.zeros_(self.adaLN_modulation[1].bias)
+
+        # ── Zero-init output projections so each block starts as identity ─
+        # (a la DiT-Zero — model behaves like residual stream at init)
+        nn.init.zeros_(self.sa_o.weight)
+        nn.init.zeros_(self.ca_o.weight)
+        nn.init.zeros_(self.ffn.down_proj.weight)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t_emb: torch.Tensor,
+        vlm_k: torch.Tensor,
+        vlm_v: torch.Tensor,
+        vlm_kv_pad_mask: Optional[torch.Tensor],
+        self_attn_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        x:               (B, L_dit, H)
+        t_emb:           (B, H) — per-batch time conditioning
+        vlm_k, vlm_v:    (B, num_kv_heads, L_vlm, head_dim) — frozen VLM cache
+        vlm_kv_pad_mask: (B, L_vlm) bool, True at valid VLM positions
+        self_attn_mask:  (L_dit, L_dit) additive mask (causal)
+        """
+        B, L_dit, H = x.shape
+
+        mod = self.adaLN_modulation(t_emb)
+        (
+            s_sa, sc_sa, g_sa,
+            s_ca, sc_ca, g_ca,
+            s_ff, sc_ff, g_ff,
+        ) = mod.chunk(9, dim=-1)
+
+        # ── Self-attention ────────────────────────────────────────────
+        h = _modulate(self.sa_norm(x), s_sa, sc_sa)
+        Q = self.sa_q(h).view(B, L_dit, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.sa_k(h).view(B, L_dit, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        V = self.sa_v(h).view(B, L_dit, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        if self.num_kv_heads != self.num_heads:
+            r = self.num_heads // self.num_kv_heads
+            K = K.repeat_interleave(r, dim=1)
+            V = V.repeat_interleave(r, dim=1)
+        sa = F.scaled_dot_product_attention(Q, K, V, attn_mask=self_attn_mask, is_causal=False)
+        sa = sa.transpose(1, 2).contiguous().view(B, L_dit, self.num_heads * self.head_dim)
+        sa = self.sa_drop(self.sa_o(sa))
+        x = x + g_sa.unsqueeze(1) * sa
+
+        # ── Cross-attention to frozen VLM cache ──────────────────────
+        h = _modulate(self.ca_norm(x), s_ca, sc_ca)
+        Q = self.ca_q(h).view(B, L_dit, self.num_heads, self.head_dim).transpose(1, 2)
+        Kv, Vv = vlm_k, vlm_v
+        if self.num_kv_heads != self.num_heads:
+            r = self.num_heads // self.num_kv_heads
+            Kv = Kv.repeat_interleave(r, dim=1)
+            Vv = Vv.repeat_interleave(r, dim=1)
+        # Build cross-attn pad mask: (B, 1, 1, L_vlm)
+        if vlm_kv_pad_mask is not None:
+            kpad = ~vlm_kv_pad_mask                                 # True = pad
+            ca_mask = torch.zeros(B, 1, 1, vlm_kv_pad_mask.shape[-1],
+                                  device=x.device, dtype=Q.dtype)
+            ca_mask.masked_fill_(kpad.unsqueeze(1).unsqueeze(1), float("-inf"))
+        else:
+            ca_mask = None
+        ca = F.scaled_dot_product_attention(Q, Kv, Vv, attn_mask=ca_mask, is_causal=False)
+        ca = ca.transpose(1, 2).contiguous().view(B, L_dit, self.num_heads * self.head_dim)
+        ca = self.ca_drop(self.ca_o(ca))
+        x = x + g_ca.unsqueeze(1) * ca
+
+        # ── FFN ──────────────────────────────────────────────────────
+        h = _modulate(self.ffn_norm(x), s_ff, sc_ff)
+        ff = self.ffn_drop(self.ffn(h))
+        x = x + g_ff.unsqueeze(1) * ff
+
+        return x
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +269,7 @@ def _build_mrope_position_ids(
 # ---------------------------------------------------------------------------
 
 class WiltechsVLATransformer(nn.Module):
-    """Interleaved flow matching policy with Qwen3-VL backbone."""
+    """Encoder-decoder flow matching VLA built on frozen Qwen3-VL-4B."""
 
     VLM_MODEL_ID: str = "Qwen/Qwen3-VL-4B-Instruct-FP8"
 
@@ -162,9 +277,9 @@ class WiltechsVLATransformer(nn.Module):
         super().__init__()
         self.config = config
 
-        # ------------------------------------------------------------------
-        # 1. Load Qwen3-VL (frozen)
-        # ------------------------------------------------------------------
+        # ─────────────────────────────────────────────────────────────
+        # 1. Load Qwen3-VL (frozen, ALL layers kept)
+        # ─────────────────────────────────────────────────────────────
         print(f"Loading {self.VLM_MODEL_ID} ...")
         vlm = Qwen3VLForConditionalGeneration.from_pretrained(
             self.VLM_MODEL_ID,
@@ -176,63 +291,65 @@ class WiltechsVLATransformer(nn.Module):
         self.visual = self.vlm_model.visual
         self.language_model = self.vlm_model.language_model
 
-        # Truncate to first num_vlm_layers
-        total_layers = len(self.language_model.layers)
-        self.language_model.layers = self.language_model.layers[: config.num_vlm_layers]
-        print(f"Using first {len(self.language_model.layers)}/{total_layers} text layers")
+        # NO LAYER TRUNCATION — encoder-decoder uses all 36 layers so that the
+        # last `num_dit_layers` KV caches benefit from the full upstream
+        # refinement. (Truncating earlier layers would degrade the cached
+        # representations the DiT cross-attends to.)
+        self.num_vlm_layers = len(self.language_model.layers)
 
-        # Read VLM attention shape from layer 0 (assume uniform across layers).
-        first_attn = self.language_model.layers[0].self_attn
         text_cfg = self.language_model.config
         self.hidden_size = int(text_cfg.hidden_size)
         self.num_heads = int(text_cfg.num_attention_heads)
         self.num_kv_heads = int(getattr(text_cfg, "num_key_value_heads", self.num_heads))
-        # IMPORTANT: read head_dim explicitly. Qwen3-VL-4B has head_dim=128
-        # while hidden_size // num_heads = 2560/32 = 80 — they DON'T match.
-        # Computing head_dim from hidden/num_heads silently produces mismatched
-        # expert projections and the joint-attention cat fails. The expert
-        # must mirror the VLM's actual q/k/v output widths.
         self.head_dim = int(
             getattr(text_cfg, "head_dim", None) or (self.hidden_size // self.num_heads)
         )
         self.intermediate_size = int(text_cfg.intermediate_size)
         self.rms_norm_eps = float(getattr(text_cfg, "rms_norm_eps", 1e-5))
-        self.rope_theta = float(getattr(text_cfg, "rope_theta", 10000.0))
-        print(f"VLM attn shape: hidden={self.hidden_size} heads={self.num_heads} "
-              f"kv_heads={self.num_kv_heads} head_dim={self.head_dim} "
-              f"intermediate={self.intermediate_size}")
+        print(f"VLM: {self.num_vlm_layers} layers  hidden={self.hidden_size}  "
+              f"heads={self.num_heads}  kv_heads={self.num_kv_heads}  "
+              f"head_dim={self.head_dim}  intermediate={self.intermediate_size}")
 
-        # The vision tower's spatial_merge_size determines the LLM-grid
-        # resolution of vision tokens — needed when we build M-RoPE
-        # position_ids. Default 2 matches Qwen3-VL configs we've inspected.
         vis_cfg = getattr(vlm.config, "vision_config", None)
         self.spatial_merge_size = int(getattr(vis_cfg, "spatial_merge_size", 2))
 
-        # Sanity: M-RoPE requires the VLM's rotary embedding module. Reuse
-        # it directly instead of re-implementing the interleaved math.
+        if config.d_model != self.hidden_size:
+            print(f"[wiltechs_vla] forcing d_model {config.d_model} → {self.hidden_size}")
+            config.d_model = self.hidden_size
+
+        # Sanity: VLM must own its rotary_emb (used by the manual layer-by-layer
+        # forward below to get M-RoPE cos/sin).
         if not hasattr(self.language_model, "rotary_emb"):
             raise RuntimeError(
-                "language_model.rotary_emb not found — M-RoPE setup expects "
+                "language_model.rotary_emb not found — encoder forward expects "
                 "Qwen3VLTextRotaryEmbedding to live on language_model."
             )
 
-        # Sanity: joint attention needs config's d_model to match VLM hidden.
-        if config.d_model != self.hidden_size:
-            print(f"[wiltechs_vla] forcing d_model {config.d_model} → {self.hidden_size} to match VLM")
-            config.d_model = self.hidden_size
-
         # Freeze VLM
-        for component in [self.visual, self.language_model]:
-            for p in component.parameters():
-                p.requires_grad = False
-            component.eval()
+        for p in self.visual.parameters():
+            p.requires_grad = False
+        for p in self.language_model.parameters():
+            p.requires_grad = False
+        self.visual.eval()
+        self.language_model.eval()
         del vlm
 
-        # ------------------------------------------------------------------
-        # 2. Trainable expert layers (parallel to each VLM layer)
-        # ------------------------------------------------------------------
-        self.expert_layers = nn.ModuleList([
-            ExpertProjections(
+        # ─────────────────────────────────────────────────────────────
+        # 2. DiT (trainable) — N layers cross-attending to last N VLM KV pairs
+        # ─────────────────────────────────────────────────────────────
+        # `num_vlm_layers` field in config is reused as DiT depth (= number
+        # of last VLM layers whose KV cache the DiT cross-attends to).
+        self.num_dit_layers = int(config.num_vlm_layers)
+        if self.num_dit_layers > self.num_vlm_layers:
+            raise ValueError(
+                f"num_dit_layers ({self.num_dit_layers}) > VLM layers "
+                f"({self.num_vlm_layers}); not enough KV caches to source from."
+            )
+        print(f"DiT: {self.num_dit_layers} layers, sourcing KV from VLM layers "
+              f"{self.num_vlm_layers - self.num_dit_layers}..{self.num_vlm_layers - 1}")
+
+        self.dit_layers = nn.ModuleList([
+            DiTLayer(
                 hidden_size=self.hidden_size,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
@@ -240,13 +357,39 @@ class WiltechsVLATransformer(nn.Module):
                 intermediate_size=self.intermediate_size,
                 rms_norm_eps=self.rms_norm_eps,
                 dropout=config.dropout,
-            )
-            for _ in range(len(self.language_model.layers))
+            ) for _ in range(self.num_dit_layers)
         ])
 
-        # ------------------------------------------------------------------
-        # 3. Robot CNN (optional) and state encoder
-        # ------------------------------------------------------------------
+        # ─────────────────────────────────────────────────────────────
+        # 3. DiT-side embeddings: SINK, state, action, time MLP
+        # ─────────────────────────────────────────────────────────────
+        self.sink_token = nn.Parameter(torch.zeros(1, 1, self.hidden_size))
+        nn.init.normal_(self.sink_token, std=0.02)
+
+        self.state_encoder = nn.Sequential(
+            nn.Linear(config.state_dim, self.hidden_size),
+            RMSNorm(self.hidden_size, eps=self.rms_norm_eps),
+        )
+
+        self.action_in_proj = nn.Linear(config.action_dim, self.hidden_size)
+        self.action_pos_emb = nn.Parameter(torch.zeros(1, config.horizon, self.hidden_size))
+        nn.init.normal_(self.action_pos_emb, std=0.02)
+
+        self.final_norm = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
+        self.action_out_proj = nn.Linear(self.hidden_size, config.action_dim)
+        nn.init.zeros_(self.action_out_proj.weight)
+        nn.init.zeros_(self.action_out_proj.bias)
+
+        # Time embedding MLP: sinusoidal → MLP → fed to every DiT layer's adaLN
+        self.time_embedder = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.SiLU(),
+            nn.Linear(self.hidden_size, self.hidden_size),
+        )
+
+        # ─────────────────────────────────────────────────────────────
+        # 4. Robot CNN (optional parallel visual path)
+        # ─────────────────────────────────────────────────────────────
         if config.use_robot_cnn:
             self.robot_visual_encoder = RobotVisualEncoder(
                 input_size=config.robot_encoder_input_size,
@@ -255,29 +398,11 @@ class WiltechsVLATransformer(nn.Module):
             )
         else:
             self.robot_visual_encoder = None
-            print("[wiltechs_vla] use_robot_cnn=False — RobotVisualEncoder disabled (ablation mode)")
-        self.state_encoder = nn.Sequential(
-            nn.Linear(config.state_dim, self.hidden_size),
-            RMSNorm(self.hidden_size, eps=self.rms_norm_eps),
-        )
+            print("[wiltechs_vla] use_robot_cnn=False — RobotVisualEncoder disabled")
 
-        # ------------------------------------------------------------------
-        # 4. Action expert input / output
-        # ------------------------------------------------------------------
-        self.action_in_proj = nn.Linear(config.action_dim, self.hidden_size)
-        self.action_out_proj = nn.Linear(self.hidden_size, config.action_dim)
-        nn.init.zeros_(self.action_out_proj.weight)
-        nn.init.zeros_(self.action_out_proj.bias)
-
-        self.action_time_mlp_in = nn.Linear(self.hidden_size * 2, self.hidden_size)
-        self.action_time_mlp_out = nn.Linear(self.hidden_size, self.hidden_size)
-
-        self.action_pos_emb = nn.Parameter(torch.zeros(1, config.horizon, self.hidden_size))
-        nn.init.normal_(self.action_pos_emb, std=0.02)
-
-        # ------------------------------------------------------------------
-        # 5. Latent "thought" tokens — task-conditional
-        # ------------------------------------------------------------------
+        # ─────────────────────────────────────────────────────────────
+        # 5. Latent "thought" tokens — task-conditional, zero-init output
+        # ─────────────────────────────────────────────────────────────
         self.num_latent_tokens = config.num_latent_tokens
         if self.num_latent_tokens > 0:
             hidden_mid = self.hidden_size * 2
@@ -289,58 +414,23 @@ class WiltechsVLATransformer(nn.Module):
             nn.init.zeros_(self.latent_generator[-1].weight)
             nn.init.zeros_(self.latent_generator[-1].bias)
 
-        # ------------------------------------------------------------------
-        # 6. Final norm before action readout
-        # ------------------------------------------------------------------
-        self.final_norm = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
-
-        # ------------------------------------------------------------------
-        # 7. Language adaptor — trainable residual projection
-        # ------------------------------------------------------------------
-        self.lang_adaptor = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size),
-            RMSNorm(self.hidden_size, eps=self.rms_norm_eps),
-        )
-        nn.init.zeros_(self.lang_adaptor[0].weight)
-        nn.init.zeros_(self.lang_adaptor[0].bias)
-
-        num_layers = len(self.language_model.layers)
-        self.lang_attn_bias = nn.Parameter(torch.zeros(num_layers))
-
         self._lang_max_len = 48
 
-    # =====================================================================
+    # =========================================================================
     # Keep frozen components in eval mode
-    # =====================================================================
-
+    # =========================================================================
     def train(self, mode: bool = True):
         super().train(mode)
         self.visual.eval()
         self.language_model.eval()
         return self
 
-    # =====================================================================
-    # Encoding helpers
-    # =====================================================================
-
+    # =========================================================================
+    # Vision / language encoding (no gradient, frozen VLM components)
+    # =========================================================================
     def _encode_images(
         self, batch: dict, B: int
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Vision tokens + per-camera grid_thw, frozen.
-
-        Returns:
-          vis_tokens: (B, sum_of_vision_tokens, hidden_size) bfloat16
-          grid_thw_list: list of (3,) tensors — one per camera that produced
-            real vision tokens, used downstream to build M-RoPE position_ids.
-
-        Qwen3-VL uses its own image processor which returns patchified
-        `pixel_values` plus `image_grid_thw`. We convert the dataset's
-        [0,1] float tensors to PIL Images and feed them through the
-        processor on-the-fly.
-
-        TODO: Pre-compute Qwen3-VL visual features in the dataset pipeline
-        to avoid the PIL conversion overhead at training time.
-        """
         device = batch["observation.state"].device
         all_vis: list[torch.Tensor] = []
         grid_thw_list: list[torch.Tensor] = []
@@ -348,47 +438,25 @@ class WiltechsVLATransformer(nn.Module):
             if cam_key not in batch:
                 continue
             imgs = batch[cam_key]
-            img = imgs[:, -1] if imgs.dim() == 5 else imgs  # (B, C, H, W)
-
-            # Dataset tensors are [0,1] float; Qwen3-VL processor expects
-            # PIL/numpy in [0,255] range. Convert to PIL for reliability.
+            img = imgs[:, -1] if imgs.dim() == 5 else imgs
             img_np = (img.permute(0, 2, 3, 1).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
             pil_images = [Image.fromarray(img_np[i]) for i in range(B)]
-
             with torch.no_grad():
-                processor_out = self.processor.image_processor(
-                    images=pil_images, return_tensors="pt"
-                )
-                pixel_values = processor_out["pixel_values"].to(device=device)
-                image_grid_thw = processor_out["image_grid_thw"].to(device=device)
-
+                proc_out = self.processor.image_processor(images=pil_images, return_tensors="pt")
+                pixel_values = proc_out["pixel_values"].to(device=device)
+                image_grid_thw = proc_out["image_grid_thw"].to(device=device)
                 vis_features = self.vlm_model.get_image_features(
-                    pixel_values=pixel_values,
-                    image_grid_thw=image_grid_thw,
+                    pixel_values=pixel_values, image_grid_thw=image_grid_thw,
                 )
-                # HF Qwen3-VL `get_image_features` returns the merged vision
-                # tokens directly as a tensor (or a `BaseModelOutput`-like
-                # object on older versions). Accept both shapes.
                 vis_tokens = getattr(vis_features, "last_hidden_state", vis_features)
-
             all_vis.append(vis_tokens)
-            # Take grid_thw of the first image — for a uniform batch every
-            # element has the same processed grid, which is what M-RoPE
-            # construction below assumes.
             grid_thw_list.append(image_grid_thw[0].detach())
-
         if not all_vis:
             empty = torch.zeros(B, 0, self.hidden_size, device=device, dtype=torch.bfloat16)
             return empty, []
         return torch.cat(all_vis, dim=1), grid_thw_list
 
     def _encode_language(self, batch: dict, device: torch.device) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        """Frozen embed_tokens + attention mask for the task description.
-
-        Returns (lang_tokens, lang_mask) or None.
-          lang_tokens: (B, L_max, hidden)
-          lang_mask:   (B, L_max) — bool, True where a real (non-pad) token sits
-        """
         descs = batch.get("task_description")
         if not descs:
             descs = batch.get("task")
@@ -399,350 +467,255 @@ class WiltechsVLATransformer(nn.Module):
             max_length=self._lang_max_len, add_special_tokens=True,
         )
         input_ids = inputs["input_ids"].to(device)
-        lang_mask = inputs["attention_mask"].bool().to(device)  # (B, L)
+        lang_mask = inputs["attention_mask"].bool().to(device)
         lang_tokens = self.language_model.get_input_embeddings()(input_ids)
         return lang_tokens, lang_mask
 
-    # =====================================================================
-    # Build attention mask for the joint sequence
-    # =====================================================================
+    # =========================================================================
+    # VLM encoder: run all 36 layers, cache K/V from the last num_dit_layers
+    # =========================================================================
+    @torch.no_grad()
+    def _run_vlm_and_cache_kv(
+        self, batch: dict
+    ) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor, int]:
+        """
+        Returns:
+          kv_cache:        list of length num_dit_layers, each entry is
+                           (K, V) of shape (B, num_kv_heads, L_vlm, head_dim).
+                           K is post-M-RoPE rotation.
+          vlm_kv_pad_mask: (B, L_vlm) bool — True at non-padded positions.
+                           Used by DiT cross-attn to ignore padded language slots.
+          L_vis:           int — number of vision tokens (so callers can locate
+                           the language slice for contrastive perturbation).
+        """
+        B = batch["observation.state"].shape[0]
+        device = batch["observation.state"].device
 
-    def _build_joint_mask(
-        self,
-        L_vlm: int,
-        R: int,
-        K: int,
-        H: int,
-        device: torch.device,
-        dtype: torch.dtype,
-        lang_start: int = 0,
-        lang_len: int = 0,
-        lang_mask: Optional[torch.Tensor] = None,
-        layer_idx: int = 0,
-    ) -> torch.Tensor:
-        L_total = L_vlm + R + K + H
-        a_start = L_vlm + R + K
-        l_start = L_vlm + R
-        r_start = L_vlm
+        vis_tokens, grid_thw_list = self._encode_images(batch, B)
+        L_vis = vis_tokens.shape[1]
 
-        mask = torch.zeros(L_total, L_total, device=device, dtype=dtype)
-
-        if R > 0:
-            mask[r_start:r_start + R, a_start:] = float("-inf")
-
-        if K > 0:
-            mask[l_start:l_start + K, a_start:] = float("-inf")
-
-        if not self.config.vlm_attends_to_expert:
-            mask[:L_vlm, L_vlm:] = float("-inf")
-
-        if H > 1:
-            causal = torch.triu(
-                torch.full((H, H), float("-inf"), device=device, dtype=dtype),
-                diagonal=1,
+        lang_result = self._encode_language(batch, device)
+        if lang_result is not None:
+            lang_tokens, lang_mask = lang_result
+            lang_tokens = lang_tokens.to(vis_tokens.dtype)
+            # Zero-out padded language embeddings so their K/V are uninformative.
+            lang_tokens = torch.where(
+                lang_mask.unsqueeze(-1), lang_tokens, torch.zeros_like(lang_tokens),
             )
-            mask[a_start:, a_start:] = causal
-
-        if lang_len > 0 and lang_mask is not None:
-            B = lang_mask.shape[0]
-            mask = mask.unsqueeze(0).expand(B, -1, -1).clone()
-
-            pad_cols = ~lang_mask.to(device)
-            for b in range(B):
-                pad_idx = pad_cols[b].nonzero(as_tuple=True)[0]
-                if pad_idx.numel() == 0:
-                    continue
-                pad_pos = lang_start + pad_idx
-                mask[b, :, pad_pos] = float("-inf")
-                mask[b, pad_pos, :] = float("-inf")
-
-            bias = F.softplus(self.lang_attn_bias[layer_idx])
-            bias_per_col = bias * lang_mask.to(device, dtype)
-            mask[:, L_vlm:, lang_start:lang_start + lang_len] += bias_per_col.unsqueeze(1)
-
-            mask = mask.unsqueeze(1)
-
-        elif lang_len > 0:
-            bias = F.softplus(self.lang_attn_bias[layer_idx])
-            mask[L_vlm:, lang_start:lang_start + lang_len] += bias
-
-        return mask
-
-    # =====================================================================
-    # Joint attention layer — the core of interleaving
-    # =====================================================================
-
-    def _joint_layer(
-        self,
-        vlm_seq: torch.Tensor,
-        exp_seq: torch.Tensor,
-        layer_idx: int,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        attn_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        vlm_layer = self.language_model.layers[layer_idx]
-        exp_layer = self.expert_layers[layer_idx]
-
-        B, L_vlm, _ = vlm_seq.shape
-        L_exp = exp_seq.size(1)
-        L_total = L_vlm + L_exp
-        H = self.num_heads
-        Hk = self.num_kv_heads
-        D = self.head_dim
-
-        # Pre-norm (separate weights)
-        vlm_norm = vlm_layer.input_layernorm(vlm_seq)
-        exp_norm = exp_layer.input_layernorm(exp_seq)
-
-        # Q/K/V from two parallel projection sets
-        Q_vlm = vlm_layer.self_attn.q_proj(vlm_norm)
-        K_vlm = vlm_layer.self_attn.k_proj(vlm_norm)
-        V_vlm = vlm_layer.self_attn.v_proj(vlm_norm)
-
-        Q_exp = exp_layer.q_proj(exp_norm)
-        K_exp = exp_layer.k_proj(exp_norm)
-        V_exp = exp_layer.v_proj(exp_norm)
-
-        Q = torch.cat([Q_vlm, Q_exp], dim=1).view(B, L_total, H, D).transpose(1, 2)
-        K = torch.cat([K_vlm, K_exp], dim=1).view(B, L_total, Hk, D).transpose(1, 2)
-        V = torch.cat([V_vlm, V_exp], dim=1).view(B, L_total, Hk, D).transpose(1, 2)
-
-        Q, K = _apply_rope(Q, K, cos, sin)
-
-        if Hk != H:
-            repeat = H // Hk
-            K = K.repeat_interleave(repeat, dim=1)
-            V = V.repeat_interleave(repeat, dim=1)
-
-        attn_out = F.scaled_dot_product_attention(
-            Q, K, V, attn_mask=attn_mask, is_causal=False,
-        )
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, L_total, H * D)
-
-        attn_vlm = vlm_layer.self_attn.o_proj(attn_out[:, :L_vlm])
-        attn_exp = exp_layer.o_proj(attn_out[:, L_vlm:])
-        attn_exp = exp_layer.attn_dropout(attn_exp)
-
-        vlm_seq = vlm_seq + attn_vlm
-        exp_seq = exp_seq + attn_exp
-
-        # FFN (pre-norm, parallel)
-        vlm_ffn_in = vlm_layer.post_attention_layernorm(vlm_seq)
-        exp_ffn_in = exp_layer.post_attention_layernorm(exp_seq)
-
-        vlm_ffn_out = vlm_layer.mlp(vlm_ffn_in)
-        exp_ffn_out = exp_layer.mlp(exp_ffn_in)
-        exp_ffn_out = exp_layer.mlp_dropout(exp_ffn_out)
-
-        vlm_seq = vlm_seq + vlm_ffn_out
-        exp_seq = exp_seq + exp_ffn_out
-
-        return vlm_seq, exp_seq
-
-    # =====================================================================
-    # Build expert sequence for a given timestep
-    # =====================================================================
-
-    def _generate_latents(
-        self,
-        lang_tokens: Optional[torch.Tensor],
-        lang_mask: Optional[torch.Tensor],
-        B: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Optional[torch.Tensor]:
-        K = self.num_latent_tokens
-        if K == 0:
-            return None
-        if lang_tokens is None or lang_mask is None:
-            pooled = torch.zeros(B, self.hidden_size, device=device, dtype=dtype)
+            L_lang = lang_tokens.shape[1]
         else:
-            mask_f = lang_mask.float().unsqueeze(-1).to(lang_tokens.dtype)
-            denom = mask_f.sum(dim=1).clamp(min=1.0)
-            pooled = (lang_tokens * mask_f).sum(dim=1) / denom
-        flat = self.latent_generator(pooled.float())
-        return flat.view(B, K, self.hidden_size).to(dtype)
+            lang_tokens = None
+            lang_mask = None
+            L_lang = 0
 
-    def _build_expert_seq(
-        self,
-        noisy_actions: torch.Tensor,
-        timesteps: torch.Tensor,
-        robot_tokens: Optional[torch.Tensor] = None,
-        latents: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        H = noisy_actions.shape[1]
+        parts = [vis_tokens]
+        if lang_tokens is not None:
+            parts.append(lang_tokens)
+        vlm_seq = torch.cat(parts, dim=1).to(torch.bfloat16)
+        L_vlm = vlm_seq.shape[1]
 
-        action_emb = self.action_in_proj(noisy_actions)
-        action_emb = action_emb + self.action_pos_emb[:, :H]
+        # M-RoPE position_ids — vision tokens get (t, h, w), lang gets monotonic
+        position_ids = _build_mrope_position_ids(
+            grid_thw_list, L_lang=L_lang, B=B,
+            spatial_merge_size=self.spatial_merge_size, device=device,
+        )
+        cos, sin = self.language_model.rotary_emb(vlm_seq, position_ids)
 
-        t_emb = create_sinusoidal_pos_embedding(timesteps, self.hidden_size).to(noisy_actions.dtype)
-        t_emb = t_emb.unsqueeze(1).expand(-1, H, -1)
-        fused = torch.cat([action_emb, t_emb], dim=-1)
-        fused = F.silu(self.action_time_mlp_in(fused))
-        fused = self.action_time_mlp_out(fused)
-        alpha = (1.0 - timesteps)[:, None, None]
-        action_tgt = fused + alpha * action_emb
+        # Valid-position mask: vision always valid; language follows lang_mask.
+        if lang_mask is not None:
+            vis_mask = torch.ones(B, L_vis, device=device, dtype=torch.bool)
+            vlm_kv_pad_mask = torch.cat([vis_mask, lang_mask], dim=1)
+        else:
+            vlm_kv_pad_mask = torch.ones(B, L_vlm, device=device, dtype=torch.bool)
 
-        parts = []
-        if robot_tokens is not None:
-            parts.append(robot_tokens.to(action_tgt.dtype))
-        if self.num_latent_tokens > 0 and latents is not None:
-            parts.append(latents.to(action_tgt.dtype))
-        parts.append(action_tgt)
-        return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
+        # Causal mask + key-padding mask for VLM self-attention (matches the
+        # mask shape Qwen3-VL was pretrained with). Shape: (B, 1, L, L).
+        causal = torch.triu(
+            torch.full((L_vlm, L_vlm), float("-inf"), device=device, dtype=vlm_seq.dtype),
+            diagonal=1,
+        )
+        full_mask = causal.unsqueeze(0).unsqueeze(0).expand(B, 1, L_vlm, L_vlm).clone()
+        key_pad = ~vlm_kv_pad_mask                            # True = pad
+        full_mask.masked_fill_(key_pad.unsqueeze(1).unsqueeze(1), float("-inf"))
 
-    # =====================================================================
-    # Compute robot CNN tokens once
-    # =====================================================================
+        # Layer-by-layer forward, capturing K/V from the trailing layers.
+        capture_start = self.num_vlm_layers - self.num_dit_layers
+        hidden = vlm_seq
+        kv_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
 
+        for i, layer in enumerate(self.language_model.layers):
+            residual = hidden
+            h_in = layer.input_layernorm(hidden)
+
+            Q = layer.self_attn.q_proj(h_in)
+            K = layer.self_attn.k_proj(h_in)
+            V = layer.self_attn.v_proj(h_in)
+
+            Bn, Ln, _ = Q.shape
+            Q = Q.view(Bn, Ln, self.num_heads, self.head_dim).transpose(1, 2)
+            K = K.view(Bn, Ln, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            V = V.view(Bn, Ln, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+            Q, K = _apply_rope(Q, K, cos, sin)
+
+            # Capture K (post-RoPE) and V — these are the cross-attn memory.
+            if i >= capture_start:
+                kv_cache.append((K.detach(), V.detach()))
+
+            if self.num_kv_heads != self.num_heads:
+                r = self.num_heads // self.num_kv_heads
+                K_x = K.repeat_interleave(r, dim=1)
+                V_x = V.repeat_interleave(r, dim=1)
+            else:
+                K_x, V_x = K, V
+
+            attn = F.scaled_dot_product_attention(Q, K_x, V_x, attn_mask=full_mask, is_causal=False)
+            attn = attn.transpose(1, 2).contiguous().view(Bn, Ln, self.num_heads * self.head_dim)
+            attn = layer.self_attn.o_proj(attn)
+            hidden = residual + attn
+
+            residual = hidden
+            h_in = layer.post_attention_layernorm(hidden)
+            hidden = residual + layer.mlp(h_in)
+
+        return kv_cache, vlm_kv_pad_mask, L_vis
+
+    # =========================================================================
+    # DiT-side helpers: robot CNN, latents, time, input assembly
+    # =========================================================================
     def _compute_robot_tokens(self, batch: dict) -> Optional[torch.Tensor]:
         if self.robot_visual_encoder is None:
             return None
-        robot_tokens_list = []
+        toks_list = []
         for cam_key in self.config.cameras_for_vision_state_concat:
             if cam_key not in batch:
                 continue
             img = batch[cam_key]
             if img.dim() == 5:
                 img = img[:, -1]
-            robot_tokens_list.append(self.robot_visual_encoder(img.float()))
-        if not robot_tokens_list:
+            toks_list.append(self.robot_visual_encoder(img.float()))
+        if not toks_list:
             return None
-        robot_tokens = torch.cat(robot_tokens_list, dim=1)
+        toks = torch.cat(toks_list, dim=1)
+        vp = float(getattr(self.config, "vision_dropout_prob", 0.0)) if self.training else 0.0
+        if vp > 0:
+            B, R, _ = toks.shape
+            keep = torch.rand(B, R, device=toks.device) > vp
+            toks = toks * keep.unsqueeze(-1).to(toks.dtype)
+        return toks
 
-        vision_dropout_prob = float(getattr(self.config, "vision_dropout_prob", 0.0)) if self.training else 0.0
-        if self.training and vision_dropout_prob > 0.0:
-            B, R, _ = robot_tokens.shape
-            keep = torch.rand(B, R, device=robot_tokens.device) > vision_dropout_prob
-            robot_tokens = robot_tokens * keep.unsqueeze(-1).to(robot_tokens.dtype)
-
-        return robot_tokens
-
-    # =====================================================================
-    # Build VLM-side sequence: frozen vision + language + (trainable) state
-    # =====================================================================
-
-    def _build_vlm_seq(
-        self, batch: dict
-    ) -> tuple[torch.Tensor, int, Optional[torch.Tensor], list[torch.Tensor]]:
-        """Returns (vlm_seq, L_vis, lang_mask, grid_thw_list).
-
-        `grid_thw_list` is passed to the M-RoPE position-id builder so
-        vision tokens get (t, h, w) coordinates rather than 1D arange.
-        """
-        B = batch["observation.state"].shape[0]
-        device = batch["observation.state"].device
-
+    def _generate_latents(
+        self, batch: dict, B: int, device: torch.device, dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if self.num_latent_tokens == 0:
+            return None
         lang_result = self._encode_language(batch, device)
-        lang_mask: Optional[torch.Tensor] = None
-
-        with torch.no_grad():
-            vis_tokens, grid_thw_list = self._encode_images(batch, B)
-
-        L_vis = vis_tokens.shape[1]
-
-        vision_dropout_prob = float(getattr(self.config, "vision_dropout_prob", 0.0)) if self.training else 0.0
-        if self.training and L_vis > 0 and vision_dropout_prob > 0.0:
-            keep = torch.rand(B, L_vis, device=vis_tokens.device) > vision_dropout_prob
-            vis_tokens = vis_tokens * keep.unsqueeze(-1).to(vis_tokens.dtype)
-
         if lang_result is not None:
             lang_tokens, lang_mask = lang_result
-            L_lang = lang_tokens.shape[1]
-
-            lang_adapted = lang_tokens.to(vis_tokens.dtype) + self.lang_adaptor(lang_tokens.to(vis_tokens.dtype))
-            lang_tokens = torch.where(
-                lang_mask.unsqueeze(-1),
-                lang_adapted,
-                torch.zeros_like(lang_adapted),
-            )
+            mask_f = lang_mask.float().unsqueeze(-1).to(lang_tokens.dtype)
+            denom = mask_f.sum(dim=1).clamp(min=1.0)
+            pooled = (lang_tokens * mask_f).sum(dim=1) / denom
         else:
-            lang_tokens = None
-            L_lang = 0
+            pooled = torch.zeros(B, self.hidden_size, device=device, dtype=dtype)
+        flat = self.latent_generator(pooled.float())
+        return flat.view(B, self.num_latent_tokens, self.hidden_size).to(dtype)
+
+    def _build_dit_input(
+        self,
+        batch: dict,
+        noisy_actions: torch.Tensor,
+        robot_tokens: Optional[torch.Tensor],
+        latents: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, int]:
+        """
+        Returns:
+          dit_seq:          (B, L_dit, H)
+          action_start_idx: int — index where action tokens begin (for readout)
+        """
+        B, H, _ = noisy_actions.shape
+        dtype = noisy_actions.dtype
+
+        sink = self.sink_token.expand(B, -1, -1).to(dtype)
 
         state = batch["observation.state"].float()
         if state.dim() == 2:
             state = state.unsqueeze(1)
         state = state.nan_to_num(0.0).clamp(-10.0, 10.0)
-        state_tokens = self.state_encoder(state).to(vis_tokens.dtype)
+        state_tok = self.state_encoder(state).to(dtype)
+        if state_tok.shape[1] > 1:
+            state_tok = state_tok[:, -1:]
 
-        parts = [vis_tokens]
-        if lang_tokens is not None:
-            parts.append(lang_tokens)
-        parts.append(state_tokens)
-        return torch.cat(parts, dim=1), L_vis, lang_mask, grid_thw_list
+        action_emb = self.action_in_proj(noisy_actions) + self.action_pos_emb[:, :H]
+        action_emb = action_emb.to(dtype)
 
-    # =====================================================================
-    # Velocity field — runs the joint stack and reads off action positions
-    # =====================================================================
+        parts = [sink, state_tok]
+        if robot_tokens is not None:
+            parts.append(robot_tokens.to(dtype))
+        if latents is not None:
+            parts.append(latents.to(dtype))
+        parts.append(action_emb)
+        seq = torch.cat(parts, dim=1)
 
-    def velocity_field(
+        # action starts at position = len of everything before it
+        action_start_idx = seq.shape[1] - H
+        return seq, action_start_idx
+
+    def _build_dit_self_attn_mask(self, L_dit: int, device, dtype) -> torch.Tensor:
+        """Full left-to-right causal mask. SINK / state / robot / latent all
+        share the same causal regime as action tokens — they only see earlier
+        positions, action tokens see everything before them including
+        themselves at their position. Action_pos_emb gives each action_t a
+        distinguishing position embedding."""
+        return torch.triu(
+            torch.full((L_dit, L_dit), float("-inf"), device=device, dtype=dtype),
+            diagonal=1,
+        )
+
+    # =========================================================================
+    # DiT decoder pass — one denoising step given pre-computed VLM KV cache
+    # =========================================================================
+    def _run_dit(
         self,
+        batch: dict,
         noisy_actions: torch.Tensor,
         timesteps: torch.Tensor,
-        vlm_seq: torch.Tensor,
-        robot_tokens: Optional[torch.Tensor] = None,
-        lang_start: int = 0,
-        lang_len: int = 0,
-        lang_mask: Optional[torch.Tensor] = None,
-        grid_thw_list: Optional[list[torch.Tensor]] = None,
+        kv_cache: list[tuple[torch.Tensor, torch.Tensor]],
+        vlm_kv_pad_mask: torch.Tensor,
+        robot_tokens: Optional[torch.Tensor],
+        latents: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        B, H, _ = noisy_actions.shape
-        K = self.num_latent_tokens
-        R = robot_tokens.size(1) if robot_tokens is not None else 0
-        L_vlm = vlm_seq.size(1)
+        """One DiT denoising step. Returns velocity prediction (B, H, action_dim)."""
+        device = noisy_actions.device
+        dtype = noisy_actions.dtype
 
-        lang_part = (
-            vlm_seq[:, lang_start : lang_start + lang_len]
-            if (lang_len > 0 and lang_mask is not None) else None
+        # Time embedding
+        t_emb_raw = create_sinusoidal_pos_embedding(timesteps, self.hidden_size).to(dtype)
+        t_emb = self.time_embedder(t_emb_raw.float()).to(dtype)
+
+        # Build sequence
+        dit_seq, action_start_idx = self._build_dit_input(
+            batch, noisy_actions, robot_tokens, latents,
         )
-        latents = self._generate_latents(
-            lang_part, lang_mask, B, vlm_seq.device, vlm_seq.dtype,
-        )
+        L_dit = dit_seq.shape[1]
+        causal_mask = self._build_dit_self_attn_mask(L_dit, device, dtype)
 
-        exp_seq = self._build_expert_seq(
-            noisy_actions, timesteps, robot_tokens, latents,
-        ).to(vlm_seq.dtype)
-
-        # ── M-RoPE: build (3, B, L_total) position_ids, then defer cos/sin
-        # synthesis to Qwen3-VL's own rotary module. L_non_vis covers the
-        # lang + state + (robot + latent + action) tokens — every position
-        # past L_vis. The lang_start the caller passed is the boundary
-        # between vis and (lang+state) inside vlm_seq, so L_vis == lang_start.
-        L_total = L_vlm + R + K + H
-        L_vis_local = lang_start
-        L_non_vis = (L_total - L_vis_local)
-        position_ids = _build_mrope_position_ids(
-            grid_thw_list or [],
-            L_non_vis=L_non_vis,
-            B=B,
-            spatial_merge_size=self.spatial_merge_size,
-            device=vlm_seq.device,
-        )
-        # `language_model.rotary_emb` is frozen but callable. It returns
-        # cos/sin in `(B, L_total, head_dim)` shape with the interleaved
-        # M-RoPE layout already applied — _apply_rope can consume directly.
-        cos, sin = self.language_model.rotary_emb(vlm_seq, position_ids)
-
-        for i in range(len(self.expert_layers)):
-            attn_mask_i = self._build_joint_mask(
-                L_vlm, R, K, H, vlm_seq.device, vlm_seq.dtype,
-                lang_start=lang_start, lang_len=lang_len,
-                lang_mask=lang_mask, layer_idx=i,
-            )
-            vlm_seq, exp_seq = self._joint_layer(
-                vlm_seq, exp_seq, layer_idx=i,
-                cos=cos, sin=sin, attn_mask=attn_mask_i,
+        # Run DiT layers, each cross-attending to its paired VLM cache
+        x = dit_seq
+        for i, layer in enumerate(self.dit_layers):
+            vlm_k, vlm_v = kv_cache[i]
+            x = layer(
+                x, t_emb=t_emb,
+                vlm_k=vlm_k, vlm_v=vlm_v,
+                vlm_kv_pad_mask=vlm_kv_pad_mask,
+                self_attn_mask=causal_mask,
             )
 
-        action_out = self.final_norm(exp_seq[:, R + K:])
+        action_out = self.final_norm(x[:, action_start_idx:])
         return self.action_out_proj(action_out)
 
-    # =====================================================================
-    # Flow matching: training loss + inference sampling
-    # =====================================================================
-
+    # =========================================================================
+    # Flow matching training / sampling
+    # =========================================================================
     def sample_noise(self, shape, device):
         rho = self.config.noise_temporal_correlation
         noise = torch.randn(shape, device=device)
@@ -762,22 +735,27 @@ class WiltechsVLATransformer(nn.Module):
         B = actions.shape[0]
         device = actions.device
 
+        # ── Encoder: run VLM once, cache KV ─────────────────────────
+        kv_cache, vlm_kv_pad_mask, L_vis = self._run_vlm_and_cache_kv(batch)
+
+        # ── DiT-side conditioning that does NOT depend on noise ─────
         robot_tokens = self._compute_robot_tokens(batch)
+        latents = self._generate_latents(batch, B, device, torch.bfloat16)
 
-        vlm_seq, L_vis, lang_mask, grid_thw_list = self._build_vlm_seq(batch)
-        vlm_seq = vlm_seq.float()
-        L_lang = lang_mask.shape[1] if lang_mask is not None else 0
-
-        noise = self.sample_noise(actions.shape, actions.device)
-        t = self.sample_time(B, actions.device)
+        # ── Flow matching: build noisy actions, predict velocity ────
+        noise = self.sample_noise(actions.shape, device)
+        t = self.sample_time(B, device)
         t_exp = t[:, None, None]
         x_t = t_exp * noise + (1.0 - t_exp) * actions
         u_t = noise - actions
 
-        v_t = self.velocity_field(x_t, t, vlm_seq.to(x_t.dtype), robot_tokens=robot_tokens,
-                                  lang_start=L_vis, lang_len=L_lang, lang_mask=lang_mask,
-                                  grid_thw_list=grid_thw_list)
+        v_t = self._run_dit(
+            batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask,
+            robot_tokens, latents,
+        ).float()
 
+        # Per-position weighting (n_action_steps gets full weight; future tail
+        # gets future_steps_weight; optional exponential decay).
         loss = F.mse_loss(v_t, u_t, reduction="none")
         if self.config.action_dim_weights:
             dim_w = torch.tensor(self.config.action_dim_weights, device=loss.device, dtype=loss.dtype)
@@ -792,80 +770,80 @@ class WiltechsVLATransformer(nn.Module):
             pos_w = pos_w * torch.exp(-self.config.pos_decay_lambda * pos)
         loss = loss * pos_w[None, :, None]
 
+        # action_is_pad / action_dim_pad masking (same as before)
         loss_dtype = loss.dtype
-        B, H_, D_ = loss.shape
+        Bn, Hn, Dn = loss.shape
 
         is_pad = batch.get("action_is_pad", batch.get("actions_id_pad"))
-        if is_pad is not None:
-            valid_t = (~is_pad.bool()).to(loss_dtype)
-        else:
-            valid_t = torch.ones(B, H_, device=loss.device, dtype=loss_dtype)
+        valid_t = (~is_pad.bool()).to(loss_dtype) if is_pad is not None \
+                  else torch.ones(Bn, Hn, device=loss.device, dtype=loss_dtype)
 
         dim_pad = batch.get("action_dim_pad")
-        if dim_pad is not None:
-            valid_d = (~dim_pad.bool()).to(loss_dtype)
-        else:
-            valid_d = torch.ones(B, D_, device=loss.device, dtype=loss_dtype)
+        valid_d = (~dim_pad.bool()).to(loss_dtype) if dim_pad is not None \
+                  else torch.ones(Bn, Dn, device=loss.device, dtype=loss_dtype)
 
         valid_cells = valid_t.unsqueeze(-1) * valid_d.unsqueeze(1)
         loss = loss * valid_cells
-
         denom = (pos_w[None, :, None] * valid_cells).sum().clamp(min=1e-6)
         main_loss = loss.sum() / denom
 
-        contrastive_weight = getattr(self.config, "contrastive_loss_weight", 0.0)
-        contrastive_loss_value = 0.0
+        # ── Contrastive language loss (cheap variant) ───────────────
+        # Permute the LANGUAGE portion of each VLM KV pair across batch and
+        # re-run the DiT. The "wrong-language" prediction should differ from
+        # the right-language one by at least `contrastive_margin`. Avoids a
+        # second full VLM forward (which would be expensive on Qwen3-VL 4B).
+        contrastive_w = float(getattr(self.config, "contrastive_loss_weight", 0.0))
+        contrastive_v = 0.0
+        L_lang_total = vlm_kv_pad_mask.shape[-1] - L_vis
         if (
-            self.training
-            and contrastive_weight > 0.0
-            and lang_mask is not None
-            and L_lang > 0
-            and B >= 2
+            self.training and contrastive_w > 0.0
+            and L_lang_total > 0 and B >= 2
         ):
             perm = torch.randperm(B, device=device)
             if (perm == torch.arange(B, device=device)).any():
                 perm = torch.roll(perm, shifts=1, dims=0)
 
-            descs = batch.get("task")
-            if descs is None:
-                descs = batch.get("task_description")
+            # Skip pairs whose language string actually matches (cross-dataset
+            # collisions, e.g. "Grasp a lego block ..." appearing 4× across
+            # community).
+            descs = batch.get("task") or batch.get("task_description")
             if descs is not None and len(descs) == B:
                 perm_cpu = perm.detach().cpu().tolist()
                 pair_diff = torch.tensor(
                     [descs[i] != descs[perm_cpu[i]] for i in range(B)],
-                    device=device,
-                    dtype=torch.bool,
+                    device=device, dtype=torch.bool,
                 )
             else:
                 pair_diff = torch.ones(B, device=device, dtype=torch.bool)
 
             if pair_diff.any():
-                vis_part = vlm_seq[:, :L_vis]
-                lang_part = vlm_seq[:, L_vis:L_vis + L_lang]
-                state_part = vlm_seq[:, L_vis + L_lang:]
-                vlm_seq_wrong = torch.cat(
-                    [vis_part, lang_part[perm], state_part], dim=1,
-                )
-                lang_mask_wrong = lang_mask[perm]
+                shuffled_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+                for K, V in kv_cache:
+                    K_shuf = K.clone()
+                    V_shuf = V.clone()
+                    K_shuf[:, :, L_vis:, :] = K[perm, :, L_vis:, :]
+                    V_shuf[:, :, L_vis:, :] = V[perm, :, L_vis:, :]
+                    shuffled_cache.append((K_shuf, V_shuf))
+                shuffled_pad_mask = vlm_kv_pad_mask.clone()
+                shuffled_pad_mask[:, L_vis:] = vlm_kv_pad_mask[perm][:, L_vis:]
 
-                v_wrong = self.velocity_field(
-                    x_t, t, vlm_seq_wrong.to(x_t.dtype),
-                    robot_tokens=robot_tokens,
-                    lang_start=L_vis, lang_len=L_lang, lang_mask=lang_mask_wrong,
-                    grid_thw_list=grid_thw_list,
-                )
+                v_wrong = self._run_dit(
+                    batch, x_t.to(torch.bfloat16), t,
+                    shuffled_cache, shuffled_pad_mask,
+                    robot_tokens, latents,
+                ).float()
 
                 diff_sq = (v_t - v_wrong).pow(2).mean(dim=[1, 2])
                 margin = float(getattr(self.config, "contrastive_margin", 0.05))
                 hinge = F.relu(margin - diff_sq) * pair_diff.float()
                 n_valid = pair_diff.float().sum().clamp(min=1.0)
                 loss_contrastive = hinge.sum() / n_valid
-                contrastive_loss_value = float(loss_contrastive.detach())
-                main_loss = main_loss + contrastive_weight * loss_contrastive
+                contrastive_v = float(loss_contrastive.detach())
+                main_loss = main_loss + contrastive_w * loss_contrastive
 
         self._last_loss_components = {
-            "main": float(main_loss.detach() - contrastive_weight * contrastive_loss_value),
-            "contrastive": contrastive_loss_value,
+            "main": float(main_loss.detach() - contrastive_w * contrastive_v),
+            "contrastive": contrastive_v,
         }
         return main_loss
 
@@ -885,22 +863,27 @@ class WiltechsVLATransformer(nn.Module):
         )
 
         with autocast_ctx:
-            robot_tokens = self._compute_robot_tokens(batch)
-            vlm_seq, L_vis, lang_mask, grid_thw_list = self._build_vlm_seq(batch)
-            vlm_seq = vlm_seq.float()
-            L_lang = lang_mask.shape[1] if lang_mask is not None else 0
+            # Encoder pass: run VLM once, get KV cache
+            kv_cache, vlm_kv_pad_mask, _L_vis = self._run_vlm_and_cache_kv(batch)
 
+            # DiT-side static conditioning (same across denoising steps)
+            robot_tokens = self._compute_robot_tokens(batch)
+            latents = self._generate_latents(batch, B, device, torch.bfloat16)
+
+            # Flow matching: N=5 inference steps (Xiaomi-Robotics-0 standard).
+            # config.num_inference_steps can override.
+            N = int(getattr(self.config, "num_inference_steps", 5))
             x_t = self.sample_noise(
                 (B, self.config.horizon, self.config.action_dim), device=device,
             )
-            N = self.config.num_inference_steps
             dt = -1.0 / N
             t = torch.ones(B, device=device, dtype=torch.float32)
 
             for _ in range(N):
-                v_t = self.velocity_field(x_t, t, vlm_seq.to(x_t.dtype), robot_tokens=robot_tokens,
-                                          lang_start=L_vis, lang_len=L_lang, lang_mask=lang_mask,
-                                          grid_thw_list=grid_thw_list)
+                v_t = self._run_dit(
+                    batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask,
+                    robot_tokens, latents,
+                ).float()
                 x_t = x_t + dt * v_t
                 t = t + dt
 

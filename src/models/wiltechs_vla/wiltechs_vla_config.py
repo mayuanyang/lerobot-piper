@@ -1,23 +1,30 @@
 """
-Config for the WiltechsVLA interleaved flow matching policy.
+Config for the WiltechsVLA encoder-decoder flow matching policy.
 
 Backbone: Qwen/Qwen3-VL-4B-Instruct-FP8
-Architecture: SmolVLA-style interleaved (joint attention every layer).
+Architecture: Mixture-of-Transformers (MoT) — encoder-decoder with KV cache.
 
-Key architectural difference vs `transformer_flow_matching`:
-  - Encoder-decoder model: VLM runs to completion frozen, action expert
-    cross-attends to its outputs. VLM is not influenced by the action context.
-  - **This model (interleaved)**: at every VLM depth, action / latent tokens
-    join the VLM sequence in a single self-attention pass. VLM tokens *and*
-    expert tokens share the same QKV pool — VLM still uses its frozen QKV/FFN, but
-    a parallel trainable "expert layer" handles the action-side QKV/FFN.
-    This lets VLM tokens attend to expert tokens (and vice versa) every
-    layer, so the VLM's activations become task-aware even though its
-    weights are frozen.
+  - **Encoder (frozen VLM)**: all 36 Qwen3-VL text layers run ONCE per
+    inference on [vision tokens, language tokens]. K, V tensors from the
+    last `num_vlm_layers` (re-purposed below as DiT depth) layers are
+    cached and exposed to the DiT.
 
-Cost of this design:
-  - Expert dim must match VLM hidden (2560 for Qwen3-VL-4B) → larger expert.
-  - Checkpoints from SmolVLM2-based interleaved model are NOT compatible.
+  - **Decoder (trainable DiT)**: `num_vlm_layers` independent DiT layers,
+    each with self-attention (causal) + cross-attention to one matched
+    VLM KV pair + SwiGLU FFN, all modulated by adaLN-Zero from the
+    flow-matching time t. DiT runs `num_inference_steps` times per
+    inference, but the VLM cache is computed only once.
+
+  - **DiT input sequence**: [SINK, state, robot_cnn_tokens, latent_tokens,
+    action_tokens]. The VLM never sees state/action tokens, preserving
+    its pretrained vision-language capabilities exactly.
+
+Compared to the previous interleaved version:
+  - VLM runs 1× instead of `num_inference_steps`× → ~5-10× faster inference.
+  - All 36 VLM layers are used; the DiT just reads from the trailing N.
+  - VLM activations are not perturbed by an untrained expert.
+
+Checkpoints from the previous (interleaved) WiltechsVLA are NOT compatible.
 """
 
 from dataclasses import dataclass, field
@@ -52,7 +59,10 @@ class WiltechsVLAConfig(PreTrainedConfig):
 
     # -------- VLM backbone --------
     num_cameras: int = 3
-    # Number of Qwen3-VL text layers used. The expert mirrors this 1:1.
+    # DiT depth = number of trailing VLM layers whose KV cache the DiT
+    # cross-attends to. The VLM itself always runs ALL 36 layers — this
+    # field controls only how many of its KV pairs are consumed.
+    # (Field name kept for backwards-compat with saved configs.)
     num_vlm_layers: int = 16
 
     # Selective camera list for vision token construction.
@@ -72,15 +82,16 @@ class WiltechsVLAConfig(PreTrainedConfig):
     # is here only for surfacing it in saved configs.
     # Qwen3-VL-4B-Instruct-FP8 text hidden size is 2560.
     d_model: int = 2560
-    # Dropout used inside expert layers (self-attn output and FFN output).
+    # Dropout used inside DiT layers (self-attn output, cross-attn output, FFN output).
     dropout: float = 0.1
-    # Allow VLM queries to attend to expert keys.
-    # True  → true SmolVLA-style interleaving (VLM perception becomes action-aware).
-    # False → expert reads VLM but not vice versa (closer to encoder-decoder).
+    # Kept for backwards-compat — has no effect in the encoder-decoder model
+    # (VLM never attends to DiT tokens; cross-attention is strictly DiT → VLM).
     vlm_attends_to_expert: bool = True
 
     # -------- Flow matching sampling --------
-    num_inference_steps: int = 10
+    # Xiaomi-Robotics-0 uses 5 steps; reducing from 10 halves inference time
+    # with negligible quality loss in well-trained flow matching policies.
+    num_inference_steps: int = 5
     noise_temporal_correlation: float = 0.0
 
     # Per-dimension and positional loss weights.
