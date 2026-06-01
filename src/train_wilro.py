@@ -137,7 +137,7 @@ def _log_gradient_analysis(policy, step: int) -> None:
 # Main training function
 # ---------------------------------------------------------------------------
 def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None,
-          gradient_checkpointing=False):
+          gradient_checkpointing=False, max_episode_index=None):
     """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model."""
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -312,9 +312,13 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     if isinstance(preprocessor, torch.nn.Module):
         preprocessor.to(device)
 
-    # Dataset setup
-    fps = 30
+    # Dataset setup — read fps from metadata instead of hardcoding. piper_arm
+    # is 30 fps but libero / community datasets are commonly 10 fps; using a
+    # mismatched frame_time makes every requested delta_timestamp fall outside
+    # tolerance_s and the constructor raises.
+    fps = int(getattr(dataset_metadata, "fps", 30) or 30)
     frame_time = 1 / fps
+    print(f"Dataset fps: {fps} (frame_time={frame_time:.4f}s)")
 
     # Observation window: last `obs` frames ending at t=0
     obs_temporal_window = [-i * frame_time for i in range(obs)][::-1]
@@ -328,15 +332,13 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         **{key: [0.0] for key in camera_keys},
     }
 
-    try:
-        dataset = LeRobotDataset(dataset_id, delta_timestamps=delta_timestamps,
-                                 force_cache_sync=True, revision="main", tolerance_s=0.005)
-    except Exception as e:
-        print(f"Error loading remote dataset: {e}")
-        local_dataset_path = "./src/output"
-        print(f"Trying local dataset at {local_dataset_path}...")
-        dataset = LeRobotDataset(local_dataset_path, delta_timestamps=delta_timestamps,
-                                 force_cache_sync=True, tolerance_s=0.005)
+    # `tolerance_s` must accommodate the dataset's frame interval — too tight
+    # and every delta lookup raises. Half a frame is a safe upper bound.
+    tolerance_s = max(0.005, frame_time / 2)
+    dataset = LeRobotDataset(
+        dataset_id, delta_timestamps=delta_timestamps,
+        force_cache_sync=True, revision="main", tolerance_s=tolerance_s,
+    )
 
     # Build task_index → description mapping from tasks.parquet
     task_idx_to_description: dict[int, str] = {}
@@ -371,9 +373,18 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         print(f"  std ={s.get('std',  'N/A')}")
 
     episode_ids = np.array(dataset.hf_dataset["episode_index"])
-    valid_indices = np.where(episode_ids <= 400)[0].tolist()
-    dataset = Subset(dataset, valid_indices)
-    print(f"Dataset subset: {len(dataset)} samples (episodes <= 400)")
+    if max_episode_index is not None:
+        valid_indices = np.where(episode_ids <= max_episode_index)[0].tolist()
+        if len(valid_indices) == 0:
+            raise ValueError(
+                f"max_episode_index={max_episode_index} excluded every sample "
+                f"(dataset episode range: {episode_ids.min()}..{episode_ids.max()})."
+            )
+        dataset = Subset(dataset, valid_indices)
+        print(f"Dataset subset: {len(dataset)} samples (episodes <= {max_episode_index})")
+    else:
+        valid_indices = list(range(len(episode_ids)))
+        print(f"Dataset: {len(dataset)} samples (no episode filter)")
 
     episode_ids_subset = episode_ids[np.array(valid_indices)]
     ep_changes = np.where(np.diff(episode_ids_subset) != 0)[0] + 1
@@ -520,5 +531,8 @@ if __name__ == "__main__":
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--gradient_checkpointing", action="store_true",
                         help="Recompute DiT activations in backward to save memory.")
+    parser.add_argument("--max_episode_index", type=int, default=None,
+                        help="Filter to episodes with index <= this value "
+                             "(piper_arm holdout convention; omit for full dataset).")
     args = parser.parse_args()
     train(**vars(args))
