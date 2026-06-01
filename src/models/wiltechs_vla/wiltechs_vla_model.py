@@ -183,18 +183,21 @@ class DiTLayer(nn.Module):
 
         # ── adaLN-Zero: produces 9 modulation vectors from t_emb ────────
         # 3 sublayers × {shift, scale, gate} = 9 × hidden_size
+        #
+        # Zero-init the modulation linear so gates start at 0 → each block
+        # acts as identity on the residual stream at init. The sublayer
+        # output projections (sa_o / ca_o / ffn.down_proj) are LEFT AT
+        # DEFAULT INIT. Zero-init'ing them in addition to the modulator
+        # creates a dead-init deadlock: residual = x + gate · sublayer_out,
+        # with gate=0 AND sublayer_out=0 the backward gradient on BOTH sides
+        # is 0·(…) = 0, so neither side can ever escape — the DiT stack
+        # never learns and only action_in/out + final_norm receive gradient.
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 9 * hidden_size, bias=True),
         )
         nn.init.zeros_(self.adaLN_modulation[1].weight)
         nn.init.zeros_(self.adaLN_modulation[1].bias)
-
-        # ── Zero-init output projections so each block starts as identity ─
-        # (a la DiT-Zero — model behaves like residual stream at init)
-        nn.init.zeros_(self.sa_o.weight)
-        nn.init.zeros_(self.ca_o.weight)
-        nn.init.zeros_(self.ffn.down_proj.weight)
 
     def forward(
         self,

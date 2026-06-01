@@ -144,17 +144,19 @@ class DiTLayer(nn.Module):
         self.ffn_drop = nn.Dropout(dropout)
 
         # ── adaLN-Zero: 9 modulation vectors (shift/scale/gate × 3) ─────
+        # Zero-init the modulation linear so gates start at 0 → each block
+        # is an identity on the residual stream at init. The sublayer output
+        # projections (sa_o / ca_o / ffn.down_proj) are LEFT AT DEFAULT INIT.
+        # Zero-init'ing them in addition to the modulator creates a dead-init
+        # deadlock: residual = x + gate · sublayer_out, with gate=0 AND
+        # sublayer_out=0 the backward gradient on BOTH sides is 0·(…) = 0, so
+        # neither side can ever escape.
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 9 * hidden_size, bias=True),
         )
         nn.init.zeros_(self.adaLN_modulation[1].weight)
         nn.init.zeros_(self.adaLN_modulation[1].bias)
-
-        # Zero-init output projections so each block starts as identity.
-        nn.init.zeros_(self.sa_o.weight)
-        nn.init.zeros_(self.ca_o.weight)
-        nn.init.zeros_(self.ffn.down_proj.weight)
 
     def forward(
         self,
@@ -358,15 +360,11 @@ class WilroTransformer(nn.Module):
             nn.init.zeros_(self.latent_generator[-1].weight)
             nn.init.zeros_(self.latent_generator[-1].bias)
 
-        # ─────────────────────────────────────────────────────────────
-        # 6. Trainable language adaptor (zero-init residual on lang embeds)
-        # ─────────────────────────────────────────────────────────────
-        self.lang_adaptor = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size),
-            RMSNorm(self.hidden_size, eps=self.rms_norm_eps),
-        )
-        nn.init.zeros_(self.lang_adaptor[0].weight)
-        nn.init.zeros_(self.lang_adaptor[0].bias)
+        # Note: no language adaptor — in this encoder-decoder design,
+        # adapted lang embeddings would flow into the frozen VLM whose
+        # no_grad context blocks gradient from coming back, so an adaptor
+        # would have no learning path. Also, perturbing VLM inputs away
+        # from its pretraining distribution degrades the cached K/V.
 
         self._lang_max_len = 48
         self.gradient_checkpointing = False
@@ -474,11 +472,9 @@ class WilroTransformer(nn.Module):
         if lang_result is not None:
             lang_tokens, lang_mask = lang_result
             lang_tokens = lang_tokens.to(vis_tokens.dtype)
-            # Trainable zero-init residual; pad slots are zeroed so they
-            # contribute no signal to the encoder.
-            lang_adapted = lang_tokens + self.lang_adaptor(lang_tokens)
+            # Zero out pad slots so they contribute no signal to the VLM.
             lang_tokens = torch.where(
-                lang_mask.unsqueeze(-1), lang_adapted, torch.zeros_like(lang_adapted),
+                lang_mask.unsqueeze(-1), lang_tokens, torch.zeros_like(lang_tokens),
             )
             L_lang = lang_tokens.shape[1]
         else:

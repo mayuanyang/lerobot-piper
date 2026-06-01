@@ -114,7 +114,6 @@ def _log_gradient_analysis(policy, step: int) -> None:
         ("Final Norm",       "final_norm"),
         ("Time MLP",         "time_embedder"),
         ("Latent Gen",       "latent_generator"),
-        ("Lang Adaptor",     "lang_adaptor"),
     ]:
         grad, n = _grad_stats(prefix)
         if grad is not None:
