@@ -137,7 +137,7 @@ def _log_gradient_analysis(policy, step: int) -> None:
 # Main training function
 # ---------------------------------------------------------------------------
 def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None,
-          gradient_checkpointing=False, max_episode_index=None):
+          gradient_checkpointing=False, max_episode_index=None, batch_size=64):
     """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model."""
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -402,7 +402,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=8,
-        batch_size=64,
+        batch_size=batch_size,
         sampler=sampler,
         pin_memory=device.type != "cpu",
         drop_last=True,
@@ -534,5 +534,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_episode_index", type=int, default=None,
                         help="Filter to episodes with index <= this value "
                              "(piper_arm holdout convention; omit for full dataset).")
+    parser.add_argument("--batch_size", type=int, default=64,
+                        help="DataLoader batch size (default: 64).")
     args = parser.parse_args()
     train(**vars(args))
