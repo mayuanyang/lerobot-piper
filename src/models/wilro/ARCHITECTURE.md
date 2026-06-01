@@ -125,13 +125,22 @@ Also emitted by Stage A:
 
   DiT sequence (concatenated):
 
-  ┌──────┬───────┬────────────┬─────────┬─────────┬─────────────────┐
-  │ SINK │ state │ prefix(P)? │ robot   │ latents │  action(H)      │
-  │  1   │   1   │   P (opt)  │  3·R    │    K    │      H          │
-  └──────┴───────┴────────────┴─────────┴─────────┴─────────────────┘
-        action_start_idx = 1 + 1 + P + 3·R + K     ▲
+  ┌──────┬─────────┬───────┬────────────┬─────────┬─────────────────┐
+  │ SINK │ latents │ state │ prefix(P)? │ robot   │  action(H)      │
+  │  1   │    K    │   1   │     P      │  3·R    │       H         │
+  └──────┴─────────┴───────┴────────────┴─────────┴─────────────────┘
+                                                   ▲
+                                                   │
+                                       action_start_idx = 1 + K + 1 + P + 3·R
                                                    │
                                        readout slice for v_t
+
+Why latents come first: in DiT self-attention with causal mask, every token
+at later positions can attend to earlier ones. Placing latents right after
+SINK lets state, prefix, robot, and action all read the pooled-language
+task summary during their self-attn at every DiT layer. This broadcasts
+language conditioning to the visual / motor path (top-down attention),
+instead of restricting it to the action readout only.
 ```
 
 Self-attention mask: full lower-triangular causal. When `action_prefix` is

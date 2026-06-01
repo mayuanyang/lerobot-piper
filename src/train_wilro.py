@@ -119,6 +119,21 @@ def _log_gradient_analysis(policy, step: int) -> None:
         if grad is not None:
             print(f"  {label:18s} - Avg Abs Grad: {grad:.6f} ({n} params)")
 
+    stats = getattr(policy.model, "_last_attention_stats", None)
+    if stats:
+        # Match DiT sequence order: [SINK, latent, state, prefix, robot, action]
+        order = ["sink", "latent", "state", "prefix", "robot", "action"]
+        ordered = [(k, stats[k]) for k in order if k in stats]
+        cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in ordered)
+        print(f"  Action→ self-attn : {cells}    (last DiT layer)")
+
+    x_stats = getattr(policy.model, "_last_cross_attention_stats", None)
+    if x_stats:
+        order = ["vision", "language"]
+        ordered = [(k, x_stats[k]) for k in order if k in x_stats]
+        cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in ordered)
+        print(f"  Action→ x-attn    : {cells}    (cross-attn to VLM KV)")
+
     comps = getattr(policy.model, "_last_loss_components", None)
     cw = getattr(policy.model.config, "contrastive_loss_weight", 0.0)
     if comps is not None and cw > 0.0:
@@ -136,7 +151,9 @@ def _log_gradient_analysis(policy, step: int) -> None:
 # Main training function
 # ---------------------------------------------------------------------------
 def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None,
-          gradient_checkpointing=False, max_episode_index=None, batch_size=64):
+          gradient_checkpointing=False, max_episode_index=None, batch_size=64,
+          contrastive_loss_weight=0.1, contrastive_margin=0.05,
+          lock_joint_index: int | None = 3):
     """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model."""
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -169,6 +186,19 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     horizon = 64
     n_action_steps = 64
 
+    # Build action_dim_weights — uniform by default. piper_arm's joint 4
+    # (index 3) is always 0, so for that dataset pass --lock_joint_index 3
+    # (the default) to zero out its loss contribution. For LIBERO / other
+    # full-DOF robots, pass --lock_joint_index "" (None) to weight all dims.
+    action_dim_weights = [1.0] * action_dim
+    if lock_joint_index is not None and 0 <= lock_joint_index < action_dim:
+        action_dim_weights[lock_joint_index] = 0.0
+        print(f"Locking action dim {lock_joint_index} (weight=0); "
+              f"action_dim_weights={action_dim_weights}")
+    else:
+        print(f"All {action_dim} action dims weighted equally; "
+              f"action_dim_weights={action_dim_weights}")
+
     # Build wilro config
     cfg = WilroConfig(
         input_features=input_features,
@@ -181,11 +211,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         num_vlm_layers=16,  # DiT depth = trailing N VLM layers consumed
         num_cameras=len(camera_keys),
         cameras_for_vision_state_concat=camera_keys,
-        # Joint 4 (index 3) is always 0 (locked) — zero weight avoids training on pure noise.
-        # Gripper (index 6) is critical for pick vs place — upweighted 3× to prevent skipping.
-        action_dim_weights=[1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0],
+        action_dim_weights=action_dim_weights,
         # n_action_steps == horizon → no exponential decay needed.
         pos_decay_lambda=0.0,
+        contrastive_loss_weight=contrastive_loss_weight,
+        contrastive_margin=contrastive_margin,
     )
 
     # Model + checkpoint loading
@@ -446,6 +476,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                     print(f"Action pad key='{pad_key}', pad fraction in first batch: {pad_frac:.2%}")
 
             # Forward & Backward
+            # Arm the attention-mass diagnostic on the same cadence as
+            # gradient analysis. The model self-disarms after one capture.
+            if step % progress_update_freq == 0:
+                policy.model._capture_attention_stats = True
+
             autocast_ctx = (
                 torch.autocast(device_type=device.type, dtype=torch.bfloat16)
                 if device.type == "cuda"
@@ -535,5 +570,20 @@ if __name__ == "__main__":
                              "(piper_arm holdout convention; omit for full dataset).")
     parser.add_argument("--batch_size", type=int, default=64,
                         help="DataLoader batch size (default: 64).")
+    parser.add_argument("--contrastive_loss_weight", type=float, default=0.1,
+                        help="Weight for the language-permute contrastive loss "
+                             "(default: 0.1). Bump to ~0.5 for LIBERO / datasets "
+                             "with diverse task descriptions.")
+    parser.add_argument("--contrastive_margin", type=float, default=0.05,
+                        help="Hinge margin on MSE between v_t and v_wrong "
+                             "(default: 0.05). Bump to ~0.2 to force the model "
+                             "to differentiate velocities by language.")
+    parser.add_argument("--lock_joint_index", type=int, default=3,
+                        help="Action dim with weight 0 (piper_arm joint 4 = "
+                             "index 3 is mechanically locked). Pass -1 to "
+                             "disable for LIBERO / other full-DOF robots.")
     args = parser.parse_args()
+    # Argparse can't express None for an int, so use -1 sentinel.
+    if args.lock_joint_index is not None and args.lock_joint_index < 0:
+        args.lock_joint_index = None
     train(**vars(args))

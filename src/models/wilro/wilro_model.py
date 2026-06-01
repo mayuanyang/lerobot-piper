@@ -357,17 +357,27 @@ class WilroTransformer(nn.Module):
                 nn.SiLU(),
                 nn.Linear(hidden_mid, self.num_latent_tokens * self.hidden_size),
             )
-            nn.init.zeros_(self.latent_generator[-1].weight)
+            # Small std init on the output projection. Zero-init here causes
+            # latents to stay exactly 0, with K/V from latent positions also
+            # exactly 0, which gives them uniform-share but zero-value
+            # attention — gradient back to latent_generator becomes near-zero
+            # and the module never wakes up. A small random start breaks the
+            # deadlock without destabilising training.
+            nn.init.normal_(self.latent_generator[-1].weight, std=0.01)
             nn.init.zeros_(self.latent_generator[-1].bias)
 
-        # Note: no language adaptor — in this encoder-decoder design,
-        # adapted lang embeddings would flow into the frozen VLM whose
-        # no_grad context blocks gradient from coming back, so an adaptor
-        # would have no learning path. Also, perturbing VLM inputs away
-        # from its pretraining distribution degrades the cached K/V.
-
+        
         self._lang_max_len = 48
         self.gradient_checkpointing = False
+
+        # Attention-mass diagnostic. When set to True, the next _run_dit call
+        # will compute action-query attention mass in the LAST DiT layer for
+        # both self-attn (per DiT region) and cross-attn (vision vs language
+        # of the VLM KV cache), then flip itself back off and stash both
+        # dicts on the model.
+        self._capture_attention_stats = False
+        self._last_attention_stats: Optional[dict] = None
+        self._last_cross_attention_stats: Optional[dict] = None
 
     # =========================================================================
     # Keep frozen components in eval mode
@@ -600,14 +610,22 @@ class WilroTransformer(nn.Module):
         robot_tokens: Optional[torch.Tensor],
         latents: Optional[torch.Tensor],
         action_prefix: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, int, int]:
+    ) -> tuple[torch.Tensor, int, int, int]:
         """
-        Layout: [SINK, state, (action_prefix?), (robot?), (latent?), action]
+        Layout: [SINK, (latent?), state, (action_prefix?), (robot?), action]
+
+        Latents sit right after SINK so that every downstream module (state
+        encoding, prefix, robot CNN, action) can self-attend to them under the
+        causal mask. This broadcasts the pooled-language task representation
+        to the visual / motor path, enabling top-down (language → vision)
+        conditioning rather than the previous layout where only `action`
+        could read latents.
 
         Returns:
           dit_seq:           (B, L_dit, H)
           action_start_idx:  index where noisy action tokens begin (for readout)
           prefix_start_idx:  index where the clean action prefix begins (-1 if none)
+          latent_start_idx:  index where latent tokens begin (-1 if none)
         """
         B, H, _ = noisy_actions.shape
         dtype = noisy_actions.dtype
@@ -625,7 +643,13 @@ class WilroTransformer(nn.Module):
         action_emb = self.action_in_proj(noisy_actions) + self.action_pos_emb[:, :H]
         action_emb = action_emb.to(dtype)
 
-        parts = [sink, state_tok]
+        # Layout: [SINK, (latent?), state, (prefix?), (robot?), action]
+        parts = [sink]
+        latent_start_idx = -1
+        if latents is not None:
+            latent_start_idx = sum(p.size(1) for p in parts)
+            parts.append(latents.to(dtype))
+        parts.append(state_tok)
         prefix_start_idx = -1
         if action_prefix is not None and action_prefix.shape[1] > 0:
             prefix_start_idx = sum(p.size(1) for p in parts)
@@ -634,13 +658,11 @@ class WilroTransformer(nn.Module):
             parts.append(prefix_emb)
         if robot_tokens is not None:
             parts.append(robot_tokens.to(dtype))
-        if latents is not None:
-            parts.append(latents.to(dtype))
 
         action_start_idx = sum(p.size(1) for p in parts)
         parts.append(action_emb)
         seq = torch.cat(parts, dim=1)
-        return seq, action_start_idx, prefix_start_idx
+        return seq, action_start_idx, prefix_start_idx, latent_start_idx
 
     def _build_dit_self_attn_mask(
         self,
@@ -673,6 +695,117 @@ class WilroTransformer(nn.Module):
         return mask.unsqueeze(0).unsqueeze(0)  # (1, 1, L, L)
 
     # =========================================================================
+    # Diagnostic: per-region attention mass from action queries
+    # =========================================================================
+    @torch.no_grad()
+    def _compute_cross_attention_mass(
+        self,
+        x: torch.Tensor,
+        t_emb: torch.Tensor,
+        kv_last: tuple[torch.Tensor, torch.Tensor],
+        vlm_kv_pad_mask: torch.Tensor,
+        action_start: int,
+        action_len: int,
+        L_vis: int,
+        L_lang: int,
+    ) -> dict[str, float]:
+        """Re-run the LAST DiT layer's cross-attn Q·K^T softmax manually and
+        report mass that action queries place on vision vs language portions
+        of the VLM KV cache.
+
+        x is the input to the last DiT layer (pre-self-attn). The "real"
+        cross-attn input is x + sa_gate · sa_out, but at training-init the
+        gate is small and x dominates — close enough for a diagnostic.
+        """
+        if action_len <= 0:
+            return {}
+        layer = self.dit_layers[-1]
+        mod = layer.adaLN_modulation(t_emb)
+        chunks = mod.chunk(9, dim=-1)
+        s_ca, sc_ca = chunks[3], chunks[4]
+        h = _modulate(layer.ca_norm(x), s_ca, sc_ca)
+
+        B, _, _ = h.shape
+        H, Hk, D = layer.num_heads, layer.num_kv_heads, layer.head_dim
+        Q_full = layer.ca_q(h).view(B, -1, H, D).transpose(1, 2).float()
+        Q = Q_full[:, :, action_start:action_start + action_len, :]   # only action rows
+
+        K = kv_last[0].float()                                          # (B, Hk, L_vlm, D)
+        if Hk != H:
+            K = K.repeat_interleave(H // Hk, dim=1)
+
+        scale = 1.0 / math.sqrt(D)
+        scores = (Q @ K.transpose(-1, -2)) * scale                      # (B, H, a_len, L_vlm)
+
+        if vlm_kv_pad_mask is not None:
+            kpad = ~vlm_kv_pad_mask
+            ca_mask = torch.zeros(
+                B, 1, 1, vlm_kv_pad_mask.shape[-1],
+                device=scores.device, dtype=scores.dtype,
+            )
+            ca_mask.masked_fill_(kpad.unsqueeze(1).unsqueeze(1), float("-inf"))
+            scores = scores + ca_mask
+
+        weights = torch.softmax(scores, dim=-1)
+
+        stats: dict[str, float] = {}
+        if L_vis > 0:
+            stats["vision"] = weights[:, :, :, :L_vis].sum(dim=-1).mean().item()
+        if L_lang > 0:
+            stats["language"] = weights[:, :, :, L_vis:L_vis + L_lang].sum(dim=-1).mean().item()
+        return stats
+
+    @torch.no_grad()
+    def _compute_attention_mass(
+        self,
+        x: torch.Tensor,
+        t_emb: torch.Tensor,
+        attn_mask: torch.Tensor,
+        regions: dict[str, tuple[int, int]],
+    ) -> dict[str, float]:
+        """Re-run the LAST DiT layer's self-attn Q·K^T softmax manually and
+        report, for each region (sink/state/prefix/robot/latent/prev_actions),
+        the average attention mass that the action queries place on it.
+
+        SDPA doesn't expose softmax weights, so this re-projects Q/K once;
+        cost ≈ one extra layer's self-attn projection.
+        """
+        layer = self.dit_layers[-1]
+        mod = layer.adaLN_modulation(t_emb)
+        chunks = mod.chunk(9, dim=-1)
+        s_sa, sc_sa = chunks[0], chunks[1]
+        h = _modulate(layer.sa_norm(x), s_sa, sc_sa)
+
+        B, L, _ = h.shape
+        H, Hk, D = layer.num_heads, layer.num_kv_heads, layer.head_dim
+        Q = layer.sa_q(h).view(B, L, H, D).transpose(1, 2).float()
+        K = layer.sa_k(h).view(B, L, Hk, D).transpose(1, 2).float()
+        if Hk != H:
+            K = K.repeat_interleave(H // Hk, dim=1)
+
+        scale = 1.0 / math.sqrt(D)
+        scores = (Q @ K.transpose(-1, -2)) * scale          # (B, H, L, L)
+        if attn_mask is not None:
+            scores = scores + attn_mask.float()
+        weights = torch.softmax(scores, dim=-1)
+
+        a_start, a_len = regions["action"]
+        if a_len <= 0:
+            return {}
+        action_w = weights[:, :, a_start:a_start + a_len, :]  # (B, H, a_len, L)
+
+        stats: dict[str, float] = {}
+        for name, span in regions.items():
+            if span is None:
+                continue
+            start, length = span
+            if length <= 0:
+                continue
+            mass = action_w[:, :, :, start:start + length].sum(dim=-1).mean().item()
+            stats[name] = mass
+        return stats
+
+    # =========================================================================
     # DiT decoder pass — one denoising step given pre-computed VLM KV cache
     # =========================================================================
     def _run_dit(
@@ -685,6 +818,8 @@ class WilroTransformer(nn.Module):
         robot_tokens: Optional[torch.Tensor],
         latents: Optional[torch.Tensor],
         action_prefix: Optional[torch.Tensor],
+        L_vis: int = 0,
+        L_lang: int = 0,
     ) -> torch.Tensor:
         """One DiT denoising step. Returns velocity prediction (B, H, action_dim)."""
         device = noisy_actions.device
@@ -695,7 +830,7 @@ class WilroTransformer(nn.Module):
         t_emb = self.time_embedder(t_emb_raw.float()).to(dtype)
 
         # Build sequence
-        dit_seq, action_start_idx, prefix_start_idx = self._build_dit_input(
+        dit_seq, action_start_idx, prefix_start_idx, latent_start_idx = self._build_dit_input(
             batch, noisy_actions, robot_tokens, latents, action_prefix,
         )
         L_dit = dit_seq.shape[1]
@@ -704,9 +839,45 @@ class WilroTransformer(nn.Module):
             L_dit, action_start_idx, prefix_len, prefix_start_idx, device, dtype,
         )
 
+        # Region boundaries (used by attention-mass diagnostic). Layout:
+        #   [SINK(1), (latent(K))?, state(1), (prefix(P))?, robot(R), action(H)]
+        robot_len = robot_tokens.shape[1] if robot_tokens is not None else 0
+        latent_len = latents.shape[1] if latents is not None else 0
+        H_horizon = self.config.horizon
+        # state always sits right after sink + optional latent block
+        state_idx = 1 + latent_len
+        # robot sits right before action
+        robot_idx = action_start_idx - robot_len
+        regions: dict[str, Optional[tuple[int, int]]] = {
+            "sink":         (0, 1),
+            "latent":       (latent_start_idx, latent_len) if latent_len > 0 else None,
+            "state":        (state_idx, 1),
+            "prefix":       (prefix_start_idx, prefix_len) if prefix_len > 0 else None,
+            "robot":        (robot_idx, robot_len),
+            "action":       (action_start_idx, H_horizon),
+        }
+
         x = dit_seq
         use_ckpt = self.gradient_checkpointing and self.training
         for i, layer in enumerate(self.dit_layers):
+            # Capture attention mass at the LAST DiT layer's input. This is
+            # the "final say" before the action readout — what action queries
+            # decide to attend to here is what shapes the velocity output.
+            if (
+                i == len(self.dit_layers) - 1
+                and self._capture_attention_stats
+            ):
+                self._last_attention_stats = self._compute_attention_mass(
+                    x, t_emb, attn_mask, regions,
+                )
+                self._last_cross_attention_stats = self._compute_cross_attention_mass(
+                    x, t_emb, kv_cache[i], vlm_kv_pad_mask,
+                    action_start_idx, H_horizon, L_vis, L_lang,
+                )
+                # one-shot: don't capture again if _run_dit is called twice
+                # (e.g. for the contrastive-language v_wrong forward).
+                self._capture_attention_stats = False
+
             vlm_k, vlm_v = kv_cache[i]
             if use_ckpt:
                 x = torch.utils.checkpoint.checkpoint(
@@ -772,6 +943,7 @@ class WilroTransformer(nn.Module):
         v_t = self._run_dit(
             batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask,
             robot_tokens, latents, action_prefix,
+            L_vis=L_vis, L_lang=L_lang,
         ).float()
 
         # ── Per-position / per-dim weighting ────────────────────────
@@ -843,6 +1015,7 @@ class WilroTransformer(nn.Module):
                     batch, x_t.to(torch.bfloat16), t,
                     shuffled_cache, shuffled_pad_mask,
                     robot_tokens, latents, action_prefix,
+                    L_vis=L_vis, L_lang=L_lang,
                 ).float()
 
                 diff_sq = (v_t - v_wrong).pow(2).mean(dim=[1, 2])
@@ -875,7 +1048,7 @@ class WilroTransformer(nn.Module):
         )
 
         with autocast_ctx:
-            kv_cache, vlm_kv_pad_mask, _L_vis, _L_lang = self._run_vlm_and_cache_kv(batch)
+            kv_cache, vlm_kv_pad_mask, L_vis, L_lang = self._run_vlm_and_cache_kv(batch)
             robot_tokens = self._compute_robot_tokens(batch)
             latents = self._generate_latents(batch, B, device, torch.bfloat16)
 
@@ -890,6 +1063,7 @@ class WilroTransformer(nn.Module):
                 v_t = self._run_dit(
                     batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask,
                     robot_tokens, latents, action_prefix=None,
+                    L_vis=L_vis, L_lang=L_lang,
                 ).float()
                 x_t = x_t + dt * v_t
                 t = t + dt
