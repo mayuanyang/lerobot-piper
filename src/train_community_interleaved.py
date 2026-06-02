@@ -93,17 +93,30 @@ INFO_MARKER = "meta/info.json"
 
 # Canonical camera names — these must be a subset of what the interleaved model
 # was configured with. Missing cameras in a sub-dataset will be zero-padded.
+# Capped at 3 slots: most community datasets have 1-2 cameras (scene + wrist)
+# and LIBERO has 2 (agentview + eye-in-hand), so 3 covers them with one spare
+# while a black padding image still costs a full vision-encoder forward — fewer
+# slots = less wasted compute and room for a larger batch. Datasets with >3
+# cameras drop their least-important extra view; datasets with <3 zero-pad the
+# missing slots. The exact names here only drive SEMANTIC matching of named
+# cameras (suffix match on the last segment); unnamed cameras like
+# `image`/`image2` fall through to positional fallback regardless.
 CANONICAL_CAMERAS = [
-    "observation.images.front",
-    "observation.images.gripper",
-    "observation.images.right",
-    "observation.images.top",
-    "observation.images.wrist",
+    "observation.images.front",   # primary third-person / scene view
+    "observation.images.wrist",   # wrist-mounted / eye-in-hand
+    "observation.images.top",     # overhead / secondary scene view
 ]
 
 # Canonical state & action dimensions. Sub-datasets with smaller dims are
 # zero-padded; larger dims are truncated (with a warning).
-CANONICAL_STATE_DIM = 7
+#
+# State is set to 8 to match downstream LIBERO finetuning (state_dim=8): a
+# pretrained state_encoder then transfers with NO re-init at finetune time.
+# Zero-padding the state input is harmless — state is input-only, so padded
+# dims are just constant zeros the encoder ignores (no loss mask needed, unlike
+# the action padding which requires `action_dim_pad`). Datasets with >8 state
+# dims are truncated, losing some proprio for those (acceptable for pretrain).
+CANONICAL_STATE_DIM = 8
 CANONICAL_ACTION_DIM = 7
 
 # Keys the adapter is allowed to pass through to the DataLoader (in addition to
@@ -501,6 +514,8 @@ class DatasetAdapter(Dataset):
         state_dim: int,
         action_dim: int,
         task_idx_to_desc: Optional[dict[int, str]] = None,
+        canonical_state_dim: Optional[int] = None,
+        canonical_action_dim: Optional[int] = None,
     ):
         self.dataset = dataset
         self.sub_dir = sub_dir
@@ -509,8 +524,16 @@ class DatasetAdapter(Dataset):
         self.action_key = action_key
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.canonical_state_dim = CANONICAL_STATE_DIM
-        self.canonical_action_dim = CANONICAL_ACTION_DIM
+        # Target dims the adapter pads/truncates to. Default to the module-level
+        # canonical schema (pretraining), but the fine-tune script can override
+        # the state dim (e.g. keep LIBERO's full 8-dim state instead of
+        # truncating to 7) — this re-inits only state_encoder[0] downstream.
+        self.canonical_state_dim = (
+            canonical_state_dim if canonical_state_dim is not None else CANONICAL_STATE_DIM
+        )
+        self.canonical_action_dim = (
+            canonical_action_dim if canonical_action_dim is not None else CANONICAL_ACTION_DIM
+        )
         self.task_idx_to_desc = task_idx_to_desc or {}
 
         # Cache canonical camera list for iteration
@@ -799,7 +822,7 @@ def train(
     source: str = COMMUNITY_DATASET_REPO,
     max_datasets: Optional[int] = None,
     seed: int = 42,
-    version_filter: str = "all",
+    version_filter: str = "v3",
 ):
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -1407,10 +1430,14 @@ if __name__ == "__main__":
     parser.add_argument("--list_versions", action="store_true",
                         help="Classify all datasets as v3.0/v2.1/unknown and print the report, "
                              "then exit (no download, no training).")
-    parser.add_argument("--version_filter", type=str, default="all",
+    parser.add_argument("--version_filter", type=str, default="v3",
                         choices=["all", "v3", "v2"],
-                        help="Train only on datasets of this format. 'v3' skips the slow "
-                             "v2.1→v3.0 conversion entirely. (default: all)")
+                        help="Train only on datasets of this format. Default 'v3': in "
+                             "community_dataset_v3_part1 ~half the roots are v2.1 `_old` "
+                             "duplicates of their v3.0 counterparts, so 'all' double-counts "
+                             "them and pays the slow v2.1→v3.0 conversion per v2.1 root. 'v3' "
+                             "drops the duplicates and skips conversion entirely. Use 'all' "
+                             "only for a repo without this v2.1/v3.0 mirroring.")
     args = parser.parse_args()
 
     # --list_versions is a standalone inspection mode.

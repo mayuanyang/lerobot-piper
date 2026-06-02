@@ -240,9 +240,23 @@ def train(
     training_steps=30000,
     reset_lang_params=False,
     camera_map=None,
+    state_dim=None,
 ):
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
+
+    # Canonical state dim for THIS run. Defaults to the pretraining canonical
+    # (7). Override (e.g. --state_dim 8) to keep a downstream dataset's full
+    # state vector instead of truncating it to 7. Changing this re-inits
+    # state_encoder[0] (the only weight keyed on state_dim) and forces a stats
+    # recompute, since the pretrained preprocessor's observation.state buffer
+    # would be the wrong width.
+    canonical_state_dim = state_dim if state_dim is not None else CANONICAL_STATE_DIM
+    state_dim_overridden = canonical_state_dim != CANONICAL_STATE_DIM
+    if state_dim_overridden:
+        print(f"[state_dim override] canonical state_dim {CANONICAL_STATE_DIM} → "
+              f"{canonical_state_dim}: state_encoder[0] will re-init and stats "
+              f"will be recomputed at dim {canonical_state_dim}.")
 
     progress_update_freq = 200
     checkpoint_freq = 1000
@@ -329,7 +343,7 @@ def train(
     canon_input_features = {
         "observation.state": PolicyFeature(
             type=FeatureType.STATE,
-            shape=(CANONICAL_STATE_DIM,),
+            shape=(canonical_state_dim,),
         ),
         **{
             cam: PolicyFeature(
@@ -352,7 +366,7 @@ def train(
         n_obs_steps=obs,
         horizon=horizon,
         n_action_steps=n_action_steps,
-        state_dim=CANONICAL_STATE_DIM,
+        state_dim=canonical_state_dim,
         action_dim=CANONICAL_ACTION_DIM,
         num_vlm_layers=16,
         num_cameras=len(canon_cams_for_run),
@@ -396,6 +410,7 @@ def train(
         state_dim=native_state_dim,
         action_dim=native_action_dim,
         task_idx_to_desc=task_idx_to_desc,
+        canonical_state_dim=canonical_state_dim,
     )
 
     # ── Build policy: resume from pretrained checkpoint, else fresh ──────────
@@ -475,21 +490,35 @@ def train(
         # weren't trained for, but works when the checkpoint pre-dates
         # preprocessor saving.
         preprocessor, postprocessor = None, None
-        try:
-            from lerobot.policies.factory import load_pre_post_processors
-            preprocessor, postprocessor = load_pre_post_processors(str(local_ckpt_path))
-            print("Loaded preprocessor + postprocessor from pretrained checkpoint "
-                  "(canonical stats preserved)")
-        except Exception as e:
-            print(f"Could not load saved preprocessor ({e}); "
-                  f"recomputing canonical stats on the fine-tune dataset")
+        if state_dim_overridden:
+            # The saved preprocessor's observation.state mean/std buffers are
+            # width CANONICAL_STATE_DIM and would broadcast-fail against the
+            # wider state vector. Recompute stats at the new dim instead.
+            print(f"Recomputing canonical stats at state_dim={canonical_state_dim} "
+                  f"(state_dim override — saved preprocessor not reusable)")
             stats = compute_unified_stats(
                 [canonical_dataset], canon_cams_for_run,
-                CANONICAL_STATE_DIM, CANONICAL_ACTION_DIM,
+                canonical_state_dim, CANONICAL_ACTION_DIM,
             )
             preprocessor, postprocessor = make_pre_post_processors(
                 policy.config, dataset_stats=stats
             )
+        else:
+            try:
+                from lerobot.policies.factory import load_pre_post_processors
+                preprocessor, postprocessor = load_pre_post_processors(str(local_ckpt_path))
+                print("Loaded preprocessor + postprocessor from pretrained checkpoint "
+                      "(canonical stats preserved)")
+            except Exception as e:
+                print(f"Could not load saved preprocessor ({e}); "
+                      f"recomputing canonical stats on the fine-tune dataset")
+                stats = compute_unified_stats(
+                    [canonical_dataset], canon_cams_for_run,
+                    canonical_state_dim, CANONICAL_ACTION_DIM,
+                )
+                preprocessor, postprocessor = make_pre_post_processors(
+                    policy.config, dataset_stats=stats
+                )
 
         trainable_params = [p for p in policy.model.parameters() if p.requires_grad]
         optimizer = torch.optim.Adam(trainable_params, lr=learning_rate, weight_decay=1e-6)
@@ -531,7 +560,7 @@ def train(
         policy.to(device)
         stats = compute_unified_stats(
             [canonical_dataset], canon_cams_for_run,
-            CANONICAL_STATE_DIM, CANONICAL_ACTION_DIM,
+            canonical_state_dim, CANONICAL_ACTION_DIM,
         )
         preprocessor, postprocessor = make_pre_post_processors(
             cfg, dataset_stats=stats
@@ -771,6 +800,13 @@ if __name__ == "__main__":
                         help="Zero out lang_attn_bias and reset lang_adaptor RMSNorm "
                              "gamma to 1. DO NOT use for routine fine-tuning — erases "
                              "the pretrained language pathway.")
+    parser.add_argument("--state_dim", type=int, default=None,
+                        help="Override the canonical state dim for this run (default: "
+                             f"{CANONICAL_STATE_DIM}, inherited from pretraining). Set to 8 to "
+                             "keep LIBERO's full 8-dim state instead of truncating to 7. "
+                             "When set, state_encoder[0] re-inits (only that weight depends "
+                             "on state_dim) and normalization stats are recomputed at the new "
+                             "dim. Action dim is unaffected.")
     parser.add_argument("--camera_map", type=str, default=None,
                         help="Manual native→canonical camera mapping, comma-separated "
                              "pairs of the form 'native_short:canonical_short'. "
