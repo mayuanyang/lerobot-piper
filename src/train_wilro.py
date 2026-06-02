@@ -153,7 +153,8 @@ def _log_gradient_analysis(policy, step: int) -> None:
 def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None,
           gradient_checkpointing=False, max_episode_index=None, batch_size=64,
           contrastive_loss_weight=0.1, contrastive_margin=0.05,
-          lock_joint_index: int | None = 3):
+          lock_joint_index: int | None = 3, kv_capture_strategy: str = "last",
+          kv_capture_layers: list | None = None):
     """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model."""
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -208,7 +209,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         n_action_steps=n_action_steps,
         state_dim=state_dim,
         action_dim=action_dim,
-        num_vlm_layers=16,  # DiT depth = trailing N VLM layers consumed
+        num_vlm_layers=16,  # DiT depth = number of VLM KV pairs consumed
+        kv_capture_strategy=kv_capture_strategy,
+        kv_capture_layers=kv_capture_layers or [],
         num_cameras=len(camera_keys),
         cameras_for_vision_state_concat=camera_keys,
         action_dim_weights=action_dim_weights,
@@ -582,8 +585,27 @@ if __name__ == "__main__":
                         help="Action dim with weight 0 (piper_arm joint 4 = "
                              "index 3 is mechanically locked). Pass -1 to "
                              "disable for LIBERO / other full-DOF robots.")
+    parser.add_argument("--kv_capture_strategy", type=str, default="last",
+                        choices=["last", "stride2", "custom"],
+                        help="Which VLM layers the DiT sources KV from. "
+                             "'last' = trailing N layers (most refined, no "
+                             "multi-scale). 'stride2' = every other layer, "
+                             "end-anchored (multi-scale: shallow DiT reads "
+                             "shallow VLM). 'custom' = exactly the layers given "
+                             "in --kv_capture_layers (DiT depth = #layers). "
+                             "NOT resume-compatible across values.")
+    parser.add_argument("--kv_capture_layers", type=str, default="",
+                        help="Comma-separated 0-based VLM layer indices for "
+                             "--kv_capture_strategy custom, e.g. '3,7,11,15,19,"
+                             "23,27,31'. Ignored for last/stride2.")
     args = parser.parse_args()
     # Argparse can't express None for an int, so use -1 sentinel.
     if args.lock_joint_index is not None and args.lock_joint_index < 0:
         args.lock_joint_index = None
+    # Parse the comma-separated custom layer list into ints.
+    args.kv_capture_layers = [
+        int(tok) for tok in args.kv_capture_layers.split(",") if tok.strip() != ""
+    ]
+    if args.kv_capture_strategy == "custom" and not args.kv_capture_layers:
+        parser.error("--kv_capture_strategy custom requires --kv_capture_layers")
     train(**vars(args))

@@ -291,8 +291,49 @@ class WilroTransformer(nn.Module):
                 f"num_dit_layers ({self.num_dit_layers}) > VLM layers "
                 f"({self.num_vlm_layers}); not enough KV caches to source from."
             )
-        print(f"DiT: {self.num_dit_layers} layers, sourcing KV from VLM layers "
-              f"{self.num_vlm_layers - self.num_dit_layers}..{self.num_vlm_layers - 1}")
+
+        # Resolve which VLM layers the DiT sources KV from. The resulting list is
+        # ascending, length == num_dit_layers; DiT layer j cross-attends to the
+        # KV cache captured at capture_indices[j].
+        strategy = getattr(config, "kv_capture_strategy", "last")
+        if strategy == "last":
+            self.capture_indices = list(
+                range(self.num_vlm_layers - self.num_dit_layers, self.num_vlm_layers)
+            )
+        elif strategy == "stride2":
+            # End-anchored stride: always include the final (most refined) layer.
+            stride = max(1, self.num_vlm_layers // self.num_dit_layers)
+            idxs = list(range(self.num_vlm_layers - 1, -1, -stride))[: self.num_dit_layers]
+            self.capture_indices = sorted(idxs)
+        elif strategy == "custom":
+            raw = list(getattr(config, "kv_capture_layers", []) or [])
+            if not raw:
+                raise ValueError(
+                    "kv_capture_strategy='custom' requires a non-empty "
+                    "config.kv_capture_layers list."
+                )
+            idxs = sorted({int(i) for i in raw})
+            for i in idxs:
+                if not (0 <= i < self.num_vlm_layers):
+                    raise ValueError(
+                        f"kv_capture_layers index {i} out of range "
+                        f"[0, {self.num_vlm_layers})."
+                    )
+            self.capture_indices = idxs
+            # DiT depth follows the explicit layer list, not num_vlm_layers.
+            self.num_dit_layers = len(idxs)
+        else:
+            raise ValueError(f"unknown kv_capture_strategy: {strategy!r}")
+
+        if len(self.capture_indices) != self.num_dit_layers:
+            raise ValueError(
+                f"kv_capture_strategy={strategy!r} produced {len(self.capture_indices)} "
+                f"indices but num_dit_layers={self.num_dit_layers} "
+                f"(VLM has {self.num_vlm_layers} layers)."
+            )
+        self._capture_set = set(self.capture_indices)
+        print(f"DiT: {self.num_dit_layers} layers, kv_capture_strategy={strategy!r}, "
+              f"sourcing KV from VLM layers {self.capture_indices}")
 
         self.dit_layers = nn.ModuleList([
             DiTLayer(
@@ -521,8 +562,7 @@ class WilroTransformer(nn.Module):
             L_vlm, self.head_dim, self.rope_theta, device, vlm_seq.dtype,
         )
 
-        # Layer-by-layer forward, capturing K/V from the trailing layers.
-        capture_start = self.num_vlm_layers - self.num_dit_layers
+        # Layer-by-layer forward, capturing K/V from the selected layers.
         hidden = vlm_seq
         kv_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
 
@@ -542,7 +582,7 @@ class WilroTransformer(nn.Module):
             Q, K = _apply_rope(Q, K, cos, sin)
 
             # Capture post-RoPE K and V for the DiT cross-attn memory.
-            if i >= capture_start:
+            if i in self._capture_set:
                 kv_cache.append((K.detach(), V.detach()))
 
             if self.num_kv_heads != self.num_heads:

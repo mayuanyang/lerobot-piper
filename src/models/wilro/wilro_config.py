@@ -51,6 +51,28 @@ class WilroConfig(PreTrainedConfig):
     # (Field name kept for backwards-compat with saved configs.)
     num_vlm_layers: int = 16
 
+    # Which VLM layers' KV the DiT sources from:
+    #   "last"    — the trailing `num_vlm_layers` layers (VLM[V-D..V-1]).
+    #               All highly next-token-specialised; uses the most refined
+    #               semantics but no multi-scale signal.
+    #   "stride2" — evenly spaced every other layer, end-anchored so the final
+    #               (most refined) layer is always included: VLM[1,3,..,V-1].
+    #               Gives the DiT multi-scale features — shallow DiT layers read
+    #               shallow VLM layers (local/token-level), deep DiT layers read
+    #               deep VLM layers (abstract/task-level).
+    #   "custom"  — use exactly the layer indices in `kv_capture_layers`. The DiT
+    #               depth becomes len(kv_capture_layers) (overrides num_vlm_layers
+    #               as the depth source). Indices are sorted ascending; DiT layer
+    #               j reads the j-th smallest index.
+    # NOTE: switching this is NOT resume-compatible — each DiT layer's cross-attn
+    # is trained against a specific VLM layer's statistics.
+    kv_capture_strategy: str = "last"
+
+    # Explicit VLM layer indices for kv_capture_strategy="custom" (0-based, each
+    # in [0, total_VLM_layers)). Ignored for "last"/"stride2". Example for a
+    # 32-layer VLM: [3, 7, 11, 15, 19, 23, 27, 31].
+    kv_capture_layers: list = field(default_factory=list)
+
     # Selective camera list for vision token construction.
     cameras_for_vision_state_concat: list[str] = field(default_factory=lambda: [
         'observation.images.front',
