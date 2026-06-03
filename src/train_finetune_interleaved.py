@@ -483,42 +483,25 @@ def train(
                 norm = policy.model.lang_adaptor[1].weight.norm().item()
                 print(f"lang_adaptor RMSNorm gamma norm: {norm:.3f}")
 
-        # Stats: prefer the saved pretrained preprocessor (carries the
-        # canonical mean/std the pretrained model was normalised against).
-        # Fall back to recomputing on this dataset via the adapter — slower,
-        # and introduces a normalization shift the pretrained input layers
-        # weren't trained for, but works when the checkpoint pre-dates
-        # preprocessor saving.
-        preprocessor, postprocessor = None, None
-        if state_dim_overridden:
-            # The saved preprocessor's observation.state mean/std buffers are
-            # width CANONICAL_STATE_DIM and would broadcast-fail against the
-            # wider state vector. Recompute stats at the new dim instead.
-            print(f"Recomputing canonical stats at state_dim={canonical_state_dim} "
-                  f"(state_dim override — saved preprocessor not reusable)")
-            stats = compute_unified_stats(
-                [canonical_dataset], canon_cams_for_run,
-                canonical_state_dim, CANONICAL_ACTION_DIM,
-            )
-            preprocessor, postprocessor = make_pre_post_processors(
-                policy.config, dataset_stats=stats
-            )
-        else:
-            try:
-                from lerobot.policies.factory import load_pre_post_processors
-                preprocessor, postprocessor = load_pre_post_processors(str(local_ckpt_path))
-                print("Loaded preprocessor + postprocessor from pretrained checkpoint "
-                      "(canonical stats preserved)")
-            except Exception as e:
-                print(f"Could not load saved preprocessor ({e}); "
-                      f"recomputing canonical stats on the fine-tune dataset")
-                stats = compute_unified_stats(
-                    [canonical_dataset], canon_cams_for_run,
-                    canonical_state_dim, CANONICAL_ACTION_DIM,
-                )
-                preprocessor, postprocessor = make_pre_post_processors(
-                    policy.config, dataset_stats=stats
-                )
+        # Stats: normalize the target by ITS OWN stats (per-dataset z-score).
+        # The community base was pretrained with per-dataset normalization, so
+        # its saved preprocessor is the IDENTITY for state/action — loading it
+        # would leave the target un-normalized. Recomputing the target's own
+        # mean/std here reproduces the exact normalized space the pretrained
+        # action head learned in (every pretrain sub-dataset was z-scored by its
+        # own stats too), so the head transfers with no scale shift. The adapter
+        # itself does NOT normalize at finetune (normalize_in_adapter defaults
+        # False); this preprocessor does the z-scoring, and the matching
+        # postprocessor unnormalizes back to physical actions at deploy.
+        print(f"Computing target-dataset stats at state_dim={canonical_state_dim} "
+              f"(per-dataset normalization; base preprocessor is identity, not reused)")
+        stats = compute_unified_stats(
+            [canonical_dataset], canon_cams_for_run,
+            canonical_state_dim, CANONICAL_ACTION_DIM,
+        )
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy.config, dataset_stats=stats
+        )
 
         trainable_params = [p for p in policy.model.parameters() if p.requires_grad]
         optimizer = torch.optim.Adam(trainable_params, lr=learning_rate, weight_decay=1e-6)

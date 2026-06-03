@@ -491,6 +491,73 @@ def build_camera_mapping(
     return mapping
 
 # ---------------------------------------------------------------------------
+# Per-dataset normalization helpers
+# ---------------------------------------------------------------------------
+def native_feature_stats(
+    dataset: LeRobotDataset, key: str, dim: int,
+) -> Optional[dict[str, torch.Tensor]]:
+    """
+    Per-dataset mean/std for a STATE or ACTION feature, in the dataset's NATIVE
+    dim space — used for in-adapter per-dataset z-scoring.
+
+    Resolution order (cheapest first):
+      1. `dataset.meta.stats[key]` — the precomputed aggregate LeRobot ships.
+      2. The raw parquet column (`hf_dataset[key]`) — reads state/action only,
+         no video decode, so it's cheap even on video datasets.
+      3. None → caller skips normalization for this dataset (no-op).
+
+    std is floored at 1e-6 to avoid divide-by-zero on constant dims.
+    """
+    # 1. shipped aggregate stats
+    try:
+        ms = getattr(getattr(dataset, "meta", None), "stats", None)
+        if ms and key in ms and "mean" in ms[key] and "std" in ms[key]:
+            mean = torch.as_tensor(np.asarray(ms[key]["mean"], dtype=np.float32)).reshape(-1)
+            std = torch.as_tensor(np.asarray(ms[key]["std"], dtype=np.float32)).reshape(-1)
+            if mean.numel() == dim:
+                return {"mean": mean, "std": std.clamp_min(1e-6)}
+    except Exception:
+        pass
+    # 2. compute from the parquet column (per-frame, pre-delta_timestamps)
+    try:
+        arr = np.asarray(dataset.hf_dataset[key], dtype=np.float32)
+        arr = arr.reshape(arr.shape[0], -1)
+        if arr.shape[-1] == dim:
+            mean = torch.from_numpy(arr.mean(axis=0))
+            std = torch.from_numpy(arr.std(axis=0)).clamp_min(1e-6)
+            return {"mean": mean, "std": std}
+    except Exception:
+        pass
+    return None
+
+
+def identity_stats(
+    camera_keys: list[str], state_dim: int, action_dim: int,
+) -> dict[str, dict[str, torch.Tensor]]:
+    """
+    Identity (mean 0 / std 1) stats for the global preprocessor when
+    per-dataset normalization is done in the adapter. Makes the
+    NormalizerProcessorStep a no-op for STATE/ACTION (the adapter already
+    z-scored them per-dataset) and keeps VISUAL identity as always.
+    """
+    stats = {
+        "observation.state": {
+            "mean": torch.zeros(state_dim), "std": torch.ones(state_dim),
+            "min": -torch.ones(state_dim), "max": torch.ones(state_dim),
+        },
+        "action": {
+            "mean": torch.zeros(action_dim), "std": torch.ones(action_dim),
+            "min": -torch.ones(action_dim), "max": torch.ones(action_dim),
+        },
+    }
+    for cam in camera_keys:
+        stats[cam] = {
+            "mean": torch.tensor([0.0]), "std": torch.tensor([1.0]),
+            "min": torch.tensor([-1.0]), "max": torch.tensor([1.0]),
+        }
+    return stats
+
+# ---------------------------------------------------------------------------
 # DatasetAdapter — wraps a LeRobotDataset, projects features into canonical schema
 # ---------------------------------------------------------------------------
 class DatasetAdapter(Dataset):
@@ -516,6 +583,9 @@ class DatasetAdapter(Dataset):
         task_idx_to_desc: Optional[dict[int, str]] = None,
         canonical_state_dim: Optional[int] = None,
         canonical_action_dim: Optional[int] = None,
+        state_stats: Optional[dict] = None,
+        action_stats: Optional[dict] = None,
+        normalize_in_adapter: bool = False,
     ):
         self.dataset = dataset
         self.sub_dir = sub_dir
@@ -535,6 +605,22 @@ class DatasetAdapter(Dataset):
             canonical_action_dim if canonical_action_dim is not None else CANONICAL_ACTION_DIM
         )
         self.task_idx_to_desc = task_idx_to_desc or {}
+
+        # Per-dataset normalization. When `normalize_in_adapter` is True, state
+        # and action are z-scored by THIS dataset's own native-dim mean/std in
+        # __getitem__ (before pad/truncate), so every heterogeneous sub-dataset
+        # reaches the model in the same ~zero-mean/unit-std space — and the
+        # global preprocessor is left as identity for STATE/ACTION. This is the
+        # pi0/Octo recipe: it removes the embodiment-scale blend that a single
+        # pooled `compute_unified_stats` would impose, and makes the pretrain
+        # normalized space identical to a finetune target normalized by ITS own
+        # stats → the action head transfers with no scale shift. `*_stats` are
+        # {"mean": tensor(native_dim), "std": tensor(native_dim)}.
+        self.normalize_in_adapter = normalize_in_adapter
+        self._state_mean = state_stats["mean"].float() if state_stats else None
+        self._state_std = state_stats["std"].float() if state_stats else None
+        self._action_mean = action_stats["mean"].float() if action_stats else None
+        self._action_std = action_stats["std"].float() if action_stats else None
 
         # Cache canonical camera list for iteration
         self._canonical_cams = list(camera_map.keys())
@@ -609,6 +695,11 @@ class DatasetAdapter(Dataset):
         if self.state_key in item:
             state = item[self.state_key]
             if isinstance(state, torch.Tensor):
+                # Per-dataset z-score in NATIVE dim space (mean/std broadcast
+                # over the trailing feature axis). Done before padding so the
+                # zero-pad below lands exactly on the normalized mean (0).
+                if self.normalize_in_adapter and self._state_mean is not None:
+                    state = (state.float() - self._state_mean) / self._state_std
                 sd = state.shape[-1] if state.dim() >= 1 else 1
                 if sd < self.canonical_state_dim:
                     pad = torch.zeros(*state.shape[:-1], self.canonical_state_dim - sd,
@@ -627,6 +718,10 @@ class DatasetAdapter(Dataset):
         if self.action_key in item:
             action = item[self.action_key]
             if isinstance(action, torch.Tensor):
+                # Per-dataset z-score in NATIVE dim space, before pad/truncate.
+                # Padded dims (masked out via action_dim_pad below) stay at 0.
+                if self.normalize_in_adapter and self._action_mean is not None:
+                    action = (action.float() - self._action_mean) / self._action_std
                 ad = action.shape[-1] if action.dim() >= 1 else 1
                 if ad < self.canonical_action_dim:
                     pad = torch.zeros(*action.shape[:-1], self.canonical_action_dim - ad,
@@ -823,6 +918,7 @@ def train(
     max_datasets: Optional[int] = None,
     seed: int = 42,
     version_filter: str = "v3",
+    per_dataset_norm: bool = True,
 ):
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -970,6 +1066,15 @@ def train(
         ad = action_dims.get(sub, CANONICAL_ACTION_DIM)
         cmap = camera_map.get(sub, {})
 
+        # Per-dataset stats for in-adapter z-scoring. Computed once here in the
+        # native dim space; None falls back to no-op normalization for that sub.
+        sst = native_feature_stats(ds, sk, sd) if per_dataset_norm else None
+        ast = native_feature_stats(ds, ak, ad) if per_dataset_norm else None
+        if per_dataset_norm and (sst is None or ast is None):
+            print(f"  [WARN] {sub}: missing native stats "
+                  f"(state={sst is not None}, action={ast is not None}); "
+                  f"that feature is left un-normalized for this dataset.")
+
         adapter = DatasetAdapter(
             dataset=ds,
             sub_dir=sub,
@@ -979,6 +1084,9 @@ def train(
             state_dim=sd,
             action_dim=ad,
             task_idx_to_desc=task_map,
+            state_stats=sst,
+            action_stats=ast,
+            normalize_in_adapter=per_dataset_norm,
         )
         adapters.append(adapter)
 
@@ -1046,10 +1154,20 @@ def train(
         vlm_attends_to_expert=True,
     )
 
-    # ── Compute dataset statistics across all sub-datasets ───────────────
-    # Since we're stitching many heterogeneous datasets, we compute unified
-    # stats by sampling frames from each sub-dataset.
-    dataset_stats = compute_unified_stats(adapters, used_canonical, CANONICAL_STATE_DIM, CANONICAL_ACTION_DIM)
+    # ── Dataset statistics ───────────────────────────────────────────────
+    # With per-dataset normalization the adapters already z-score state/action
+    # by each sub-dataset's own stats, so the global preprocessor must be the
+    # identity (mean 0 / std 1) for STATE/ACTION — otherwise we'd normalize
+    # twice. Without it, fall back to a single pooled stat across all
+    # sub-datasets (the old behavior; blends embodiment scales).
+    if per_dataset_norm:
+        print("\nPer-dataset normalization ON: each sub-dataset is z-scored by its "
+              "own native stats in the adapter; global preprocessor is identity.")
+        dataset_stats = identity_stats(used_canonical, CANONICAL_STATE_DIM, CANONICAL_ACTION_DIM)
+    else:
+        dataset_stats = compute_unified_stats(
+            adapters, used_canonical, CANONICAL_STATE_DIM, CANONICAL_ACTION_DIM,
+        )
 
     # ── Model setup ─────────────────────────────────────────────────────
     if resume_from_checkpoint is not None:
@@ -1430,6 +1548,14 @@ if __name__ == "__main__":
     parser.add_argument("--list_versions", action="store_true",
                         help="Classify all datasets as v3.0/v2.1/unknown and print the report, "
                              "then exit (no download, no training).")
+    parser.add_argument("--per_dataset_norm", dest="per_dataset_norm",
+                        default=True, action=argparse.BooleanOptionalAction,
+                        help="Z-score state/action per sub-dataset by its own stats "
+                             "(global preprocessor identity). The pi0/Octo recipe — best "
+                             "for transfer, since the pretrain normalized space matches a "
+                             "finetune target normalized by its own stats. Use "
+                             "--no-per_dataset_norm for the old single pooled-stat behavior. "
+                             "(default: on)")
     parser.add_argument("--version_filter", type=str, default="v3",
                         choices=["all", "v3", "v2"],
                         help="Train only on datasets of this format. Default 'v3': in "
