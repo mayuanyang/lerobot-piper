@@ -96,7 +96,7 @@ class InterleavedFlowMatchingConfig(PreTrainedConfig):
     scheduler_warmup_steps: int = 1500
 
     # -------- Robot visual encoder (parallel ResNet-18) --------
-    robot_encoder_tokens: int = 16
+    robot_encoder_tokens: int = 49
     robot_encoder_input_size: int = 224
     # Enable / disable the parallel ResNet visual encoder entirely.
     # True (default): create RobotVisualEncoder and route its tokens through
@@ -106,6 +106,13 @@ class InterleavedFlowMatchingConfig(PreTrainedConfig):
     #                 measure whether the CNN actually contributes anything
     #                 beyond what SmolVLM2 already provides.
     use_robot_cnn: bool = True
+    # Give one camera a denser token grid than the rest. The gripper / wrist
+    # view drives close-range placement precision, so a finer grid there buys
+    # spatial detail where it matters. Shares the same ResNet backbone (no extra
+    # params — only the pooling grid differs). Must be a perfect square. Set
+    # equal to robot_encoder_tokens to disable the per-camera difference.
+    gripper_camera: str = "observation.images.gripper"
+    gripper_encoder_tokens: int = 100
 
     # -------- Latent "thought" tokens --------
     # Prepended to the expert sequence. 0 disables.

@@ -154,7 +154,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           gradient_checkpointing=False, max_episode_index=None, batch_size=64,
           contrastive_loss_weight=0.1, contrastive_margin=0.05,
           lock_joint_index: int | None = 3, kv_capture_strategy: str = "last",
-          kv_capture_layers: list | None = None):
+          kv_capture_layers: list | None = None,
+          robot_encoder_tokens: int = 49, gripper_encoder_tokens: int = 100):
     """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model."""
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -219,7 +220,13 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         pos_decay_lambda=0.0,
         contrastive_loss_weight=contrastive_loss_weight,
         contrastive_margin=contrastive_margin,
+        robot_encoder_tokens=robot_encoder_tokens,
+        gripper_encoder_tokens=gripper_encoder_tokens,
     )
+    print(f"Robot CNN tokens: {robot_encoder_tokens} per cam "
+          f"({int(robot_encoder_tokens ** 0.5)}x{int(robot_encoder_tokens ** 0.5)} grid); "
+          f"gripper cam '{cfg.gripper_camera}': {gripper_encoder_tokens} "
+          f"({int(gripper_encoder_tokens ** 0.5)}x{int(gripper_encoder_tokens ** 0.5)} grid)")
 
     # Model + checkpoint loading
     if resume_from_checkpoint is not None:
@@ -598,7 +605,22 @@ if __name__ == "__main__":
                         help="Comma-separated 0-based VLM layer indices for "
                              "--kv_capture_strategy custom, e.g. '3,7,11,15,19,"
                              "23,27,31'. Ignored for last/stride2.")
+    parser.add_argument("--robot_encoder_tokens", type=int, default=49,
+                        help="Robot CNN tokens per non-gripper camera. Must be a "
+                             "perfect square (grid side = sqrt). Spatial ceiling "
+                             "is the 14x14 layer3 map (=196); 49 (7x7) or 100 "
+                             "(10x10) buy real localisation resolution over the "
+                             "default 16 (4x4 ~25%% of frame per token).")
+    parser.add_argument("--gripper_encoder_tokens", type=int, default=100,
+                        help="Robot CNN tokens for the gripper/wrist camera "
+                             "(close-range placement precision). Perfect square; "
+                             "set equal to --robot_encoder_tokens to disable the "
+                             "per-camera difference.")
     args = parser.parse_args()
+    for _name in ("robot_encoder_tokens", "gripper_encoder_tokens"):
+        _v = getattr(args, _name)
+        if int(_v ** 0.5) ** 2 != _v:
+            parser.error(f"--{_name} must be a perfect square, got {_v}")
     # Argparse can't express None for an int, so use -1 sentinel.
     if args.lock_joint_index is not None and args.lock_joint_index < 0:
         args.lock_joint_index = None

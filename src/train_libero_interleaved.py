@@ -149,6 +149,8 @@ def train(
     train_ratio=1.0,
     batch_size=64,
     reset_lang_params=False,
+    robot_encoder_tokens=49,
+    gripper_encoder_tokens=100,
 ):
     """Train the InterleavedFlowMatching model on LIBERO."""
     output_directory = Path(output_dir)
@@ -209,7 +211,13 @@ def train(
         num_latent_tokens=8,
         # Allow VLM attention to expert tokens (SmolVLA-style true interleaving).
         vlm_attends_to_expert=True,
+        robot_encoder_tokens=robot_encoder_tokens,
+        gripper_encoder_tokens=gripper_encoder_tokens,
     )
+    print(f"Robot CNN tokens: {robot_encoder_tokens} per cam "
+          f"({int(robot_encoder_tokens ** 0.5)}x{int(robot_encoder_tokens ** 0.5)} grid); "
+          f"gripper cam '{cfg.gripper_camera}': {gripper_encoder_tokens} "
+          f"({int(gripper_encoder_tokens ** 0.5)}x{int(gripper_encoder_tokens ** 0.5)} grid)")
 
     if resume_from_checkpoint is not None:
         print(f"Resuming training from checkpoint: {resume_from_checkpoint}")
@@ -632,5 +640,18 @@ if __name__ == "__main__":
                              "to 1 after loading checkpoint. Use when testing a new language "
                              "forcing strategy from a checkpoint that learned to suppress "
                              "language. DO NOT use for routine resume — erases progress.")
+    parser.add_argument("--robot_encoder_tokens", type=int, default=49,
+                        help="Robot CNN tokens per non-gripper camera. Perfect square "
+                             "(grid side = sqrt). Spatial ceiling is the 14x14 layer3 map "
+                             "(=196); 49 (7x7) or 100 (10x10) buy real localisation "
+                             "resolution over the default 16 (4x4 ~25%% of frame per token).")
+    parser.add_argument("--gripper_encoder_tokens", type=int, default=100,
+                        help="Robot CNN tokens for the gripper/wrist camera (close-range "
+                             "placement precision). Perfect square; set equal to "
+                             "--robot_encoder_tokens to disable the per-camera difference.")
     args = parser.parse_args()
+    for _name in ("robot_encoder_tokens", "gripper_encoder_tokens"):
+        _v = getattr(args, _name)
+        if int(_v ** 0.5) ** 2 != _v:
+            parser.error(f"--{_name} must be a perfect square, got {_v}")
     train(**vars(args))

@@ -13,6 +13,8 @@ size is too coarse and its pretraining domain is internet images.
 ~11M params (ResNet-18 backbone), negligible vs VLM.
 """
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -67,10 +69,16 @@ class RobotVisualEncoder(nn.Module):
             "img_std",  torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, out_tokens: Optional[int] = None) -> torch.Tensor:
         """
         Args:
             x: (B, 3, H, W) in [0, 1] — raw camera image, any resolution.
+            out_tokens: override the token grid for this call (must be a perfect
+                square). Lets a single shared backbone emit a denser grid for
+                some cameras (e.g. the gripper view, for placement precision)
+                and a coarser grid for others. None → the construction default.
+                Only the pooling grid changes; proj/norm are per-token, so no
+                parameters depend on the count.
         Returns:
             (B, out_tokens, out_dim) float32 feature tokens.
         """
@@ -89,6 +97,11 @@ class RobotVisualEncoder(nn.Module):
         feat = self.layer2(feat) # (B, 128, 28, 28)
         feat = self.layer3(feat) # (B, 256, 14, 14)
 
-        feat = self.pool(feat)                          # (B, 256, token_side, token_side)
+        if out_tokens is None:
+            feat = self.pool(feat)                      # (B, 256, token_side, token_side)
+        else:
+            side = int(out_tokens ** 0.5)
+            assert side * side == out_tokens, "out_tokens must be a perfect square"
+            feat = F.adaptive_avg_pool2d(feat, (side, side))
         feat = feat.flatten(2).transpose(1, 2)          # (B, out_tokens, 256)
         return self.norm(self.proj(feat))               # (B, out_tokens, out_dim)

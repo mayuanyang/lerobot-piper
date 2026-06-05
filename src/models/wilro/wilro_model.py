@@ -616,7 +616,12 @@ class WilroTransformer(nn.Module):
             img = batch[cam_key]
             if img.dim() == 5:
                 img = img[:, -1]
-            toks_list.append(self.robot_visual_encoder(img.float()))
+            n_tok = (
+                self.config.gripper_encoder_tokens
+                if cam_key == self.config.gripper_camera
+                else self.config.robot_encoder_tokens
+            )
+            toks_list.append(self.robot_visual_encoder(img.float(), out_tokens=n_tok))
         if not toks_list:
             return None
         toks = torch.cat(toks_list, dim=1)

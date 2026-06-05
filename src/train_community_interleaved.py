@@ -919,6 +919,8 @@ def train(
     seed: int = 42,
     version_filter: str = "v3",
     per_dataset_norm: bool = True,
+    robot_encoder_tokens: int = 49,
+    gripper_encoder_tokens: int = 100,
 ):
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -1152,7 +1154,13 @@ def train(
         vision_lora_num_layers=0,
         num_latent_tokens=8,
         vlm_attends_to_expert=True,
+        robot_encoder_tokens=robot_encoder_tokens,
+        gripper_encoder_tokens=gripper_encoder_tokens,
     )
+    print(f"Robot CNN tokens: {robot_encoder_tokens} per cam "
+          f"({int(robot_encoder_tokens ** 0.5)}x{int(robot_encoder_tokens ** 0.5)} grid); "
+          f"gripper cam '{cfg.gripper_camera}': {gripper_encoder_tokens} "
+          f"({int(gripper_encoder_tokens ** 0.5)}x{int(gripper_encoder_tokens ** 0.5)} grid)")
 
     # ── Dataset statistics ───────────────────────────────────────────────
     # With per-dataset normalization the adapters already z-score state/action
@@ -1576,12 +1584,26 @@ if __name__ == "__main__":
                              "them and pays the slow v2.1→v3.0 conversion per v2.1 root. 'v3' "
                              "drops the duplicates and skips conversion entirely. Use 'all' "
                              "only for a repo without this v2.1/v3.0 mirroring.")
+    parser.add_argument("--robot_encoder_tokens", type=int, default=49,
+                        help="Robot CNN tokens per non-gripper camera. Perfect square "
+                             "(grid side = sqrt). Spatial ceiling is the 14x14 layer3 map "
+                             "(=196); 49 (7x7) or 100 (10x10) buy real localisation "
+                             "resolution over the default 16 (4x4 ~25%% of frame per token).")
+    parser.add_argument("--gripper_encoder_tokens", type=int, default=100,
+                        help="Robot CNN tokens for the gripper/wrist camera (close-range "
+                             "placement precision). Perfect square; set equal to "
+                             "--robot_encoder_tokens to disable the per-camera difference.")
     args = parser.parse_args()
 
     # --list_versions is a standalone inspection mode.
     if args.list_versions:
         print_version_report(args.source)
         raise SystemExit(0)
+
+    for _name in ("robot_encoder_tokens", "gripper_encoder_tokens"):
+        _v = getattr(args, _name)
+        if int(_v ** 0.5) ** 2 != _v:
+            parser.error(f"--{_name} must be a perfect square, got {_v}")
 
     # SystemExit-only flag — drop it before calling train().
     kwargs = vars(args)

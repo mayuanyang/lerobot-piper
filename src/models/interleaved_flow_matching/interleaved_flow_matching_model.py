@@ -698,7 +698,14 @@ class InterleavedFlowMatchingTransformer(nn.Module):
             img = batch[cam_key]
             if img.dim() == 5:
                 img = img[:, -1]
-            robot_tokens_list.append(self.robot_visual_encoder(img.float()))
+            # Gripper/wrist camera gets a denser token grid (close-range
+            # placement precision); other cameras use the default count.
+            n_tok = (
+                self.config.gripper_encoder_tokens
+                if cam_key == self.config.gripper_camera
+                else self.config.robot_encoder_tokens
+            )
+            robot_tokens_list.append(self.robot_visual_encoder(img.float(), out_tokens=n_tok))
         if not robot_tokens_list:
             return None
         robot_tokens = torch.cat(robot_tokens_list, dim=1)
