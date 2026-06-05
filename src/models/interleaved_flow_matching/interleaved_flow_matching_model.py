@@ -266,6 +266,15 @@ class InterleavedFlowMatchingTransformer(nn.Module):
 
         self._lang_max_len = 48
 
+        # ---- Attention-mass diagnostic (mirrors wilro) ----
+        # When armed, the LAST joint layer records how much attention the action
+        # queries place on each segment of the joint sequence. Unlike wilro
+        # (separate DiT self-attn + cross-attn to VLM KV), this model runs ONE
+        # joint softmax, so vision/language/state share the same distribution as
+        # robot/latent/action. The model self-disarms after a single capture.
+        self._capture_attention_stats = False
+        self._last_attention_stats: Optional[dict] = None
+
     # =====================================================================
     # Keep frozen components in eval mode
     # =====================================================================
@@ -445,6 +454,54 @@ class InterleavedFlowMatchingTransformer(nn.Module):
     # Joint attention layer — the core of interleaving
     # =====================================================================
 
+    @torch.no_grad()
+    def _compute_joint_attention_mass(
+        self,
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+        regions: dict,
+        head_dim: int,
+    ) -> dict[str, float]:
+        """Average attention mass the action queries place on each joint-sequence
+        segment, using the same Q/K (post-RoPE, post-GQA) that SDPA consumes.
+
+        Q, K: (B, H_heads, L_total, head_dim).
+        attn_mask: additive mask, either (L_total, L_total) or
+            (B, 1, L_total, L_total); may be None.
+        regions: {name: (start, length)} over the joint sequence; must contain
+            "action". Segments with length <= 0 are skipped.
+        """
+        a_start, a_len = regions["action"]
+        if a_len <= 0:
+            return {}
+
+        Qf = Q.float()[:, :, a_start:a_start + a_len, :]    # action rows only
+        Kf = K.float()
+        scale = 1.0 / math.sqrt(head_dim)
+        scores = (Qf @ Kf.transpose(-1, -2)) * scale         # (B, H, a_len, L_total)
+
+        if attn_mask is not None:
+            m = attn_mask.float()
+            if m.dim() == 2:                                 # (L_total, L_total)
+                m = m[a_start:a_start + a_len, :]
+                scores = scores + m
+            else:                                            # (B, 1, L_total, L_total)
+                m = m[:, :, a_start:a_start + a_len, :]
+                scores = scores + m
+
+        weights = torch.softmax(scores, dim=-1)              # (B, H, a_len, L_total)
+
+        stats: dict[str, float] = {}
+        for name, span in regions.items():
+            if span is None:
+                continue
+            start, length = span
+            if length <= 0:
+                continue
+            stats[name] = weights[:, :, :, start:start + length].sum(dim=-1).mean().item()
+        return stats
+
     def _joint_layer(
         self,
         vlm_seq: torch.Tensor,
@@ -453,12 +510,15 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attn_mask: torch.Tensor,
+        capture_regions: Optional[dict] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         One layer of joint VLM + expert processing. Returns updated (vlm_seq, exp_seq).
 
         cos, sin: precomputed RoPE for the *full* combined sequence length.
         attn_mask: precomputed additive mask for the full combined sequence.
+        capture_regions: when given (last layer only), record the action queries'
+            attention mass over each segment into self._last_attention_stats.
         """
         vlm_layer = self.text_model.layers[layer_idx]
         exp_layer = self.expert_layers[layer_idx]
@@ -498,6 +558,15 @@ class InterleavedFlowMatchingTransformer(nn.Module):
             repeat = H // Hk
             K = K.repeat_interleave(repeat, dim=1)
             V = V.repeat_interleave(repeat, dim=1)
+
+        # ---- Attention-mass diagnostic (action queries only) ----
+        # Re-run the softmax for just the action rows (cheap: (B,H,a_len,L) vs the
+        # full (B,H,L,L)) so we can see where action tokens look. Uses the exact
+        # post-RoPE/post-GQA Q,K that SDPA consumes below.
+        if capture_regions is not None:
+            self._last_attention_stats = self._compute_joint_attention_mass(
+                Q, K, attn_mask, capture_regions, D,
+            )
 
         # ---- Scaled dot-product attention over the joint sequence ----
         # attn_mask: (L_total, L_total). SDPA broadcasts over batch + heads.
@@ -764,16 +833,37 @@ class InterleavedFlowMatchingTransformer(nn.Module):
         # differs. Could be optimised by precomputing base+addend, but the
         # simple per-layer rebuild is correct and avoids autograd hazards
         # from in-place mutation between SDPA calls.
-        for i in range(len(self.expert_layers)):
+        # Segment layout of the joint sequence (for the attention-mass diagnostic):
+        #   [vision | language | state | robot | latent | action]
+        # vision occupies [0, lang_start); state is whatever sits between the
+        # language block and the end of vlm_seq (normally 1 token).
+        n_layers = len(self.expert_layers)
+        state_start = lang_start + lang_len
+        regions = {
+            "vision":   (0, lang_start),
+            "language": (lang_start, lang_len),
+            "state":    (state_start, L_vlm - state_start),
+            "robot":    (L_vlm, R),
+            "latent":   (L_vlm + R, K),
+            "action":   (L_vlm + R + K, H),
+        }
+
+        for i in range(n_layers):
             attn_mask_i = self._build_joint_mask(
                 L_vlm, R, K, H, vlm_seq.device, vlm_seq.dtype,
                 lang_start=lang_start, lang_len=lang_len,
                 lang_mask=lang_mask, layer_idx=i,
             )
+            capture = (i == n_layers - 1) and self._capture_attention_stats
             vlm_seq, exp_seq = self._joint_layer(
                 vlm_seq, exp_seq, layer_idx=i,
                 cos=cos, sin=sin, attn_mask=attn_mask_i,
+                capture_regions=regions if capture else None,
             )
+            if capture:
+                # one-shot: don't re-capture on the contrastive v_wrong pass or
+                # subsequent inference steps.
+                self._capture_attention_stats = False
 
         # Read out the action positions (skip robot + latent prefix)
         action_out = self.final_norm(exp_seq[:, R + K:])

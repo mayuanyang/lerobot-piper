@@ -641,6 +641,11 @@ def train(
                     print(f"Action pad key='{pad_key}', pad fraction: "
                           f"{batch[pad_key].float().mean().item():.2%}")
 
+            # Arm the attention-mass diagnostic on the gradient-analysis cadence.
+            # The model self-disarms after a single capture.
+            if step % progress_update_freq == 0:
+                policy.model._capture_attention_stats = True
+
             autocast_ctx = (
                 torch.autocast(device_type=device.type, dtype=torch.bfloat16)
                 if device.type == "cuda"
@@ -748,6 +753,13 @@ def _log_gradient_analysis(policy, step):
         w_norm = sum(p.detach().norm().item() ** 2 for p in policy.model.lang_adaptor.parameters()) ** 0.5
         g_norm_sq = sum(p.grad.norm().item() ** 2 for p in policy.model.lang_adaptor.parameters() if p.grad is not None)
         print(f"  Lang adaptor   - weight_norm: {w_norm:.4e}   grad_norm: {g_norm_sq ** 0.5:.4e}")
+
+    stats = getattr(policy.model, "_last_attention_stats", None)
+    if stats:
+        order = ["vision", "language", "state", "robot", "latent", "action"]
+        ordered = [(k, stats[k]) for k in order if k in stats]
+        cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in ordered)
+        print(f"  Action→ attn   : {cells}    (last joint layer)")
 
     comps = getattr(policy.model, "_last_loss_components", None)
     cw = getattr(policy.model.config, "contrastive_loss_weight", 0.0)

@@ -431,6 +431,11 @@ def train(
                 else:
                     print(f"Action pad key='{pad_key}', pad fraction: {batch[pad_key].float().mean().item():.2%}")
 
+            # Arm the attention-mass diagnostic on the gradient-analysis cadence.
+            # The model self-disarms after a single capture.
+            if step % progress_update_freq == 0:
+                policy.model._capture_attention_stats = True
+
             autocast_ctx = (
                 torch.autocast(device_type=device.type, dtype=torch.bfloat16)
                 if device.type == "cuda"
@@ -533,6 +538,17 @@ def train(
                             adaptor_g_norm_sq += p.grad.norm().item() ** 2
                     adaptor_g_norm = adaptor_g_norm_sq ** 0.5
                     print(f"  Lang adaptor   - weight_norm: {adaptor_w_norm:.4e}   grad_norm: {adaptor_g_norm:.4e}")
+
+                # Attention-mass diagnostic — where do the action queries look?
+                # One joint softmax, so every segment shares the distribution
+                # (unlike wilro's split self-attn / cross-attn). Mass sums to
+                # ~100% across the row.
+                stats = getattr(policy.model, "_last_attention_stats", None)
+                if stats:
+                    order = ["vision", "language", "state", "robot", "latent", "action"]
+                    ordered = [(k, stats[k]) for k in order if k in stats]
+                    cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in ordered)
+                    print(f"  Action→ attn   : {cells}    (last joint layer)")
 
                 # Contrastive loss diagnostics — only print if enabled.
                 # `contrastive` ≈ margin at training start (predictions agree
