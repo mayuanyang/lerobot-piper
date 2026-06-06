@@ -167,7 +167,7 @@ class RFTParams:
     weight_decay: float = 1e-6
     grad_clip: float = 1.0
     max_steps: int = 0                # cap rollout length (0 = use the env's per-suite default)
-    buffer_size: int = 8000           # max (obs, action-chunk) samples retained (~0.4GB RAM w/ JPEG)
+    buffer_size: int = 20000          # max (obs, action-chunk) samples retained (~1GB RAM w/ JPEG)
     min_buffer_to_train: int = 256    # don't train until the buffer has this many
     save_freq: int = 2                # save a checkpoint every N iterations (best != last, so save often)
     keep_last: int = 5                # keep only the N most recent checkpoint-<step> dirs (0 = keep all)
@@ -591,12 +591,12 @@ def main(cfg: RFTConfig):
         # best, eval the kept checkpoints on held-out init states.
         if succ_rate > best_succ:
             best_succ = succ_rate
-            print(f"           new best success {succ_rate:.1f}% → checkpoint-best", flush=True)
+            print(f"  new best success {succ_rate:.1f}% → checkpoint-best", flush=True)
             _save(policy, preprocessor, postprocessor, out_dir, "checkpoint-best", step=global_step)
 
         # ---- 2) Reward-filtered BC on the success buffer -----------------------
         if len(buffer) < cfg.rft.min_buffer_to_train:
-            print(f"           buffer < {cfg.rft.min_buffer_to_train}; skipping update "
+            print(f"  buffer < {cfg.rft.min_buffer_to_train}; skipping update "
                   f"(policy too weak — start RFT from a stronger checkpoint).")
             continue
         avg_loss, n_demo = _train_on_buffer(
@@ -604,7 +604,7 @@ def main(cfg: RFTConfig):
             demo_ds=demo_ds, demo_info=demo_info,
         )
         global_step += cfg.rft.updates_per_iter
-        print(f"           train : {cfg.rft.updates_per_iter} updates  "
+        print(f"  train: {cfg.rft.updates_per_iter} updates  "
               f"avg_loss={avg_loss:.4f}  demo_batches={n_demo}  (global_step={global_step})")
 
         if it % cfg.rft.save_freq == 0 or it == cfg.rft.iterations:
