@@ -52,23 +52,62 @@ Known limitation (intentional, to keep the scaffold runnable):
 # get the config dataclass; deferred annotations would turn `RFTConfig` into a
 # string and draccus would fail with "must be called with a dataclass type".
 
+import importlib
+import os
 import random
+import sys
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from contextlib import nullcontext
 
+import huggingface_hub
 import numpy as np
 import torch
 from torch import nn
+from safetensors.torch import load_file as load_safetensors
 
 from lerobot.configs import parser
 from lerobot.configs.eval import EvalPipelineConfig
 from lerobot.envs.factory import make_env
 from lerobot.envs.utils import add_envs_task, preprocess_observation
-from lerobot.policies.factory import make_policy, make_pre_post_processors
+from lerobot.policies.factory import make_pre_post_processors
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.utils import get_safe_torch_device
+
+# --- Register the custom policy/config/processor types ----------------------
+# Run as a fresh `python src/train_rft.py` process, nothing has imported the
+# models yet, so draccus can't parse `--policy.path=<wilro ckpt>`
+# ("Couldn't find a choice class for 'wilro'"). Importing the config modules
+# runs their @PreTrainedConfig.register_subclass decorators; importing the
+# policy/processor modules makes their classes + any custom processor steps
+# available. Must happen at import time, BEFORE parser.wrap() parses argv.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # ensure src/ importable
+
+# (config_module, policy_module, ClassName) keyed by the registered policy type.
+_POLICY_CLASS: dict[str, tuple[str, str, str]] = {
+    "wilro": (
+        "models.wilro.wilro_config",
+        "models.wilro.wilro_policy",
+        "WilroPolicy",
+    ),
+    "interleaved_flow_matching": (
+        "models.interleaved_flow_matching.interleaved_flow_matching_config",
+        "models.interleaved_flow_matching.interleaved_flow_matching_policy",
+        "InterleavedFlowMatchingPolicy",
+    ),
+    "wiltechs_vla": (
+        "models.wiltechs_vla.wiltechs_vla_config",
+        "models.wiltechs_vla.wiltechs_vla_policy",
+        "WiltechsVLAPolicy",
+    ),
+}
+for _cfg_mod, _pol_mod, _ in _POLICY_CLASS.values():
+    try:
+        importlib.import_module(_cfg_mod)   # registers the config choice for draccus
+        importlib.import_module(_pol_mod)   # makes the policy class importable
+    except Exception as _e:                 # e.g. wiltechs_vla's Qwen3-VL deps absent
+        print(f"[train_rft] could not register '{_cfg_mod}' ({type(_e).__name__}: {_e})")
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +283,43 @@ def _train_on_buffer(policy, optimizer, buffer, cfg: RFTParams, preprocessor,
     return running / max(1, cfg.updates_per_iter)
 
 
+def _load_policy(cfg, device):
+    """Build the custom policy from the (already CLI-overridden) cfg.policy and
+    load its checkpoint weights. Bypasses lerobot's make_policy/get_policy_class,
+    which is a hardcoded registry with no entry for wilro/interleaved/wiltechs.
+
+    Constructing from cfg.policy (not from_pretrained(path)) preserves CLI
+    overrides like --policy.n_action_steps=2; weights are then loaded by shape
+    match (robust to token-count / minor config changes).
+    """
+    ptype = cfg.policy.type
+    if ptype not in _POLICY_CLASS:
+        raise ValueError(f"Unsupported policy type '{ptype}'. Known: {list(_POLICY_CLASS)}")
+    _, pol_mod, cls_name = _POLICY_CLASS[ptype]
+    PolicyCls = getattr(importlib.import_module(pol_mod), cls_name)
+
+    policy = PolicyCls(cfg.policy)
+
+    path = Path(str(cfg.policy.pretrained_path))
+    local = path if path.exists() else Path(huggingface_hub.snapshot_download(str(path)))
+    model_file = local / "model.safetensors"
+    if not model_file.exists():
+        cands = list(local.glob("*.safetensors"))
+        if not cands:
+            raise FileNotFoundError(f"No .safetensors found in {local}")
+        model_file = cands[0]
+
+    ckpt_state = load_safetensors(str(model_file), device="cpu")
+    cur = policy.state_dict()
+    filtered = {k: v for k, v in ckpt_state.items() if k in cur and cur[k].shape == v.shape}
+    skipped = [k for k in ckpt_state if k not in filtered]
+    missing = [k for k in cur if k not in filtered]
+    policy.load_state_dict(filtered, strict=False)
+    print(f"Loaded {cls_name}: {len(filtered)}/{len(cur)} keys "
+          f"(skipped {len(skipped)}, missing {len(missing)}) from {model_file}")
+    return policy
+
+
 def _save(policy, preprocessor, postprocessor, out_dir: Path, step: int):
     ckpt = out_dir / f"checkpoint-{step}"
     ckpt.mkdir(parents=True, exist_ok=True)
@@ -267,7 +343,7 @@ def main(cfg: RFTConfig):
 
     # Env / policy / processors — identical construction to lerobot-eval.
     envs = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
-    policy = make_policy(cfg=cfg.policy, env_cfg=cfg.env)
+    policy = _load_policy(cfg, device)
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
         pretrained_path=cfg.policy.pretrained_path,
