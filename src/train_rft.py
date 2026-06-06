@@ -169,8 +169,14 @@ class RFTParams:
     max_steps: int = 0                # cap rollout length (0 = use the env's per-suite default)
     buffer_size: int = 8000           # max (obs, action-chunk) samples retained (~0.4GB RAM w/ JPEG)
     min_buffer_to_train: int = 256    # don't train until the buffer has this many
-    save_freq: int = 5                # save a checkpoint every N iterations
+    save_freq: int = 2                # save a checkpoint every N iterations (best != last, so save often)
+    keep_last: int = 5                # keep only the N most recent checkpoint-<step> dirs (0 = keep all)
     output_dir: str = "outputs/rft/run"
+    # --- demo anchoring (collapse prevention) ---
+    # Mix expert-demo batches into training so the policy can't drift/forget while
+    # self-imitating its own successes. 0 = off. ~0.3 = 30% of updates use demos.
+    demo_dataset: str = ""            # e.g. "lerobot/libero" (must share the policy's obs/action space)
+    demo_fraction: float = 0.0        # probability each update trains on a demo batch instead of RFT
 
 
 @dataclass
@@ -327,22 +333,87 @@ def _collate(batch_samples, preprocessor, device, action_dim):
     return batch
 
 
+def _build_demo_dataset(demo_id, horizon, env_cam_keys, env_state_key):
+    """Load the expert-demo dataset for anchoring. Returns (LeRobotDataset, info).
+    Demo cameras are positionally mapped to the env's obs keys so demo batches
+    flow through the SAME preprocessor as RFT obs."""
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+    from lerobot.datasets.utils import dataset_to_policy_features
+    from lerobot.configs.types import FeatureType
+
+    meta = LeRobotDatasetMetadata(demo_id, revision="main")
+    feats = dataset_to_policy_features(meta.features)
+    cam_keys = sorted(k for k, f in feats.items() if f.type == FeatureType.VISUAL)
+    state_key = next(k for k, f in feats.items() if f.type == FeatureType.STATE)
+    action_key = next(k for k, f in feats.items() if f.type == FeatureType.ACTION)
+    fps = getattr(meta, "fps", None) or 10
+    ft = 1.0 / fps
+    delta = {action_key: [k * ft for k in range(horizon)], state_key: [0.0]}
+    for c in cam_keys:
+        delta[c] = [0.0]
+    ds = LeRobotDataset(demo_id, delta_timestamps=delta, revision="main")
+    cam_map = {cam_keys[i]: env_cam_keys[i] for i in range(min(len(cam_keys), len(env_cam_keys)))}
+    a_mean = torch.tensor(np.asarray(meta.stats["action"]["mean"], dtype=np.float32)).reshape(-1)
+    a_std = torch.tensor(np.asarray(meta.stats["action"]["std"], dtype=np.float32)).reshape(-1).clamp_min(1e-6)
+    info = dict(cam_map=cam_map, state_key=state_key, action_key=action_key,
+                env_state_key=env_state_key, a_mean=a_mean, a_std=a_std, n=len(ds))
+    print(f"[demo] {demo_id}: {len(ds)} frames | cam_map={cam_map} | "
+          f"state '{state_key}'→'{env_state_key}' | action '{action_key}' dim={a_mean.numel()}",
+          flush=True)
+    return ds, info
+
+
+def _collate_demo(ds, info, bs, preprocessor, device, action_dim):
+    """One expert-demo training batch in the SAME normalized space as _collate:
+    raw obs (under env keys) → preprocessor; action normalized with demo stats."""
+    cam_map, sk, ak, esk = info["cam_map"], info["state_key"], info["action_key"], info["env_state_key"]
+    img_acc = {ev: [] for ev in cam_map.values()}
+    state_acc, act_acc, pad_acc, tasks = [], [], [], []
+    for _ in range(bs):
+        item = ds[random.randint(0, info["n"] - 1)]
+        for dc, ev in cam_map.items():
+            img = item[dc]
+            img = img[-1] if img.dim() == 4 else img          # single current frame
+            img_acc[ev].append(img.float())
+        st = item[sk]
+        state_acc.append((st[-1] if st.dim() == 2 else st).float())
+        act_acc.append(item[ak].float())                       # (horizon, action_dim) raw
+        pad = item.get("action_is_pad")
+        pad_acc.append(pad.bool() if isinstance(pad, torch.Tensor)
+                       else torch.zeros(act_acc[-1].shape[0], dtype=torch.bool))
+        t = item.get("task", item.get("task_description", ""))
+        tasks.append(t if isinstance(t, str) else "")
+
+    batch = {ev: torch.stack(lst, 0).to(device) for ev, lst in img_acc.items()}
+    batch[esk] = torch.stack(state_acc, 0).to(device)
+    batch["task"] = tasks
+    batch = preprocessor(batch)                                # normalize obs (action absent)
+    a = torch.stack(act_acc, 0).to(device)
+    a = (a - info["a_mean"].to(device)) / info["a_std"].to(device)   # normalize action w/ demo stats
+    batch["action"] = a
+    batch["action_is_pad"] = torch.stack(pad_acc, 0).to(device)
+    batch["action_dim_pad"] = torch.zeros(a.shape[0], action_dim, dtype=torch.bool, device=device)
+    return batch
+
+
 def _train_on_buffer(policy, optimizer, buffer, cfg: RFTParams, preprocessor,
-                     device, action_dim):
+                     device, action_dim, demo_ds=None, demo_info=None):
     policy.train()
     trainable = [p for p in policy.parameters() if p.requires_grad]
     autocast_ctx = (
         torch.autocast(device_type=device.type, dtype=torch.bfloat16)
         if device.type == "cuda" else nullcontext()
     )
-    running = 0.0
+    running, n_demo = 0.0, 0
     for _ in range(cfg.updates_per_iter):
-        picks = random.sample(buffer, min(cfg.train_batch_size, len(buffer)))
-        # ---- collapse-prevention hooks (extend here) -------------------------
-        #   * demo anchoring: append a few demo samples to `picks`
-        #   * KL anchor: add a penalty to keep v_theta close to a frozen reference
-        # ----------------------------------------------------------------------
-        batch = _collate(picks, preprocessor, device, action_dim)
+        # Demo anchoring: with prob demo_fraction, train on an expert-demo batch
+        # instead of an RFT-success batch — keeps the policy from drifting/forgetting.
+        if demo_ds is not None and cfg.demo_fraction > 0 and random.random() < cfg.demo_fraction:
+            batch = _collate_demo(demo_ds, demo_info, cfg.train_batch_size, preprocessor, device, action_dim)
+            n_demo += 1
+        else:
+            picks = random.sample(buffer, min(cfg.train_batch_size, len(buffer)))
+            batch = _collate(picks, preprocessor, device, action_dim)
         with autocast_ctx:
             loss, _ = policy.forward(batch)
         optimizer.zero_grad()
@@ -350,7 +421,7 @@ def _train_on_buffer(policy, optimizer, buffer, cfg: RFTParams, preprocessor,
         torch.nn.utils.clip_grad_norm_(trainable, cfg.grad_clip)
         optimizer.step()
         running += loss.item()
-    return running / max(1, cfg.updates_per_iter)
+    return running / max(1, cfg.updates_per_iter), n_demo
 
 
 def _load_policy(cfg, device):
@@ -390,14 +461,33 @@ def _load_policy(cfg, device):
     return policy
 
 
-def _save(policy, preprocessor, postprocessor, out_dir: Path, step: int):
-    ckpt = out_dir / f"checkpoint-{step}"
+def _save(policy, preprocessor, postprocessor, out_dir: Path, name: str, step: int = 0):
+    ckpt = out_dir / name
     ckpt.mkdir(parents=True, exist_ok=True)
     policy.config.training_step = step
     policy.save_pretrained(ckpt)
     preprocessor.save_pretrained(ckpt)
     postprocessor.save_pretrained(ckpt)
-    print(f"  [save] {ckpt}")
+    print(f"  [save] {ckpt}", flush=True)
+
+
+def _prune_checkpoints(out_dir: Path, keep_last: int):
+    """Keep only the `keep_last` most recent checkpoint-<step> dirs (never touches
+    checkpoint-best). Lets you run --rft.save_freq=1 without filling the disk."""
+    if keep_last <= 0:
+        return
+    ckpts = []
+    for p in out_dir.glob("checkpoint-*"):
+        if p.is_dir() and p.name != "checkpoint-best":
+            try:
+                ckpts.append((int(p.name.split("-")[1]), p))
+            except (IndexError, ValueError):
+                pass
+    ckpts.sort()
+    for _, p in ckpts[:-keep_last]:
+        import shutil
+        shutil.rmtree(p, ignore_errors=True)
+        print(f"  [prune] removed {p.name}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +532,19 @@ def main(cfg: RFTConfig):
         for tid, e in by_task.items()
     ]
 
+    # Demo anchoring: build the demo dataset, mapping its cameras to the env's
+    # raw obs keys so demo batches flow through the SAME preprocessor as RFT obs.
+    demo_ds, demo_info = None, None
+    if cfg.rft.demo_fraction > 0 and cfg.rft.demo_dataset:
+        _obs0, _ = task_envs[0][1].reset()
+        _obs0 = preprocess_observation(_obs0)
+        env_cam_keys = sorted(k for k in _obs0 if "image" in k)
+        env_state_key = "observation.state" if "observation.state" in _obs0 else next(
+            (k for k in _obs0 if "state" in k), "observation.state")
+        demo_ds, demo_info = _build_demo_dataset(
+            cfg.rft.demo_dataset, policy.config.horizon, env_cam_keys, env_state_key,
+        )
+
     print("\n" + "=" * 64)
     print("Reward-Filtered Fine-Tuning")
     print("=" * 64)
@@ -453,10 +556,13 @@ def main(cfg: RFTConfig):
     print(f"  lr={cfg.rft.lr:.1e}  updates/iter={cfg.rft.updates_per_iter}  "
           f"train_bs={cfg.rft.train_batch_size}  buffer<={cfg.rft.buffer_size}")
     print(f"  max_steps     : {cfg.rft.max_steps if cfg.rft.max_steps > 0 else 'env default per suite'}")
+    print(f"  demo anchor   : {cfg.rft.demo_dataset or 'off'}  (fraction={cfg.rft.demo_fraction})")
+    print(f"  save          : every {cfg.rft.save_freq} iter, keep_last={cfg.rft.keep_last} + checkpoint-best")
     print("=" * 64 + "\n")
 
     buffer: deque = deque(maxlen=cfg.rft.buffer_size)
     global_step = 0
+    best_succ = -1.0
 
     for it in range(1, cfg.rft.iterations + 1):
         # ---- 1) Collect successful trajectories --------------------------------
@@ -479,20 +585,31 @@ def main(cfg: RFTConfig):
         print(f"[iter {it:3d}] rollout: {ep_success}/{ep_total} success "
               f"({succ_rate:4.1f}%)  +{new_samples} samples  buffer={len(buffer)}")
 
+        # Save the policy that achieved the best in-pool success — done BEFORE this
+        # iteration's training, so checkpoint-best is exactly the policy that
+        # produced succ_rate (no off-by-one). NOTE: in-pool success; for the true
+        # best, eval the kept checkpoints on held-out init states.
+        if succ_rate > best_succ:
+            best_succ = succ_rate
+            print(f"           new best success {succ_rate:.1f}% → checkpoint-best", flush=True)
+            _save(policy, preprocessor, postprocessor, out_dir, "checkpoint-best", step=global_step)
+
         # ---- 2) Reward-filtered BC on the success buffer -----------------------
         if len(buffer) < cfg.rft.min_buffer_to_train:
             print(f"           buffer < {cfg.rft.min_buffer_to_train}; skipping update "
                   f"(policy too weak — start RFT from a stronger checkpoint).")
             continue
-        avg_loss = _train_on_buffer(
-            policy, optimizer, buffer, cfg.rft, preprocessor, device, action_dim
+        avg_loss, n_demo = _train_on_buffer(
+            policy, optimizer, buffer, cfg.rft, preprocessor, device, action_dim,
+            demo_ds=demo_ds, demo_info=demo_info,
         )
         global_step += cfg.rft.updates_per_iter
         print(f"           train : {cfg.rft.updates_per_iter} updates  "
-              f"avg_loss={avg_loss:.4f}  (global_step={global_step})")
+              f"avg_loss={avg_loss:.4f}  demo_batches={n_demo}  (global_step={global_step})")
 
         if it % cfg.rft.save_freq == 0 or it == cfg.rft.iterations:
-            _save(policy, preprocessor, postprocessor, out_dir, global_step)
+            _save(policy, preprocessor, postprocessor, out_dir, f"checkpoint-{global_step}", step=global_step)
+            _prune_checkpoints(out_dir, cfg.rft.keep_last)
 
     print("\nRFT complete.")
 
