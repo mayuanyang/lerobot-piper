@@ -65,6 +65,7 @@ import huggingface_hub
 import numpy as np
 import torch
 from torch import nn
+from tqdm import tqdm
 from safetensors.torch import load_file as load_safetensors
 
 # JPEG-compress buffered frames to keep system RAM bounded (~10-15× vs raw
@@ -239,7 +240,7 @@ def _episode_to_samples(obs_hist: list[dict], act_hist: list[torch.Tensor], hori
 
 
 @torch.no_grad()
-def _rft_rollout(env, policy, preprocessor, postprocessor, device, action_dim):
+def _rft_rollout(env, policy, preprocessor, postprocessor, device, action_dim, desc=""):
     """One batched rollout. Returns a flat list of (obs_t, action_chunk, is_pad)
     samples harvested ONLY from successful episodes. Non-success episode buffers
     are dropped as soon as they terminate, to bound peak memory."""
@@ -256,6 +257,7 @@ def _rft_rollout(env, policy, preprocessor, postprocessor, device, action_dim):
     n_success = 0
     horizon = policy.config.horizon
     step = 0
+    pbar = tqdm(total=max_steps, desc=desc, leave=False, dynamic_ncols=True)
     while not np.all(done) and step < max_steps:
         obs_lr = preprocess_observation(obs)            # → lerobot keys, float images
         obs_lr = add_envs_task(env, obs_lr)             # inject per-env "task" string
@@ -286,7 +288,10 @@ def _rft_rollout(env, policy, preprocessor, postprocessor, device, action_dim):
                 obs_hist[i], act_hist[i] = [], []
         done = terminated | truncated | done
         step += 1
+        pbar.update(1)
+        pbar.set_postfix(done=f"{int(done.sum())}/{B}", success=n_success)
 
+    pbar.close()
     return samples, n_success, B
 
 
@@ -436,6 +441,7 @@ def main(cfg: RFTConfig):
     print("Reward-Filtered Fine-Tuning")
     print("=" * 64)
     print(f"  policy        : {cfg.policy.type}  (path={cfg.policy.pretrained_path})")
+    print(f"  device        : {device}   (if 'cpu', rollouts will be ~unusably slow — pass --policy.device=cuda)")
     print(f"  trainable     : {n_train:,}   frozen: {n_frozen:,}")
     print(f"  env/task      : {cfg.env.type}/{cfg.env.task}  ({len(task_envs)} task env(s))")
     print(f"  n_action_steps: {policy.config.n_action_steps}  horizon: {policy.config.horizon}")
@@ -449,16 +455,19 @@ def main(cfg: RFTConfig):
     for it in range(1, cfg.rft.iterations + 1):
         # ---- 1) Collect successful trajectories --------------------------------
         ep_total, ep_success, new_samples = 0, 0, 0
-        for label, env in task_envs:
+        for t_idx, (label, env) in enumerate(task_envs):
             n_batches = -(-cfg.rft.rollouts_per_task // env.num_envs)  # ceil
-            for _ in range(n_batches):
+            for b in range(n_batches):
+                desc = f"iter{it} collect {label} [{t_idx+1}/{len(task_envs)}] b{b+1}/{n_batches}"
                 samples, n_succ, B = _rft_rollout(
-                    env, policy, preprocessor, postprocessor, device, action_dim
+                    env, policy, preprocessor, postprocessor, device, action_dim, desc=desc,
                 )
                 buffer.extend(samples)
                 ep_total += B
                 ep_success += n_succ
                 new_samples += len(samples)
+                print(f"  {desc}: {n_succ}/{B} success  +{len(samples)} samples  "
+                      f"buffer={len(buffer)}", flush=True)
         succ_rate = 100.0 * ep_success / max(1, ep_total)
         print(f"[iter {it:3d}] rollout: {ep_success}/{ep_total} success "
               f"({succ_rate:4.1f}%)  +{new_samples} samples  buffer={len(buffer)}")
