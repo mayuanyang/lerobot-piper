@@ -155,7 +155,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           contrastive_loss_weight=0.1, contrastive_margin=0.05,
           lock_joint_index: int | None = 3, kv_capture_strategy: str = "last",
           kv_capture_layers: list | None = None,
-          robot_encoder_tokens: int = 49, gripper_encoder_tokens: int = 100):
+          robot_encoder_tokens: int = 49, gripper_encoder_tokens: int = 100,
+          noise_temporal_correlation: float = 0.0):
     """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model."""
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -222,6 +223,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         contrastive_margin=contrastive_margin,
         robot_encoder_tokens=robot_encoder_tokens,
         gripper_encoder_tokens=gripper_encoder_tokens,
+        noise_temporal_correlation=noise_temporal_correlation,
     )
     print(f"Robot CNN tokens: {robot_encoder_tokens} per cam "
           f"({int(robot_encoder_tokens ** 0.5)}x{int(robot_encoder_tokens ** 0.5)} grid); "
@@ -616,6 +618,12 @@ if __name__ == "__main__":
                              "(close-range placement precision). Perfect square; "
                              "set equal to --robot_encoder_tokens to disable the "
                              "per-camera difference.")
+    parser.add_argument("--noise_temporal_correlation", type=float, default=0.0,
+                        help="AR(1) coefficient correlating the flow-matching source "
+                             "noise along the action horizon (0=white noise; ~0.9=temporally "
+                             "smooth). Source dist changes, so this is NOT inference-only — "
+                             "resume from a rho=0 checkpoint and fine-tune to adapt. Too high "
+                             "(>0.95) over-smooths sharp/contact motions.")
     args = parser.parse_args()
     for _name in ("robot_encoder_tokens", "gripper_encoder_tokens"):
         _v = getattr(args, _name)

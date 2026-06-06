@@ -258,6 +258,7 @@ def train(
     state_dim=None,
     robot_encoder_tokens=49,
     gripper_encoder_tokens=100,
+    noise_temporal_correlation=0.0,
 ):
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -426,6 +427,7 @@ def train(
         pos_decay_lambda=0.0,
         vision_lora_num_layers=0,
         num_latent_tokens=8,
+        noise_temporal_correlation=noise_temporal_correlation,
         # Fine-tuning LR/warmup defaults
         optimizer_lr=learning_rate,
         scheduler_warmup_steps=warmup_steps,
@@ -866,6 +868,11 @@ if __name__ == "__main__":
                              "placement precision). Perfect square; set equal to "
                              "--robot_encoder_tokens to disable the per-camera difference. "
                              "Used by interleaved and wilro models only.")
+    parser.add_argument("--noise_temporal_correlation", type=float, default=0.0,
+                        help="AR(1) coefficient correlating the flow-matching source noise "
+                             "along the action horizon (0=white; ~0.9=temporally smooth). "
+                             "Source dist changes — resume from a rho=0 checkpoint and "
+                             "fine-tune to adapt; >0.95 over-smooths sharp/contact motions.")
     args = parser.parse_args()
     for _name in ("robot_encoder_tokens", "gripper_encoder_tokens"):
         _v = getattr(args, _name)
