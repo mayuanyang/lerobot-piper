@@ -166,6 +166,7 @@ class RFTParams:
     lr: float = 1e-5
     weight_decay: float = 1e-6
     grad_clip: float = 1.0
+    max_steps: int = 0                # cap rollout length (0 = use the env's per-suite default)
     buffer_size: int = 8000           # max (obs, action-chunk) samples retained (~0.4GB RAM w/ JPEG)
     min_buffer_to_train: int = 256    # don't train until the buffer has this many
     save_freq: int = 5                # save a checkpoint every N iterations
@@ -240,7 +241,8 @@ def _episode_to_samples(obs_hist: list[dict], act_hist: list[torch.Tensor], hori
 
 
 @torch.no_grad()
-def _rft_rollout(env, policy, preprocessor, postprocessor, device, action_dim, desc=""):
+def _rft_rollout(env, policy, preprocessor, postprocessor, device, action_dim,
+                 desc="", max_steps_cap=0):
     """One batched rollout. Returns a flat list of (obs_t, action_chunk, is_pad)
     samples harvested ONLY from successful episodes. Non-success episode buffers
     are dropped as soon as they terminate, to bound peak memory."""
@@ -252,6 +254,9 @@ def _rft_rollout(env, policy, preprocessor, postprocessor, device, action_dim, d
     act_hist = [[] for _ in range(B)]
     done = np.zeros(B, dtype=bool)
     max_steps = int(env.call("_max_episode_steps")[0])
+    if max_steps_cap > 0:
+        max_steps = min(max_steps, max_steps_cap)   # --rft.max_steps: stop early (episodes
+        #   not done by here are dropped — they almost never succeed later for this policy)
 
     samples: list = []
     n_success = 0
@@ -447,6 +452,7 @@ def main(cfg: RFTConfig):
     print(f"  n_action_steps: {policy.config.n_action_steps}  horizon: {policy.config.horizon}")
     print(f"  lr={cfg.rft.lr:.1e}  updates/iter={cfg.rft.updates_per_iter}  "
           f"train_bs={cfg.rft.train_batch_size}  buffer<={cfg.rft.buffer_size}")
+    print(f"  max_steps     : {cfg.rft.max_steps if cfg.rft.max_steps > 0 else 'env default per suite'}")
     print("=" * 64 + "\n")
 
     buffer: deque = deque(maxlen=cfg.rft.buffer_size)
@@ -460,7 +466,8 @@ def main(cfg: RFTConfig):
             for b in range(n_batches):
                 desc = f"iter{it} collect {label} [{t_idx+1}/{len(task_envs)}] b{b+1}/{n_batches}"
                 samples, n_succ, B = _rft_rollout(
-                    env, policy, preprocessor, postprocessor, device, action_dim, desc=desc,
+                    env, policy, preprocessor, postprocessor, device, action_dim,
+                    desc=desc, max_steps_cap=cfg.rft.max_steps,
                 )
                 buffer.extend(samples)
                 ep_total += B
