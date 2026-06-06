@@ -47,7 +47,10 @@ Known limitation (intentional, to keep the scaffold runnable):
     See _train_on_buffer() for the hook to mix in demo batches / add a KL anchor.
 """
 
-from __future__ import annotations
+# NOTE: do NOT add `from __future__ import annotations` here. lerobot's
+# parser.wrap reads the RAW function annotation (argspec.annotations[...]) to
+# get the config dataclass; deferred annotations would turn `RFTConfig` into a
+# string and draccus would fail with "must be called with a dataclass type".
 
 import random
 from collections import deque
