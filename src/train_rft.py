@@ -67,6 +67,14 @@ import torch
 from torch import nn
 from safetensors.torch import load_file as load_safetensors
 
+# JPEG-compress buffered frames to keep system RAM bounded (~10-15× vs raw
+# uint8). Falls back to raw uint8 tensors if opencv is unavailable.
+try:
+    import cv2
+    _USE_JPEG = True
+except Exception:
+    _USE_JPEG = False
+
 from lerobot.configs import parser
 from lerobot.configs.eval import EvalPipelineConfig
 from lerobot.envs.factory import make_env
@@ -114,8 +122,42 @@ for _cfg_mod, _pol_mod, _ in _POLICY_CLASS.values():
 # Config: EvalPipelineConfig (env / policy / eval) + an `rft` block.
 # Reuses lerobot's parser so --policy.path / --env.* behave exactly as in eval.
 # ---------------------------------------------------------------------------
+# --- LIBERO / robosuite 1.4.1 compatibility (mirrors benchmark_libero.py) ---
+# lerobot.envs.libero builds robosuite envs that expect symbols robosuite 1.4.x
+# dropped. These patches must be applied BEFORE make_env constructs the env.
+def _apply_robosuite_patches():
+    import json as _json
+    import robosuite.controllers as controllers
+    import robosuite.robots as robots
+    from robosuite.robots.robot import Robot
+
+    def _load_controller_config(custom_fpath=None, default_controller=None):
+        if custom_fpath is not None:
+            with open(custom_fpath) as f:
+                return _json.load(f)
+        return {"type": default_controller} if default_controller else {}
+
+    if not hasattr(controllers, "load_controller_config"):
+        setattr(controllers, "load_controller_config", _load_controller_config)
+    if not hasattr(robots, "SingleArm"):
+        setattr(robots, "SingleArm", Robot)
+
+
+def _start_virtual_display():
+    """Headless rendering for Colab (Xvfb + EGL). No-op if a display already exists."""
+    try:
+        from pyvirtualdisplay import Display
+        Display(visible=0, size=(1400, 900)).start()
+    except Exception as e:
+        print(f"[train_rft] virtual display not started ({type(e).__name__}: {e}); "
+              f"assuming one already exists.")
+    os.environ.setdefault("MUJOCO_GL", "egl")
+    os.environ.setdefault("DISPLAY", ":99")
+
+
 @dataclass
 class RFTParams:
+    headless: bool = True             # start Xvfb + EGL (Colab); set --rft.headless=false if you have a display
     iterations: int = 50              # collect→train cycles
     rollouts_per_task: int = 16       # episodes to roll out per task per iteration
     updates_per_iter: int = 400       # optimizer steps per iteration
@@ -123,7 +165,7 @@ class RFTParams:
     lr: float = 1e-5
     weight_decay: float = 1e-6
     grad_clip: float = 1.0
-    buffer_size: int = 20000          # max (obs, action-chunk) samples retained
+    buffer_size: int = 8000           # max (obs, action-chunk) samples retained (~0.4GB RAM w/ JPEG)
     min_buffer_to_train: int = 256    # don't train until the buffer has this many
     save_freq: int = 5                # save a checkpoint every N iterations
     output_dir: str = "outputs/rft/run"
@@ -137,11 +179,31 @@ class RFTConfig(EvalPipelineConfig):
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
+def _encode_img(t: torch.Tensor):
+    """(C,H,W) float[0,1] → compact JPEG buffer (np.uint8 1-D). Falls back to a
+    uint8 tensor when opencv is absent or the shape is unexpected."""
+    if _USE_JPEG and t.dim() == 3 and t.shape[0] in (1, 3):
+        arr = (t.clamp(0, 1).permute(1, 2, 0).contiguous().numpy() * 255).astype(np.uint8)
+        ok, buf = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        if ok:
+            return buf  # cv2 BGR convention round-trips to itself (channel order preserved)
+    return (t.clamp(0, 1) * 255).round().to(torch.uint8)
+
+
+def _decode_img(v) -> torch.Tensor:
+    """Inverse of _encode_img → (C,H,W) float[0,1]."""
+    if isinstance(v, np.ndarray):                      # JPEG buffer
+        arr = cv2.imdecode(v, cv2.IMREAD_COLOR)        # HWC uint8
+        return torch.from_numpy(arr).permute(2, 0, 1).contiguous().float() / 255.0
+    return v.float() / 255.0                            # uint8 tensor fallback
+
+
 def _slice_obs(obs: dict, i: int) -> dict:
     """Extract env i's slice of a batched lerobot obs dict, on CPU.
 
-    Images are stored as uint8 (×255) to cut buffer memory 4×; everything else
-    is kept as float. `task` is a per-env list of strings.
+    Image frames are JPEG-compressed (~10-15× less RAM than raw uint8) so the
+    success buffer doesn't blow system memory; everything else stays float.
+    `task` is a per-env list of strings.
     """
     out = {}
     for k, v in obs.items():
@@ -149,9 +211,7 @@ def _slice_obs(obs: dict, i: int) -> dict:
             out[k] = v[i] if isinstance(v, (list, tuple)) else v
         elif isinstance(v, torch.Tensor):
             t = v[i].detach().to("cpu")
-            if "image" in k:
-                t = (t.clamp(0, 1) * 255).round().to(torch.uint8)
-            out[k] = t
+            out[k] = _encode_img(t) if "image" in k else t
         else:
             out[k] = v
     return out
@@ -240,7 +300,7 @@ def _collate(batch_samples, preprocessor, device, action_dim):
         for s in batch_samples:
             t = s[0][k]
             if "image" in k:
-                t = t.float() / 255.0                   # uint8 → float [0,1]
+                t = _decode_img(t)                      # JPEG/uint8 → float [0,1]
             vals.append(t)
         batch[k] = torch.stack(vals, dim=0).to(device)
     batch["task"] = [s[0].get("task", "") for s in batch_samples]
@@ -340,6 +400,12 @@ def main(cfg: RFTConfig):
         set_seed(cfg.seed)
     out_dir = Path(cfg.rft.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # LIBERO/robosuite setup must happen BEFORE make_env builds the env.
+    if "libero" in str(cfg.env.type):
+        if cfg.rft.headless:
+            _start_virtual_display()
+        _apply_robosuite_patches()
 
     # Env / policy / processors — identical construction to lerobot-eval.
     envs = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
