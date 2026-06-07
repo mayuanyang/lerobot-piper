@@ -2,11 +2,11 @@
 Generic fine-tuning script supporting interleaved, wilro, and wiltechs_vla models.
 
 Loads a pretrained checkpoint produced by `train_community.py` and fine-tunes it
-on a single LeRobot v3 dataset. The model type is auto-detected from the
+on ONE OR MORE LeRobot v3 datasets. The model type is auto-detected from the
 checkpoint's config.json (the `model_type` field), so no --model_type flag is
-needed — just point at a checkpoint and a target dataset.
+needed — just point at a checkpoint and the target dataset(s).
 
-The downstream dataset is projected into the same canonical schema via
+Each downstream dataset is projected into the same canonical schema via
 `DatasetAdapter` (imported from `train_community`), so every pretrained weight
 transfers directly — no `state_encoder` / `action_in` / `action_out`
 re-initialisation. State dims > canonical are truncated; state dims < canonical
@@ -14,9 +14,18 @@ are zero-padded. Cameras are mapped semantically (then positional fallback),
 missing canonical cameras are zero-filled, and every camera is letterbox-padded
 + resized to the pretrained vision_input_size.
 
-Replaces the old `train_finetune_interleaved.py`. The LIBERO 90/10 per-task
-split is still available via `--train_ratio < 1.0` — for a single-task dataset
-this degenerates to a 90/10 episode split.
+Multiple datasets:
+  Pass several ids to `--dataset_id A B C` (e.g. RFT-collected rollouts + the
+  expert demos). They are concatenated via `StitchedDataset` and sampled
+  frame-uniformly by an `EpisodeAwareSampler`. Normalization is PER-DATASET:
+  each set is z-scored by ITS OWN native stats inside the adapter (the global
+  preprocessor is identity), so heterogeneous action/state scales mix correctly
+  — exactly the scheme `train_community.py` pretrains with. `--camera_map` is
+  applied to every dataset that has those native camera names (with a per-dataset
+  automatic fallback), so it assumes the datasets share a camera layout.
+
+The LIBERO 90/10 per-task split via `--train_ratio < 1.0` is applied
+independently within each dataset.
 
 Key differences vs. pretraining:
   - Lower default LR (1e-5) and shorter warmup (200 steps).
@@ -24,32 +33,29 @@ Key differences vs. pretraining:
     different `num_cameras`, `horizon`, or stale `state_dim`) abandons the
     saved Adam momentum and restarts fresh instead of crashing inside
     `_foreach_lerp_`.
-  - Per-dataset normalization: the target dataset is z-scored by ITS OWN
-    stats, matching the normalized space the pretrained action head learned in.
 
 Usage:
-    # Fine-tune an interleaved checkpoint on LIBERO
-    python src/train_finetune.py \
-        --output_dir outputs/train/libero_finetune \
-        --dataset_id lerobot/libero \
-        --resume_from_checkpoint outputs/train/community_interleaved/checkpoint-100000 \
-        --state_dim 8 \
-        --batch_size 24 \
-        --training_steps 30000
-
-    # Fine-tune a wilro checkpoint
+    # Fine-tune a wilro checkpoint on LIBERO
     python src/train_finetune.py \
         --output_dir outputs/train/libero_wilro_finetune \
         --dataset_id lerobot/libero \
         --resume_from_checkpoint outputs/train/community_wilro/checkpoint-69000 \
-        --state_dim 8 \
+        --camera_map 'image:front,image2:wrist' \
+        --batch_size 24 \
+        --training_steps 30000
+
+    # Mix RFT-collected rollouts WITH the expert demos
+    python src/train_finetune.py \
+        --output_dir outputs/train/rft_sft \
+        --dataset_id outputs/rft/collected_object lerobot/libero \
+        --resume_from_checkpoint ISdept/Wilro-il-comm-38k \
+        --camera_map 'image:front,image2:wrist' \
         --batch_size 24 \
         --training_steps 30000
 """
 from pathlib import Path
 import json
 import torch
-import pandas as pd
 from tqdm import tqdm
 import huggingface_hub
 from safetensors.torch import load_file as load_safetensors
@@ -58,7 +64,6 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetad
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import dataset_to_policy_features
 import numpy as np
-from torch.utils.data import Subset
 
 from torchvision.transforms import v2
 from transformers import get_cosine_schedule_with_warmup
@@ -69,9 +74,12 @@ from train_community import (
     CANONICAL_STATE_DIM,
     CANONICAL_ACTION_DIM,
     DatasetAdapter,
+    StitchedDataset,
     build_camera_mapping,
-    compute_unified_stats,
     discover_state_action_dims,
+    get_sub_dataset_ep_boundaries,
+    identity_stats,
+    native_feature_stats,
     load_task_descriptions,
     get_model_components,
 )
@@ -221,6 +229,25 @@ def _resolve_camera_mapping(
     return out
 
 
+def _resolve_camera_mapping_for_dataset(
+    camera_map_spec, native_camera_keys, canon_cams_for_run, dataset_id,
+):
+    """Per-dataset camera mapping. Try the user --camera_map spec; if a dataset
+    doesn't have those native cameras, fall back to automatic semantic+positional
+    matching for that dataset (so heterogeneous sets don't hard-fail)."""
+    if camera_map_spec:
+        try:
+            return _resolve_camera_mapping(
+                camera_map_spec, native_camera_keys, canon_cams_for_run
+            )
+        except ValueError as e:
+            print(f"  [camera_map] '{dataset_id}': spec didn't apply ({e}); "
+                  f"falling back to automatic mapping for this dataset.")
+    return build_camera_mapping(
+        {dataset_id: set(native_camera_keys)}, canon_cams_for_run
+    )[dataset_id]
+
+
 # ---------------------------------------------------------------------------
 # Detect model type from checkpoint config
 # ---------------------------------------------------------------------------
@@ -242,6 +269,91 @@ def detect_model_type_from_checkpoint(local_ckpt_path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Build one per-dataset adapter + (optionally split) episode boundaries.
+# ---------------------------------------------------------------------------
+def _build_dataset_adapter(
+    dataset_id, canon_cams_for_run, canonical_state_dim, canonical_image_size,
+    obs, horizon, camera_map_spec, train_ratio,
+):
+    """Returns (adapter, ep_boundaries). The adapter z-scores state/action by this
+    dataset's OWN native stats (per-dataset normalization); ep_boundaries are
+    (start, end) frame ranges in the dataset's own index space, filtered to the
+    train split when train_ratio < 1.0."""
+    meta = LeRobotDatasetMetadata(dataset_id, force_cache_sync=True, revision="main")
+    features = dataset_to_policy_features(meta.features)
+
+    state_dims, action_dims, state_keys, action_keys = discover_state_action_dims(
+        {dataset_id: meta}
+    )
+    native_state_dim = state_dims[dataset_id]
+    native_action_dim = action_dims[dataset_id]
+    state_key = state_keys[dataset_id]
+    action_key = action_keys[dataset_id]
+    native_camera_keys = sorted(
+        k for k, ft in features.items() if ft.type is FeatureType.VISUAL
+    )
+    print(f"\n[dataset] {dataset_id}")
+    print(f"  state '{state_key}'(dim={native_state_dim}) → canonical {canonical_state_dim}")
+    print(f"  action '{action_key}'(dim={native_action_dim}) → canonical {CANONICAL_ACTION_DIM}")
+    print(f"  cameras ({len(native_camera_keys)}): {native_camera_keys}")
+
+    cam_mapping = _resolve_camera_mapping_for_dataset(
+        camera_map_spec, native_camera_keys, canon_cams_for_run, dataset_id,
+    )
+    for canon, src in cam_mapping.items():
+        print(f"    {canon:35s} ← {src if src else '<zero-padded>'}")
+
+    fps = meta.fps if getattr(meta, "fps", None) else 10
+    frame_time = 1 / fps
+    obs_temporal_window = [-i * frame_time for i in range(obs)][::-1]
+    action_temporal_window = [i * frame_time for i in range(horizon)]
+    delta_timestamps = {
+        state_key: obs_temporal_window,
+        action_key: action_temporal_window,
+        **{key: [0.0] for key in native_camera_keys},
+    }
+    base_dataset = LeRobotDataset(
+        dataset_id, delta_timestamps=delta_timestamps,
+        force_cache_sync=True, revision="main", tolerance_s=0.04,
+    )
+    print(f"  loaded: {len(base_dataset)} frames @ {fps} fps")
+    task_idx_to_desc = load_task_descriptions(base_dataset)
+
+    # Per-dataset normalization: z-score by this dataset's own native stats.
+    sst = native_feature_stats(base_dataset, state_key, native_state_dim)
+    ast = native_feature_stats(base_dataset, action_key, native_action_dim)
+    if sst is None or ast is None:
+        print(f"  [WARN] {dataset_id}: missing native stats "
+              f"(state={sst is not None}, action={ast is not None}); that feature "
+              f"is left un-normalized — mixing it with normalized sets can destabilize.")
+
+    adapter = DatasetAdapter(
+        dataset=base_dataset,
+        sub_dir=dataset_id,
+        camera_map=cam_mapping,
+        state_key=state_key,
+        action_key=action_key,
+        state_dim=native_state_dim,
+        action_dim=native_action_dim,
+        task_idx_to_desc=task_idx_to_desc,
+        canonical_state_dim=canonical_state_dim,
+        canonical_image_size=canonical_image_size,
+        state_stats=sst,
+        action_stats=ast,
+        normalize_in_adapter=True,
+    )
+
+    ep_bounds = get_sub_dataset_ep_boundaries(base_dataset)
+    if train_ratio < 1.0:
+        train_eps = get_per_task_train_episodes(base_dataset.hf_dataset, train_ratio)
+        ep_ids = np.array(base_dataset.hf_dataset["episode_index"])
+        ep_bounds = [(s, e) for (s, e) in ep_bounds if int(ep_ids[s]) in train_eps]
+        print(f"  train split: kept {len(ep_bounds)} episodes")
+
+    return adapter, ep_bounds
+
+
+# ---------------------------------------------------------------------------
 # Main fine-tuning routine.
 # ---------------------------------------------------------------------------
 def train(
@@ -260,6 +372,11 @@ def train(
     gripper_encoder_tokens=100,
     noise_temporal_correlation=0.0,
 ):
+    # Accept a single id (str) or several (list) — normalize to a list.
+    dataset_ids = [dataset_id] if isinstance(dataset_id, str) else list(dataset_id)
+    if not dataset_ids:
+        raise ValueError("At least one --dataset_id is required.")
+
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
 
@@ -289,7 +406,7 @@ def train(
     print(f"  d_model:           {model_defaults['d_model']}")
     print(f"  vision_input_size: {canonical_image_size}")
     print(f"  Checkpoint:        {local_ckpt_path}")
-    print(f"  Target dataset:    {dataset_id}")
+    print(f"  Target dataset(s): {dataset_ids}")
     print(f"{'='*60}\n")
 
     # Canonical state dim for THIS run. Defaults to the pretraining canonical
@@ -305,39 +422,10 @@ def train(
     checkpoint_freq = 1000
     image_transforms = get_augmentations()
 
-    # ── Dataset metadata + canonical projection setup ────────────────────────
-    dataset_metadata = LeRobotDatasetMetadata(dataset_id, force_cache_sync=True, revision="main")
-    features = dataset_to_policy_features(dataset_metadata.features)
-    output_features = {k: ft for k, ft in features.items() if ft.type is FeatureType.ACTION}
-    input_features = {k: ft for k, ft in features.items() if k not in output_features}
-
-    if not output_features:
-        raise ValueError("No output features (actions) found.")
-
-    print('input_features:', list(input_features.keys()))
-    print('output_features:', list(output_features.keys()))
-
-    # Native dims/keys from the downstream dataset.
-    state_dims, action_dims, state_keys, action_keys = discover_state_action_dims(
-        {dataset_id: dataset_metadata}
-    )
-    native_state_dim = state_dims[dataset_id]
-    native_action_dim = action_dims[dataset_id]
-    state_key = state_keys[dataset_id]
-    action_key = action_keys[dataset_id]
-    print(f"Native state_key='{state_key}' (dim={native_state_dim})  →  canonical {canonical_state_dim}")
-    print(f"Native action_key='{action_key}' (dim={native_action_dim})  →  canonical {CANONICAL_ACTION_DIM}")
-
-    # Native camera keys from this dataset.
-    native_camera_keys = sorted(
-        k for k, ft in input_features.items() if ft.type is FeatureType.VISUAL
-    )
-    print(f"Native cameras ({len(native_camera_keys)}): {native_camera_keys}")
-
-    # Canonical camera subset: read from pretrained checkpoint's config.json
-    # so num_cameras and camera list match exactly.
+    # ── Read pretrained config ONCE (camera set, robot tokens, gripper cam) ──
     canon_cams_for_run = list(CANONICAL_CAMERAS)
     pre_gripper_camera: str | None = None
+    pre_cfg: dict = {}
     for cfg_name in ("config.json", "pretrained_config.json"):
         cfg_file = local_ckpt_path / cfg_name
         if cfg_file.exists():
@@ -349,11 +437,7 @@ def train(
                 print(f"Using pretrained camera set ({len(canon_cams_for_run)}): "
                       f"{canon_cams_for_run}")
             # Inherit the robot-token structure from the checkpoint so the
-            # fine-tune matches what the backbone was pretrained with. Token
-            # count is shape-safe to change, but a mismatch shifts the robot
-            # pathway's input distribution for no reason. Checkpoint wins;
-            # CLI value is only the fallback for older checkpoints that don't
-            # record these fields.
+            # fine-tune matches what the backbone was pretrained with.
             if pre_cfg.get("robot_encoder_tokens") is not None:
                 if pre_cfg["robot_encoder_tokens"] != robot_encoder_tokens:
                     print(f"[inherit] robot_encoder_tokens {robot_encoder_tokens} "
@@ -365,25 +449,9 @@ def train(
                           f"→ {pre_cfg['gripper_encoder_tokens']} (from checkpoint)")
                 gripper_encoder_tokens = pre_cfg["gripper_encoder_tokens"]
             pre_gripper_camera = pre_cfg.get("gripper_camera")
-            # Also read pretrained config values that may affect fine-tuning
-            pretrain_step = pre_cfg.get("training_step", 0)
-            print(f"Pretrained checkpoint was at step {pretrain_step}; "
+            print(f"Pretrained checkpoint was at step {pre_cfg.get('training_step', 0)}; "
                   f"fine-tune starts at step 0")
             break
-
-    if camera_map:
-        cam_mapping = _resolve_camera_mapping(
-            camera_map, native_camera_keys, canon_cams_for_run
-        )
-        print(f"Canonical camera mapping (user --camera_map='{camera_map}', "
-              f"unspecified slots auto-filled):")
-    else:
-        cam_mapping = build_camera_mapping(
-            {dataset_id: set(native_camera_keys)}, canon_cams_for_run
-        )[dataset_id]
-        print("Canonical camera mapping (automatic: semantic match + positional fallback):")
-    for canon, src in cam_mapping.items():
-        print(f"  {canon:35s} ← {src if src else '<zero-padded>'}")
 
     # ── Build cfg with canonical dims (matching pretraining checkpoint) ──────
     obs = 2
@@ -411,7 +479,6 @@ def train(
         ),
     }
 
-    # Build config kwargs — common fields for all model types
     cfg_kwargs = dict(
         input_features=canon_input_features,
         output_features=canon_output_features,
@@ -428,41 +495,27 @@ def train(
         vision_lora_num_layers=0,
         num_latent_tokens=8,
         noise_temporal_correlation=noise_temporal_correlation,
-        # Fine-tuning LR/warmup defaults
         optimizer_lr=learning_rate,
         scheduler_warmup_steps=warmup_steps,
         robot_encoder_tokens=robot_encoder_tokens,
     )
 
-    # Model-specific fields
     if model_type == "interleaved":
         cfg_kwargs["vlm_attends_to_expert"] = True
         cfg_kwargs["gripper_encoder_tokens"] = gripper_encoder_tokens
     elif model_type == "wilro":
         cfg_kwargs["gripper_encoder_tokens"] = gripper_encoder_tokens
         cfg_kwargs["use_robot_cnn"] = True
-        # Preserve kv_capture_strategy from pretrained checkpoint
-        for cfg_name in ("config.json", "pretrained_config.json"):
-            cfg_file = local_ckpt_path / cfg_name
-            if cfg_file.exists():
-                with open(cfg_file) as f:
-                    pre_cfg = json.load(f)
-                kv_strat = pre_cfg.get("kv_capture_strategy")
-                if kv_strat:
-                    cfg_kwargs["kv_capture_strategy"] = kv_strat
-                    print(f"KV capture strategy (from checkpoint): {kv_strat}")
-                kv_layers = pre_cfg.get("kv_capture_layers")
-                if kv_layers:
-                    cfg_kwargs["kv_capture_layers"] = kv_layers
-                break
+        kv_strat = pre_cfg.get("kv_capture_strategy")
+        if kv_strat:
+            cfg_kwargs["kv_capture_strategy"] = kv_strat
+            print(f"KV capture strategy (from checkpoint): {kv_strat}")
+        kv_layers = pre_cfg.get("kv_capture_layers")
+        if kv_layers:
+            cfg_kwargs["kv_capture_layers"] = kv_layers
     elif model_type == "wiltechs_vla":
         cfg_kwargs["use_robot_cnn"] = True
 
-    # Gripper densification target. Inherit from the checkpoint (so it matches
-    # pretraining); fall back to the community canonical close-range cam
-    # "observation.images.wrist" — NOT the config default ".gripper", which
-    # matches no camera in the front/wrist/top set and silently disables the
-    # dense grid.
     if model_type in ("interleaved", "wilro"):
         cfg_kwargs["gripper_camera"] = pre_gripper_camera or "observation.images.wrist"
 
@@ -473,35 +526,18 @@ def train(
         print(f"Gripper cam '{cfg.gripper_camera}': {gripper_encoder_tokens} "
               f"({int(gripper_encoder_tokens ** 0.5)}x{int(gripper_encoder_tokens ** 0.5)} grid)")
 
-    # ── Build the dataset adapter ────────────────────────────────────────────
-    fps = dataset_metadata.fps if hasattr(dataset_metadata, "fps") and dataset_metadata.fps else 10
-    frame_time = 1 / fps
-    obs_temporal_window = [-i * frame_time for i in range(obs)][::-1]
-    action_temporal_window = [i * frame_time for i in range(horizon)]
-    delta_timestamps = {
-        state_key: obs_temporal_window,
-        action_key: action_temporal_window,
-        **{key: [0.0] for key in native_camera_keys},
-    }
-    base_dataset = LeRobotDataset(
-        dataset_id, delta_timestamps=delta_timestamps,
-        force_cache_sync=True, revision="main", tolerance_s=0.04,
-    )
-    print(f"Dataset loaded: {len(base_dataset)} total frames")
-    task_idx_to_desc = load_task_descriptions(base_dataset)
-    print(f"Loaded {len(task_idx_to_desc)} task descriptions")
-    canonical_dataset = DatasetAdapter(
-        dataset=base_dataset,
-        sub_dir=dataset_id,
-        camera_map=cam_mapping,
-        state_key=state_key,
-        action_key=action_key,
-        state_dim=native_state_dim,
-        action_dim=native_action_dim,
-        task_idx_to_desc=task_idx_to_desc,
-        canonical_state_dim=canonical_state_dim,
-        canonical_image_size=canonical_image_size,
-    )
+    # ── Build per-dataset adapters + stitch ──────────────────────────────────
+    adapters, all_boundaries = [], []
+    for did in dataset_ids:
+        adapter, ep_bounds = _build_dataset_adapter(
+            did, canon_cams_for_run, canonical_state_dim, canonical_image_size,
+            obs, horizon, camera_map, train_ratio,
+        )
+        adapters.append(adapter)
+        all_boundaries.append(ep_bounds)
+
+    stitched = StitchedDataset(adapters, all_boundaries)
+    ep_from, ep_to = stitched.get_episode_boundaries()
 
     # ── Build policy: resume from pretrained checkpoint ──────────────────────
     print(f"\nFine-tuning from pretrained checkpoint: {resume_from_checkpoint}")
@@ -515,7 +551,6 @@ def train(
         model_file = candidates[0]
 
     step, epoch = 0, 0
-
     ckpt_state = load_safetensors(model_file, device=str(device))
 
     policy.train()
@@ -538,37 +573,24 @@ def train(
                 policy.model.lang_attn_bias.zero_()
                 print("Reset lang_attn_bias → 0")
             if hasattr(policy.model, "lang_adaptor"):
-                rms_gamma = policy.model.lang_adaptor[1].weight
-                rms_gamma.fill_(1.0)
-                print(f"Reset lang_adaptor RMSNorm gamma → 1 "
-                      f"(new norm = {rms_gamma.norm().item():.3f})")
+                policy.model.lang_adaptor[1].weight.fill_(1.0)
+                print("Reset lang_adaptor RMSNorm gamma → 1")
     else:
         if hasattr(policy.model, "lang_attn_bias"):
-            bias = policy.model.lang_attn_bias.detach()
-            sp = torch.nn.functional.softplus(bias).cpu()
+            sp = torch.nn.functional.softplus(policy.model.lang_attn_bias.detach()).cpu()
             print(f"lang_attn_bias on resume — per-layer softplus: "
                   f"min={sp.min().item():.3f} max={sp.max().item():.3f} "
                   f"mean={sp.mean().item():.3f}")
-        if hasattr(policy.model, "lang_adaptor"):
-            norm = policy.model.lang_adaptor[1].weight.norm().item()
-            print(f"lang_adaptor RMSNorm gamma norm: {norm:.3f}")
 
-    # Stats: normalize the target by ITS OWN stats (per-dataset z-score).
-    # The community base was pretrained with per-dataset normalization, so
-    # its saved preprocessor is the IDENTITY for state/action — loading it
-    # would leave the target un-normalized. Recomputing the target's own
-    # mean/std here reproduces the exact normalized space the pretrained
-    # action head learned in (every pretrain sub-dataset was z-scored by its
-    # own stats too), so the head transfers with no scale shift.
-    print(f"Computing target-dataset stats at state_dim={canonical_state_dim} "
-          f"(per-dataset normalization; base preprocessor is identity, not reused)")
-    stats = compute_unified_stats(
-        [canonical_dataset], canon_cams_for_run,
-        canonical_state_dim, CANONICAL_ACTION_DIM,
-    )
-    preprocessor, postprocessor = processor_fn(
-        policy.config, dataset_stats=stats
-    )
+    # ── Stats: PER-DATASET normalization → global preprocessor is identity ───
+    # Each adapter already z-scores its state/action by its own native stats
+    # (normalize_in_adapter=True), reproducing the per-dataset normalized space
+    # the pretrained action head learned in. So the global preprocessor must be
+    # identity for state/action (VISUAL is IDENTITY anyway).
+    stats = identity_stats(canon_cams_for_run, canonical_state_dim, CANONICAL_ACTION_DIM)
+    preprocessor, postprocessor = processor_fn(policy.config, dataset_stats=stats)
+    print("\nPer-dataset normalization ON: each dataset is z-scored by its own "
+          "native stats in the adapter; global preprocessor is identity.")
 
     trainable_params = [p for p in policy.model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable_params, lr=learning_rate, weight_decay=1e-6)
@@ -599,29 +621,6 @@ def train(
 
     if isinstance(preprocessor, torch.nn.Module):
         preprocessor.to(device)
-    print(f"Dataset FPS: {fps}")
-
-    # ── Optional per-task train split ───────────────────────────────────
-    all_episode_ids = np.array(base_dataset.hf_dataset["episode_index"])
-    if train_ratio < 1.0:
-        train_episodes = get_per_task_train_episodes(base_dataset.hf_dataset, train_ratio)
-        valid_indices = [i for i, ep in enumerate(all_episode_ids) if int(ep) in train_episodes]
-        train_subset = Subset(canonical_dataset, valid_indices)
-        ep_ids_subset = all_episode_ids[np.array(valid_indices)]
-    else:
-        train_subset = canonical_dataset
-        ep_ids_subset = all_episode_ids
-        valid_indices = None
-    print(f"Training subset: {len(train_subset)} frames "
-          f"({'no split' if valid_indices is None else f'from {len(train_episodes)} episodes'})")
-
-    # EpisodeAwareSampler boundaries against the (possibly subset) index space.
-    if len(ep_ids_subset) > 0:
-        ep_changes = np.where(np.diff(ep_ids_subset) != 0)[0] + 1
-        ep_from = np.concatenate([[0], ep_changes]).tolist()
-        ep_to = np.concatenate([ep_changes, [len(ep_ids_subset)]]).tolist()
-    else:
-        ep_from, ep_to = [0], [0]
 
     sampler = EpisodeAwareSampler(
         dataset_from_indices=ep_from,
@@ -631,10 +630,10 @@ def train(
         shuffle=True,
     )
 
-    print(f"Batch size: {batch_size}  ({model_type} model, d_model={model_defaults['d_model']}; "
+    print(f"\nBatch size: {batch_size}  ({model_type} model, d_model={model_defaults['d_model']}; "
           f"drop to 16 if you OOM)")
     dataloader = torch.utils.data.DataLoader(
-        train_subset,
+        stitched,
         num_workers=8,
         batch_size=batch_size,
         sampler=sampler,
@@ -662,9 +661,11 @@ def train(
             batch = apply_joint_augmentations(batch, canonical_state_key)
 
             if step == 0:
-                raw_st = batch[canonical_state_key].float()
-                print(f"\nRaw (pre-norm) {canonical_state_key}: "
-                      f"min={raw_st.min():.4f} max={raw_st.max():.4f} std={raw_st.std():.4f}")
+                # State is already per-dataset normalized in the adapter, so this
+                # should read ~unit-scale; a wild range flags a stats problem.
+                norm_st = batch[canonical_state_key].float()
+                print(f"\n(post-adapter-norm) {canonical_state_key}: "
+                      f"min={norm_st.min():.4f} max={norm_st.max():.4f} std={norm_st.std():.4f}")
 
             batch = preprocessor(batch)
 
@@ -798,7 +799,6 @@ def _log_gradient_analysis(policy, step, model_type):
         cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in ordered)
         label = "self-attn" if xstats else "attn     "
         print(f"  Action→ {label} : {cells}")
-    # wilro only: cross-attn to the VLM KV cache (vision vs language).
     if xstats:
         cells = "  ".join(f"{k}={xstats[k]*100:5.1f}%" for k in ("vision", "language") if k in xstats)
         print(f"  Action→ x-attn     : {cells}    (cross-attn to VLM KV)")
@@ -821,14 +821,16 @@ if __name__ == "__main__":
     )
     parser.add_argument("--output_dir", type=str, required=True,
                         help="Output directory for fine-tuned checkpoints")
-    parser.add_argument("--dataset_id", type=str, required=True,
-                        help="Any LeRobot v3 dataset id (HF hub or local path).")
+    parser.add_argument("--dataset_id", type=str, required=True, nargs="+",
+                        help="One or more LeRobot v3 dataset ids (HF hub or local paths). "
+                             "Pass several to mix (e.g. RFT-collected rollouts + expert demos); "
+                             "they're concatenated and each is normalized by its own stats.")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                         help="Pretrained checkpoint produced by train_community.py. "
                              "Model type is auto-detected from config.json.")
     parser.add_argument("--train_ratio", type=float, default=1.0,
-                        help="Per-task train ratio. 1.0 = use everything (default for "
-                             "fine-tuning). 0.9 = LIBERO-convention 90/10 episode split.")
+                        help="Per-task train ratio, applied within EACH dataset. 1.0 = use "
+                             "everything (default). 0.9 = LIBERO-convention 90/10 episode split.")
     parser.add_argument("--batch_size", type=int, default=64,
                         help="Batch size. interleaved/wilro: 24-64, wiltechs_vla: 8-24 "
                              "(4B VLM is memory-heavy).")
@@ -846,28 +848,19 @@ if __name__ == "__main__":
                              "the pretrained language pathway.")
     parser.add_argument("--state_dim", type=int, default=None,
                         help="Override the canonical state dim for this run (default: "
-                             f"{CANONICAL_STATE_DIM}, inherited from pretraining). Set to 8 to "
-                             "keep LIBERO's full 8-dim state instead of truncating to 7. "
-                             "When set, state_encoder[0] re-inits (only that weight depends "
-                             "on state_dim) and normalization stats are recomputed at the new "
-                             "dim. Action dim is unaffected.")
+                             f"{CANONICAL_STATE_DIM}, inherited from pretraining). When set, "
+                             "state_encoder[0] re-inits and normalization is done at the new dim.")
     parser.add_argument("--camera_map", type=str, default=None,
                         help="Manual native→canonical camera mapping, comma-separated "
-                             "pairs of the form 'native_short:canonical_short'. "
-                             "Pin a camera to a slot whose pretraining content prior "
-                             "matches its semantic content (slot 0 'front' = scene view, "
-                             "slot 1 'gripper' = wrist-mount, slot 2 'right' = side, ...). "
-                             "Cameras not mentioned are auto-assigned to remaining slots "
-                             "via positional fallback. Example: "
-                             "--camera_map 'image:gripper,image2:front,image3:right'")
+                             "pairs 'native_short:canonical_short'. Applied to every dataset "
+                             "that has those native cameras (per-dataset automatic fallback "
+                             "otherwise). Example: --camera_map 'image:front,image2:wrist'")
     parser.add_argument("--robot_encoder_tokens", type=int, default=49,
                         help="Robot CNN tokens per non-gripper camera. Perfect square "
-                             "(grid side = sqrt). Default: 49 (7x7).")
+                             "(grid side = sqrt). Default: 49 (7x7). Overridden by checkpoint.")
     parser.add_argument("--gripper_encoder_tokens", type=int, default=100,
-                        help="Robot CNN tokens for the gripper/wrist camera (close-range "
-                             "placement precision). Perfect square; set equal to "
-                             "--robot_encoder_tokens to disable the per-camera difference. "
-                             "Used by interleaved and wilro models only.")
+                        help="Robot CNN tokens for the gripper/wrist camera. Perfect square. "
+                             "Used by interleaved and wilro models only. Overridden by checkpoint.")
     parser.add_argument("--noise_temporal_correlation", type=float, default=0.0,
                         help="AR(1) coefficient correlating the flow-matching source noise "
                              "along the action horizon (0=white; ~0.9=temporally smooth). "

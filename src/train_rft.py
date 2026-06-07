@@ -177,6 +177,16 @@ class RFTParams:
     # self-imitating its own successes. 0 = off. ~0.3 = 30% of updates use demos.
     demo_dataset: str = ""            # e.g. "lerobot/libero" (must share the policy's obs/action space)
     demo_fraction: float = 0.0        # probability each update trains on a demo batch instead of RFT
+    # --- collect-only: decouple slow sim from training -----------------------
+    # When set, skip ALL training. Roll out, keep only successful episodes, and
+    # write them to a LeRobot v3 dataset on disk (raw images/state/env-space
+    # action/task). Then run ordinary SFT with src/train_finetune.py on that
+    # dataset — no sim in the training loop. `iterations` x `rollouts_per_task`
+    # controls how much is collected.
+    collect_only: bool = False
+    save_dataset_dir: str = ""        # output dataset root (default: <output_dir>/collected_dataset)
+    save_dataset_repo_id: str = "rft/collected"  # local repo_id label (no hub push)
+    save_fps: int = 20                # fps stamped into the dataset (set to match your demo set)
 
 
 @dataclass
@@ -304,6 +314,178 @@ def _rft_rollout(env, policy, preprocessor, postprocessor, device, action_dim,
 
     pbar.close()
     return samples, n_success, B
+
+
+# ---------------------------------------------------------------------------
+# Collect-only: harvest successful episodes → write a LeRobot v3 dataset.
+# Decouples the slow sim from training so you can SFT later with train_finetune.
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def _rft_collect_episodes(env, policy, preprocessor, postprocessor, device,
+                          desc="", max_steps_cap=0):
+    """One batched rollout. Returns (episodes, n_success, B) where `episodes` is a
+    list of SUCCESSFUL episodes, each a list of per-frame dicts holding RAW
+    (un-normalized) data ready to write to a LeRobot dataset:
+        {<cam_key>: jpeg-buffer, "observation.state": tensor,
+         "action": env-space tensor, "task": str}
+    The action stored is the env-space action actually executed (postprocessor
+    output), so train_finetune re-normalizes it with the dataset's own stats —
+    exactly like a normal expert-demo dataset."""
+    policy.eval()
+    policy.reset()
+    obs, _ = env.reset()
+    B = env.num_envs
+    frames: list[list[dict]] = [[] for _ in range(B)]
+    done = np.zeros(B, dtype=bool)
+    max_steps = int(env.call("_max_episode_steps")[0])
+    if max_steps_cap > 0:
+        max_steps = min(max_steps, max_steps_cap)
+
+    episodes: list[list[dict]] = []
+    n_success = 0
+    step = 0
+    pbar = tqdm(total=max_steps, desc=desc, leave=False, dynamic_ncols=True)
+    while not np.all(done) and step < max_steps:
+        obs_lr = preprocess_observation(obs)            # → lerobot keys, float images
+        obs_lr = add_envs_task(env, obs_lr)             # inject per-env "task" string
+        proc = preprocessor(obs_lr)
+        with torch.inference_mode():
+            norm_action = policy.select_action(proc)    # (B, action_dim) — NORMALIZED
+        env_action = postprocessor(norm_action.clone())  # → env (un-normalized) space
+
+        for i in range(B):
+            if done[i]:
+                continue
+            fr: dict = {}
+            for k, v in obs_lr.items():
+                if k == "task":
+                    fr["task"] = v[i] if isinstance(v, (list, tuple)) else v
+                elif isinstance(v, torch.Tensor):
+                    t = v[i].detach().to("cpu")
+                    if "image" in k:
+                        fr[k] = _encode_img(t)          # JPEG to bound RAM during rollout
+                    elif "state" in k:
+                        fr[k] = t.float()
+            fr["action"] = env_action[i].detach().to("cpu").float()
+            frames[i].append(fr)
+
+        obs, _, terminated, truncated, info = env.step(env_action.to("cpu").numpy())
+        successes = (
+            info["final_info"]["is_success"]
+            if "final_info" in info else np.zeros(B, dtype=bool)
+        )
+        newly_done = (terminated | truncated) & (~done)
+        for i in range(B):
+            if newly_done[i]:
+                if bool(successes[i]):
+                    episodes.append(frames[i])
+                    n_success += 1
+                frames[i] = []                          # free either way
+        done = terminated | truncated | done
+        step += 1
+        pbar.update(1)
+        pbar.set_postfix(done=f"{int(done.sum())}/{B}", success=n_success)
+
+    pbar.close()
+    return episodes, n_success, B
+
+
+def _create_collect_dataset(save_dir: str, repo_id: str, fps: int,
+                            sample_obs_lr: dict, action_dim: int):
+    """Build an empty LeRobot v3 dataset whose schema matches the env obs +
+    env-space action. Returns (dataset, cam_keys, state_key)."""
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    root = Path(save_dir)
+    if root.exists() and any(root.iterdir()):
+        raise FileExistsError(
+            f"--rft.save_dataset_dir '{root}' is not empty. Pick a fresh dir or "
+            f"delete it (LeRobotDataset.create won't overwrite an existing dataset)."
+        )
+
+    cam_keys = sorted(
+        k for k, v in sample_obs_lr.items()
+        if "image" in k and isinstance(v, torch.Tensor)
+    )
+    state_key = ("observation.state" if "observation.state" in sample_obs_lr
+                 else next((k for k in sample_obs_lr if "state" in k), "observation.state"))
+
+    features: dict = {}
+    for ck in cam_keys:
+        t = sample_obs_lr[ck][0]                        # (C, H, W)
+        c, h, w = int(t.shape[0]), int(t.shape[1]), int(t.shape[2])
+        features[ck] = {"dtype": "video", "shape": (c, h, w),
+                        "names": ["channels", "height", "width"]}
+    sdim = int(sample_obs_lr[state_key][0].numel())
+    features[state_key] = {"dtype": "float32", "shape": (sdim,), "names": None}
+    features["action"] = {"dtype": "float32", "shape": (action_dim,), "names": None}
+
+    ds = LeRobotDataset.create(
+        repo_id=repo_id, fps=fps, features=features, root=str(root),
+        use_videos=True, image_writer_processes=0, image_writer_threads=4,
+    )
+    print(f"[collect] created LeRobot dataset at {root}")
+    print(f"[collect]   cameras={cam_keys}  state='{state_key}'(dim={sdim})  action(dim={action_dim})  fps={fps}")
+    return ds, cam_keys, state_key
+
+
+def _write_episode(ds, episode_frames: list[dict], cam_keys: list[str], state_key: str):
+    """Decode one successful episode's frames and append to the dataset."""
+    for fr in episode_frames:
+        frame: dict = {"task": fr.get("task", "")}
+        for ck in cam_keys:
+            frame[ck] = _decode_img(fr[ck]).numpy()     # (C, H, W) float[0,1]
+        frame[state_key] = fr[state_key].numpy().astype(np.float32)
+        frame["action"] = fr["action"].numpy().astype(np.float32)
+        ds.add_frame(frame)
+    ds.save_episode()
+
+
+def _run_collect_only(cfg, task_envs, policy, preprocessor, postprocessor, device, action_dim):
+    """Roll out, keep successes, stream them into a LeRobot v3 dataset. No training."""
+    save_dir = cfg.rft.save_dataset_dir or str(Path(cfg.rft.output_dir) / "collected_dataset")
+    _obs0, _ = task_envs[0][1].reset()
+    _obs0 = preprocess_observation(_obs0)
+    ds, cam_keys, state_key = _create_collect_dataset(
+        save_dir, cfg.rft.save_dataset_repo_id, cfg.rft.save_fps, _obs0, action_dim,
+    )
+
+    print("\n" + "=" * 64)
+    print("RFT collect-only  (sim → LeRobot dataset, no training)")
+    print("=" * 64)
+    print(f"  policy     : {cfg.policy.type}  (path={cfg.policy.pretrained_path})")
+    print(f"  device     : {device}")
+    print(f"  env/task   : {cfg.env.type}/{cfg.env.task}  ({len(task_envs)} task env(s))")
+    print(f"  collect    : {cfg.rft.iterations} pass(es) x {cfg.rft.rollouts_per_task} rollouts/task")
+    print(f"  max_steps  : {cfg.rft.max_steps if cfg.rft.max_steps > 0 else 'env default per suite'}")
+    print(f"  dataset    : {save_dir}  (fps={cfg.rft.save_fps})")
+    print("=" * 64 + "\n")
+
+    total_ep, total_succ, saved = 0, 0, 0
+    for it in range(1, cfg.rft.iterations + 1):
+        for t_idx, (label, env) in enumerate(task_envs):
+            n_batches = -(-cfg.rft.rollouts_per_task // env.num_envs)  # ceil
+            for b in range(n_batches):
+                desc = f"pass{it} collect {label} [{t_idx+1}/{len(task_envs)}] b{b+1}/{n_batches}"
+                episodes, n_succ, B = _rft_collect_episodes(
+                    env, policy, preprocessor, postprocessor, device,
+                    desc=desc, max_steps_cap=cfg.rft.max_steps,
+                )
+                for ep in episodes:
+                    _write_episode(ds, ep, cam_keys, state_key)
+                    saved += 1
+                total_ep += B
+                total_succ += n_succ
+                print(f"  {desc}: {n_succ}/{B} success  (saved episodes={saved})", flush=True)
+
+    print(f"\n[collect] done: {total_succ}/{total_ep} successful episodes "
+          f"({100.0 * total_succ / max(1, total_ep):.1f}%) → {saved} written to {save_dir}")
+    print("\nNext — ordinary SFT on the collected dataset (no sim in the loop):")
+    print(f"  python src/train_finetune.py \\")
+    print(f"    --output_dir outputs/train/rft_sft \\")
+    print(f"    --dataset_id {save_dir} \\")
+    print(f"    --resume_from_checkpoint {cfg.policy.pretrained_path} \\")
+    print(f"    --camera_map '<native:canonical,...>' --batch_size 24 --training_steps 30000")
 
 
 def _collate(batch_samples, preprocessor, device, action_dim):
@@ -531,6 +713,13 @@ def main(cfg: RFTConfig):
         for suite, by_task in envs.items()
         for tid, e in by_task.items()
     ]
+
+    # Collect-only: decouple the slow sim from training. Harvest successful
+    # episodes into a LeRobot dataset and stop — SFT later with train_finetune.
+    if cfg.rft.collect_only:
+        _run_collect_only(cfg, task_envs, policy, preprocessor, postprocessor, device, action_dim)
+        print("\nCollect-only complete (no training).")
+        return
 
     # Demo anchoring: build the demo dataset, mapping its cameras to the env's
     # raw obs keys so demo batches flow through the SAME preprocessor as RFT obs.
