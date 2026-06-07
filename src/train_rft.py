@@ -462,23 +462,37 @@ def _run_collect_only(cfg, task_envs, policy, preprocessor, postprocessor, devic
     print("=" * 64 + "\n")
 
     total_ep, total_succ, saved = 0, 0, 0
-    for it in range(1, cfg.rft.iterations + 1):
-        for t_idx, (label, env) in enumerate(task_envs):
-            n_batches = -(-cfg.rft.rollouts_per_task // env.num_envs)  # ceil
-            for b in range(n_batches):
-                desc = f"pass{it} collect {label} [{t_idx+1}/{len(task_envs)}] b{b+1}/{n_batches}"
-                episodes, n_succ, B = _rft_collect_episodes(
-                    env, policy, preprocessor, postprocessor, device,
-                    desc=desc, max_steps_cap=cfg.rft.max_steps,
-                )
-                for ep in episodes:
-                    _write_episode(ds, ep, cam_keys, state_key)
-                    saved += 1
-                total_ep += B
-                total_succ += n_succ
-                print(f"  {desc}: {n_succ}/{B} success  (saved episodes={saved})", flush=True)
+    interrupted = False
+    try:
+        for it in range(1, cfg.rft.iterations + 1):
+            for t_idx, (label, env) in enumerate(task_envs):
+                n_batches = -(-cfg.rft.rollouts_per_task // env.num_envs)  # ceil
+                for b in range(n_batches):
+                    desc = f"pass{it} collect {label} [{t_idx+1}/{len(task_envs)}] b{b+1}/{n_batches}"
+                    episodes, n_succ, B = _rft_collect_episodes(
+                        env, policy, preprocessor, postprocessor, device,
+                        desc=desc, max_steps_cap=cfg.rft.max_steps,
+                    )
+                    for ep in episodes:
+                        _write_episode(ds, ep, cam_keys, state_key)
+                        saved += 1
+                    total_ep += B
+                    total_succ += n_succ
+                    print(f"  {desc}: {n_succ}/{B} success  (saved episodes={saved})", flush=True)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n[collect] interrupted — finalizing with episodes saved so far...", flush=True)
+    finally:
+        # CRITICAL: v3 streams parquet + buffers metadata (flush every 10 eps), so
+        # without finalize() the footers/last batch are never written and the
+        # dataset CANNOT be loaded. try/finally also makes Ctrl-C safe: every
+        # episode whose save_episode() finished before the stop is kept; only the
+        # one being collected at the moment of the stop is lost.
+        ds.finalize()
+        print(f"[collect] dataset finalized → {save_dir}", flush=True)
 
-    print(f"\n[collect] done: {total_succ}/{total_ep} successful episodes "
+    status = "INTERRUPTED" if interrupted else "done"
+    print(f"\n[collect] {status}: {total_succ}/{total_ep} successful episodes "
           f"({100.0 * total_succ / max(1, total_ep):.1f}%) → {saved} written to {save_dir}")
     print("\nNext — ordinary SFT on the collected dataset (no sim in the loop):")
     print(f"  python src/train_finetune.py \\")
