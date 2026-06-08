@@ -571,6 +571,17 @@ def train(
     if model_type in ("interleaved", "wilro") and hasattr(cfg, "gripper_camera"):
         print(f"Gripper cam '{cfg.gripper_camera}': {gripper_encoder_tokens} "
               f"({int(gripper_encoder_tokens ** 0.5)}x{int(gripper_encoder_tokens ** 0.5)} grid)")
+        # Cameras here are the CANONICAL names; gripper_camera should be the
+        # canonical wrist slot. Warn if it matches none of the canonical set —
+        # then the dense grid is inert and every camera gets robot_encoder_tokens.
+        if cfg.gripper_camera in canon_cams_for_run:
+            print(f"  gripper grid ACTIVE on '{cfg.gripper_camera}' "
+                  f"→ {gripper_encoder_tokens} tokens; other cams → {robot_encoder_tokens}.")
+        else:
+            print(f"  WARNING: gripper_camera '{cfg.gripper_camera}' matches NONE of "
+                  f"{canon_cams_for_run} → gripper_encoder_tokens is INERT; every camera "
+                  f"gets robot_encoder_tokens={robot_encoder_tokens}. Ensure a camera maps "
+                  f"to the canonical wrist slot (e.g. --camera_map 'image2:wrist').")
 
     # ── Build per-dataset adapters + stitch ──────────────────────────────────
     adapters, all_boundaries = [], []
