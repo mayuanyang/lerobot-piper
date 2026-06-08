@@ -1,7 +1,7 @@
 """
 Config for the WiltechsVLA encoder-decoder flow matching policy.
 
-Backbone: Qwen/Qwen3-VL-4B-Instruct-FP8
+Backbone: Qwen/Qwen3-VL-4B-Instruct (bf16; non-FP8 to avoid the finegrained-fp8 kernel dependency)
 Architecture: Mixture-of-Transformers (MoT) — encoder-decoder with KV cache.
 
   - **Encoder (frozen VLM)**: all 36 Qwen3-VL text layers run ONCE per

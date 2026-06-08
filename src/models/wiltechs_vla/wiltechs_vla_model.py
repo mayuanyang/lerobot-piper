@@ -274,7 +274,11 @@ class DiTLayer(nn.Module):
 class WiltechsVLATransformer(nn.Module):
     """Encoder-decoder flow matching VLA built on frozen Qwen3-VL-4B."""
 
-    VLM_MODEL_ID: str = "Qwen/Qwen3-VL-4B-Instruct-FP8"
+    # Non-FP8 bf16 backbone: avoids the finegrained-fp8 CUDA kernel (which needs
+    # the `kernels` package AND an FP8-capable GPU, sm_89+/Hopper). The VLM is
+    # frozen, so this is just the bf16 view of the same weights — KV cache is
+    # numerically near-identical and FP8-pretrained checkpoints load/fine-tune fine.
+    VLM_MODEL_ID: str = "Qwen/Qwen3-VL-4B-Instruct"
 
     def __init__(self, config: WiltechsVLAConfig):
         super().__init__()
