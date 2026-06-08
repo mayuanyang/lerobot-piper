@@ -157,6 +157,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           lock_joint_index: int | None = 3, kv_capture_strategy: str = "last",
           kv_capture_layers: list | None = None,
           robot_encoder_tokens: int = 49, gripper_encoder_tokens: int = 100,
+          gripper_camera: str | None = None,
           noise_temporal_correlation: float = 0.0):
     """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model.
 
@@ -240,6 +241,13 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         print(f"All {action_dim} action dims weighted equally; "
               f"action_dim_weights={action_dim_weights}")
 
+    # The camera that gets the dense gripper_encoder_tokens grid (the rest get
+    # robot_encoder_tokens). The config default is "observation.images.gripper",
+    # which matches NO camera on LIBERO (image/image2) — leaving the dense grid
+    # silently inert. Pass --gripper_camera observation.images.image2 (the wrist /
+    # eye-in-hand view) to actually activate it.
+    gripper_camera = gripper_camera if gripper_camera is not None else WilroConfig.gripper_camera
+
     # Build wilro config
     cfg = WilroConfig(
         input_features=input_features,
@@ -261,12 +269,22 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         contrastive_margin=contrastive_margin,
         robot_encoder_tokens=robot_encoder_tokens,
         gripper_encoder_tokens=gripper_encoder_tokens,
+        gripper_camera=gripper_camera,
         noise_temporal_correlation=noise_temporal_correlation,
     )
+    gripper_active = cfg.gripper_camera in camera_keys
     print(f"Robot CNN tokens: {robot_encoder_tokens} per cam "
           f"({int(robot_encoder_tokens ** 0.5)}x{int(robot_encoder_tokens ** 0.5)} grid); "
           f"gripper cam '{cfg.gripper_camera}': {gripper_encoder_tokens} "
           f"({int(gripper_encoder_tokens ** 0.5)}x{int(gripper_encoder_tokens ** 0.5)} grid)")
+    if gripper_active:
+        print(f"  gripper grid ACTIVE on '{cfg.gripper_camera}' "
+              f"→ {gripper_encoder_tokens} tokens; other cams → {robot_encoder_tokens}.")
+    else:
+        print(f"  WARNING: gripper_camera '{cfg.gripper_camera}' matches NONE of "
+              f"{camera_keys} → gripper_encoder_tokens is INERT; every camera gets "
+              f"robot_encoder_tokens={robot_encoder_tokens}. Pass --gripper_camera "
+              f"<one of {camera_keys}> (the wrist view) to activate the dense grid.")
 
     # Model + checkpoint loading
     if resume_from_checkpoint is not None:
@@ -681,6 +699,13 @@ if __name__ == "__main__":
                              "(close-range placement precision). Perfect square; "
                              "set equal to --robot_encoder_tokens to disable the "
                              "per-camera difference.")
+    parser.add_argument("--gripper_camera", type=str, default=None,
+                        help="Which camera key gets the dense --gripper_encoder_tokens "
+                             "grid (all others get --robot_encoder_tokens). Default is "
+                             "the config's 'observation.images.gripper', which matches "
+                             "NO camera on LIBERO (image/image2) and silently disables "
+                             "the dense grid. For LIBERO pass the wrist / eye-in-hand "
+                             "view, e.g. --gripper_camera observation.images.image2.")
     parser.add_argument("--noise_temporal_correlation", type=float, default=0.0,
                         help="AR(1) coefficient correlating the flow-matching source "
                              "noise along the action horizon (0=white noise; ~0.9=temporally "
