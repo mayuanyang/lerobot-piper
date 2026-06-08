@@ -895,6 +895,7 @@ def train(
 
     adapters: list[DatasetAdapter] = []
     all_ep_boundaries: list[list[tuple[int, int]]] = []
+    dataset_stats_summary: list[tuple[str, int, int]] = []  # (sub, n_frames, n_episodes)
 
     for sub in sub_metas:
         meta = sub_metas[sub]
@@ -955,6 +956,7 @@ def train(
 
         ep_bounds = get_sub_dataset_ep_boundaries(ds)
         all_ep_boundaries.append(ep_bounds)
+        dataset_stats_summary.append((sub, len(ds), len(ep_bounds)))
         print(f"  {sub}: {len(ds)} frames, {len(ep_bounds)} episodes")
 
     if len(adapters) == 0:
@@ -980,6 +982,27 @@ def train(
         drop_last=True,
     )
     print(f"\nDataLoader: {len(dataloader)} batches/epoch, batch_size={batch_size}")
+
+    # ── Dataset statistics summary (trajectories + frames) ──────────────
+    total_frames = sum(n_f for _, n_f, _ in dataset_stats_summary)
+    total_episodes = sum(n_e for _, _, n_e in dataset_stats_summary)
+    steps_per_epoch = max(1, len(dataloader))
+    print(f"\n{'='*64}")
+    print(f"Dataset statistics ({len(dataset_stats_summary)} datasets loaded)")
+    print(f"{'='*64}")
+    print(f"  {'dataset':<34} {'frames':>10} {'episodes':>9}")
+    print(f"  {'-'*34} {'-'*10} {'-'*9}")
+    for sub, n_f, n_e in sorted(dataset_stats_summary, key=lambda x: -x[1]):
+        name = sub if len(sub) <= 34 else "…" + sub[-33:]
+        print(f"  {name:<34} {n_f:>10,} {n_e:>9,}")
+    print(f"  {'-'*34} {'-'*10} {'-'*9}")
+    print(f"  {'TOTAL':<34} {total_frames:>10,} {total_episodes:>9,}")
+    avg_len = total_frames / total_episodes if total_episodes else 0.0
+    print(f"\n  avg trajectory length: {avg_len:.1f} frames "
+          f"({avg_len / fps:.1f}s @ {fps} fps)")
+    print(f"  1 epoch = {steps_per_epoch:,} steps (batch_size={batch_size})")
+    print(f"  budget {training_steps:,} steps ≈ {training_steps / steps_per_epoch:.2f} epochs")
+    print(f"{'='*64}")
 
     # ── Build config ────────────────────────────────────────────────────
     from lerobot.configs.types import PolicyFeature
