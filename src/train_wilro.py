@@ -8,8 +8,9 @@ from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import dataset_to_policy_features
+from lerobot.datasets.compute_stats import aggregate_stats
 import numpy as np
-from torch.utils.data import Subset
+from torch.utils.data import ConcatDataset
 
 # Wilro-specific components
 from models.wilro.wilro_config import WilroConfig
@@ -157,7 +158,16 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           kv_capture_layers: list | None = None,
           robot_encoder_tokens: int = 49, gripper_encoder_tokens: int = 100,
           noise_temporal_correlation: float = 0.0):
-    """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model."""
+    """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model.
+
+    `dataset_id` may be a single id or a list. Multiple datasets are concatenated
+    and assumed HOMOGENEOUS (same robot / cameras / state+action dims / fps) — e.g.
+    several piper sets — and their normalization stats are aggregated. For
+    mixed-robot data use the canonical train_finetune.py path instead.
+    """
+    dataset_ids = [dataset_id] if isinstance(dataset_id, str) else list(dataset_id)
+    if not dataset_ids:
+        raise ValueError("At least one dataset_id is required.")
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
 
@@ -166,9 +176,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     checkpoint_freq = 1000
     image_transforms = get_augmentations()
 
-    # Load dataset metadata
-    dataset_metadata = LeRobotDatasetMetadata(dataset_id, force_cache_sync=True, revision="main")
-    features = dataset_to_policy_features(dataset_metadata.features)
+    # Load metadata for all datasets. Schema is taken from the first and the rest
+    # are validated against it (homogeneous assumption).
+    metas = {did: LeRobotDatasetMetadata(did, force_cache_sync=True, revision="main")
+             for did in dataset_ids}
+    ref_meta = metas[dataset_ids[0]]
+    features = dataset_to_policy_features(ref_meta.features)
     output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     input_features = {key: ft for key, ft in features.items() if key not in output_features}
 
@@ -183,6 +196,31 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     action_dim = next(iter(output_features.values())).shape[-1]
     print(f"Detected cameras ({len(camera_keys)}): {camera_keys}")
     print(f"State dim: {state_dim}, Action dim: {action_dim}")
+
+    # Validate the other datasets share the same schema.
+    for did in dataset_ids[1:]:
+        f = dataset_to_policy_features(metas[did].features)
+        out_f = {k: ft for k, ft in f.items() if ft.type is FeatureType.ACTION}
+        in_f = {k: ft for k, ft in f.items() if k not in out_f}
+        cks = sorted(k for k, ft in in_f.items() if ft.type is FeatureType.VISUAL)
+        sd = in_f["observation.state"].shape[-1] if "observation.state" in in_f else 7
+        ad = next(iter(out_f.values())).shape[-1]
+        if cks != camera_keys or sd != state_dim or ad != action_dim:
+            raise ValueError(
+                f"Dataset '{did}' schema differs from '{dataset_ids[0]}':\n"
+                f"  cameras {cks} vs {camera_keys}\n"
+                f"  state_dim {sd} vs {state_dim}, action_dim {ad} vs {action_dim}\n"
+                f"train_wilro.py concatenation requires a homogeneous schema. For "
+                f"mixed robots use the canonical train_finetune.py path."
+            )
+
+    # Aggregate normalization stats across datasets (count-weighted mean, global
+    # min/max, combined std). One dataset keeps its own stats unchanged.
+    if len(dataset_ids) == 1:
+        combined_stats = ref_meta.stats
+    else:
+        combined_stats = aggregate_stats([metas[did].stats for did in dataset_ids])
+        print(f"Aggregated normalization stats across {len(dataset_ids)} datasets.")
 
     # Training parameters — match train_transformer.py for like-for-like comparison
     obs = 2
@@ -288,7 +326,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
 
         preprocessor, postprocessor = make_pre_post_processors(
             policy.config,
-            dataset_stats=dataset_metadata.stats,
+            dataset_stats=combined_stats,
         )
 
         resume_lr = saved_cfg_json.get("optimizer_lr", cfg.optimizer_lr)
@@ -326,7 +364,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
 
         preprocessor, postprocessor = make_pre_post_processors(
             cfg,
-            dataset_stats=dataset_metadata.stats,
+            dataset_stats=combined_stats,
         )
         step = 0
         epoch = 0
@@ -356,8 +394,17 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     # Dataset setup — read fps from metadata instead of hardcoding. piper_arm
     # is 30 fps but libero / community datasets are commonly 10 fps; using a
     # mismatched frame_time makes every requested delta_timestamp fall outside
-    # tolerance_s and the constructor raises.
-    fps = int(getattr(dataset_metadata, "fps", 30) or 30)
+    # tolerance_s and the constructor raises. All datasets must share one fps so
+    # the action horizon means the same real time everywhere.
+    fps = int(getattr(ref_meta, "fps", 30) or 30)
+    for did in dataset_ids[1:]:
+        f2 = int(getattr(metas[did], "fps", fps) or fps)
+        if f2 != fps:
+            raise ValueError(
+                f"Dataset '{did}' fps={f2} differs from '{dataset_ids[0]}' fps={fps}. "
+                f"Resample to a common fps before mixing — the chunk horizon must "
+                f"cover the same real time across datasets."
+            )
     frame_time = 1 / fps
     print(f"Dataset fps: {fps} (frame_time={frame_time:.4f}s)")
 
@@ -376,15 +423,47 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     # `tolerance_s` must accommodate the dataset's frame interval — too tight
     # and every delta lookup raises. Half a frame is a safe upper bound.
     tolerance_s = max(0.005, frame_time / 2)
-    dataset = LeRobotDataset(
-        dataset_id, delta_timestamps=delta_timestamps,
-        force_cache_sync=True, revision="main", tolerance_s=tolerance_s,
-    )
 
-    # Build task_index → description mapping from tasks.parquet
+    # Build each dataset, concatenate, and accumulate episode boundaries in the
+    # concatenated index space (optionally filtered per-dataset by --max_episode_index).
+    sub_datasets = []
+    ep_from: list[int] = []
+    ep_to: list[int] = []
+    offset = 0
+    first_root = None
+    for did in dataset_ids:
+        ds = LeRobotDataset(
+            did, delta_timestamps=delta_timestamps,
+            force_cache_sync=True, revision="main", tolerance_s=tolerance_s,
+        )
+        if first_root is None:
+            first_root = ds.root
+        ep_ids = np.array(ds.hf_dataset["episode_index"])
+        changes = np.where(np.diff(ep_ids) != 0)[0] + 1
+        starts = np.concatenate([[0], changes])
+        ends = np.concatenate([changes, [len(ep_ids)]])
+        kept = 0
+        for s, e in zip(starts, ends):
+            if max_episode_index is not None and int(ep_ids[s]) > max_episode_index:
+                continue
+            ep_from.append(offset + int(s))
+            ep_to.append(offset + int(e))
+            kept += 1
+        suffix = f" (<= ep {max_episode_index})" if max_episode_index is not None else ""
+        print(f"  {did}: {len(ds)} frames, {kept} episodes{suffix}")
+        sub_datasets.append(ds)
+        offset += len(ds)
+
+    dataset = ConcatDataset(sub_datasets)
+    print(f"Combined dataset: {len(dataset)} frames, {len(ep_from)} episodes "
+          f"across {len(sub_datasets)} dataset(s)")
+
+    # Build task_index → description mapping from the first dataset's tasks.parquet.
+    # Batches carry the per-frame "task" string directly (preferred by the loop);
+    # for multi-dataset, task_index is dataset-local so we rely on batch["task"].
     task_idx_to_description: dict[int, str] = {}
     try:
-        tasks_parquet_path = dataset.root / "meta" / "tasks.parquet"
+        tasks_parquet_path = first_root / "meta" / "tasks.parquet"
         if tasks_parquet_path.exists():
             tasks_df = pd.read_parquet(tasks_parquet_path)
             if "task_index" in tasks_df.columns:
@@ -400,37 +479,18 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     except Exception as e:
         print(f"Warning: could not load tasks.parquet: {e}")
 
-    if dataset_metadata.stats and "observation.state" in dataset_metadata.stats:
-        s = dataset_metadata.stats["observation.state"]
+    if combined_stats and "observation.state" in combined_stats:
+        s = combined_stats["observation.state"]
         print(f"\nNorm stats observation.state:")
         print(f"  mean={s.get('mean', 'N/A')}")
         print(f"  std ={s.get('std',  'N/A')}")
     else:
-        print("WARNING: observation.state not found in dataset_metadata.stats — will not be normalized!")
-    if dataset_metadata.stats and "action" in dataset_metadata.stats:
-        s = dataset_metadata.stats["action"]
+        print("WARNING: observation.state not found in combined_stats — will not be normalized!")
+    if combined_stats and "action" in combined_stats:
+        s = combined_stats["action"]
         print(f"Norm stats action:")
         print(f"  mean={s.get('mean', 'N/A')}")
         print(f"  std ={s.get('std',  'N/A')}")
-
-    episode_ids = np.array(dataset.hf_dataset["episode_index"])
-    if max_episode_index is not None:
-        valid_indices = np.where(episode_ids <= max_episode_index)[0].tolist()
-        if len(valid_indices) == 0:
-            raise ValueError(
-                f"max_episode_index={max_episode_index} excluded every sample "
-                f"(dataset episode range: {episode_ids.min()}..{episode_ids.max()})."
-            )
-        dataset = Subset(dataset, valid_indices)
-        print(f"Dataset subset: {len(dataset)} samples (episodes <= {max_episode_index})")
-    else:
-        valid_indices = list(range(len(episode_ids)))
-        print(f"Dataset: {len(dataset)} samples (no episode filter)")
-
-    episode_ids_subset = episode_ids[np.array(valid_indices)]
-    ep_changes = np.where(np.diff(episode_ids_subset) != 0)[0] + 1
-    ep_from = np.concatenate([[0], ep_changes]).tolist()
-    ep_to = np.concatenate([ep_changes, [len(valid_indices)]]).tolist()
     sampler = EpisodeAwareSampler(
         dataset_from_indices=ep_from,
         dataset_to_indices=ep_to,
@@ -573,7 +633,10 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--dataset_id", type=str, default="ISdept/piper_arm")
+    parser.add_argument("--dataset_id", type=str, nargs="+", default=["ISdept/piper_arm"],
+                        help="One or more LeRobot dataset ids. Multiple are concatenated and "
+                             "must share a homogeneous schema (same robot/cameras/dims/fps); "
+                             "their normalization stats are aggregated.")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--gradient_checkpointing", action="store_true",
                         help="Recompute DiT activations in backward to save memory.")
