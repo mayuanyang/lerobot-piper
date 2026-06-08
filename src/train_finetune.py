@@ -250,19 +250,23 @@ def _resolve_camera_mapping_for_dataset(
 # Detect model type from checkpoint config
 # ---------------------------------------------------------------------------
 def detect_model_type_from_checkpoint(local_ckpt_path: Path) -> str:
-    """Read the model_type from the checkpoint's config.json."""
+    """Read the registered policy type from the checkpoint's config.json.
+
+    LeRobot's PreTrainedConfig stores the name registered via
+    @register_subclass(...) under the "type" key (see config.pop("type") on
+    load). Older/other configs may use "model_type", so accept both.
+    """
     for cfg_name in ("config.json", "pretrained_config.json"):
         cfg_file = local_ckpt_path / cfg_name
         if cfg_file.exists():
             with open(cfg_file) as f:
                 cfg = json.load(f)
-            # LeRobot configs store the registered name in `model_type`
-            model_type = cfg.get("model_type")
+            model_type = cfg.get("type") or cfg.get("model_type")
             if model_type:
                 return model_type
     raise ValueError(
-        f"Could not detect model_type from checkpoint at {local_ckpt_path}. "
-        "Ensure the checkpoint has a config.json with a 'model_type' field."
+        f"Could not detect the policy type from checkpoint at {local_ckpt_path}. "
+        "Ensure its config.json has a 'type' (or 'model_type') field, e.g. 'wilro'."
     )
 
 
