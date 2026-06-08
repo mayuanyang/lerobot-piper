@@ -347,12 +347,20 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
             dataset_stats=combined_stats,
         )
 
-        resume_lr = saved_cfg_json.get("optimizer_lr", cfg.optimizer_lr)
+        # The cosine scheduler's base LR must be the PEAK (pre-decay) value: the
+        # decay is reconstructed purely by fast-forwarding scheduler.step() `step`
+        # times below. The checkpoint's saved "optimizer_lr" is the ALREADY-DECAYED
+        # lr (overwritten at save time), so using it as the base double-applies the
+        # decay → peak·cos(step)². Use the config peak (cfg.optimizer_lr — not in
+        # the WilroConfig kwargs, so it's the default peak) so fast-forwarding
+        # rebuilds the correct peak·cos(step). Matches train_community.py.
+        base_lr = cfg.optimizer_lr
         resume_warmup = saved_cfg_json.get("scheduler_warmup_steps", cfg.scheduler_warmup_steps)
-        print(f"Initializing optimizer with learning rate: {resume_lr}")
+        print(f"Scheduler base (peak) LR: {base_lr:.2e}  (decay rebuilt by "
+              f"fast-forwarding to step {step})")
 
         trainable_params = [p for p in policy.model.parameters() if p.requires_grad]
-        optimizer = torch.optim.Adam(trainable_params, lr=resume_lr, weight_decay=cfg.optimizer_weight_decay)
+        optimizer = torch.optim.Adam(trainable_params, lr=base_lr, weight_decay=cfg.optimizer_weight_decay)
         print(f"Total trainable parameters: {sum(p.numel() for p in trainable_params):,}")
 
         optimizer_state_path = local_ckpt_path / "optimizer_state.pth"
@@ -360,9 +368,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
             try:
                 optimizer.load_state_dict(torch.load(optimizer_state_path, map_location=device))
                 for param_group in optimizer.param_groups:
-                    param_group['lr'] = resume_lr
-                    param_group['initial_lr'] = resume_lr
-                print(f"Optimizer state loaded. LR reset to {resume_lr}")
+                    param_group['lr'] = base_lr
+                    param_group['initial_lr'] = base_lr
+                print(f"Optimizer state loaded. Scheduler base LR set to peak {base_lr:.2e}")
             except ValueError as e:
                 print(f"Skipping optimizer state — architecture mismatch ({e})")
 
