@@ -684,73 +684,6 @@ def get_sub_dataset_ep_boundaries(dataset: LeRobotDataset) -> list[tuple[int, in
     return boundaries
 
 # ---------------------------------------------------------------------------
-# Unified statistics computation
-# ---------------------------------------------------------------------------
-def compute_unified_stats(
-    adapters: list[DatasetAdapter],
-    camera_keys: list[str],
-    state_dim: int,
-    action_dim: int,
-    max_samples: int = 5000,
-) -> dict:
-    print("\nComputing unified dataset statistics...")
-    all_states = []
-    all_actions = []
-
-    total_frames = sum(len(a) for a in adapters)
-    sample_ratio = min(1.0, max_samples / max(total_frames, 1))
-
-    for adapter in adapters:
-        n_samples = max(1, int(len(adapter) * sample_ratio))
-        indices = np.random.choice(len(adapter), n_samples, replace=False)
-        for idx in indices:
-            item = adapter[int(idx)]
-            if "observation.state" in item:
-                s = item["observation.state"]
-                if isinstance(s, torch.Tensor):
-                    s = s.numpy()
-                all_states.append(np.asarray(s).reshape(-1)[:state_dim])
-            if "action" in item:
-                a = item["action"]
-                if isinstance(a, torch.Tensor):
-                    a = a.numpy()
-                all_actions.append(np.asarray(a).reshape(-1)[:action_dim])
-
-    if len(all_states) == 0:
-        all_states = [np.zeros(state_dim)]
-    if len(all_actions) == 0:
-        all_actions = [np.zeros(action_dim)]
-
-    all_states = np.stack(all_states).astype(np.float32)
-    all_actions = np.stack(all_actions).astype(np.float32)
-
-    stats = {
-        "observation.state": {
-            "mean": torch.from_numpy(all_states.mean(axis=0)),
-            "std": torch.from_numpy(all_states.std(axis=0).clip(min=1e-6)),
-            "min": torch.from_numpy(all_states.min(axis=0)),
-            "max": torch.from_numpy(all_states.max(axis=0)),
-        },
-        "action": {
-            "mean": torch.from_numpy(all_actions.mean(axis=0)),
-            "std": torch.from_numpy(all_actions.std(axis=0).clip(min=1e-6)),
-            "min": torch.from_numpy(all_actions.min(axis=0)),
-            "max": torch.from_numpy(all_actions.max(axis=0)),
-        },
-    }
-    for cam in camera_keys:
-        stats[cam] = {
-            "mean": torch.tensor([0.0]),
-            "std": torch.tensor([1.0]),
-            "min": torch.tensor([-1.0]),
-            "max": torch.tensor([1.0]),
-        }
-    print(f"  Sampled {len(all_states)} state frames, {len(all_actions)} action frames")
-    print(f"  State mean: {stats['observation.state']['mean'].numpy()}")
-    print(f"  State std:  {stats['observation.state']['std'].numpy()}")
-    return stats
-
-# ---------------------------------------------------------------------------
 # Gradient analysis
 # ---------------------------------------------------------------------------
 def _log_gradient_analysis(policy, step: int) -> None:
@@ -855,7 +788,6 @@ def train(
     max_datasets: Optional[int] = None,
     seed: int = 42,
     version_filter: str = "v3",
-    per_dataset_norm: bool = True,
     robot_encoder_tokens: int = 49,
     gripper_encoder_tokens: int = 100,
     kv_capture_strategy: str = "last",
@@ -876,7 +808,7 @@ def train(
     workspace.mkdir(parents=True, exist_ok=True)
 
     progress_update_freq = 200
-    checkpoint_freq = 1000
+    checkpoint_freq = 2000
     image_transforms = get_augmentations()
 
     # Canonical image size is model-dependent
@@ -998,9 +930,9 @@ def train(
         ad = action_dims.get(sub, CANONICAL_ACTION_DIM)
         cmap = camera_map.get(sub, {})
 
-        sst = native_feature_stats(ds, sk, sd) if per_dataset_norm else None
-        ast = native_feature_stats(ds, ak, ad) if per_dataset_norm else None
-        if per_dataset_norm and (sst is None or ast is None):
+        sst = native_feature_stats(ds, sk, sd)
+        ast = native_feature_stats(ds, ak, ad)
+        if sst is None or ast is None:
             print(f"  [WARN] {sub}: missing native stats "
                   f"(state={sst is not None}, action={ast is not None}); "
                   f"that feature is left un-normalized for this dataset.")
@@ -1016,7 +948,7 @@ def train(
             task_idx_to_desc=task_map,
             state_stats=sst,
             action_stats=ast,
-            normalize_in_adapter=per_dataset_norm,
+            normalize_in_adapter=True,
             canonical_image_size=canonical_image_size,
         )
         adapters.append(adapter)
@@ -1116,14 +1048,13 @@ def train(
             print(f"KV capture layers: {kv_capture_layers}")
 
     # ── Dataset statistics ───────────────────────────────────────────────
-    if per_dataset_norm:
-        print("\nPer-dataset normalization ON: each sub-dataset is z-scored by its "
-              "own stats in the adapter; global preprocessor is identity.")
-        dataset_stats = identity_stats(used_canonical, CANONICAL_STATE_DIM, CANONICAL_ACTION_DIM)
-    else:
-        dataset_stats = compute_unified_stats(
-            adapters, used_canonical, CANONICAL_STATE_DIM, CANONICAL_ACTION_DIM,
-        )
+    # Per-dataset normalization: each sub-dataset is z-scored by its own native
+    # stats in the adapter, so the global preprocessor is identity. This is the
+    # right scheme for heterogeneous multi-robot community data — a single pooled
+    # mean/std across different robots would be wrong.
+    print("\nPer-dataset normalization: each sub-dataset is z-scored by its own "
+          "stats in the adapter; global preprocessor is identity.")
+    dataset_stats = identity_stats(used_canonical, CANONICAL_STATE_DIM, CANONICAL_ACTION_DIM)
 
     # ── Model setup ─────────────────────────────────────────────────────
     if resume_from_checkpoint is not None:
@@ -1354,9 +1285,6 @@ if __name__ == "__main__":
                         help="Random seed for --max_datasets sampling")
     parser.add_argument("--list_versions", action="store_true",
                         help="Classify all datasets as v3.0/v2.1/unknown and print the report, then exit")
-    parser.add_argument("--per_dataset_norm", dest="per_dataset_norm",
-                        default=True, action=argparse.BooleanOptionalAction,
-                        help="Z-score state/action per sub-dataset by its own stats (default: on)")
     parser.add_argument("--version_filter", type=str, default="v3",
                         choices=["all", "v3", "v2"],
                         help="Train only on datasets of this format (default: v3)")
