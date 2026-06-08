@@ -1046,22 +1046,30 @@ class WilroTransformer(nn.Module):
                 pair_diff = torch.ones(B, device=device, dtype=torch.bool)
 
             if pair_diff.any():
-                shuffled_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
-                for K, V in kv_cache:
-                    K_shuf = K.clone()
-                    V_shuf = V.clone()
-                    K_shuf[:, :, L_vis:L_vis + L_lang, :] = K[perm, :, L_vis:L_vis + L_lang, :]
-                    V_shuf[:, :, L_vis:L_vis + L_lang, :] = V[perm, :, L_vis:L_vis + L_lang, :]
-                    shuffled_cache.append((K_shuf, V_shuf))
-                shuffled_pad_mask = vlm_kv_pad_mask.clone()
-                shuffled_pad_mask[:, L_vis:L_vis + L_lang] = vlm_kv_pad_mask[perm][:, L_vis:L_vis + L_lang]
+                # Treat the wrong-language prediction as a FIXED negative
+                # target (stop-gradient). Building the shuffled KV cache and
+                # running the second DiT forward under no_grad frees the
+                # activations immediately instead of storing a full 309M-param
+                # backward graph — this removes the ~2x memory blow-up. The
+                # contrastive gradient still flows through v_t, pushing the
+                # correct-language prediction away from the (detached) wrong one.
+                with torch.no_grad():
+                    shuffled_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+                    for K, V in kv_cache:
+                        K_shuf = K.clone()
+                        V_shuf = V.clone()
+                        K_shuf[:, :, L_vis:L_vis + L_lang, :] = K[perm, :, L_vis:L_vis + L_lang, :]
+                        V_shuf[:, :, L_vis:L_vis + L_lang, :] = V[perm, :, L_vis:L_vis + L_lang, :]
+                        shuffled_cache.append((K_shuf, V_shuf))
+                    shuffled_pad_mask = vlm_kv_pad_mask.clone()
+                    shuffled_pad_mask[:, L_vis:L_vis + L_lang] = vlm_kv_pad_mask[perm][:, L_vis:L_vis + L_lang]
 
-                v_wrong = self._run_dit(
-                    batch, x_t.to(torch.bfloat16), t,
-                    shuffled_cache, shuffled_pad_mask,
-                    robot_tokens, latents, action_prefix,
-                    L_vis=L_vis, L_lang=L_lang,
-                ).float()
+                    v_wrong = self._run_dit(
+                        batch, x_t.to(torch.bfloat16), t,
+                        shuffled_cache, shuffled_pad_mask,
+                        robot_tokens, latents, action_prefix,
+                        L_vis=L_vis, L_lang=L_lang,
+                    ).float()
 
                 diff_sq = (v_t - v_wrong).pow(2).mean(dim=[1, 2])
                 margin = float(getattr(self.config, "contrastive_margin", 0.05))
