@@ -422,6 +422,7 @@ def train(
     gripper_encoder_tokens=100,
     gripper_camera=None,
     noise_temporal_correlation=0.0,
+    cameras=None,
 ):
     # Accept a single id (str) or several (list) — normalize to a list.
     dataset_ids = [dataset_id] if isinstance(dataset_id, str) else list(dataset_id)
@@ -503,6 +504,33 @@ def train(
             print(f"Pretrained checkpoint was at step {pre_cfg.get('training_step', 0)}; "
                   f"fine-tune starts at step 0")
             break
+
+    # ── Optionally restrict the camera set (--cameras) ──────────────────────
+    # The pretrained backbone may carry more camera slots than the fine-tune
+    # data provides (e.g. a 3-cam community base vs a 2-cam LIBERO dataset).
+    # Any slot not supplied by the data is fed a black image, which still
+    # incurs a full frozen-VLM forward + robot-CNN pass — pure wasted compute
+    # and memory. Passing --cameras drops those slots entirely. No weight is
+    # shaped by the camera count (the model just iterates + concatenates), so
+    # this loads cleanly; dropped slots must be the TRAILING ones in the
+    # pretrained order to avoid shifting the remaining tokens' positions.
+    if cameras:
+        def _canon(name: str) -> str:
+            return name if name.startswith("observation.images.") \
+                else f"observation.images.{name}"
+        requested = {_canon(c) for c in cameras}
+        unknown = requested - set(canon_cams_for_run)
+        if unknown:
+            raise ValueError(
+                f"--cameras {sorted(unknown)} not in the pretrained camera set "
+                f"{canon_cams_for_run}. Only dropping existing slots is supported."
+            )
+        kept = [c for c in canon_cams_for_run if c in requested]  # preserve order
+        dropped = [c for c in canon_cams_for_run if c not in requested]
+        if dropped:
+            print(f"--cameras: keeping {kept}; dropping {dropped} "
+                  f"(no black-image padding for these)")
+        canon_cams_for_run = kept
 
     # ── Build cfg with canonical dims (matching pretraining checkpoint) ──────
     obs = 2
@@ -940,6 +968,14 @@ if __name__ == "__main__":
                              "the checkpoint uses native names (e.g. a train_wilro LIBERO model "
                              "with image/image2), pass the wrist view directly, e.g. "
                              "--gripper_camera observation.images.image2.")
+    parser.add_argument("--cameras", type=str, nargs="+", default=None,
+                        help="Restrict the (inherited) pretrained camera set to this "
+                             "subset, dropping any other slots instead of feeding them a "
+                             "black image. Saves the wasted VLM+CNN forward on padded "
+                             "cameras and shrinks GPU memory. Use canonical names (short "
+                             "ok), e.g. --cameras front wrist for a 2-cam LIBERO fine-tune "
+                             "off a 3-cam community base. Dropped slots must be trailing in "
+                             "the pretrained order; keep --gripper_camera's view in the set.")
     parser.add_argument("--noise_temporal_correlation", type=float, default=0.0,
                         help="AR(1) coefficient correlating the flow-matching source noise "
                              "along the action horizon (0=white; ~0.9=temporally smooth). "
