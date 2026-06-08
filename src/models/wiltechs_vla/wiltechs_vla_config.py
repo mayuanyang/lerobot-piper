@@ -41,9 +41,9 @@ class WiltechsVLAConfig(PreTrainedConfig):
     """Configuration for the WiltechsVLA interleaved flow matching policy."""
 
     # -------- I/O structure --------
-    n_obs_steps: int = 1
-    horizon: int = 4
-    n_action_steps: int = 4
+    n_obs_steps: int = 2
+    horizon: int = 64
+    n_action_steps: int = 32
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -114,10 +114,10 @@ class WiltechsVLAConfig(PreTrainedConfig):
 
     # -------- Latent "thought" tokens --------
     # Prepended to the expert sequence. 0 disables.
-    num_latent_tokens: int = 8
+    num_latent_tokens: int = 4
 
     # -------- Vision token dropout (regularizer) --------
-    vision_dropout_prob: float = 0.15
+    vision_dropout_prob: float = 0.3
 
     # -------- Auxiliary contrastive loss (language forcing) --------
     contrastive_loss_weight: float = 0.1
@@ -125,13 +125,6 @@ class WiltechsVLAConfig(PreTrainedConfig):
     # Minimum mean-squared L2 distance between correct-lang and wrong-lang
     # velocity predictions.
     contrastive_margin: float = 0.05
-
-    # -------- LoRA (vision; text stays frozen — single-task) --------
-    lora_rank: int = 16
-    lora_alpha: int = 32
-    lora_dropout: float = 0.05
-    lora_target_modules: list = field(default_factory=lambda: ["q_proj", "v_proj"])
-    vision_lora_num_layers: int = 0  # default off (joint attention already heavy)
 
     # -------- Resume bookkeeping --------
     training_step: int = 0
