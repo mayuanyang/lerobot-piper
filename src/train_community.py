@@ -1032,21 +1032,24 @@ def train(
         cameras_for_vision_state_concat=used_canonical,
         action_dim_weights=[1.0] * CANONICAL_ACTION_DIM,
         pos_decay_lambda=0.0,
-        vision_lora_num_layers=0,
         num_latent_tokens=8,
         robot_encoder_tokens=robot_encoder_tokens,
     )
 
-    # Model-specific fields
+    # Model-specific fields. `vision_lora_num_layers` exists only on the
+    # interleaved/wilro configs (wiltechs_vla has no LoRA), so it is set per
+    # model type rather than in the common kwargs above.
     if model_type == "interleaved":
         cfg_kwargs["vlm_attends_to_expert"] = True
         cfg_kwargs["gripper_encoder_tokens"] = gripper_encoder_tokens
+        cfg_kwargs["vision_lora_num_layers"] = 0
     elif model_type == "wilro":
         cfg_kwargs["kv_capture_strategy"] = kv_capture_strategy
         if kv_capture_layers is not None:
             cfg_kwargs["kv_capture_layers"] = kv_capture_layers
         cfg_kwargs["gripper_encoder_tokens"] = gripper_encoder_tokens
         cfg_kwargs["use_robot_cnn"] = True
+        cfg_kwargs["vision_lora_num_layers"] = 0
     elif model_type == "wiltechs_vla":
         cfg_kwargs["use_robot_cnn"] = True
 

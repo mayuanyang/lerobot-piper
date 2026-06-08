@@ -274,7 +274,11 @@ class DiTLayer(nn.Module):
 class WiltechsVLATransformer(nn.Module):
     """Encoder-decoder flow matching VLA built on frozen Qwen3-VL-4B."""
 
-    VLM_MODEL_ID: str = "Qwen/Qwen3-VL-4B-Instruct-FP8"
+    # Non-FP8 bf16 backbone: avoids the finegrained-fp8 CUDA kernel (which needs
+    # the `kernels` package AND an FP8-capable GPU, sm_89+/Hopper). The VLM is
+    # frozen, so this is just the bf16 view of the same weights — KV cache is
+    # numerically near-identical and FP8-pretrained checkpoints load/fine-tune fine.
+    VLM_MODEL_ID: str = "Qwen/Qwen3-VL-4B-Instruct"
 
     def __init__(self, config: WiltechsVLAConfig):
         super().__init__()
@@ -708,14 +712,19 @@ class WiltechsVLATransformer(nn.Module):
     ) -> Optional[torch.Tensor]:
         if self.num_latent_tokens == 0:
             return None
-        lang_result = self._encode_language(batch, device)
-        if lang_result is not None:
-            lang_tokens, lang_mask = lang_result
-            mask_f = lang_mask.float().unsqueeze(-1).to(lang_tokens.dtype)
-            denom = mask_f.sum(dim=1).clamp(min=1.0)
-            pooled = (lang_tokens * mask_f).sum(dim=1) / denom
-        else:
-            pooled = torch.zeros(B, self.hidden_size, device=device, dtype=dtype)
+        # Language encoding uses the FROZEN embedding table; mean-pooling it is a
+        # constant w.r.t. the trainable params. Run it under no_grad so no
+        # autograd graph is built for the (recomputed) language embeddings —
+        # gradient still flows into the trainable latent_generator below.
+        with torch.no_grad():
+            lang_result = self._encode_language(batch, device)
+            if lang_result is not None:
+                lang_tokens, lang_mask = lang_result
+                mask_f = lang_mask.float().unsqueeze(-1).to(lang_tokens.dtype)
+                denom = mask_f.sum(dim=1).clamp(min=1.0)
+                pooled = (lang_tokens * mask_f).sum(dim=1) / denom
+            else:
+                pooled = torch.zeros(B, self.hidden_size, device=device, dtype=dtype)
         flat = self.latent_generator(pooled.float())
         return flat.view(B, self.num_latent_tokens, self.hidden_size).to(dtype)
 
@@ -857,9 +866,10 @@ class WiltechsVLATransformer(nn.Module):
         t_exp = t[:, None, None]
         x_t = t_exp * noise + (1.0 - t_exp) * actions
         u_t = noise - actions
+        x_t_bf16 = x_t.to(torch.bfloat16)  # reused by the contrastive forward
 
         v_t = self._run_dit(
-            batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask,
+            batch, x_t_bf16, t, kv_cache, vlm_kv_pad_mask,
             robot_tokens, latents,
         ).float()
 
@@ -937,7 +947,7 @@ class WiltechsVLATransformer(nn.Module):
                 shuffled_pad_mask[:, L_vis:] = vlm_kv_pad_mask[perm][:, L_vis:]
 
                 v_wrong = self._run_dit(
-                    batch, x_t.to(torch.bfloat16), t,
+                    batch, x_t_bf16, t,
                     shuffled_cache, shuffled_pad_mask,
                     robot_tokens, latents,
                 ).float()
