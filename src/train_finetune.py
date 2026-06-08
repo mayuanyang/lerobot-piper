@@ -416,6 +416,7 @@ def train(
     state_dim=None,
     robot_encoder_tokens=49,
     gripper_encoder_tokens=100,
+    gripper_camera=None,
     noise_temporal_correlation=0.0,
 ):
     # Accept a single id (str) or several (list) — normalize to a list.
@@ -563,7 +564,13 @@ def train(
         cfg_kwargs["use_robot_cnn"] = True
 
     if model_type in ("interleaved", "wilro"):
-        cfg_kwargs["gripper_camera"] = pre_gripper_camera or "observation.images.wrist"
+        # Priority: explicit --gripper_camera > checkpoint value > canonical-wrist
+        # fallback. The explicit flag lets you point the dense grid at the wrist
+        # view (e.g. the canonical wrist slot, or a native key like
+        # observation.images.image2) when the inherited value matches no camera.
+        cfg_kwargs["gripper_camera"] = (
+            gripper_camera or pre_gripper_camera or "observation.images.wrist"
+        )
 
     cfg = ConfigCls(**cfg_kwargs)
     print(f"Robot CNN tokens: {robot_encoder_tokens} per cam "
@@ -921,6 +928,14 @@ if __name__ == "__main__":
     parser.add_argument("--gripper_encoder_tokens", type=int, default=100,
                         help="Robot CNN tokens for the gripper/wrist camera. Perfect square. "
                              "Used by interleaved and wilro models only. Overridden by checkpoint.")
+    parser.add_argument("--gripper_camera", type=str, default=None,
+                        help="Which camera key gets the dense --gripper_encoder_tokens grid "
+                             "(others get --robot_encoder_tokens). Priority: this flag > the "
+                             "checkpoint's value > 'observation.images.wrist'. Cameras here are "
+                             "the CANONICAL names, so usually 'observation.images.wrist'. When "
+                             "the checkpoint uses native names (e.g. a train_wilro LIBERO model "
+                             "with image/image2), pass the wrist view directly, e.g. "
+                             "--gripper_camera observation.images.image2.")
     parser.add_argument("--noise_temporal_correlation", type=float, default=0.0,
                         help="AR(1) coefficient correlating the flow-matching source noise "
                              "along the action horizon (0=white; ~0.9=temporally smooth). "
