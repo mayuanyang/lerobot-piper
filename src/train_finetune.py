@@ -78,8 +78,6 @@ from train_community import (
     build_camera_mapping,
     discover_state_action_dims,
     get_sub_dataset_ep_boundaries,
-    identity_stats,
-    native_feature_stats,
     load_task_descriptions,
     get_model_components,
 )
@@ -319,14 +317,10 @@ def _build_dataset_adapter(
     print(f"  loaded: {len(base_dataset)} frames @ {fps} fps")
     task_idx_to_desc = load_task_descriptions(base_dataset)
 
-    # Per-dataset normalization: z-score by this dataset's own native stats.
-    sst = native_feature_stats(base_dataset, state_key, native_state_dim)
-    ast = native_feature_stats(base_dataset, action_key, native_action_dim)
-    if sst is None or ast is None:
-        print(f"  [WARN] {dataset_id}: missing native stats "
-              f"(state={sst is not None}, action={ast is not None}); that feature "
-              f"is left un-normalized — mixing it with normalized sets can destabilize.")
-
+    # The adapter returns RAW (un-normalized) canonical-projected values; the
+    # global preprocessor does the normalization, with REAL pooled stats computed
+    # below. This keeps the saved preprocessor/postprocessor non-identity so the
+    # finetuned checkpoint is deployable (eval un-normalizes actions correctly).
     adapter = DatasetAdapter(
         dataset=base_dataset,
         sub_dir=dataset_id,
@@ -338,9 +332,7 @@ def _build_dataset_adapter(
         task_idx_to_desc=task_idx_to_desc,
         canonical_state_dim=canonical_state_dim,
         canonical_image_size=canonical_image_size,
-        state_stats=sst,
-        action_stats=ast,
-        normalize_in_adapter=True,
+        normalize_in_adapter=False,
     )
 
     ep_bounds = get_sub_dataset_ep_boundaries(base_dataset)
@@ -351,6 +343,60 @@ def _build_dataset_adapter(
         print(f"  train split: kept {len(ep_bounds)} episodes")
 
     return adapter, ep_bounds
+
+
+def _compute_pooled_stats(adapters, camera_keys, state_dim, action_dim, max_samples=5000):
+    """Pool state/action stats across all adapters by sampling their raw,
+    canonical-projected output. Returns a stats dict (mean/std/min/max per key)
+    of REAL stats for the preprocessor, so the finetuned checkpoint is deployable.
+    For one dataset this is just that dataset's stats; for several it is the pooled
+    normalization (correct when they share an action space, e.g. LIBERO demos +
+    RFT rollouts)."""
+    print("\nComputing pooled dataset statistics (real stats for the preprocessor)...")
+    all_states, all_actions = [], []
+    total_frames = sum(len(a) for a in adapters)
+    sample_ratio = min(1.0, max_samples / max(total_frames, 1))
+    for adapter in adapters:
+        n = max(1, int(len(adapter) * sample_ratio))
+        idxs = np.random.choice(len(adapter), n, replace=False)
+        for idx in idxs:
+            item = adapter[int(idx)]
+            if "observation.state" in item:
+                s = item["observation.state"]
+                s = s.numpy() if isinstance(s, torch.Tensor) else s
+                all_states.append(np.asarray(s).reshape(-1)[:state_dim])
+            if "action" in item:
+                a = item["action"]
+                a = a.numpy() if isinstance(a, torch.Tensor) else a
+                all_actions.append(np.asarray(a).reshape(-1)[:action_dim])
+    if not all_states:
+        all_states = [np.zeros(state_dim)]
+    if not all_actions:
+        all_actions = [np.zeros(action_dim)]
+    all_states = np.stack(all_states).astype(np.float32)
+    all_actions = np.stack(all_actions).astype(np.float32)
+    stats = {
+        "observation.state": {
+            "mean": torch.from_numpy(all_states.mean(0)),
+            "std": torch.from_numpy(all_states.std(0).clip(min=1e-6)),
+            "min": torch.from_numpy(all_states.min(0)),
+            "max": torch.from_numpy(all_states.max(0)),
+        },
+        "action": {
+            "mean": torch.from_numpy(all_actions.mean(0)),
+            "std": torch.from_numpy(all_actions.std(0).clip(min=1e-6)),
+            "min": torch.from_numpy(all_actions.min(0)),
+            "max": torch.from_numpy(all_actions.max(0)),
+        },
+    }
+    for cam in camera_keys:
+        stats[cam] = {"mean": torch.tensor([0.0]), "std": torch.tensor([1.0]),
+                      "min": torch.tensor([-1.0]), "max": torch.tensor([1.0])}
+    print(f"  pooled {len(all_states)} state / {len(all_actions)} action frames")
+    print(f"  state  mean: {stats['observation.state']['mean'].numpy()}")
+    print(f"  action mean: {stats['action']['mean'].numpy()}")
+    print(f"  action std : {stats['action']['std'].numpy()}")
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -582,15 +628,18 @@ def train(
                   f"min={sp.min().item():.3f} max={sp.max().item():.3f} "
                   f"mean={sp.mean().item():.3f}")
 
-    # ── Stats: PER-DATASET normalization → global preprocessor is identity ───
-    # Each adapter already z-scores its state/action by its own native stats
-    # (normalize_in_adapter=True), reproducing the per-dataset normalized space
-    # the pretrained action head learned in. So the global preprocessor must be
-    # identity for state/action (VISUAL is IDENTITY anyway).
-    stats = identity_stats(canon_cams_for_run, canonical_state_dim, CANONICAL_ACTION_DIM)
+    # ── Stats: REAL pooled stats → deployable preprocessor ──────────────────
+    # Pool mean/std/min/max across all datasets (sampling the raw, canonical-
+    # projected adapter output) and bake those REAL stats into the
+    # preprocessor/postprocessor. This is what makes the finetuned checkpoint
+    # deployable: at eval the preprocessor normalizes the state and the
+    # postprocessor un-normalizes the action with these stats. (For same-action-
+    # space datasets — e.g. LIBERO demos + RFT rollouts — pooled normalization is
+    # the correct single normalization.)
+    stats = _compute_pooled_stats(
+        adapters, canon_cams_for_run, canonical_state_dim, CANONICAL_ACTION_DIM,
+    )
     preprocessor, postprocessor = processor_fn(policy.config, dataset_stats=stats)
-    print("\nPer-dataset normalization ON: each dataset is z-scored by its own "
-          "native stats in the adapter; global preprocessor is identity.")
 
     trainable_params = [p for p in policy.model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable_params, lr=learning_rate, weight_decay=1e-6)
@@ -661,11 +710,11 @@ def train(
             batch = apply_joint_augmentations(batch, canonical_state_key)
 
             if step == 0:
-                # State is already per-dataset normalized in the adapter, so this
-                # should read ~unit-scale; a wild range flags a stats problem.
-                norm_st = batch[canonical_state_key].float()
-                print(f"\n(post-adapter-norm) {canonical_state_key}: "
-                      f"min={norm_st.min():.4f} max={norm_st.max():.4f} std={norm_st.std():.4f}")
+                # Raw state (adapter returns un-normalized); the preprocessor below
+                # normalizes it with the pooled stats. Sanity check on the range.
+                raw_st = batch[canonical_state_key].float()
+                print(f"\nRaw (pre-norm) {canonical_state_key}: "
+                      f"min={raw_st.min():.4f} max={raw_st.max():.4f} std={raw_st.std():.4f}")
 
             batch = preprocessor(batch)
 
