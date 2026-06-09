@@ -120,6 +120,9 @@ class WiltechsVLAConfig(PreTrainedConfig):
     # -------- Latent "thought" tokens --------
     # Prepended to the expert sequence. 0 disables.
     num_latent_tokens: int = 4
+    # Number of Q-Former cross-attention blocks that distill the VLM KV cache
+    # into the latent tokens (learned queries → cross-attn to VLM vision+lang).
+    num_latent_qformer_layers: int = 2
 
     # -------- Vision token dropout (regularizer) --------
     vision_dropout_prob: float = 0.3

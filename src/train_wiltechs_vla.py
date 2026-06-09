@@ -155,7 +155,7 @@ def _log_gradient_analysis(policy, step: int) -> None:
         ("DiT Layers",     "dit_layers"),
         ("Action In/Out",  "action_"),
         ("Final Norm",     "final_norm"),
-        ("Latent Gen",     "latent_generator"),
+        ("Latent QFormer", "latent_qformer"),
         ("Lang Adaptor",   "lang_adaptor"),
     ]:
         grad, n = _grad_stats(prefix)
@@ -164,18 +164,18 @@ def _log_gradient_analysis(policy, step: int) -> None:
         else:
             print(f"  {label:14s} - no grad")
 
-    if hasattr(policy.model, "latent_generator"):
-        gen = policy.model.latent_generator
+    if hasattr(policy.model, "latent_qformer"):
+        qf = policy.model.latent_qformer
         w_norm_sq = 0.0
         g_norm_sq = 0.0
-        for p in gen.parameters():
+        for p in qf.parameters():
             w_norm_sq += p.detach().norm().item() ** 2
             if p.grad is not None:
                 g_norm_sq += p.grad.norm().item() ** 2
-        out_layer = gen[-1]
-        out_w_norm = out_layer.weight.detach().norm().item()
-        print(f"  Latent gen     - weight_norm: {w_norm_sq ** 0.5:.4e}   "
-              f"grad_norm: {g_norm_sq ** 0.5:.4e}   out_layer_w: {out_w_norm:.4e}")
+        # Residual gates start at 0; their growth shows the latents becoming active.
+        gate_vals = torch.cat([g.detach().reshape(-1) for g in qf.gates]).abs()
+        print(f"  Latent QFormer - weight_norm: {w_norm_sq ** 0.5:.4e}   "
+              f"grad_norm: {g_norm_sq ** 0.5:.4e}   gate|mean|: {gate_vals.mean().item():.4e}")
 
     if hasattr(policy.model, "lang_attn_bias"):
         bias_tensor = policy.model.lang_attn_bias.detach()

@@ -279,6 +279,83 @@ class DiTLayer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Latent Q-Former: learned queries distill the frozen VLM KV cache (vision +
+# language) into a small set of "thought" tokens. Vision-aware, per-frame, fully
+# differentiable, and computed ONCE per forward (noise-independent), so it adds
+# no cost inside the N-step denoising loop. Replaces the old MLP-on-pooled-
+# language latent_generator. Zero-init output gates → starts as a no-op so the
+# latent tokens begin at ~0 (matching the previous safe init) and only grow if
+# the action loss finds them useful.
+# ---------------------------------------------------------------------------
+
+class LatentQFormer(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_queries: int,
+        n_layers: int,
+        ca_num_heads: int,
+        ca_num_kv_heads: int,
+        ca_head_dim: int,
+        intermediate_size: int,
+        rms_norm_eps: float = 1e-5,
+    ):
+        super().__init__()
+        self.ca_num_heads = ca_num_heads
+        self.ca_num_kv_heads = ca_num_kv_heads
+        self.ca_head_dim = ca_head_dim
+        self.queries = nn.Parameter(torch.randn(1, num_queries, dim) * 0.02)
+        self.layers = nn.ModuleList([
+            nn.ModuleDict(dict(
+                ca_norm=RMSNorm(dim, eps=rms_norm_eps),
+                ca_q=nn.Linear(dim, ca_num_heads * ca_head_dim, bias=False),
+                ca_o=nn.Linear(ca_num_heads * ca_head_dim, dim, bias=False),
+                ffn_norm=RMSNorm(dim, eps=rms_norm_eps),
+                ffn=SwiGLU(dim, intermediate_size),
+            )) for _ in range(n_layers)
+        ])
+        # Per-block residual gates, zero-init → no-op at start.
+        self.gates = nn.ParameterList([nn.Parameter(torch.zeros(2)) for _ in range(n_layers)])
+        for blk in self.layers:
+            nn.init.zeros_(blk["ca_o"].weight)
+
+    def forward(
+        self,
+        vlm_k: torch.Tensor,
+        vlm_v: torch.Tensor,
+        vlm_kv_pad_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """vlm_k, vlm_v: (B, num_kv_heads, L_vlm, head_dim) from one VLM layer.
+        Returns latent tokens (B, num_queries, dim)."""
+        B = vlm_k.shape[0]
+        x = self.queries.expand(B, -1, -1).to(vlm_k.dtype)
+
+        if vlm_kv_pad_mask is not None:
+            ca_mask = torch.zeros(B, 1, 1, vlm_kv_pad_mask.shape[-1],
+                                  device=x.device, dtype=x.dtype)
+            ca_mask.masked_fill_((~vlm_kv_pad_mask).unsqueeze(1).unsqueeze(1), float("-inf"))
+        else:
+            ca_mask = None
+
+        # GQA expand once (K/V are the same constant across blocks).
+        Kv, Vv = vlm_k, vlm_v
+        if self.ca_num_kv_heads != self.ca_num_heads:
+            r = self.ca_num_heads // self.ca_num_kv_heads
+            Kv = Kv.repeat_interleave(r, dim=1)
+            Vv = Vv.repeat_interleave(r, dim=1)
+
+        for blk, g in zip(self.layers, self.gates):
+            g0, g1 = g[0].to(x.dtype), g[1].to(x.dtype)
+            h = blk["ca_norm"](x)
+            Q = blk["ca_q"](h).view(B, -1, self.ca_num_heads, self.ca_head_dim).transpose(1, 2)
+            a = F.scaled_dot_product_attention(Q, Kv, Vv, attn_mask=ca_mask, is_causal=False)
+            a = a.transpose(1, 2).contiguous().view(B, -1, self.ca_num_heads * self.ca_head_dim)
+            x = x + g0 * blk["ca_o"](a)
+            x = x + g1 * blk["ffn"](blk["ffn_norm"](x))
+        return x
+
+
+# ---------------------------------------------------------------------------
 # Main model
 # ---------------------------------------------------------------------------
 
@@ -452,16 +529,21 @@ class WiltechsVLATransformer(nn.Module):
         # ─────────────────────────────────────────────────────────────
         self.num_latent_tokens = config.num_latent_tokens
         if self.num_latent_tokens > 0:
-            # Input is the VLM-width pooled language embedding; output is the DiT
-            # width (num_latent_tokens × dit_hidden).
-            hidden_mid = self.dit_hidden * 2
-            self.latent_generator = nn.Sequential(
-                nn.Linear(self.hidden_size, hidden_mid),
-                nn.SiLU(),
-                nn.Linear(hidden_mid, self.num_latent_tokens * self.dit_hidden),
+            # Learned-query Q-Former: the latent "thought" tokens are produced by
+            # cross-attending a small set of learned queries to the frozen VLM KV
+            # cache (vision + language), rather than an MLP on pooled language
+            # embeddings. Vision-aware, per-frame, differentiable. FFN inner dim
+            # is kept at the DiT width to stay parameter-light.
+            self.latent_qformer = LatentQFormer(
+                dim=self.dit_hidden,
+                num_queries=self.num_latent_tokens,
+                n_layers=int(getattr(config, "num_latent_qformer_layers", 2)),
+                ca_num_heads=self.num_heads,
+                ca_num_kv_heads=self.num_kv_heads,
+                ca_head_dim=self.head_dim,
+                intermediate_size=self.dit_hidden,
+                rms_norm_eps=self.rms_norm_eps,
             )
-            nn.init.zeros_(self.latent_generator[-1].weight)
-            nn.init.zeros_(self.latent_generator[-1].bias)
 
         self._lang_max_len = 48
 
@@ -750,25 +832,17 @@ class WiltechsVLATransformer(nn.Module):
         return toks
 
     def _generate_latents(
-        self, batch: dict, B: int, device: torch.device, dtype: torch.dtype,
+        self,
+        kv_cache: list[tuple[torch.Tensor, torch.Tensor]],
+        vlm_kv_pad_mask: torch.Tensor,
     ) -> Optional[torch.Tensor]:
+        """Distill the top (most semantic) captured VLM layer's KV cache into the
+        latent 'thought' tokens via the learned-query Q-Former. Noise-independent
+        → computed once per forward and shared across all denoising steps."""
         if self.num_latent_tokens == 0:
             return None
-        # Language encoding uses the FROZEN embedding table; mean-pooling it is a
-        # constant w.r.t. the trainable params. Run it under no_grad so no
-        # autograd graph is built for the (recomputed) language embeddings —
-        # gradient still flows into the trainable latent_generator below.
-        with torch.no_grad():
-            lang_result = self._encode_language(batch, device)
-            if lang_result is not None:
-                lang_tokens, lang_mask = lang_result
-                mask_f = lang_mask.float().unsqueeze(-1).to(lang_tokens.dtype)
-                denom = mask_f.sum(dim=1).clamp(min=1.0)
-                pooled = (lang_tokens * mask_f).sum(dim=1) / denom
-            else:
-                pooled = torch.zeros(B, self.hidden_size, device=device, dtype=dtype)
-        flat = self.latent_generator(pooled.float())
-        return flat.view(B, self.num_latent_tokens, self.dit_hidden).to(dtype)
+        vlm_k, vlm_v = kv_cache[-1]
+        return self.latent_qformer(vlm_k, vlm_v, vlm_kv_pad_mask)
 
     def _build_dit_input(
         self,
@@ -900,7 +974,7 @@ class WiltechsVLATransformer(nn.Module):
 
         # ── DiT-side conditioning that does NOT depend on noise ─────
         robot_tokens = self._compute_robot_tokens(batch)
-        latents = self._generate_latents(batch, B, device, torch.bfloat16)
+        latents = self._generate_latents(kv_cache, vlm_kv_pad_mask)
 
         # ── Flow matching: build noisy actions, predict velocity ────
         noise = self.sample_noise(actions.shape, device)
@@ -1029,7 +1103,7 @@ class WiltechsVLATransformer(nn.Module):
 
             # DiT-side static conditioning (same across denoising steps)
             robot_tokens = self._compute_robot_tokens(batch)
-            latents = self._generate_latents(batch, B, device, torch.bfloat16)
+            latents = self._generate_latents(kv_cache, vlm_kv_pad_mask)
 
             # Flow matching: N=5 inference steps (Xiaomi-Robotics-0 standard).
             # config.num_inference_steps can override.
