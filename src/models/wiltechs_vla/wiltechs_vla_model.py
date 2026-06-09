@@ -347,10 +347,10 @@ class LatentQFormer(nn.Module):
                 ffn=SwiGLU(dim, intermediate_size),
             )) for _ in range(n_layers)
         ])
-        # Per-block residual gates, zero-init → no-op at start.
-        self.gates = nn.ParameterList([nn.Parameter(torch.zeros(2)) for _ in range(n_layers)])
-        for blk in self.layers:
-            nn.init.zeros_(blk["ca_o"].weight)
+        # Per-block residual gates, small-init → gentle (non-zero) contribution
+        # at start so the latents aren't inert but still don't dominate. ca_o
+        # keeps its default init (no zero-init) so the gated path is non-zero.
+        self.gates = nn.ParameterList([nn.Parameter(torch.full((2,), 0.1)) for _ in range(n_layers)])
 
     def forward(
         self,
