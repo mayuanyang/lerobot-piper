@@ -77,6 +77,23 @@ if device.type == "cuda":
 
 
 # ---------------------------------------------------------------------------
+# Optimizer factory — optional 8-bit Adam (bitsandbytes) to cut optimizer
+# state memory ~4× (fp32 m+v → int8 m+v). The big DiT stack dominates GPU
+# memory via its Adam state, so this is the main lever on small GPUs.
+# ---------------------------------------------------------------------------
+def make_optimizer(params, lr, weight_decay, use_8bit: bool):
+    if use_8bit:
+        try:
+            import bitsandbytes as bnb
+            print("Using 8-bit Adam (bitsandbytes) — optimizer state in int8.")
+            return bnb.optim.Adam8bit(params, lr=lr, weight_decay=weight_decay)
+        except ImportError:
+            print("[WARN] --use_8bit_adam set but bitsandbytes not installed; "
+                  "falling back to fp32 Adam. `pip install bitsandbytes` to enable.")
+    return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+
+
+# ---------------------------------------------------------------------------
 # Augmentation
 # ---------------------------------------------------------------------------
 def get_augmentations():
@@ -199,6 +216,8 @@ def train(
     training_steps: int = 300000,
     reset_lang_params: bool = False,
     gradient_checkpointing: bool = False,
+    num_dit_layers: int = 16,
+    use_8bit_adam: bool = False,
     max_episode_index: Optional[int] = None,
     lock_joint_index: Optional[int] = None,
     contrastive_loss_weight: float = 0.1,
@@ -293,7 +312,7 @@ def train(
         n_action_steps=n_action_steps,
         state_dim=state_dim,
         action_dim=action_dim,
-        num_vlm_layers=16,
+        num_vlm_layers=num_dit_layers,
         num_cameras=len(camera_keys),
         cameras_for_vision_state_concat=camera_keys,
         action_dim_weights=action_dim_weights,
@@ -380,7 +399,7 @@ def train(
               f"fast-forwarding to step {step})")
 
         trainable_params = [p for p in policy.model.parameters() if p.requires_grad]
-        optimizer = torch.optim.Adam(trainable_params, lr=base_lr, weight_decay=cfg.optimizer_weight_decay)
+        optimizer = make_optimizer(trainable_params, base_lr, cfg.optimizer_weight_decay, use_8bit_adam)
         opt_state_path = local_ckpt / "optimizer_state.pth"
         if opt_state_path.exists():
             try:
@@ -407,7 +426,7 @@ def train(
         n_trainable = sum(p.numel() for p in trainable_params)
         n_frozen = sum(p.numel() for p in policy.parameters() if not p.requires_grad)
         print(f"Total trainable parameters: {n_trainable:,}  (frozen: {n_frozen:,})")
-        optimizer = torch.optim.Adam(trainable_params, lr=cfg.optimizer_lr, weight_decay=cfg.optimizer_weight_decay)
+        optimizer = make_optimizer(trainable_params, cfg.optimizer_lr, cfg.optimizer_weight_decay, use_8bit_adam)
         scheduler = get_cosine_schedule_with_warmup(
             optimizer, num_warmup_steps=cfg.scheduler_warmup_steps, num_training_steps=training_steps,
         )
@@ -646,6 +665,14 @@ if __name__ == "__main__":
                         help="Recompute DiT layer activations in backward to save GPU memory "
                              "(trades ~extra forward compute; frozen VLM is unaffected). "
                              "Recommended when using the contrastive loss, which runs a 2nd DiT forward.")
+    parser.add_argument("--num_dit_layers", type=int, default=16,
+                        help="DiT decoder depth = number of trailing VLM layers whose KV the DiT "
+                             "cross-attends to. Each layer is ~180M params, so this is the BIGGEST "
+                             "memory lever: 16 (default) ~2.9B trainable params; drop to 6-8 to fit "
+                             "a 22-24GB GPU. Lower = less capacity. Must be <= the VLM's layer count (36).")
+    parser.add_argument("--use_8bit_adam", action="store_true",
+                        help="Use bitsandbytes 8-bit Adam (int8 optimizer state) instead of fp32 Adam, "
+                             "cutting optimizer memory ~4x. Requires `pip install bitsandbytes` + CUDA.")
     parser.add_argument("--max_episode_index", type=int, default=None,
                         help="Filter to episodes with index <= this value "
                              "(piper_arm holdout convention; omit for full dataset).")
