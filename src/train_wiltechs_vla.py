@@ -56,6 +56,9 @@ from lerobot.datasets.compute_stats import aggregate_stats
 from models.wiltechs_vla.wiltechs_vla_config import WiltechsVLAConfig
 from models.wiltechs_vla.wiltechs_vla_policy import WiltechsVLAPolicy
 from models.wiltechs_vla.processor_wiltechs_vla import make_pre_post_processors
+from models.wiltechs_vla.wiltechs_vla_model import (
+    preprocess_camera_to_pixels, vlm_pixels_key, vlm_grid_key, _VLM_PIX_PREFIX,
+)
 
 from torchvision.transforms import v2
 from transformers import get_cosine_schedule_with_warmup
@@ -131,6 +134,59 @@ def apply_joint_augmentations(batch: dict, state_key: str) -> dict:
             noise = torch.randn_like(batch[state_key]) * 0.02
             batch[state_key] = batch[state_key] + noise
     return batch
+
+
+# ---------------------------------------------------------------------------
+# Move the Qwen image preprocessing (and image augmentation) into the DataLoader
+# workers so it runs in parallel and overlaps with GPU compute, instead of on
+# the critical path inside _encode_images every step.
+# ---------------------------------------------------------------------------
+class VLMImagePreprocDataset(torch.utils.data.Dataset):
+    """Wraps a dataset; per sample it (optionally) augments the camera images
+    with cross-camera-consistent transforms, then runs the Qwen image_processor
+    to produce pixel_values / grid_thw, stored under vlm_pixels_key()/
+    vlm_grid_key(). The (augmented) raw camera tensors are kept too — the robot
+    CNN still consumes them. Assumes a uniform camera resolution (true for a
+    single homogeneous dataset) so pixel_values collate cleanly to (B, P, dim)."""
+
+    def __init__(self, dataset, image_processor, camera_keys, augment=None):
+        self.dataset = dataset
+        self.image_processor = image_processor
+        self.camera_keys = list(camera_keys)
+        self.augment = augment  # torchvision transform, or None (e.g. eval)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        sample = self.dataset[idx]
+        present = [k for k in self.camera_keys
+                   if k in sample and isinstance(sample[k], torch.Tensor)]
+        if not present:
+            return sample
+
+        # Normalize each camera to (3, H, W) for the transform; remember whether
+        # it carried a leading T=1 dim so we can restore the original shape.
+        imgs3, had_t = [], []
+        for k in present:
+            v = sample[k]
+            had_t.append(v.dim() == 4)
+            imgs3.append(v[0] if v.dim() == 4 else v)
+
+        if self.augment is not None:
+            # One transform call over the stacked cameras → identical random
+            # params across cameras of this sample (cross-camera consistency).
+            stacked = self.augment(torch.stack(imgs3, dim=0))
+            imgs3 = [stacked[i] for i in range(len(present))]
+            for i, k in enumerate(present):
+                sample[k] = imgs3[i].unsqueeze(0) if had_t[i] else imgs3[i]
+
+        # Run the (CPU) Qwen image_processor here, in the worker.
+        for i, k in enumerate(present):
+            pv, thw = preprocess_camera_to_pixels(self.image_processor, imgs3[i])
+            sample[vlm_pixels_key(k)] = pv         # (P, dim)
+            sample[vlm_grid_key(k)] = thw[0]       # (3,)
+        return sample
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +282,7 @@ def train(
     contrastive_margin: float = 0.05,
     robot_encoder_tokens: int = 16,
     noise_temporal_correlation: float = 0.0,
+    preprocess_in_workers: bool = False,
 ):
     """Train WiltechsVLA on one or more HOMOGENEOUS LeRobot datasets.
 
@@ -362,9 +419,14 @@ def train(
             step = int(local_ckpt.name.split("-")[1])
         print(f"Resuming from step {step}, epoch {epoch}")
 
-        ckpt_state = load_safetensors(model_file, device=str(device))
+        # Load the checkpoint onto CPU, NOT the GPU. model.safetensors holds the
+        # WHOLE policy (frozen 4B VLM + DiT, ~11GB) and the freshly-built `policy`
+        # already holds its own copy. Loading the checkpoint straight to CUDA
+        # would keep TWO full copies on the GPU at once (~22GB) and OOM a 24GB
+        # card at policy.to(device). Load on CPU, copy into the (still-CPU)
+        # policy, free the checkpoint, then move the SINGLE policy to the GPU.
+        ckpt_state = load_safetensors(model_file, device="cpu")
         policy.train()
-        policy.to(device)
         cur_state = policy.state_dict()
         filtered = {
             k: v for k, v in ckpt_state.items()
@@ -377,7 +439,10 @@ def train(
         if missing:
             print(f"Missing {len(missing)} keys (will use init values): {missing[:5]}")
         policy.load_state_dict(filtered, strict=False)
-        print(f"Loaded {len(filtered)}/{len(cur_state)} model keys")
+        n_loaded, n_total = len(filtered), len(cur_state)
+        del ckpt_state, filtered
+        policy.to(device)
+        print(f"Loaded {n_loaded}/{n_total} model keys (on CPU), moved policy to {device}")
 
         if reset_lang_params:
             with torch.no_grad():
@@ -406,12 +471,17 @@ def train(
         opt_state_path = local_ckpt / "optimizer_state.pth"
         if opt_state_path.exists():
             try:
-                optimizer.load_state_dict(torch.load(opt_state_path, map_location=device))
+                # Load to CPU first; load_state_dict casts the Adam state to each
+                # param's device lazily. Loading straight to CUDA holds the full
+                # optimizer state (~GBs) on top of the model and can OOM.
+                opt_sd = torch.load(opt_state_path, map_location="cpu")
+                optimizer.load_state_dict(opt_sd)
+                del opt_sd
                 for pg in optimizer.param_groups:
                     pg["lr"] = base_lr
                     pg["initial_lr"] = base_lr
-                print(f"Optimizer state loaded. Scheduler base LR set to peak {base_lr:.2e}")
-            except ValueError as e:
+                print(f"Optimizer state loaded (via CPU). Scheduler base LR set to peak {base_lr:.2e}")
+            except (ValueError, RuntimeError) as e:
                 print(f"Skipping optimizer state — {e}")
         scheduler = get_cosine_schedule_with_warmup(
             optimizer, num_warmup_steps=resume_warmup, num_training_steps=training_steps,
@@ -505,6 +575,15 @@ def train(
     print(f"Combined dataset: {len(dataset)} frames, {len(ep_from)} episodes "
           f"across {len(sub_datasets)} dataset(s)")
 
+    # Optionally move augmentation + Qwen image preprocessing into the workers.
+    if preprocess_in_workers:
+        dataset = VLMImagePreprocDataset(
+            dataset, policy.model.processor.image_processor, camera_keys,
+            augment=image_transforms,
+        )
+        print("Image preprocessing moved into DataLoader workers "
+              "(augment + Qwen image_processor per-sample, parallel + overlapped).")
+
     # task_index → description (from the first dataset's tasks.parquet). Batches
     # carry the per-frame "task" string directly (preferred); for multi-dataset
     # task_index is dataset-local, so we rely on batch["task"].
@@ -557,7 +636,10 @@ def train(
         epoch += 1
         for batch in dataloader:
             for key in list(batch.keys()):
-                if isinstance(batch[key], torch.Tensor):
+                # Keep the worker-computed VLM pixels on CPU; _encode_images moves
+                # them to GPU just-in-time (transient) so they aren't resident
+                # through the backward pass and don't inflate the memory peak.
+                if isinstance(batch[key], torch.Tensor) and not key.startswith(_VLM_PIX_PREFIX):
                     batch[key] = batch[key].to(device, non_blocking=True)
 
             # Task description handling
@@ -571,13 +653,19 @@ def train(
                     task_idx_to_description.get(int(ti), "") for ti in task_indices
                 ]
 
-            present_cams = [c for c in camera_keys if c in batch]
-            batch = apply_image_augmentations(batch, present_cams, image_transforms)
+            # Image augmentation: in-loop only when the workers aren't doing it.
+            if not preprocess_in_workers:
+                present_cams = [c for c in camera_keys if c in batch]
+                batch = apply_image_augmentations(batch, present_cams, image_transforms)
 
             if "observation.state" in batch:
                 batch = apply_joint_augmentations(batch, "observation.state")
 
+            # Hold out the worker-computed VLM pixels so the LeRobot preprocessor
+            # (normalizer / device / add-batch-dim steps) never touches them.
+            vlm_pix = {k: batch.pop(k) for k in list(batch) if k.startswith(_VLM_PIX_PREFIX)}
             batch = preprocessor(batch)
+            batch.update(vlm_pix)
 
             autocast_ctx = (
                 torch.autocast(device_type=device.type, dtype=torch.bfloat16)
@@ -697,6 +785,12 @@ if __name__ == "__main__":
     parser.add_argument("--noise_temporal_correlation", type=float, default=0.0,
                         help="AR(1) coefficient correlating the flow-matching source noise "
                              "along the action horizon (0=white; ~0.9=temporally smooth).")
+    parser.add_argument("--preprocess_in_workers", action="store_true",
+                        help="Run image augmentation + the Qwen image_processor inside the "
+                             "DataLoader workers (parallel, overlapped with GPU) instead of on "
+                             "the critical path in _encode_images. Speeds up training when the "
+                             "per-step image preprocessing is a bottleneck. Inference is "
+                             "unaffected (the model preprocesses raw frames itself).")
     args = parser.parse_args()
 
     _v = args.robot_encoder_tokens

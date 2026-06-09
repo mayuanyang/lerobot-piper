@@ -51,6 +51,39 @@ from ..transformer_flow_matching.robot_visual_encoder import RobotVisualEncoder
 
 
 # ---------------------------------------------------------------------------
+# Shared camera preprocessing (Qwen image_processor → pixel_values / grid_thw).
+#
+# Called from TWO places so the training and inference paths can never drift:
+#   1. The training DataLoader workers (parallel, overlapped with GPU compute)
+#      when --preprocess_in_workers is on — results land in the batch under the
+#      vlm_pixels_key()/vlm_grid_key() keys.
+#   2. The model's _encode_images fallback (inference, or when workers are off),
+#      which preprocesses raw camera frames on the fly.
+# ---------------------------------------------------------------------------
+_VLM_PIX_PREFIX = "_vlmpix_"
+
+
+def vlm_pixels_key(cam_key: str) -> str:
+    return f"{_VLM_PIX_PREFIX}pv::{cam_key}"
+
+
+def vlm_grid_key(cam_key: str) -> str:
+    return f"{_VLM_PIX_PREFIX}thw::{cam_key}"
+
+
+def preprocess_camera_to_pixels(image_processor, img: torch.Tensor):
+    """img: (B, 3, H, W) or (3, H, W) float in [0, 1]. Returns
+    (pixel_values, image_grid_thw) on CPU from the Qwen image_processor."""
+    if img.dim() == 3:
+        img = img.unsqueeze(0)
+    B = img.shape[0]
+    img_np = (img.permute(0, 2, 3, 1).detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+    pil_images = [Image.fromarray(img_np[i]) for i in range(B)]
+    proc_out = image_processor(images=pil_images, return_tensors="pt")
+    return proc_out["pixel_values"], proc_out["image_grid_thw"]
+
+
+# ---------------------------------------------------------------------------
 # Sinusoidal time embedding (flow matching)
 # ---------------------------------------------------------------------------
 
@@ -601,16 +634,33 @@ class WiltechsVLATransformer(nn.Module):
         all_vis: list[torch.Tensor] = []
         grid_thw_list: list[torch.Tensor] = []
         for cam_key in self.config.cameras_for_vision_state_concat:
-            if cam_key not in batch:
-                continue
-            imgs = batch[cam_key]
-            img = imgs[:, -1] if imgs.dim() == 5 else imgs
-            img_np = (img.permute(0, 2, 3, 1).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
-            pil_images = [Image.fromarray(img_np[i]) for i in range(B)]
+            pvk, thwk = vlm_pixels_key(cam_key), vlm_grid_key(cam_key)
             with torch.no_grad():
-                proc_out = self.processor.image_processor(images=pil_images, return_tensors="pt")
-                pixel_values = proc_out["pixel_values"].to(device=device)
-                image_grid_thw = proc_out["image_grid_thw"].to(device=device)
+                if pvk in batch:
+                    # Fast path: the DataLoader workers already ran the (CPU)
+                    # image_processor. pixel_values collate as (B, P, dim) and
+                    # grid_thw as (B, 3); flatten the patches back to the
+                    # (sum_patches, dim) layout the vision tower expects.
+                    pv = batch[pvk]
+                    image_grid_thw = batch[thwk]
+                    if pv.dim() == 3:
+                        pv = pv.reshape(-1, pv.shape[-1])
+                    if image_grid_thw.dim() == 1:
+                        image_grid_thw = image_grid_thw.unsqueeze(0)
+                    pixel_values = pv.to(device=device)
+                    image_grid_thw = image_grid_thw.to(device=device)
+                elif cam_key in batch:
+                    # Fallback (inference, or --preprocess_in_workers off): run the
+                    # SAME preprocessing here on the raw camera frames.
+                    imgs = batch[cam_key]
+                    img = imgs[:, -1] if imgs.dim() == 5 else imgs
+                    pixel_values, image_grid_thw = preprocess_camera_to_pixels(
+                        self.processor.image_processor, img,
+                    )
+                    pixel_values = pixel_values.to(device=device)
+                    image_grid_thw = image_grid_thw.to(device=device)
+                else:
+                    continue
                 # Call the vision tower directly. `Qwen3VLVisionTransformer`
                 # already includes the spatial merger that projects vision
                 # features (vision_hidden, e.g. 1024) → text_hidden (2560),
