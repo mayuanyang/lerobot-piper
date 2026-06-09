@@ -217,6 +217,7 @@ def train(
     reset_lang_params: bool = False,
     gradient_checkpointing: bool = False,
     num_dit_layers: int = 16,
+    dit_hidden_size: int = 0,
     use_8bit_adam: bool = False,
     max_episode_index: Optional[int] = None,
     lock_joint_index: Optional[int] = None,
@@ -313,6 +314,7 @@ def train(
         state_dim=state_dim,
         action_dim=action_dim,
         num_vlm_layers=num_dit_layers,
+        dit_hidden_size=dit_hidden_size,
         num_cameras=len(camera_keys),
         cameras_for_vision_state_concat=camera_keys,
         action_dim_weights=action_dim_weights,
@@ -670,6 +672,11 @@ if __name__ == "__main__":
                              "cross-attends to. Each layer is ~180M params, so this is the BIGGEST "
                              "memory lever: 16 (default) ~2.9B trainable params; drop to 6-8 to fit "
                              "a 22-24GB GPU. Lower = less capacity. Must be <= the VLM's layer count (36).")
+    parser.add_argument("--dit_hidden_size", type=int, default=0,
+                        help="DiT decoder width. 0 (default) = match the VLM hidden size (2560). "
+                             "Set a smaller multiple of the VLM head_dim (e.g. 1280) to shrink the "
+                             "DiT self-attn/FFN/adaLN (~quadratic param savings); cross-attention is "
+                             "bridged back up to the frozen VLM KV. Lower = less capacity.")
     parser.add_argument("--use_8bit_adam", action="store_true",
                         help="Use bitsandbytes 8-bit Adam (int8 optimizer state) instead of fp32 Adam, "
                              "cutting optimizer memory ~4x. Requires `pip install bitsandbytes` + CUDA.")

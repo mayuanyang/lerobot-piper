@@ -148,32 +148,43 @@ class DiTLayer(nn.Module):
     def __init__(
         self,
         hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
+        sa_num_heads: int,
+        sa_num_kv_heads: int,
+        sa_head_dim: int,
+        ca_num_heads: int,
+        ca_num_kv_heads: int,
+        ca_head_dim: int,
         intermediate_size: int,
         rms_norm_eps: float = 1e-5,
         dropout: float = 0.1,
     ):
         super().__init__()
         self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = head_dim
+        # Self-attention runs at the DiT width (sa_*); cross-attention bridges
+        # the DiT width to the frozen VLM KV geometry (ca_*). When the DiT width
+        # equals the VLM width both specs are identical (original behavior).
+        self.sa_num_heads = sa_num_heads
+        self.sa_num_kv_heads = sa_num_kv_heads
+        self.sa_head_dim = sa_head_dim
+        self.ca_num_heads = ca_num_heads
+        self.ca_num_kv_heads = ca_num_kv_heads
+        self.ca_head_dim = ca_head_dim
 
-        # ── Self-attention (over DiT sequence) ──────────────────────────
+        # ── Self-attention (over DiT sequence, at the DiT width) ────────
         self.sa_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.sa_q = nn.Linear(hidden_size, num_heads * head_dim, bias=False)
-        self.sa_k = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=False)
-        self.sa_v = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=False)
-        self.sa_o = nn.Linear(num_heads * head_dim, hidden_size, bias=False)
+        self.sa_q = nn.Linear(hidden_size, sa_num_heads * sa_head_dim, bias=False)
+        self.sa_k = nn.Linear(hidden_size, sa_num_kv_heads * sa_head_dim, bias=False)
+        self.sa_v = nn.Linear(hidden_size, sa_num_kv_heads * sa_head_dim, bias=False)
+        self.sa_o = nn.Linear(sa_num_heads * sa_head_dim, hidden_size, bias=False)
         self.sa_drop = nn.Dropout(dropout)
 
         # ── Cross-attention (Q from DiT, K/V from VLM KV cache) ─────────
         # Only Q has trainable projection; K, V are the cached VLM tensors.
+        # ca_q projects the DiT width UP to the VLM head geometry (so the queries
+        # dot-product against the cached K/V); ca_o projects back DOWN.
         self.ca_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.ca_q = nn.Linear(hidden_size, num_heads * head_dim, bias=False)
-        self.ca_o = nn.Linear(num_heads * head_dim, hidden_size, bias=False)
+        self.ca_q = nn.Linear(hidden_size, ca_num_heads * ca_head_dim, bias=False)
+        self.ca_o = nn.Linear(ca_num_heads * ca_head_dim, hidden_size, bias=False)
         self.ca_drop = nn.Dropout(dropout)
 
         # ── FFN ─────────────────────────────────────────────────────────
@@ -226,24 +237,24 @@ class DiTLayer(nn.Module):
 
         # ── Self-attention ────────────────────────────────────────────
         h = _modulate(self.sa_norm(x), s_sa, sc_sa)
-        Q = self.sa_q(h).view(B, L_dit, self.num_heads, self.head_dim).transpose(1, 2)
-        K = self.sa_k(h).view(B, L_dit, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        V = self.sa_v(h).view(B, L_dit, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        if self.num_kv_heads != self.num_heads:
-            r = self.num_heads // self.num_kv_heads
+        Q = self.sa_q(h).view(B, L_dit, self.sa_num_heads, self.sa_head_dim).transpose(1, 2)
+        K = self.sa_k(h).view(B, L_dit, self.sa_num_kv_heads, self.sa_head_dim).transpose(1, 2)
+        V = self.sa_v(h).view(B, L_dit, self.sa_num_kv_heads, self.sa_head_dim).transpose(1, 2)
+        if self.sa_num_kv_heads != self.sa_num_heads:
+            r = self.sa_num_heads // self.sa_num_kv_heads
             K = K.repeat_interleave(r, dim=1)
             V = V.repeat_interleave(r, dim=1)
         sa = F.scaled_dot_product_attention(Q, K, V, attn_mask=self_attn_mask, is_causal=False)
-        sa = sa.transpose(1, 2).contiguous().view(B, L_dit, self.num_heads * self.head_dim)
+        sa = sa.transpose(1, 2).contiguous().view(B, L_dit, self.sa_num_heads * self.sa_head_dim)
         sa = self.sa_drop(self.sa_o(sa))
         x = x + g_sa.unsqueeze(1) * sa
 
         # ── Cross-attention to frozen VLM cache ──────────────────────
         h = _modulate(self.ca_norm(x), s_ca, sc_ca)
-        Q = self.ca_q(h).view(B, L_dit, self.num_heads, self.head_dim).transpose(1, 2)
+        Q = self.ca_q(h).view(B, L_dit, self.ca_num_heads, self.ca_head_dim).transpose(1, 2)
         Kv, Vv = vlm_k, vlm_v
-        if self.num_kv_heads != self.num_heads:
-            r = self.num_heads // self.num_kv_heads
+        if self.ca_num_kv_heads != self.ca_num_heads:
+            r = self.ca_num_heads // self.ca_num_kv_heads
             Kv = Kv.repeat_interleave(r, dim=1)
             Vv = Vv.repeat_interleave(r, dim=1)
         # Build cross-attn pad mask: (B, 1, 1, L_vlm)
@@ -255,7 +266,7 @@ class DiTLayer(nn.Module):
         else:
             ca_mask = None
         ca = F.scaled_dot_product_attention(Q, Kv, Vv, attn_mask=ca_mask, is_causal=False)
-        ca = ca.transpose(1, 2).contiguous().view(B, L_dit, self.num_heads * self.head_dim)
+        ca = ca.transpose(1, 2).contiguous().view(B, L_dit, self.ca_num_heads * self.ca_head_dim)
         ca = self.ca_drop(self.ca_o(ca))
         x = x + g_ca.unsqueeze(1) * ca
 
@@ -355,13 +366,42 @@ class WiltechsVLATransformer(nn.Module):
         print(f"DiT: {self.num_dit_layers} layers, sourcing KV from VLM layers "
               f"{self.num_vlm_layers - self.num_dit_layers}..{self.num_vlm_layers - 1}")
 
+        # ── DiT width (may be < VLM width to save params) ───────────────
+        # 0 → match the VLM hidden size (original behavior). Otherwise the DiT
+        # residual stream / self-attn / FFN / adaLN run at this smaller width
+        # (~quadratic param savings), while cross-attention bridges back up to
+        # the VLM head geometry. Must be a multiple of the VLM head_dim.
+        self.dit_hidden = int(getattr(config, "dit_hidden_size", 0)) or self.hidden_size
+        if self.dit_hidden % self.head_dim != 0:
+            raise ValueError(
+                f"dit_hidden_size ({self.dit_hidden}) must be divisible by the VLM "
+                f"head_dim ({self.head_dim})."
+            )
+        # Cross-attn always bridges to the VLM KV geometry.
+        ca_nh, ca_nkv, ca_hd = self.num_heads, self.num_kv_heads, self.head_dim
+        if self.dit_hidden == self.hidden_size:
+            # Unchanged default: self-attn uses the exact VLM head config and the
+            # VLM FFN width, so saved checkpoints load identically.
+            sa_nh, sa_nkv, sa_hd = self.num_heads, self.num_kv_heads, self.head_dim
+            dit_intermediate = self.intermediate_size
+        else:
+            sa_hd = self.head_dim
+            sa_nh = self.dit_hidden // sa_hd
+            gqa_ratio = max(1, self.num_heads // max(1, self.num_kv_heads))
+            sa_nkv = max(1, sa_nh // gqa_ratio)
+            while sa_nh % sa_nkv != 0:
+                sa_nkv -= 1
+            dit_intermediate = int(round(self.intermediate_size * self.dit_hidden / self.hidden_size))
+            print(f"DiT width decoupled: dit_hidden={self.dit_hidden} (VLM hidden={self.hidden_size}); "
+                  f"self-attn {sa_nh}x{sa_hd} (kv {sa_nkv}), cross-attn {ca_nh}x{ca_hd} (kv {ca_nkv}), "
+                  f"ffn_intermediate={dit_intermediate}")
+
         self.dit_layers = nn.ModuleList([
             DiTLayer(
-                hidden_size=self.hidden_size,
-                num_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_dim=self.head_dim,
-                intermediate_size=self.intermediate_size,
+                hidden_size=self.dit_hidden,
+                sa_num_heads=sa_nh, sa_num_kv_heads=sa_nkv, sa_head_dim=sa_hd,
+                ca_num_heads=ca_nh, ca_num_kv_heads=ca_nkv, ca_head_dim=ca_hd,
+                intermediate_size=dit_intermediate,
                 rms_norm_eps=self.rms_norm_eps,
                 dropout=config.dropout,
             ) for _ in range(self.num_dit_layers)
@@ -370,28 +410,28 @@ class WiltechsVLATransformer(nn.Module):
         # ─────────────────────────────────────────────────────────────
         # 3. DiT-side embeddings: SINK, state, action, time MLP
         # ─────────────────────────────────────────────────────────────
-        self.sink_token = nn.Parameter(torch.zeros(1, 1, self.hidden_size))
+        self.sink_token = nn.Parameter(torch.zeros(1, 1, self.dit_hidden))
         nn.init.normal_(self.sink_token, std=0.02)
 
         self.state_encoder = nn.Sequential(
-            nn.Linear(config.state_dim, self.hidden_size),
-            RMSNorm(self.hidden_size, eps=self.rms_norm_eps),
+            nn.Linear(config.state_dim, self.dit_hidden),
+            RMSNorm(self.dit_hidden, eps=self.rms_norm_eps),
         )
 
-        self.action_in_proj = nn.Linear(config.action_dim, self.hidden_size)
-        self.action_pos_emb = nn.Parameter(torch.zeros(1, config.horizon, self.hidden_size))
+        self.action_in_proj = nn.Linear(config.action_dim, self.dit_hidden)
+        self.action_pos_emb = nn.Parameter(torch.zeros(1, config.horizon, self.dit_hidden))
         nn.init.normal_(self.action_pos_emb, std=0.02)
 
-        self.final_norm = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
-        self.action_out_proj = nn.Linear(self.hidden_size, config.action_dim)
+        self.final_norm = RMSNorm(self.dit_hidden, eps=self.rms_norm_eps)
+        self.action_out_proj = nn.Linear(self.dit_hidden, config.action_dim)
         nn.init.zeros_(self.action_out_proj.weight)
         nn.init.zeros_(self.action_out_proj.bias)
 
         # Time embedding MLP: sinusoidal → MLP → fed to every DiT layer's adaLN
         self.time_embedder = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.Linear(self.dit_hidden, self.dit_hidden),
             nn.SiLU(),
-            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.Linear(self.dit_hidden, self.dit_hidden),
         )
 
         # ─────────────────────────────────────────────────────────────
@@ -401,7 +441,7 @@ class WiltechsVLATransformer(nn.Module):
             self.robot_visual_encoder = RobotVisualEncoder(
                 input_size=config.robot_encoder_input_size,
                 out_tokens=config.robot_encoder_tokens,
-                out_dim=self.hidden_size,
+                out_dim=self.dit_hidden,
             )
         else:
             self.robot_visual_encoder = None
@@ -412,11 +452,13 @@ class WiltechsVLATransformer(nn.Module):
         # ─────────────────────────────────────────────────────────────
         self.num_latent_tokens = config.num_latent_tokens
         if self.num_latent_tokens > 0:
-            hidden_mid = self.hidden_size * 2
+            # Input is the VLM-width pooled language embedding; output is the DiT
+            # width (num_latent_tokens × dit_hidden).
+            hidden_mid = self.dit_hidden * 2
             self.latent_generator = nn.Sequential(
                 nn.Linear(self.hidden_size, hidden_mid),
                 nn.SiLU(),
-                nn.Linear(hidden_mid, self.num_latent_tokens * self.hidden_size),
+                nn.Linear(hidden_mid, self.num_latent_tokens * self.dit_hidden),
             )
             nn.init.zeros_(self.latent_generator[-1].weight)
             nn.init.zeros_(self.latent_generator[-1].bias)
@@ -726,7 +768,7 @@ class WiltechsVLATransformer(nn.Module):
             else:
                 pooled = torch.zeros(B, self.hidden_size, device=device, dtype=dtype)
         flat = self.latent_generator(pooled.float())
-        return flat.view(B, self.num_latent_tokens, self.hidden_size).to(dtype)
+        return flat.view(B, self.num_latent_tokens, self.dit_hidden).to(dtype)
 
     def _build_dit_input(
         self,
@@ -797,7 +839,7 @@ class WiltechsVLATransformer(nn.Module):
         dtype = noisy_actions.dtype
 
         # Time embedding
-        t_emb_raw = create_sinusoidal_pos_embedding(timesteps, self.hidden_size).to(dtype)
+        t_emb_raw = create_sinusoidal_pos_embedding(timesteps, self.dit_hidden).to(dtype)
         t_emb = self.time_embedder(t_emb_raw.float()).to(dtype)
 
         # Build sequence

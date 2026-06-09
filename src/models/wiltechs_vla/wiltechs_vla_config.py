@@ -82,6 +82,11 @@ class WiltechsVLAConfig(PreTrainedConfig):
     # is here only for surfacing it in saved configs.
     # Qwen3-VL-4B-Instruct-FP8 text hidden size is 2560.
     d_model: int = 2560
+    # DiT decoder width. 0 → match the VLM hidden size (d_model). Set a smaller
+    # multiple of the VLM head_dim (e.g. 1280) to shrink the DiT residual stream /
+    # self-attn / FFN / adaLN (~quadratic param savings) while cross-attention is
+    # bridged back up to the frozen VLM KV geometry. Big GPU-memory lever.
+    dit_hidden_size: int = 0
     # Dropout used inside DiT layers (self-attn output, cross-attn output, FFN output).
     dropout: float = 0.1
     # Kept for backwards-compat — has no effect in the encoder-decoder model
