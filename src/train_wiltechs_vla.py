@@ -152,6 +152,7 @@ def _log_gradient_analysis(policy, step: int) -> None:
         ("State Enc",      "state_encoder"),
         ("Robot CNN",      "robot_visual_encoder"),
         ("Expert Layers",  "expert_layers"),
+        ("DiT Layers",     "dit_layers"),
         ("Action In/Out",  "action_"),
         ("Final Norm",     "final_norm"),
         ("Latent Gen",     "latent_generator"),
