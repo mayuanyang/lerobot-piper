@@ -204,15 +204,15 @@ def _log_gradient_analysis(policy, step: int) -> None:
         return (total / count, count) if count > 0 else (None, 0)
 
     for label, prefix in [
-        ("Vision",         "visual"),
-        ("State Enc",      "state_encoder"),
         ("Robot CNN",      "robot_visual_encoder"),
-        ("Expert Layers",  "expert_layers"),
+        ("State Enc",      "state_encoder"),
+        ("Sink Token",     "sink_token"),
+        ("Action Pos Emb", "action_pos_emb"),
+        ("Time Embedder",  "time_embedder"),
         ("DiT Layers",     "dit_layers"),
         ("Action In/Out",  "action_"),
         ("Final Norm",     "final_norm"),
         ("Latent QFormer", "latent_qformer"),
-        ("Lang Adaptor",   "lang_adaptor"),
     ]:
         grad, n = _grad_stats(prefix)
         if grad is not None:
