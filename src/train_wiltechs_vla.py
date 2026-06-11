@@ -249,6 +249,21 @@ def _log_gradient_analysis(policy, step: int) -> None:
         g_norm_sq = sum(p.grad.norm().item() ** 2 for p in policy.model.lang_adaptor.parameters() if p.grad is not None) ** 0.5
         print(f"  Lang adaptor   - weight_norm: {w_norm:.4e}   grad_norm: {g_norm_sq:.4e}")
 
+    stats = getattr(policy.model, "_last_attention_stats", None)
+    if stats:
+        # Match DiT sequence order: [SINK, state, robot, latent, action]
+        order = ["sink", "state", "robot", "latent", "action"]
+        ordered = [(k, stats[k]) for k in order if k in stats]
+        cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in ordered)
+        print(f"  Action→ self-attn : {cells}    (last DiT layer)")
+
+    x_stats = getattr(policy.model, "_last_cross_attention_stats", None)
+    if x_stats:
+        order = ["vision", "language"]
+        ordered = [(k, x_stats[k]) for k in order if k in x_stats]
+        cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in ordered)
+        print(f"  Action→ x-attn    : {cells}    (cross-attn to VLM KV)")
+
     comps = getattr(policy.model, "_last_loss_components", None)
     cw = getattr(policy.model.config, "contrastive_loss_weight", 0.0)
     if comps is not None and cw > 0.0:
@@ -280,6 +295,7 @@ def train(
     lock_joint_index: Optional[int] = None,
     contrastive_loss_weight: float = 0.1,
     contrastive_margin: float = 0.05,
+    vision_kv_dropout_prob: float = 0.0,
     robot_encoder_tokens: int = 16,
     noise_temporal_correlation: float = 0.0,
     preprocess_in_workers: bool = False,
@@ -381,6 +397,7 @@ def train(
         vlm_attends_to_expert=True,
         contrastive_loss_weight=contrastive_loss_weight,
         contrastive_margin=contrastive_margin,
+        vision_kv_dropout_prob=vision_kv_dropout_prob,
         robot_encoder_tokens=robot_encoder_tokens,
         noise_temporal_correlation=noise_temporal_correlation,
     )
@@ -703,6 +720,11 @@ def train(
                               "the model. Fix data flow before tuning contrastive loss.")
                     print("--- end LANG CHECK ---\n")
 
+            # Arm the attention-mass diagnostic on the same cadence as
+            # gradient analysis. The model self-disarms after one capture.
+            if step % progress_update_freq == 0:
+                policy.model._capture_attention_stats = True
+
             autocast_ctx = (
                 torch.autocast(device_type=device.type, dtype=torch.bfloat16)
                 if device.type == "cuda"
@@ -815,6 +837,11 @@ if __name__ == "__main__":
                         help="Weight for the language-permute contrastive loss (default: 0.1).")
     parser.add_argument("--contrastive_margin", type=float, default=0.05,
                         help="Hinge margin on MSE between v_t and v_wrong (default: 0.05).")
+    parser.add_argument("--vision_kv_dropout_prob", type=float, default=0.0,
+                        help="Training-time dropout on the VLM VISION positions of the DiT "
+                             "cross-attn memory (language is never dropped). Weakens the "
+                             "~25:1 vision:language shortcut to force language reliance. "
+                             "Try 0.25-0.4; 0 disables (default).")
     parser.add_argument("--robot_encoder_tokens", type=int, default=16,
                         help="Robot CNN tokens per camera. Must be a perfect square "
                              "(grid side = sqrt). Default: 16 (4x4).")

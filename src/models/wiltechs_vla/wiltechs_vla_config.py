@@ -125,7 +125,14 @@ class WiltechsVLAConfig(PreTrainedConfig):
     num_latent_qformer_layers: int = 2
 
     # -------- Vision token dropout (regularizer) --------
+    # Applied to the robot-CNN tokens only (see _compute_robot_tokens).
     vision_dropout_prob: float = 0.3
+    # Training-time dropout on the VLM vision positions of the KV cross-attn
+    # memory (masks vision slots in vlm_kv_pad_mask; the VLM forward itself is
+    # untouched). Language slots are never dropped, so this directly weakens
+    # the visual shortcut and forces the DiT/QFormer to lean on language.
+    # 0 disables (default, checkpoint-compatible).
+    vision_kv_dropout_prob: float = 0.0
 
     # -------- Auxiliary contrastive loss (language forcing) --------
     contrastive_loss_weight: float = 0.1
