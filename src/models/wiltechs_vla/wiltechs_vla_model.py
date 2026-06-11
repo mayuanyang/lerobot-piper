@@ -746,8 +746,6 @@ class WiltechsVLATransformer(nn.Module):
             descs = batch.get("task")
         if not descs or not any(descs):
             return None
-          
-        print(descs)
         inputs = self.processor.tokenizer(
             descs, return_tensors="pt", padding=True, truncation=True,
             max_length=self._lang_max_len, add_special_tokens=True,
