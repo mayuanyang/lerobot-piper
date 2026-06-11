@@ -249,6 +249,17 @@ def _log_gradient_analysis(policy, step: int) -> None:
         g_norm_sq = sum(p.grad.norm().item() ** 2 for p in policy.model.lang_adaptor.parameters() if p.grad is not None) ** 0.5
         print(f"  Lang adaptor   - weight_norm: {w_norm:.4e}   grad_norm: {g_norm_sq:.4e}")
 
+    # Name any DiT params that missed gradient this step — explains drops in
+    # the "DiT Layers" param count above (which only counts grad-carrying params).
+    none_named = [
+        (name, p.numel()) for name, p in policy.model.named_parameters()
+        if p.requires_grad and "dit_layers" in name and p.grad is None
+    ]
+    if none_named:
+        n_none = sum(n for _, n in none_named)
+        print(f"  [grad=None] {n_none} DiT params across {len(none_named)} tensors, "
+              f"e.g.: {[name for name, _ in none_named[:4]]}")
+
     stats = getattr(policy.model, "_last_attention_stats", None)
     if stats:
         # Match DiT sequence order: [SINK, state, robot, latent, action]
