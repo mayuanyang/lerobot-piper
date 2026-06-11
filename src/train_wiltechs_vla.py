@@ -630,6 +630,7 @@ def train(
     # ── Training loop ────────────────────────────────────────────────────
     print(f"\nStarting training loop ({training_steps} steps, batch_size={batch_size})...")
     done = False
+    lang_check_done = False  # one-shot: fires on first batch even when resuming
     prog_bar = tqdm(total=training_steps, desc="Training Progress", initial=step)
 
     while not done:
@@ -666,6 +667,41 @@ def train(
             vlm_pix = {k: batch.pop(k) for k in list(batch) if k.startswith(_VLM_PIX_PREFIX)}
             batch = preprocessor(batch)
             batch.update(vlm_pix)
+
+            # One-time language-reaches-model sanity check (step 0). The model's
+            # _encode_language reads task_description, falling back to task; if
+            # both are absent/empty here, it silently runs vision-only and no
+            # contrastive weight can fix that. This logs AFTER the preprocessor,
+            # which historically stripped task_description (the 2026-05 goal-9%
+            # bug). Verify language is present BEFORE blaming contrastive_loss_weight.
+            if not lang_check_done:
+                lang_check_done = True
+                descs = batch.get("task_description")
+                if descs is None:
+                    descs = batch.get("task")
+                if descs is None:
+                    print("⚠️  LANG CHECK: neither 'task_description' nor 'task' in "
+                          "batch after preprocessor — model will train VISION-ONLY.")
+                else:
+                    n_nonempty = sum(1 for d in descs if d)
+                    print(f"\n--- LANG CHECK (step 0) ---")
+                    print(f"  key present: task_description={'task_description' in batch}, "
+                          f"task={'task' in batch}")
+                    print(f"  non-empty descriptions: {n_nonempty}/{len(descs)}")
+                    print(f"  examples: {list(descs[:2])}")
+                    try:
+                        tok = policy.model.processor.tokenizer(
+                            list(descs), return_tensors="pt", padding=True,
+                            truncation=True, add_special_tokens=True,
+                        )
+                        L_lang = int(tok["input_ids"].shape[1])
+                        print(f"  tokenized L_lang (padded): {L_lang}")
+                    except Exception as e:
+                        print(f"  (could not tokenize to report L_lang: {e})")
+                    if n_nonempty == 0:
+                        print("⚠️  ALL descriptions empty — language is NOT reaching "
+                              "the model. Fix data flow before tuning contrastive loss.")
+                    print("--- end LANG CHECK ---\n")
 
             autocast_ctx = (
                 torch.autocast(device_type=device.type, dtype=torch.bfloat16)
