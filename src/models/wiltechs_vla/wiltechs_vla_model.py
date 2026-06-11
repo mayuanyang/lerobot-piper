@@ -1130,6 +1130,12 @@ class WiltechsVLATransformer(nn.Module):
                 # one-shot: don't capture again if _run_dit is called twice
                 # (e.g. for the contrastive-language v_wrong forward).
                 self._capture_attention_stats = False
+                # The no_grad capture above populated the autocast weight
+                # cache with GRAD-LESS bf16 casts of this layer's sa_q/sa_k/
+                # ca_q/adaLN weights. Clear it so the real forward below
+                # re-casts them WITH grad tracking — otherwise those weights
+                # silently receive no gradient on every capture step.
+                torch.clear_autocast_cache()
 
             vlm_k, vlm_v = kv_cache[i]
             if use_ckpt:
