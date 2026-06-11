@@ -134,6 +134,21 @@ class WiltechsVLAConfig(PreTrainedConfig):
     # 0 disables (default, checkpoint-compatible).
     vision_kv_dropout_prob: float = 0.0
 
+    # -------- Chat-template input format (Qwen ChatML) --------
+    # Wrap the VLM input as a proper instruct-style turn:
+    #   <|im_start|>user\n
+    #   (<|vision_start|> [cam tokens] <|vision_end|>) x num_cameras
+    #   {chat_directive }{task}<|im_end|>\n<|im_start|>assistant\n
+    # instead of the raw [vision | task] concatenation. In-distribution for
+    # the instruct-tuned VLM; the trailing assistant header adds "answer
+    # preparation" registers the DiT can cross-attend to. Off by default
+    # (exact legacy behavior, checkpoint-compatible).
+    use_chat_template: bool = False
+    # Optional short directive prepended to the task inside the user turn,
+    # e.g. "Identify the objects mentioned in the instruction and where they
+    # are, then perform:". Empty disables. Only used with use_chat_template.
+    chat_directive: str = ""
+
     # -------- Auxiliary contrastive loss (language forcing) --------
     contrastive_loss_weight: float = 0.1
 

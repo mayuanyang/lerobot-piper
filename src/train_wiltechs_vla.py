@@ -307,6 +307,8 @@ def train(
     contrastive_loss_weight: float = 0.1,
     contrastive_margin: float = 0.05,
     vision_kv_dropout_prob: float = 0.0,
+    use_chat_template: bool = False,
+    chat_directive: str = "",
     robot_encoder_tokens: int = 16,
     noise_temporal_correlation: float = 0.0,
     preprocess_in_workers: bool = False,
@@ -409,6 +411,8 @@ def train(
         contrastive_loss_weight=contrastive_loss_weight,
         contrastive_margin=contrastive_margin,
         vision_kv_dropout_prob=vision_kv_dropout_prob,
+        use_chat_template=use_chat_template,
+        chat_directive=chat_directive,
         robot_encoder_tokens=robot_encoder_tokens,
         noise_temporal_correlation=noise_temporal_correlation,
     )
@@ -853,6 +857,16 @@ if __name__ == "__main__":
                              "cross-attn memory (language is never dropped). Weakens the "
                              "~25:1 vision:language shortcut to force language reliance. "
                              "Try 0.25-0.4; 0 disables (default).")
+    parser.add_argument("--use_chat_template", action="store_true",
+                        help="Wrap the VLM input as a Qwen ChatML turn: <|im_start|>user + "
+                             "<|vision_start|>[cam]<|vision_end|> per camera + task + "
+                             "<|im_end|> + assistant header, instead of the raw "
+                             "[vision|task] concat. In-distribution for the instruct-tuned "
+                             "VLM; off = exact legacy behavior.")
+    parser.add_argument("--chat_directive", type=str, default="",
+                        help="Optional short directive prepended to the task inside the user "
+                             "turn (only with --use_chat_template), e.g. 'Identify the objects "
+                             "mentioned in the instruction and where they are, then perform:'.")
     parser.add_argument("--robot_encoder_tokens", type=int, default=16,
                         help="Robot CNN tokens per camera. Must be a perfect square "
                              "(grid side = sqrt). Default: 16 (4x4).")

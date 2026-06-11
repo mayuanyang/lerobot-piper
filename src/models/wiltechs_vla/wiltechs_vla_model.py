@@ -123,44 +123,45 @@ def _apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.
 
 
 def _build_mrope_position_ids(
-    image_grid_thw_list: list[torch.Tensor],
-    L_lang: int,
+    segments: list[tuple[str, object]],
     B: int,
     spatial_merge_size: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """(3, B, L_vlm) M-RoPE position_ids for [vision … | language].
+    """(3, B, L_vlm) M-RoPE position_ids for an ordered list of segments.
 
-    Mirrors HF Qwen3VL.get_vision_position_ids: each camera's vision tokens
-    get (t, h, w) at the LLM-grid resolution (post spatial_merge_size). After
-    all vision, language tokens get a monotonic temporal arange replicated
-    across the three channels.
+    Each segment is ("text", n_tokens) or ("image", grid_thw). Mirrors HF
+    Qwen3VL.get_rope_index: text tokens advance a scalar position replicated
+    across the three channels; each image block gets (t, h, w) coordinates at
+    the LLM-grid resolution (post spatial_merge_size) offset by the current
+    position, after which the position advances by max(t, h, w).
     """
-    pos_pieces: list[torch.Tensor] = []
-    cur_start = 0
-    for grid_thw in image_grid_thw_list:
-        t = int(grid_thw[0].item())
-        h = int(grid_thw[1].item()) // spatial_merge_size
-        w = int(grid_thw[2].item()) // spatial_merge_size
+    pieces: list[torch.Tensor] = []
+    cur = 0
+    for kind, val in segments:
+        if kind == "text":
+            n = int(val)
+            if n <= 0:
+                continue
+            p = torch.arange(cur, cur + n, device=device).unsqueeze(0).expand(3, -1)
+            pieces.append(p)
+            cur += n
+        else:
+            grid_thw = val
+            t = int(grid_thw[0].item())
+            h = int(grid_thw[1].item()) // spatial_merge_size
+            w = int(grid_thw[2].item()) // spatial_merge_size
 
-        pos_t = torch.arange(t, device=device).repeat_interleave(h * w) + cur_start
-        pos_h = torch.arange(h, device=device).repeat_interleave(w).repeat(t) + cur_start
-        pos_w = torch.arange(w, device=device).repeat(t * h) + cur_start
-        pos_pieces.append(torch.stack([pos_t, pos_h, pos_w], dim=0))
-        cur_start += max(t, h, w)
+            pos_t = torch.arange(t, device=device).repeat_interleave(h * w) + cur
+            pos_h = torch.arange(h, device=device).repeat_interleave(w).repeat(t) + cur
+            pos_w = torch.arange(w, device=device).repeat(t * h) + cur
+            pieces.append(torch.stack([pos_t, pos_h, pos_w], dim=0))
+            cur += max(t, h, w)
 
-    if pos_pieces:
-        vis_pos = torch.cat(pos_pieces, dim=1)
-        next_pos = int(vis_pos.max().item()) + 1
+    if pieces:
+        full = torch.cat(pieces, dim=1)
     else:
-        vis_pos = torch.zeros(3, 0, dtype=torch.long, device=device)
-        next_pos = 0
-
-    lang_pos = (
-        torch.arange(next_pos, next_pos + L_lang, device=device)
-        .unsqueeze(0).expand(3, -1)
-    )
-    full = torch.cat([vis_pos, lang_pos], dim=1)
+        full = torch.zeros(3, 0, dtype=torch.long, device=device)
     return full.unsqueeze(1).expand(3, B, -1).contiguous()
 
 
@@ -580,6 +581,11 @@ class WiltechsVLATransformer(nn.Module):
 
         self._lang_max_len = 48
 
+        # Chat-template static token ids (lazy; only built when
+        # config.use_chat_template is on) + one-shot format print.
+        self._template_ids_cpu: Optional[tuple] = None
+        self._template_format_printed = False
+
         # Activation checkpointing toggle for the DiT layers. The VLM runs in
         # @torch.no_grad and would not benefit from checkpointing; only the
         # trainable DiT decoder stack stores activations for backward.
@@ -755,13 +761,39 @@ class WiltechsVLATransformer(nn.Module):
         lang_tokens = self.language_model.get_input_embeddings()(input_ids)
         return lang_tokens, lang_mask
 
+    def _get_template_ids(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Token ids for the static ChatML pieces (cached after first call).
+
+        Returns (prefix_ids, vision_start_id, vision_end_id) — prefix is
+        "<|im_start|>user\\n"; the marker ids bracket each camera's vision block.
+        """
+        if self._template_ids_cpu is None:
+            tok = self.processor.tokenizer
+            prefix_ids = tok(
+                "<|im_start|>user\n", add_special_tokens=False, return_tensors="pt",
+            )["input_ids"][0].long()
+            vs = tok.convert_tokens_to_ids("<|vision_start|>")
+            ve = tok.convert_tokens_to_ids("<|vision_end|>")
+            if vs is None or ve is None or vs == tok.unk_token_id or ve == tok.unk_token_id:
+                raise RuntimeError(
+                    "use_chat_template=True but the tokenizer has no "
+                    "<|vision_start|>/<|vision_end|> special tokens — check the "
+                    "Qwen3-VL processor version."
+                )
+            self._template_ids_cpu = (
+                prefix_ids,
+                torch.tensor([vs], dtype=torch.long),
+                torch.tensor([ve], dtype=torch.long),
+            )
+        return tuple(t.to(device) for t in self._template_ids_cpu)
+
     # =========================================================================
     # VLM encoder: run all 36 layers, cache K/V from the last num_dit_layers
     # =========================================================================
     @torch.no_grad()
     def _run_vlm_and_cache_kv(
         self, batch: dict
-    ) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor, int]:
+    ) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor, torch.Tensor, int]:
         """
         Returns:
           kv_cache:        list of length num_dit_layers, each entry is
@@ -769,8 +801,14 @@ class WiltechsVLATransformer(nn.Module):
                            K is post-M-RoPE rotation.
           vlm_kv_pad_mask: (B, L_vlm) bool — True at non-padded positions.
                            Used by DiT cross-attn to ignore padded language slots.
-          L_vis:           int — number of vision tokens (so callers can locate
-                           the language slice for contrastive perturbation).
+          vis_mask:        (L_vlm,) bool — True at actual VISION token positions
+                           (excludes the ChatML prefix/markers when
+                           use_chat_template is on). Sample-independent.
+          text_start:      int — index where the PER-SAMPLE text begins. With the
+                           chat template that is the {directive task <|im_end|>
+                           assistant-header} suffix; legacy it equals L_vis.
+                           Everything before it is identical across the batch, so
+                           contrastive perturbation shuffles [text_start:].
         """
         B = batch["observation.state"].shape[0]
         device = batch["observation.state"].device
@@ -778,39 +816,122 @@ class WiltechsVLATransformer(nn.Module):
         vis_tokens, grid_thw_list = self._encode_images(batch, B)
         L_vis = vis_tokens.shape[1]
 
-        lang_result = self._encode_language(batch, device)
-        if lang_result is not None:
-            lang_tokens, lang_mask = lang_result
-            lang_tokens = lang_tokens.to(vis_tokens.dtype)
-            # Zero-out padded language embeddings so their K/V are uninformative.
-            lang_tokens = torch.where(
-                lang_mask.unsqueeze(-1), lang_tokens, torch.zeros_like(lang_tokens),
+        descs = batch.get("task_description")
+        if not descs:
+            descs = batch.get("task")
+        have_lang = bool(descs) and any(descs)
+        use_template = bool(getattr(self.config, "use_chat_template", False)) and have_lang
+        embed_tokens = self.language_model.get_input_embeddings()
+
+        if use_template:
+            # ChatML wrapping (in-distribution for the instruct-tuned VLM):
+            #   <|im_start|>user\n
+            #   (<|vision_start|> [cam tokens] <|vision_end|>) × num_cameras
+            #   {directive }{task}<|im_end|>\n<|im_start|>assistant\n
+            # Per-camera markers match Qwen's multi-image pretraining; the
+            # trailing assistant header adds "answer preparation" registers
+            # the DiT can cross-attend to.
+            m = self.spatial_merge_size
+            cam_sizes = [
+                int(g[0].item()) * (int(g[1].item()) // m) * (int(g[2].item()) // m)
+                for g in grid_thw_list
+            ]
+            cam_tokens = list(vis_tokens.split(cam_sizes, dim=1)) if cam_sizes else []
+
+            directive = str(getattr(self.config, "chat_directive", "") or "").strip()
+            texts = [
+                (f"{directive} {d}" if directive else str(d))
+                + "<|im_end|>\n<|im_start|>assistant\n"
+                for d in descs
+            ]
+            suf = self.processor.tokenizer(
+                texts, return_tensors="pt", padding=True, truncation=True,
+                max_length=self._lang_max_len + 24, add_special_tokens=False,
             )
-            L_lang = lang_tokens.shape[1]
+            suffix_ids = suf["input_ids"].to(device)
+            suffix_mask = suf["attention_mask"].bool().to(device)
+            suffix_emb = embed_tokens(suffix_ids)
+            # Zero-out padded embeddings so their K/V are uninformative.
+            suffix_emb = torch.where(
+                suffix_mask.unsqueeze(-1), suffix_emb, torch.zeros_like(suffix_emb),
+            )
+
+            prefix_ids, vs_id, ve_id = self._get_template_ids(device)
+            prefix_emb = embed_tokens(prefix_ids).unsqueeze(0).expand(B, -1, -1)
+            vs_emb = embed_tokens(vs_id).unsqueeze(0).expand(B, -1, -1)
+            ve_emb = embed_tokens(ve_id).unsqueeze(0).expand(B, -1, -1)
+
+            parts = [prefix_emb]
+            segments: list[tuple[str, object]] = [("text", prefix_ids.shape[0])]
+            vis_flags = [False] * prefix_ids.shape[0]
+            for ct, g in zip(cam_tokens, grid_thw_list):
+                parts += [vs_emb, ct, ve_emb]
+                segments += [("text", 1), ("image", g), ("text", 1)]
+                vis_flags += [False] + [True] * ct.shape[1] + [False]
+            parts.append(suffix_emb)
+            segments.append(("text", suffix_ids.shape[1]))
+            vis_flags += [False] * suffix_ids.shape[1]
+
+            vlm_seq = torch.cat(parts, dim=1).to(torch.bfloat16)
+            L_vlm = vlm_seq.shape[1]
+            text_start = L_vlm - suffix_ids.shape[1]
+            vis_mask = torch.tensor(vis_flags, device=device, dtype=torch.bool)
+            vlm_kv_pad_mask = torch.cat(
+                [torch.ones(B, text_start, device=device, dtype=torch.bool), suffix_mask],
+                dim=1,
+            )
+
+            if not self._template_format_printed:
+                self._template_format_printed = True
+                decoded = self.processor.tokenizer.decode(
+                    suffix_ids[0][suffix_mask[0]], skip_special_tokens=False,
+                )
+                print(f"[wiltechs_vla] chat template ON — L_vlm={L_vlm} "
+                      f"(prefix {prefix_ids.shape[0]} | {len(cam_tokens)} cams ×(1+vis+1) "
+                      f"| suffix {suffix_ids.shape[1]})")
+                print(f"[wiltechs_vla]   suffix[0]: {decoded!r}")
         else:
-            lang_tokens = None
-            lang_mask = None
-            L_lang = 0
+            # Legacy raw concatenation [vision | task].
+            lang_result = self._encode_language(batch, device)
+            if lang_result is not None:
+                lang_tokens, lang_mask = lang_result
+                lang_tokens = lang_tokens.to(vis_tokens.dtype)
+                # Zero-out padded language embeddings so their K/V are uninformative.
+                lang_tokens = torch.where(
+                    lang_mask.unsqueeze(-1), lang_tokens, torch.zeros_like(lang_tokens),
+                )
+                L_lang = lang_tokens.shape[1]
+            else:
+                lang_tokens = None
+                lang_mask = None
+                L_lang = 0
 
-        parts = [vis_tokens]
-        if lang_tokens is not None:
-            parts.append(lang_tokens)
-        vlm_seq = torch.cat(parts, dim=1).to(torch.bfloat16)
-        L_vlm = vlm_seq.shape[1]
+            parts = [vis_tokens]
+            if lang_tokens is not None:
+                parts.append(lang_tokens)
+            vlm_seq = torch.cat(parts, dim=1).to(torch.bfloat16)
+            L_vlm = vlm_seq.shape[1]
+            text_start = L_vis
+            vis_mask = torch.zeros(L_vlm, device=device, dtype=torch.bool)
+            vis_mask[:L_vis] = True
 
-        # M-RoPE position_ids — vision tokens get (t, h, w), lang gets monotonic
+            segments = [("image", g) for g in grid_thw_list]
+            if L_lang > 0:
+                segments.append(("text", L_lang))
+
+            # Valid-position mask: vision always valid; language follows lang_mask.
+            if lang_mask is not None:
+                vis_ones = torch.ones(B, L_vis, device=device, dtype=torch.bool)
+                vlm_kv_pad_mask = torch.cat([vis_ones, lang_mask], dim=1)
+            else:
+                vlm_kv_pad_mask = torch.ones(B, L_vlm, device=device, dtype=torch.bool)
+
+        # M-RoPE position_ids — image segments get (t, h, w), text monotonic
         position_ids = _build_mrope_position_ids(
-            grid_thw_list, L_lang=L_lang, B=B,
+            segments, B=B,
             spatial_merge_size=self.spatial_merge_size, device=device,
         )
         cos, sin = self.language_model.rotary_emb(vlm_seq, position_ids)
-
-        # Valid-position mask: vision always valid; language follows lang_mask.
-        if lang_mask is not None:
-            vis_mask = torch.ones(B, L_vis, device=device, dtype=torch.bool)
-            vlm_kv_pad_mask = torch.cat([vis_mask, lang_mask], dim=1)
-        else:
-            vlm_kv_pad_mask = torch.ones(B, L_vlm, device=device, dtype=torch.bool)
 
         # Causal mask + key-padding mask for VLM self-attention (matches the
         # mask shape Qwen3-VL was pretrained with). Shape: (B, 1, L, L).
@@ -862,7 +983,7 @@ class WiltechsVLATransformer(nn.Module):
             h_in = layer.post_attention_layernorm(hidden)
             hidden = residual + layer.mlp(h_in)
 
-        return kv_cache, vlm_kv_pad_mask, L_vis
+        return kv_cache, vlm_kv_pad_mask, vis_mask, text_start
 
     # =========================================================================
     # DiT-side helpers: robot CNN, latents, time, input assembly
@@ -1014,8 +1135,7 @@ class WiltechsVLATransformer(nn.Module):
         vlm_kv_pad_mask: Optional[torch.Tensor],
         action_start: int,
         action_len: int,
-        L_vis: int,
-        L_lang: int,
+        vis_mask: Optional[torch.Tensor],
     ) -> dict[str, float]:
         """Re-run the LAST DiT layer's cross-attn Q·K^T softmax manually and
         report mass that action queries place on vision vs language portions
@@ -1057,10 +1177,14 @@ class WiltechsVLATransformer(nn.Module):
         weights = torch.softmax(scores, dim=-1)
 
         stats: dict[str, float] = {}
-        if L_vis > 0:
-            stats["vision"] = weights[:, :, :, :L_vis].sum(dim=-1).mean().item()
-        if L_lang > 0:
-            stats["language"] = weights[:, :, :, L_vis:L_vis + L_lang].sum(dim=-1).mean().item()
+        if vis_mask is not None:
+            if bool(vis_mask.any()):
+                stats["vision"] = weights[:, :, :, vis_mask].sum(dim=-1).mean().item()
+            txt_mask = ~vis_mask
+            if bool(txt_mask.any()):
+                # "language" = every non-vision KV position (task text; plus the
+                # ChatML prefix/markers/assistant header when the template is on).
+                stats["language"] = weights[:, :, :, txt_mask].sum(dim=-1).mean().item()
         return stats
 
     # =========================================================================
@@ -1075,8 +1199,7 @@ class WiltechsVLATransformer(nn.Module):
         vlm_kv_pad_mask: torch.Tensor,
         robot_tokens: Optional[torch.Tensor],
         latents: Optional[torch.Tensor],
-        L_vis: int = 0,
-        L_lang: int = 0,
+        vis_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """One DiT denoising step. Returns velocity prediction (B, H, action_dim)."""
         device = noisy_actions.device
@@ -1125,7 +1248,7 @@ class WiltechsVLATransformer(nn.Module):
                 )
                 self._last_cross_attention_stats = self._compute_cross_attention_mass(
                     x, t_emb, kv_cache[i], vlm_kv_pad_mask,
-                    action_start_idx, H_horizon, L_vis, L_lang,
+                    action_start_idx, H_horizon, vis_mask,
                 )
                 # one-shot: don't capture again if _run_dit is called twice
                 # (e.g. for the contrastive-language v_wrong forward).
@@ -1177,7 +1300,7 @@ class WiltechsVLATransformer(nn.Module):
         device = actions.device
 
         # ── Encoder: run VLM once, cache KV ─────────────────────────
-        kv_cache, vlm_kv_pad_mask, L_vis = self._run_vlm_and_cache_kv(batch)
+        kv_cache, vlm_kv_pad_mask, vis_mask, text_start = self._run_vlm_and_cache_kv(batch)
 
         # ── Vision-KV dropout (training only) ───────────────────────
         # Mask a random fraction of VISION positions in the cross-attn pad
@@ -1189,15 +1312,17 @@ class WiltechsVLATransformer(nn.Module):
         # language reliance there). Applied BEFORE latents/DiT/contrastive
         # so all consumers see one consistent mask.
         vkv_p = float(getattr(self.config, "vision_kv_dropout_prob", 0.0))
-        if self.training and vkv_p > 0.0 and L_vis > 0:
-            keep = torch.rand(B, L_vis, device=device) > vkv_p
+        n_vis = int(vis_mask.sum().item())
+        if self.training and vkv_p > 0.0 and n_vis > 0:
+            vis_idx = vis_mask.nonzero(as_tuple=True)[0]
+            keep = torch.rand(B, n_vis, device=device) > vkv_p
             # Never let a sample lose its entire memory (all-pad rows make
             # SDPA emit NaN when no language tokens exist either).
             dead = ~keep.any(dim=1)
             if dead.any():
                 keep[dead, 0] = True
             vlm_kv_pad_mask = vlm_kv_pad_mask.clone()
-            vlm_kv_pad_mask[:, :L_vis] &= keep
+            vlm_kv_pad_mask[:, vis_idx] &= keep
 
         # ── DiT-side conditioning that does NOT depend on noise ─────
         robot_tokens = self._compute_robot_tokens(batch)
@@ -1214,7 +1339,7 @@ class WiltechsVLATransformer(nn.Module):
         v_t = self._run_dit(
             batch, x_t_bf16, t, kv_cache, vlm_kv_pad_mask,
             robot_tokens, latents,
-            L_vis=L_vis, L_lang=vlm_kv_pad_mask.shape[-1] - L_vis,
+            vis_mask=vis_mask,
         ).float()
 
         # Per-position weighting (n_action_steps gets full weight; future tail
@@ -1251,13 +1376,16 @@ class WiltechsVLATransformer(nn.Module):
         main_loss = loss.sum() / denom
 
         # ── Contrastive language loss (cheap variant) ───────────────
-        # Permute the LANGUAGE portion of each VLM KV pair across batch and
-        # re-run the DiT. The "wrong-language" prediction should differ from
-        # the right-language one by at least `contrastive_margin`. Avoids a
-        # second full VLM forward (which would be expensive on Qwen3-VL 4B).
+        # Permute the per-sample TEXT slice [text_start:] of each VLM KV pair
+        # across batch and re-run the DiT. (Legacy that slice is the raw task;
+        # with the chat template it is the task + <|im_end|> + assistant-header
+        # registers — all task-conditioned summaries.) The "wrong-language"
+        # prediction should differ from the right-language one by at least
+        # `contrastive_margin`. Avoids a second full VLM forward (which would
+        # be expensive on Qwen3-VL 4B).
         contrastive_w = float(getattr(self.config, "contrastive_loss_weight", 0.0))
         contrastive_v = 0.0
-        L_lang_total = vlm_kv_pad_mask.shape[-1] - L_vis
+        L_lang_total = vlm_kv_pad_mask.shape[-1] - text_start
         if (
             self.training and contrastive_w > 0.0
             and L_lang_total > 0 and B >= 2
@@ -1284,11 +1412,11 @@ class WiltechsVLATransformer(nn.Module):
                 for K, V in kv_cache:
                     K_shuf = K.clone()
                     V_shuf = V.clone()
-                    K_shuf[:, :, L_vis:, :] = K[perm, :, L_vis:, :]
-                    V_shuf[:, :, L_vis:, :] = V[perm, :, L_vis:, :]
+                    K_shuf[:, :, text_start:, :] = K[perm, :, text_start:, :]
+                    V_shuf[:, :, text_start:, :] = V[perm, :, text_start:, :]
                     shuffled_cache.append((K_shuf, V_shuf))
                 shuffled_pad_mask = vlm_kv_pad_mask.clone()
-                shuffled_pad_mask[:, L_vis:] = vlm_kv_pad_mask[perm][:, L_vis:]
+                shuffled_pad_mask[:, text_start:] = vlm_kv_pad_mask[perm][:, text_start:]
 
                 # Recompute the latents from the wrong-language cache so the
                 # QFormer path is ALSO language-forced. Passing the correct-
@@ -1334,7 +1462,7 @@ class WiltechsVLATransformer(nn.Module):
 
         with autocast_ctx:
             # Encoder pass: run VLM once, get KV cache
-            kv_cache, vlm_kv_pad_mask, _L_vis = self._run_vlm_and_cache_kv(batch)
+            kv_cache, vlm_kv_pad_mask, _vis_mask, _text_start = self._run_vlm_and_cache_kv(batch)
 
             # DiT-side static conditioning (same across denoising steps)
             robot_tokens = self._compute_robot_tokens(batch)
