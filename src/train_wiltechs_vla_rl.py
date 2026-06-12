@@ -84,17 +84,25 @@ def grpo_clip_loss(
     advantages: torch.Tensor,
     clip_low: float = 0.2,
     clip_high: float = 0.28,
+    weights: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict]:
     """PPO-clip objective with decoupled clip range (DAPO clip-higher), no KL.
 
     logp_new/logp_old: (B, T) per-timestep log-probs; advantages: (B,) per
-    trajectory, broadcast over the chunk's timesteps.
+    trajectory, broadcast over the chunk's timesteps. `weights` (B,) optionally
+    weights each chunk (used for per-trajectory length normalization, paper
+    eq. 11 — otherwise long failed episodes dominate the batch).
     """
     ratio = torch.exp(logp_new - logp_old)
     adv = advantages.unsqueeze(-1)
     unclipped = ratio * adv
     clipped = torch.clamp(ratio, 1.0 - clip_low, 1.0 + clip_high) * adv
-    loss = -torch.minimum(unclipped, clipped).mean()
+    per_elem = torch.minimum(unclipped, clipped)
+    if weights is None:
+        loss = -per_elem.mean()
+    else:
+        w = weights.unsqueeze(-1)
+        loss = -(per_elem * w).sum() / (w.sum() * per_elem.shape[-1])
     stats = {
         "ratio_mean": float(ratio.detach().mean()),
         "ratio_max": float(ratio.detach().max()),
@@ -117,6 +125,7 @@ class ChunkRecord:
     action: np.ndarray                 # (n_exec, action_dim) f32 — executed, NORMALIZED space
     logp_old: np.ndarray               # (n_exec,) f32
     advantage: float = 0.0             # filled in after the group finishes
+    weight: float = 1.0                # 1/episode_chunks — per-trajectory normalization
 
 
 @dataclass
@@ -302,48 +311,59 @@ def grpo_update(
     )
     trainable = [p for p in policy.model.parameters() if p.requires_grad]
 
-    # FIXED minibatch partition, reused across epochs. logp_old is computed at
-    # FIRST use, inside the exact same forward (same batch composition, same
-    # kernel shapes) that computes logp_new — detached. So epoch 0 is an exact
-    # vanilla policy gradient (ratio == 1 bitwise, clipping vacuous) and
-    # bf16/batch-composition nondeterminism between rollout and update CANNOT
-    # contaminate the ratios (observed before this: rollout-logp comparison gave
-    # ratio_mean 0.97 but clip_frac 0.81 — 81% of data zero-gradient). For
-    # update_epochs > 1 the cached logp_old makes ratios measure only real
-    # policy change. The rollout-time logp is kept as a drift diagnostic.
+    # FIXED minibatch partition, reused by the pre-pass and all epochs:
+    # identical batch composition => identical kernel shapes => exact logp
+    # baselines (bf16 reduction-order noise between DIFFERENT compositions
+    # previously zeroed 81% of gradients via spurious clipping).
     order = np.random.permutation(len(records))
     minibatches = [
         [records[i] for i in order[s:s + args.update_minibatch]]
         for s in range(0, len(records), args.update_minibatch)
     ]
-    logp_old_cache: list[Optional[torch.Tensor]] = [None] * len(minibatches)
 
+    def mb_tensors(mb):
+        obs_list = [{"pixels": r.pixels, "agent_pos": r.agent_pos} for r in mb]
+        batch = obs_list_to_model_batch(obs_list, [r.task for r in mb], preprocessor)
+        x1 = torch.from_numpy(np.stack([r.x1 for r in mb])).to(device)
+        actions = torch.from_numpy(np.stack([r.action for r in mb])).to(device)
+        adv = torch.tensor([r.advantage for r in mb], device=device, dtype=torch.float32)
+        w = torch.tensor([r.weight for r in mb], device=device, dtype=torch.float32)
+        return batch, x1, actions, adv, w
+
+    def forward_logp(batch, x1, actions):
+        with autocast_ctx:
+            mu_full = policy.model.flow_actions_from_noise(batch, x1)
+        mu = mu_full[:, :args.n_action_steps].float()
+        return gaussian_logp_per_step(actions, mu, args.exploration_std)
+
+    # ── Pre-pass: logp_old for ALL minibatches BEFORE any optimizer step ──
+    # This is PPO's trust region: ratios during the update measure ONLY genuine
+    # policy movement within this iteration, and clipping caps it. (Computing
+    # logp_old lazily at first use removed the anchor — ~110 sequential steps
+    # on one rollout batch moved mu by ~0.2 normalized units, drift=201.)
+    logp_old_list: list[torch.Tensor] = []
     agg = {"loss": 0.0, "ratio_mean": 0.0, "ratio_max": 0.0, "clip_frac": 0.0,
            "rollout_drift": 0.0, "n_minibatches": 0}
+    with torch.no_grad():
+        for mb in minibatches:
+            batch, x1, actions, _adv, _w = mb_tensors(mb)
+            lp = forward_logp(batch, x1, actions)
+            logp_old_list.append(lp)
+            # Diagnostic only: recompute-vs-rollout logp gap (bf16/batch-shape
+            # noise, since theta is unchanged here). Expect ~0.1-0.5.
+            lp_roll = torch.from_numpy(np.stack([r.logp_old for r in mb])).to(device)
+            agg["rollout_drift"] += float((lp - lp_roll).abs().mean())
+
+    # ── Clipped updates ──
     for _epoch in range(args.update_epochs):
         for mi, mb in enumerate(minibatches):
-            obs_list = [{"pixels": r.pixels, "agent_pos": r.agent_pos} for r in mb]
-            batch = obs_list_to_model_batch(obs_list, [r.task for r in mb], preprocessor)
-
-            x1 = torch.from_numpy(np.stack([r.x1 for r in mb])).to(device)
-            actions = torch.from_numpy(np.stack([r.action for r in mb])).to(device)
-            adv = torch.tensor([r.advantage for r in mb], device=device, dtype=torch.float32)
-
-            with autocast_ctx:
-                mu_full = policy.model.flow_actions_from_noise(batch, x1)
-            mu = mu_full[:, :args.n_action_steps].float()
-            logp_new = gaussian_logp_per_step(actions, mu, args.exploration_std)
-
-            if logp_old_cache[mi] is None:
-                logp_old_cache[mi] = logp_new.detach()
-                # Diagnostic: how far the update-time recompute drifted from the
-                # rollout-time logp (bf16/batch-shape noise, NOT policy change).
-                lp_roll = torch.from_numpy(np.stack([r.logp_old for r in mb])).to(device)
-                agg["rollout_drift"] += float((logp_old_cache[mi] - lp_roll).abs().mean())
+            batch, x1, actions, adv, w = mb_tensors(mb)
+            logp_new = forward_logp(batch, x1, actions)
 
             loss, stats = grpo_clip_loss(
-                logp_new, logp_old_cache[mi], adv,
+                logp_new, logp_old_list[mi], adv,
                 clip_low=args.clip_low, clip_high=args.clip_high,
+                weights=w,
             )
             optimizer.zero_grad()
             loss.backward()
@@ -533,6 +553,9 @@ def main():
             for env_i, env_records in enumerate(res.records_per_env):
                 for r in env_records:
                     r.advantage = adv[env_i]
+                    # Per-trajectory normalization (paper eq. 11): each episode
+                    # contributes equally, so long failed episodes don't dominate.
+                    r.weight = 1.0 / max(1, len(env_records))
                 records.extend(env_records)
 
         rollout_s = time.time() - t_iter
