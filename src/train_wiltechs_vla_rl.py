@@ -116,12 +116,19 @@ def grpo_clip_loss(
         loss = -(per_elem * w).sum() / (w.sum() * per_elem.shape[-1])
     with torch.no_grad():
         # k3 estimator of KL(old || new): non-negative, low variance.
-        approx_kl = float(((ratio - 1.0) - log_ratio).mean())
+        kl_elems = (ratio - 1.0) - log_ratio
+        # Mean is dominated by single outliers (one sample at the -20 clamp
+        # contributes ~19 — observed tripping early-stop at bulk kl 0.003).
+        # Those outliers are already gradient-dead via clipping; the MEDIAN
+        # measures bulk policy movement and is what the early stop should see.
+        approx_kl = float(kl_elems.mean())
+        approx_kl_median = float(kl_elems.median())
     stats = {
         "ratio_mean": float(ratio.detach().mean()),
         "ratio_max": float(ratio.detach().max()),
         "clip_frac": float(((ratio < 1.0 - clip_low) | (ratio > 1.0 + clip_high)).float().mean()),
         "approx_kl": approx_kl,
+        "approx_kl_median": approx_kl_median,
     }
     return loss, stats
 
@@ -385,13 +392,15 @@ def grpo_update(
                 weights=w, dual_clip=args.dual_clip,
             )
 
-            # Trust-region early stop: once the policy has moved target_kl away
-            # from the pre-pass anchor, further steps on this rollout batch are
-            # off-policy extrapolation — stop and collect fresh data.
-            if stats["approx_kl"] > args.target_kl:
+            # Trust-region early stop on the MEDIAN per-sample KL: once the
+            # BULK of the policy has moved target_kl from the pre-pass anchor,
+            # further steps on this rollout batch are off-policy extrapolation.
+            # (Mean k3 is outlier-dominated and fired at bulk kl ~0.003.)
+            if stats["approx_kl_median"] > args.target_kl:
                 agg["stopped_early"] = 1
                 print(f"[rl]   early stop at minibatch {agg['n_minibatches']}: "
-                      f"approx_kl {stats['approx_kl']:.3f} > {args.target_kl}")
+                      f"median kl {stats['approx_kl_median']:.4f} > {args.target_kl} "
+                      f"(mean kl {stats['approx_kl']:.3f})")
                 done = True
                 break
 
@@ -408,13 +417,14 @@ def grpo_update(
             agg["ratio_max"] = max(agg["ratio_max"], stats["ratio_max"])
             agg["clip_frac"] += stats["clip_frac"]
             agg["approx_kl"] += stats["approx_kl"]
+            agg["approx_kl_median"] = agg.get("approx_kl_median", 0.0) + stats["approx_kl_median"]
             agg["n_minibatches"] += 1
         if done:
             break
 
     n = max(1, agg["n_minibatches"])
-    for k in ("loss", "ratio_mean", "clip_frac", "approx_kl"):
-        agg[k] /= n
+    for k in ("loss", "ratio_mean", "clip_frac", "approx_kl", "approx_kl_median"):
+        agg[k] = agg.get(k, 0.0) / n
     agg["rollout_drift"] /= max(1, len(minibatches))
     return agg
 
@@ -503,9 +513,10 @@ def main():
     parser.add_argument("--update_epochs", type=int, default=1)
     parser.add_argument("--update_minibatch", type=int, default=8)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--target_kl", type=float, default=0.5,
-                        help="Early-stop the update phase once mean per-timestep approx-KL "
-                             "to the pre-pass policy exceeds this (trust region).")
+    parser.add_argument("--target_kl", type=float, default=0.05,
+                        help="Early-stop the update phase once the MEDIAN per-timestep "
+                             "approx-KL to the pre-pass policy exceeds this (bulk trust "
+                             "region; robust to gradient-dead outlier samples).")
     parser.add_argument("--dual_clip", type=float, default=3.0,
                         help="Dual-clip PPO bound on the negative-advantage branch "
                              "(Ye et al. 2020). Prevents unbounded loss as ratios grow.")
@@ -630,7 +641,8 @@ def main():
               f"loss={stats.get('loss', float('nan')):.4f}, "
               f"ratio={stats.get('ratio_mean', float('nan')):.3f}, "
               f"clip={stats.get('clip_frac', float('nan')):.2f}, "
-              f"kl={stats.get('approx_kl', float('nan')):.3f}, "
+              f"kl={stats.get('approx_kl', float('nan')):.3f}/"
+              f"med={stats.get('approx_kl_median', float('nan')):.4f}, "
               f"drift={stats.get('rollout_drift', float('nan')):.3f}, "
               f"{line['elapsed_s']}s (rollout {line['rollout_s']}s / update {line['update_s']}s) "
               f"| rolling SR: {sr_str}")
