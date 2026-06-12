@@ -302,17 +302,31 @@ def grpo_update(
     )
     trainable = [p for p in policy.model.parameters() if p.requires_grad]
 
-    agg = {"loss": 0.0, "ratio_mean": 0.0, "ratio_max": 0.0, "clip_frac": 0.0, "n_minibatches": 0}
+    # FIXED minibatch partition, reused across epochs. logp_old is computed at
+    # FIRST use, inside the exact same forward (same batch composition, same
+    # kernel shapes) that computes logp_new — detached. So epoch 0 is an exact
+    # vanilla policy gradient (ratio == 1 bitwise, clipping vacuous) and
+    # bf16/batch-composition nondeterminism between rollout and update CANNOT
+    # contaminate the ratios (observed before this: rollout-logp comparison gave
+    # ratio_mean 0.97 but clip_frac 0.81 — 81% of data zero-gradient). For
+    # update_epochs > 1 the cached logp_old makes ratios measure only real
+    # policy change. The rollout-time logp is kept as a drift diagnostic.
+    order = np.random.permutation(len(records))
+    minibatches = [
+        [records[i] for i in order[s:s + args.update_minibatch]]
+        for s in range(0, len(records), args.update_minibatch)
+    ]
+    logp_old_cache: list[Optional[torch.Tensor]] = [None] * len(minibatches)
+
+    agg = {"loss": 0.0, "ratio_mean": 0.0, "ratio_max": 0.0, "clip_frac": 0.0,
+           "rollout_drift": 0.0, "n_minibatches": 0}
     for _epoch in range(args.update_epochs):
-        order = np.random.permutation(len(records))
-        for start in range(0, len(records), args.update_minibatch):
-            mb = [records[i] for i in order[start:start + args.update_minibatch]]
+        for mi, mb in enumerate(minibatches):
             obs_list = [{"pixels": r.pixels, "agent_pos": r.agent_pos} for r in mb]
             batch = obs_list_to_model_batch(obs_list, [r.task for r in mb], preprocessor)
 
             x1 = torch.from_numpy(np.stack([r.x1 for r in mb])).to(device)
             actions = torch.from_numpy(np.stack([r.action for r in mb])).to(device)
-            logp_old = torch.from_numpy(np.stack([r.logp_old for r in mb])).to(device)
             adv = torch.tensor([r.advantage for r in mb], device=device, dtype=torch.float32)
 
             with autocast_ctx:
@@ -320,8 +334,15 @@ def grpo_update(
             mu = mu_full[:, :args.n_action_steps].float()
             logp_new = gaussian_logp_per_step(actions, mu, args.exploration_std)
 
+            if logp_old_cache[mi] is None:
+                logp_old_cache[mi] = logp_new.detach()
+                # Diagnostic: how far the update-time recompute drifted from the
+                # rollout-time logp (bf16/batch-shape noise, NOT policy change).
+                lp_roll = torch.from_numpy(np.stack([r.logp_old for r in mb])).to(device)
+                agg["rollout_drift"] += float((logp_old_cache[mi] - lp_roll).abs().mean())
+
             loss, stats = grpo_clip_loss(
-                logp_new, logp_old, adv,
+                logp_new, logp_old_cache[mi], adv,
                 clip_low=args.clip_low, clip_high=args.clip_high,
             )
             optimizer.zero_grad()
@@ -338,6 +359,7 @@ def grpo_update(
     n = max(1, agg["n_minibatches"])
     for k in ("loss", "ratio_mean", "clip_frac"):
         agg[k] /= n
+    agg["rollout_drift"] /= max(1, len(minibatches))
     return agg
 
 
@@ -543,6 +565,7 @@ def main():
               f"loss={stats.get('loss', float('nan')):.4f}, "
               f"ratio={stats.get('ratio_mean', float('nan')):.3f}, "
               f"clip={stats.get('clip_frac', float('nan')):.2f}, "
+              f"drift={stats.get('rollout_drift', float('nan')):.3f}, "
               f"{line['elapsed_s']}s (rollout {line['rollout_s']}s / update {line['update_s']}s) "
               f"| rolling SR: {sr_str}")
 
