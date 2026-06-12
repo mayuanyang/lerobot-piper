@@ -287,6 +287,13 @@ def grpo_update(
     policy, preprocessor, optimizer, records: list[ChunkRecord], args, device,
 ) -> dict:
     policy.model.train()   # enables DiT gradient checkpointing; dropout is zeroed at load
+    # The ResNet robot encoder contains BatchNorm: in train mode it switches to
+    # BATCH statistics (and updates running stats), but rollout ran in eval mode
+    # with RUNNING stats — the mu mismatch collapses importance ratios
+    # (observed: iter-0 ratio 0.38, clip_frac 0.97). Keep the CNN in eval; the
+    # model-level train() flag stays on for the DiT checkpointing gate.
+    if getattr(policy.model, "robot_visual_encoder", None) is not None:
+        policy.model.robot_visual_encoder.eval()
     horizon = policy.config.horizon
 
     autocast_ctx = (
