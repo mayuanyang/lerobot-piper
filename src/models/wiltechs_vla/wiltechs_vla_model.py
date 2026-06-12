@@ -1450,7 +1450,6 @@ class WiltechsVLATransformer(nn.Module):
             return self.compute_loss(batch), {}
         return self.sample_actions(batch), {}
 
-    @torch.no_grad()
     def flow_actions_from_noise(self, batch: dict, x_init: torch.Tensor) -> torch.Tensor:
         """Deterministic flow ODE solution from a GIVEN initial noise x_init
         (B, horizon, action_dim), returned for the FULL horizon in normalized
