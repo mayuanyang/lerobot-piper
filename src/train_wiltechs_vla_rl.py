@@ -513,10 +513,14 @@ def main():
                     r.advantage = adv[env_i]
                 records.extend(env_records)
 
+        rollout_s = time.time() - t_iter
+
         # ── Update ──
+        t_upd = time.time()
         stats = {"loss": float("nan")}
         if records:
             stats = grpo_update(policy, preprocessor, optimizer, records, args, device)
+        update_s = time.time() - t_upd
 
         sr_str = "  ".join(
             f"T{tid}={np.mean(sr_track[tid]) * 100:.0f}%" if sr_track[tid] else f"T{tid}=–"
@@ -528,6 +532,8 @@ def main():
             "kept_groups": kept,
             "n_records": len(records),
             "elapsed_s": round(time.time() - t_iter, 1),
+            "rollout_s": round(rollout_s, 1),
+            "update_s": round(update_s, 1),
             **{k: v for k, v in stats.items() if k != "n_minibatches"},
             "sr": {tid: (float(np.mean(sr_track[tid])) if sr_track[tid] else None) for tid in task_ids},
         }
@@ -537,7 +543,8 @@ def main():
               f"loss={stats.get('loss', float('nan')):.4f}, "
               f"ratio={stats.get('ratio_mean', float('nan')):.3f}, "
               f"clip={stats.get('clip_frac', float('nan')):.2f}, "
-              f"{line['elapsed_s']}s | rolling SR: {sr_str}")
+              f"{line['elapsed_s']}s (rollout {line['rollout_s']}s / update {line['update_s']}s) "
+              f"| rolling SR: {sr_str}")
 
         if (it + 1) % args.save_freq == 0:
             save_checkpoint(policy, preprocessor, postprocessor, out_dir, tag=str(it + 1))
