@@ -1451,6 +1451,37 @@ class WiltechsVLATransformer(nn.Module):
         return self.sample_actions(batch), {}
 
     @torch.no_grad()
+    def flow_actions_from_noise(self, batch: dict, x_init: torch.Tensor) -> torch.Tensor:
+        """Deterministic flow ODE solution from a GIVEN initial noise x_init
+        (B, horizon, action_dim), returned for the FULL horizon in normalized
+        action space. Differentiable through the DiT / robot CNN / QFormer (the
+        frozen VLM encoder still runs under no_grad inside _run_vlm_and_cache_kv).
+
+        Used by RL (GRPO): the policy is N(flow_actions_from_noise(s, x1), sigma^2)
+        conditioned on the stored noise latent x1, so action log-probs are exact
+        and importance ratios are computable. Caller controls grad/no_grad and
+        autocast context. Mirrors sample_actions' integration exactly.
+        """
+        B = x_init.shape[0]
+        device = x_init.device
+
+        kv_cache, vlm_kv_pad_mask, _vis_mask, _text_start = self._run_vlm_and_cache_kv(batch)
+        robot_tokens = self._compute_robot_tokens(batch)
+        latents = self._generate_latents(kv_cache, vlm_kv_pad_mask)
+
+        N = int(getattr(self.config, "num_inference_steps", 5))
+        x_t = x_init.float()
+        dt = -1.0 / N
+        t = torch.ones(B, device=device, dtype=torch.float32)
+        for _ in range(N):
+            v_t = self._run_dit(
+                batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask,
+                robot_tokens, latents,
+            ).float()
+            x_t = x_t + dt * v_t
+            t = t + dt
+        return x_t
+
     def sample_actions(self, batch: dict) -> torch.Tensor:
         B = batch["observation.state"].shape[0]
         device = batch["observation.state"].device
