@@ -1481,6 +1481,7 @@ class WiltechsVLATransformer(nn.Module):
             t = t + dt
         return x_t
 
+    @torch.no_grad()
     def sample_actions(self, batch: dict) -> torch.Tensor:
         B = batch["observation.state"].shape[0]
         device = batch["observation.state"].device
