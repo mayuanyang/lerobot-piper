@@ -39,6 +39,13 @@ mode), and dynamic sampling will simply skip them.
 
 from __future__ import annotations
 
+import os
+# MuJoCo/LIBERO offscreen rendering: force GPU (EGL) before robosuite/mujoco is
+# imported. The GL backend is locked in at first import, so this MUST run above
+# the lerobot/LIBERO imports below. setdefault lets a launch-time override win.
+os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+
 import argparse
 import json
 import math
@@ -187,7 +194,8 @@ class TaskEnvGroup:
     times). Stepped serially; policy inference is batched across members."""
 
     def __init__(self, suite, suite_name: str, task_id: int, group_size: int,
-                 expected_cams: Optional[list[str]] = None):
+                 expected_cams: Optional[list[str]] = None,
+                 max_episode_steps: int = 0):
         from lerobot.envs.libero import LiberoEnv
 
         self.task_id = task_id
@@ -222,7 +230,11 @@ class TaskEnvGroup:
             print(f"[rl] camera check OK — env provides {sorted(got)}, "
                   f"policy expects {expected_cams}")
         self.task_description = self.envs[0].task_description
-        self.max_steps = self.envs[0]._max_episode_steps
+        suite_default = self.envs[0]._max_episode_steps
+        self.max_steps = min(suite_default, max_episode_steps) if max_episode_steps else suite_default
+        if self.max_steps < suite_default:
+            print(f"[rl] task {task_id}: capping episode length {suite_default} -> {self.max_steps} "
+                  f"(rollouts past {self.max_steps} steps count as failure)")
         self.n_init_states = len(self.envs[0]._init_states)
 
     def reset_group(self, init_state_id: int, base_seed: int):
@@ -504,6 +516,11 @@ def main():
                         help="Groups collected per update iteration (round-robin over task_ids)")
     parser.add_argument("--n_action_steps", type=int, default=8,
                         help="Executed chunk length between replans (paper uses 8 on LIBERO)")
+    parser.add_argument("--max_episode_steps", type=int, default=0,
+                        help="Cap rollout episode length (0 = use the LIBERO suite default, "
+                             "e.g. 520 for libero_10). Shortening speeds rollout but truncates "
+                             "long tasks to a failure, so only set below the suite default "
+                             "if those tasks usually finish sooner.")
     parser.add_argument("--exploration_std", type=float, default=0.1,
                         help="Gaussian exploration std in NORMALIZED action units (MEAN_STD space)")
     parser.add_argument("--rl_iterations", type=int, default=300)
@@ -566,6 +583,7 @@ def main():
             env_pool[tid] = TaskEnvGroup(
                 suite, args.env_task, tid, args.group_size,
                 expected_cams=expected_cams,
+                max_episode_steps=args.max_episode_steps,
             )
             print(f"[rl] built {args.group_size} envs for task {tid} in {time.time()-t0:.1f}s")
         return env_pool[tid]
