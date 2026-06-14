@@ -46,6 +46,7 @@ import torch.nn.functional as F
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
 from .wiltechs_vla_config import WiltechsVLAConfig
+from .task_rewrites import rewrite_instruction
 from ..interleaved_flow_matching.expert_layer import RMSNorm, SwiGLU
 from ..transformer_flow_matching.robot_visual_encoder import RobotVisualEncoder
 
@@ -746,10 +747,21 @@ class WiltechsVLATransformer(nn.Module):
             return empty, []
         return torch.cat(all_vis, dim=1), grid_thw_list
 
+    def _resolve_descs(self, batch: dict):
+        """Single entry point for the instruction strings the model consumes.
+
+        Pulls the task string from the batch and, when use_descriptive_objects
+        is on, rewrites ambiguous object/region names via the task_rewrites
+        single source of truth. Used by every language read site so the same
+        phrasing reaches training, RL rollout, and eval.
+        """
+        descs = batch.get("task_description") or batch.get("task")
+        if descs and getattr(self.config, "use_descriptive_objects", False):
+            descs = [rewrite_instruction(d) for d in descs]
+        return descs
+
     def _encode_language(self, batch: dict, device: torch.device) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        descs = batch.get("task_description")
-        if not descs:
-            descs = batch.get("task")
+        descs = self._resolve_descs(batch)
         if not descs or not any(descs):
             return None
         inputs = self.processor.tokenizer(
@@ -816,9 +828,7 @@ class WiltechsVLATransformer(nn.Module):
         vis_tokens, grid_thw_list = self._encode_images(batch, B)
         L_vis = vis_tokens.shape[1]
 
-        descs = batch.get("task_description")
-        if not descs:
-            descs = batch.get("task")
+        descs = self._resolve_descs(batch)
         have_lang = bool(descs) and any(descs)
         use_template = bool(getattr(self.config, "use_chat_template", False)) and have_lang
         embed_tokens = self.language_model.get_input_embeddings()
@@ -1397,7 +1407,7 @@ class WiltechsVLATransformer(nn.Module):
             # Skip pairs whose language string actually matches (cross-dataset
             # collisions, e.g. "Grasp a lego block ..." appearing 4× across
             # community).
-            descs = batch.get("task") or batch.get("task_description")
+            descs = self._resolve_descs(batch)
             if descs is not None and len(descs) == B:
                 perm_cpu = perm.detach().cpu().tolist()
                 pair_diff = torch.tensor(

@@ -149,6 +149,14 @@ class WiltechsVLAConfig(PreTrainedConfig):
     # are, then perform:". Empty disables. Only used with use_chat_template.
     chat_directive: str = ""
 
+    # Rewrite ambiguous LIBERO object/region names into visually-groundable
+    # descriptions (e.g. "alphabet soup" -> "blue can of alphabet soup") via
+    # the single-source-of-truth map in task_rewrites.py. Applied to every
+    # task string the model consumes, so training/RL/eval stay consistent.
+    # Off by default (legacy phrasing); enable for the descriptive-grounding
+    # experiment and use the SAME setting at eval.
+    use_descriptive_objects: bool = False
+
     # -------- Auxiliary contrastive loss (language forcing) --------
     contrastive_loss_weight: float = 0.1
 
