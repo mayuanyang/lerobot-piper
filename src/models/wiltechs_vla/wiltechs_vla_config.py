@@ -132,7 +132,7 @@ class WiltechsVLAConfig(PreTrainedConfig):
     # untouched). Language slots are never dropped, so this directly weakens
     # the visual shortcut and forces the DiT/QFormer to lean on language.
     # 0 disables (default, checkpoint-compatible).
-    vision_kv_dropout_prob: float = 0.0
+    vision_kv_dropout_prob: float = 0.4
 
     # -------- Chat-template input format (Qwen ChatML) --------
     # Wrap the VLM input as a proper instruct-style turn:
@@ -163,6 +163,17 @@ class WiltechsVLAConfig(PreTrainedConfig):
     # Minimum mean-squared L2 distance between correct-lang and wrong-lang
     # velocity predictions.
     contrastive_margin: float = 0.05
+
+    # Pair each sample with its HARDEST in-batch negative (most word overlap,
+    # different instruction) instead of a random one. Random pairs are almost
+    # always grossly-different tasks the model already separates, so the hinge
+    # is satisfied without ever forcing fine-grained object grounding (e.g.
+    # "alphabet soup" vs "tomato sauce" in the same basket template). Hard
+    # negatives focus the gradient on the confusable minimal pairs that fail at
+    # eval. Off by default (legacy random pairing). Expect the reported
+    # contrastive value to JUMP UP when first enabled — it is now measuring the
+    # hard cases — then decline as training installs the discrimination.
+    contrastive_hard_negatives: bool = False
 
     # -------- Resume bookkeeping --------
     training_step: int = 0

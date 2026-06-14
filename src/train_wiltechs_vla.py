@@ -306,6 +306,7 @@ def train(
     lock_joint_index: Optional[int] = None,
     contrastive_loss_weight: float = 0.1,
     contrastive_margin: float = 0.05,
+    contrastive_hard_negatives: bool = False,
     vision_kv_dropout_prob: float = 0.0,
     use_chat_template: bool = False,
     chat_directive: str = "",
@@ -411,6 +412,7 @@ def train(
         vlm_attends_to_expert=True,
         contrastive_loss_weight=contrastive_loss_weight,
         contrastive_margin=contrastive_margin,
+        contrastive_hard_negatives=contrastive_hard_negatives,
         vision_kv_dropout_prob=vision_kv_dropout_prob,
         use_chat_template=use_chat_template,
         chat_directive=chat_directive,
@@ -854,6 +856,13 @@ if __name__ == "__main__":
                         help="Weight for the language-permute contrastive loss (default: 0.1).")
     parser.add_argument("--contrastive_margin", type=float, default=0.05,
                         help="Hinge margin on MSE between v_t and v_wrong (default: 0.05).")
+    parser.add_argument("--contrastive_hard_negatives", action="store_true",
+                        help="Pair each sample with its hardest in-batch negative (most word "
+                             "overlap, different instruction) instead of a random one, so the "
+                             "contrastive hinge pressures fine-grained object grounding (the "
+                             "confusable minimal pairs that fail at eval) rather than trivially-"
+                             "different tasks. Expect the reported contrastive value to spike "
+                             "when first enabled, then decline. Off = legacy random pairing.")
     parser.add_argument("--vision_kv_dropout_prob", type=float, default=0.0,
                         help="Training-time dropout on the VLM VISION positions of the DiT "
                              "cross-attn memory (language is never dropped). Weakens the "
