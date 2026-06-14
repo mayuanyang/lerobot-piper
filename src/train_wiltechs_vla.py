@@ -309,6 +309,7 @@ def train(
     vision_kv_dropout_prob: float = 0.0,
     use_chat_template: bool = False,
     chat_directive: str = "",
+    use_descriptive_objects: bool = False,
     robot_encoder_tokens: int = 16,
     noise_temporal_correlation: float = 0.0,
     preprocess_in_workers: bool = False,
@@ -413,6 +414,7 @@ def train(
         vision_kv_dropout_prob=vision_kv_dropout_prob,
         use_chat_template=use_chat_template,
         chat_directive=chat_directive,
+        use_descriptive_objects=use_descriptive_objects,
         robot_encoder_tokens=robot_encoder_tokens,
         noise_temporal_correlation=noise_temporal_correlation,
     )
@@ -867,6 +869,12 @@ if __name__ == "__main__":
                         help="Optional short directive prepended to the task inside the user "
                              "turn (only with --use_chat_template), e.g. 'Identify the objects "
                              "mentioned in the instruction and where they are, then perform:'.")
+    parser.add_argument("--use_descriptive_objects", action="store_true",
+                        help="Rewrite ambiguous LIBERO object/region names into visually-"
+                             "groundable descriptions (e.g. 'alphabet soup' -> 'blue can of "
+                             "alphabet soup') via task_rewrites.py before the VLM sees them. "
+                             "Persisted in the saved config so eval inherits it automatically. "
+                             "Off = legacy phrasing.")
     parser.add_argument("--robot_encoder_tokens", type=int, default=16,
                         help="Robot CNN tokens per camera. Must be a perfect square "
                              "(grid side = sqrt). Default: 16 (4x4).")
