@@ -287,21 +287,35 @@ def rollout_group(
         if device.type == "cuda" else torch.autocast(device_type="cpu", enabled=False)
     )
 
+    # --- rollout profiling buckets (where does the time go?) ---
+    t_obs = t_infer = t_env = t_track = 0.0
+
+    def _sync():
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+
     while active and steps_done < group.max_steps:
+        _t = time.time()
         cur_obs = [obs_list[i] for i in active]
         batch = obs_list_to_model_batch(
             cur_obs, [group.task_description] * len(active), preprocessor,
         )
+        t_obs += time.time() - _t
 
         x1 = torch.randn(len(active), horizon, action_dim, device=device)
+        _sync(); _t = time.time()
         with autocast_ctx:
             mu_full = policy.model.flow_actions_from_noise(batch, x1)
+        _sync(); t_infer += time.time() - _t
+
+        _t = time.time()
         mu = mu_full[:, :n_exec].float()
         actions = mu + sigma * torch.randn_like(mu)
         logp_old = gaussian_logp_per_step(actions, mu, sigma)        # (B, n_exec)
 
         env_actions = postprocessor(actions.reshape(len(active) * n_exec, action_dim))
         env_actions = env_actions.reshape(len(active), n_exec, action_dim).numpy()
+        t_obs += time.time() - _t
 
         for j, i in enumerate(list(active)):
             result.records_per_env[i].append(ChunkRecord(
@@ -321,7 +335,9 @@ def rollout_group(
             terminated = False
             for k in range(n_exec):
                 a = np.clip(env_actions[j, k], env.action_space.low, env.action_space.high)
+                _t = time.time()
                 obs, _r, terminated, _trunc, info = env.step(a.astype(np.float32))
+                t_env += time.time() - _t
                 obs_list[i] = obs
                 if terminated:
                     succ = bool(info.get("is_success", False))
@@ -333,7 +349,9 @@ def rollout_group(
                         result.rewards[i] = 1.0 if succ else trackers[i].reward()
                     break
                 if trackers is not None:
+                    _t = time.time()
                     trackers[i].update()   # bank stage on the post-action state
+                    t_track += time.time() - _t
             if not terminated:
                 still_active.append(i)
         active = still_active
@@ -343,6 +361,14 @@ def rollout_group(
     if trackers is not None:
         for i in active:
             result.rewards[i] = trackers[i].reward()
+
+    total = t_obs + t_infer + t_env + t_track + 1e-9
+    print(f"[rl][profile] task {group.task_id}: rollout {total:.0f}s — "
+          f"infer {t_infer:.0f}s ({100*t_infer/total:.0f}%)  "
+          f"env.step {t_env:.0f}s ({100*t_env/total:.0f}%)  "
+          f"obs/post {t_obs:.0f}s ({100*t_obs/total:.0f}%)  "
+          f"reward {t_track:.1f}s ({100*t_track/total:.0f}%)  "
+          f"[{steps_done} sim steps, {steps_done//max(1,n_exec)} chunks]")
 
     return result
 
