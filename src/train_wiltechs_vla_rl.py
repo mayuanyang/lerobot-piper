@@ -163,6 +163,10 @@ class GroupResult:
     init_state_id: int
     successes: list[bool] = field(default_factory=list)
     records_per_env: list[list[ChunkRecord]] = field(default_factory=list)
+    # Staged (dense) reward per env, in [0,1]; filled only when staged_reward is
+    # on. Defaults to 0.0; success-terminations are set to 1.0 (env auto-resets,
+    # so the final sim state is gone — but full success ⇒ all conjuncts placed).
+    rewards: list[float] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -258,13 +262,21 @@ class TaskEnvGroup:
 def rollout_group(
     policy, preprocessor, postprocessor, group: TaskEnvGroup,
     init_state_id: int, n_exec: int, sigma: float, device, base_seed: int,
+    staged_reward: bool = False,
 ) -> GroupResult:
     G = len(group.envs)
     result = GroupResult(task_id=group.task_id, init_state_id=init_state_id,
-                         successes=[False] * G, records_per_env=[[] for _ in range(G)])
+                         successes=[False] * G, records_per_env=[[] for _ in range(G)],
+                         rewards=[0.0] * G)
 
     policy.model.eval()
     obs_list = group.reset_group(init_state_id, base_seed)
+    # Staged-reward trackers must be built AFTER reset (objects at init pose) so
+    # the lift baseline is the rest height.
+    trackers = None
+    if staged_reward:
+        from rl_staged_reward import StagedRewardTracker
+        trackers = [StagedRewardTracker(group.envs[i]) for i in range(G)]
     active = list(range(G))
     steps_done = 0
     horizon = policy.config.horizon
@@ -312,12 +324,25 @@ def rollout_group(
                 obs, _r, terminated, _trunc, info = env.step(a.astype(np.float32))
                 obs_list[i] = obs
                 if terminated:
-                    result.successes[i] = bool(info.get("is_success", False))
+                    succ = bool(info.get("is_success", False))
+                    result.successes[i] = succ
+                    if trackers is not None:
+                        # Env auto-reset on termination → can't read final state;
+                        # full success ⇒ all conjuncts placed ⇒ 1.0, else use the
+                        # stage banked before this terminating step.
+                        result.rewards[i] = 1.0 if succ else trackers[i].reward()
                     break
+                if trackers is not None:
+                    trackers[i].update()   # bank stage on the post-action state
             if not terminated:
                 still_active.append(i)
         active = still_active
         steps_done += n_exec
+
+    # Timed-out envs (never terminated): state is intact, banked stage is current.
+    if trackers is not None:
+        for i in active:
+            result.rewards[i] = trackers[i].reward()
 
     return result
 
@@ -516,6 +541,11 @@ def main():
                         help="Groups collected per update iteration (round-robin over task_ids)")
     parser.add_argument("--n_action_steps", type=int, default=8,
                         help="Executed chunk length between replans (paper uses 8 on LIBERO)")
+    parser.add_argument("--staged_reward", action="store_true",
+                        help="Use a dense staged reward (reach/grasp/lift/place per goal object, "
+                             "mean over conjuncts) instead of binary success. Gives all-fail GRPO "
+                             "groups within-group variance so grasp-fumble and compound 'put both' "
+                             "tasks produce gradient. True task success is still logged separately.")
     parser.add_argument("--max_episode_steps", type=int, default=0,
                         help="Cap rollout episode length (0 = use the LIBERO suite default, "
                              "e.g. 520 for libero_10). Shortening speeds rollout but truncates "
@@ -611,13 +641,21 @@ def main():
                 policy, preprocessor, postprocessor, group, isid,
                 args.n_action_steps, args.exploration_std, device,
                 base_seed=args.seed + 100_000 * it + 1000 * attempts,
+                staged_reward=args.staged_reward,
             )
             sr_track[tid].extend([float(s) for s in res.successes])
             n_succ = sum(res.successes)
-            group_summaries.append({"task_id": tid, "init_state": isid, "successes": n_succ,
-                                    "of": len(res.successes)})
+            summary = {"task_id": tid, "init_state": isid, "successes": n_succ,
+                       "of": len(res.successes)}
+            if args.staged_reward:
+                summary["reward_mean"] = round(float(np.mean(res.rewards)), 3)
+            group_summaries.append(summary)
 
-            adv = grpo_group_advantages([1.0 if s else 0.0 for s in res.successes])
+            # Staged reward (dense, in [0,1]) gives partial credit so all-fail
+            # groups stop being degenerate; binary success is the fallback.
+            reward_vals = (res.rewards if args.staged_reward
+                           else [1.0 if s else 0.0 for s in res.successes])
+            adv = grpo_group_advantages(reward_vals)
             if adv is None:
                 continue  # all-success or all-fail: zero advantage, skip (paper eq. 10)
             kept += 1
