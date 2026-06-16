@@ -275,6 +275,13 @@ def _log_gradient_analysis(policy, step: int) -> None:
         cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in ordered)
         print(f"  Action→ x-attn    : {cells}    (cross-attn to VLM KV)")
 
+    _cfg = policy.model.config
+    _rcnn_on = getattr(_cfg, "use_robot_cnn", True)
+    _vdrop = float(getattr(_cfg, "vision_dropout_prob", 0.0))
+    _vkvdrop = float(getattr(_cfg, "vision_kv_dropout_prob", 0.0))
+    print(f"  Vision dropout    : robotCNN={_vdrop:.2f} ({'ON' if _rcnn_on else 'OFF'})  "
+          f"VLM-vis-KV={_vkvdrop:.2f}    (training-time only; forced 0 at eval/RL)")
+
     comps = getattr(policy.model, "_last_loss_components", None)
     cw = getattr(policy.model.config, "contrastive_loss_weight", 0.0)
     if comps is not None and cw > 0.0:
