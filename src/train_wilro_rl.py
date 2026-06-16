@@ -141,7 +141,7 @@ def obs_list_to_model_batch(obs_list: list[dict], tasks: list[str], preprocessor
 
 
 # ---------------------------------------------------------------------------
-# Environment pool
+# Environment pool — raw LiberoEnv instances, lockstep stepping
 # ---------------------------------------------------------------------------
 
 class TaskEnvGroup:
@@ -196,57 +196,6 @@ class TaskEnvGroup:
 
 
 # ---------------------------------------------------------------------------
-# WilR-specific: flow matching denoising from stored noise
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def flow_actions_from_noise_wilro(
-    model, batch: dict, x1: torch.Tensor, n_exec: int,
-) -> torch.Tensor:
-    """Run WilR's flow matching denoising starting from stored noise x1.
-
-    This mirrors WilR's sample_actions() but:
-      1. Uses the provided x1 instead of sampling new noise
-      2. Returns the FULL horizon (not just n_exec) so the caller can slice
-      3. Runs under no_grad (used during rollout and pre-pass)
-
-    Returns: mu_full (B, horizon, action_dim) — the deterministic denoised output
-    """
-    B = batch["observation.state"].shape[0]
-    device = batch["observation.state"].device
-    horizon = model.config.horizon
-    action_dim = model.config.action_dim
-
-    autocast_ctx = (
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        if device.type == "cuda" else torch.autocast(device_type="cpu", enabled=False)
-    )
-
-    with autocast_ctx:
-        # Stage A: VLM encoder (run once)
-        kv_cache, vlm_kv_pad_mask, L_vis, L_lang = model._run_vlm_and_cache_kv(batch)
-        robot_tokens = model._compute_robot_tokens(batch)
-        latents = model._generate_latents(batch, B, device, torch.bfloat16)
-
-        # Stage B: DiT denoising from x1
-        N = int(getattr(model.config, "num_inference_steps", 10))
-        x_t = x1.clone()  # Start from the provided noise
-        dt = -1.0 / N
-        t = torch.ones(B, device=device, dtype=torch.float32)
-
-        for _ in range(N):
-            v_t = model._run_dit(
-                batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask,
-                robot_tokens, latents, action_prefix=None,
-                L_vis=L_vis, L_lang=L_lang,
-            ).float()
-            x_t = x_t + dt * v_t
-            t = t + dt
-
-    return x_t  # (B, horizon, action_dim) — full denoised output
-
-
-# ---------------------------------------------------------------------------
 # Rollout: one GRPO group
 # ---------------------------------------------------------------------------
 
@@ -287,8 +236,8 @@ def rollout_group(
         # Sample flow noise (stored as latent for recomputation)
         x1 = torch.randn(len(active), horizon, action_dim, device=device)
 
-        # Run flow matching denoising from x1
-        mu_full = flow_actions_from_noise_wilro(policy.model, batch, x1, n_exec)
+        # Run flow matching denoising from x1 (model method, differentiable)
+        mu_full = policy.model.flow_actions_from_noise(batch, x1)
         mu = mu_full[:, :n_exec].float()
 
         # Add exploration noise
@@ -379,7 +328,7 @@ def grpo_update(
         return batch, x1, actions, adv, w
 
     def forward_logp(batch, x1, actions):
-        mu_full = flow_actions_from_noise_wilro(policy.model, batch, x1, args.n_action_steps)
+        mu_full = policy.model.flow_actions_from_noise(batch, x1)
         mu = mu_full[:, :args.n_action_steps].float()
         return gaussian_logp_per_step(actions, mu, args.exploration_std)
 
