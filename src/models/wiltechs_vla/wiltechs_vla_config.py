@@ -116,6 +116,14 @@ class WiltechsVLAConfig(PreTrainedConfig):
     robot_encoder_input_size: int = 224
     # Enable / disable the parallel ResNet visual encoder entirely.
     use_robot_cnn: bool = True
+    # Cameras the trainable RobotCNN ingests. EMPTY = use every camera in
+    # `cameras_for_vision_state_concat` (legacy behavior: the CNN re-encodes the
+    # same scene views as the frozen VLM, so it competes with — instead of
+    # complements — the VLM). Set this to the WRIST/gripper view(s) only to
+    # specialize the CNN to close-range manipulation detail the frozen VLM is
+    # worst at, and leave scene/color/spatial grounding to the VLM where it
+    # demonstrably lives (libero wrist key: 'observation.images.image2').
+    robot_cnn_cameras: list[str] = field(default_factory=list)
 
     # -------- Latent "thought" tokens --------
     # Prepended to the expert sequence. 0 disables.
@@ -132,7 +140,7 @@ class WiltechsVLAConfig(PreTrainedConfig):
     # untouched). Language slots are never dropped, so this directly weakens
     # the visual shortcut and forces the DiT/QFormer to lean on language.
     # 0 disables (default, checkpoint-compatible).
-    vision_kv_dropout_prob: float = 0.4
+    vision_kv_dropout_prob: float = 0.0
 
     # -------- Chat-template input format (Qwen ChatML) --------
     # Wrap the VLM input as a proper instruct-style turn:

@@ -1055,7 +1055,11 @@ class WiltechsVLATransformer(nn.Module):
         if self.robot_visual_encoder is None:
             return None
         toks_list = []
-        for cam_key in self.config.cameras_for_vision_state_concat:
+        # CNN-specific camera list (wrist-only specialization) when set; else
+        # legacy behavior of re-encoding every VLM scene view.
+        cnn_cams = getattr(self.config, "robot_cnn_cameras", None) \
+            or self.config.cameras_for_vision_state_concat
+        for cam_key in cnn_cams:
             if cam_key not in batch:
                 continue
             img = batch[cam_key]

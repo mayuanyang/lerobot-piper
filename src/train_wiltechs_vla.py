@@ -279,8 +279,14 @@ def _log_gradient_analysis(policy, step: int) -> None:
     _rcnn_on = getattr(_cfg, "use_robot_cnn", True)
     _vdrop = float(getattr(_cfg, "vision_dropout_prob", 0.0))
     _vkvdrop = float(getattr(_cfg, "vision_kv_dropout_prob", 0.0))
+    _cnn_cams = getattr(_cfg, "robot_cnn_cameras", None) \
+        or getattr(_cfg, "cameras_for_vision_state_concat", [])
+    _cnn_cams_short = [c.rsplit(".", 1)[-1] for c in _cnn_cams]
     print(f"  Vision dropout    : robotCNN={_vdrop:.2f} ({'ON' if _rcnn_on else 'OFF'})  "
           f"VLM-vis-KV={_vkvdrop:.2f}    (training-time only; forced 0 at eval/RL)")
+    if _rcnn_on:
+        print(f"  RobotCNN cameras  : {_cnn_cams_short}  (VLM sees all "
+              f"{len(getattr(_cfg, 'cameras_for_vision_state_concat', []))})")
 
     comps = getattr(policy.model, "_last_loss_components", None)
     cw = getattr(policy.model.config, "contrastive_loss_weight", 0.0)
@@ -323,6 +329,8 @@ def train(
     vision_dropout_prob: float = 0.3,
     vision_dropout_start: float = -1.0,
     vision_dropout_anneal_steps: int = 0,
+    robot_cnn_cameras: Optional[list] = None,
+    robot_cnn_wrist_only: bool = False,
     preprocess_in_workers: bool = False,
 ):
     """Train WiltechsVLA on one or more HOMOGENEOUS LeRobot datasets.
@@ -362,6 +370,31 @@ def train(
     action_dim = next(iter(output_features.values())).shape[-1]
     print(f"Detected cameras ({len(camera_keys)}): {camera_keys}")
     print(f"State dim: {state_dim}, Action dim: {action_dim}")
+
+    # ── Resolve the RobotCNN camera list (design A: specialize the trainable
+    #    CNN to the WRIST view so it complements the frozen VLM instead of
+    #    competing with it on the scene/color cameras). ───────────────────────
+    robot_cnn_camera_keys: list[str] = []
+    if robot_cnn_cameras:
+        missing = [c for c in robot_cnn_cameras if c not in camera_keys]
+        if missing:
+            raise ValueError(
+                f"--robot_cnn_cameras {missing} not in detected cameras {camera_keys}")
+        robot_cnn_camera_keys = list(robot_cnn_cameras)
+    elif robot_cnn_wrist_only:
+        _WRIST_HINTS = ("image2", "wrist", "gripper", "eye_in_hand", "hand")
+        robot_cnn_camera_keys = [
+            c for c in camera_keys
+            if any(h in c.rsplit(".", 1)[-1].lower() for h in _WRIST_HINTS)]
+        if not robot_cnn_camera_keys:
+            raise ValueError(
+                f"--robot_cnn_wrist_only: no wrist-like camera among {camera_keys}. "
+                f"Pass --robot_cnn_cameras <key> explicitly.")
+    if robot_cnn_camera_keys:
+        print(f"RobotCNN cameras (wrist-specialized): {robot_cnn_camera_keys}  "
+              f"(VLM still sees all {len(camera_keys)})")
+    else:
+        print(f"RobotCNN cameras: ALL {camera_keys} (legacy: CNN re-encodes VLM views)")
 
     # ── Validate the other datasets share the same schema ────────────────
     for did in dataset_ids[1:]:
@@ -416,6 +449,7 @@ def train(
         dit_hidden_size=dit_hidden_size,
         num_cameras=len(camera_keys),
         cameras_for_vision_state_concat=camera_keys,
+        robot_cnn_cameras=robot_cnn_camera_keys,
         action_dim_weights=action_dim_weights,
         pos_decay_lambda=0.0,
         num_latent_tokens=8,
@@ -920,6 +954,18 @@ if __name__ == "__main__":
     parser.add_argument("--robot_encoder_tokens", type=int, default=16,
                         help="Robot CNN tokens per camera. Must be a perfect square "
                              "(grid side = sqrt). Default: 16 (4x4).")
+    parser.add_argument("--robot_cnn_cameras", type=str, nargs="+", default=None,
+                        help="Explicit camera key(s) the trainable RobotCNN ingests "
+                             "(must be among the detected cameras). Default: all of them "
+                             "(legacy). Use this OR --robot_cnn_wrist_only to specialize "
+                             "the CNN to the wrist view so it complements the frozen VLM.")
+    parser.add_argument("--robot_cnn_wrist_only", action="store_true",
+                        help="Restrict the RobotCNN to the auto-detected WRIST/gripper "
+                             "camera (matches image2/wrist/gripper/eye_in_hand/hand), "
+                             "leaving scene/color/spatial grounding to the frozen VLM. "
+                             "Design A: stops the trainable CNN from out-competing the "
+                             "VLM on the agentview where color-binding lives (fixes T0 "
+                             "structurally). Ignored if --robot_cnn_cameras is given.")
     parser.add_argument("--noise_temporal_correlation", type=float, default=0.0,
                         help="AR(1) coefficient correlating the flow-matching source noise "
                              "along the action horizon (0=white; ~0.9=temporally smooth).")
