@@ -320,6 +320,9 @@ def train(
     use_descriptive_objects: bool = False,
     robot_encoder_tokens: int = 16,
     noise_temporal_correlation: float = 0.0,
+    vision_dropout_prob: float = 0.3,
+    vision_dropout_start: float = -1.0,
+    vision_dropout_anneal_steps: int = 0,
     preprocess_in_workers: bool = False,
 ):
     """Train WiltechsVLA on one or more HOMOGENEOUS LeRobot datasets.
@@ -421,6 +424,7 @@ def train(
         contrastive_margin=contrastive_margin,
         contrastive_hard_negatives=contrastive_hard_negatives,
         vision_kv_dropout_prob=vision_kv_dropout_prob,
+        vision_dropout_prob=vision_dropout_prob,
         use_chat_template=use_chat_template,
         chat_directive=chat_directive,
         use_descriptive_objects=use_descriptive_objects,
@@ -751,6 +755,15 @@ def train(
             if step % progress_update_freq == 0:
                 policy.model._capture_attention_stats = True
 
+            # Vision-dropout curriculum: anneal RobotCNN token dropout from a high
+            # start (no/weak CNN shortcut → forces Qwen-vision grounding first)
+            # linearly down to vision_dropout_prob (the floor) over
+            # vision_dropout_anneal_steps. <0 start disables (constant dropout).
+            if vision_dropout_start >= 0.0 and vision_dropout_anneal_steps > 0:
+                frac = min(step / vision_dropout_anneal_steps, 1.0)
+                vp_now = vision_dropout_start + (vision_dropout_prob - vision_dropout_start) * frac
+                policy.model.config.vision_dropout_prob = float(vp_now)
+
             autocast_ctx = (
                 torch.autocast(device_type=device.type, dtype=torch.bfloat16)
                 if device.type == "cuda"
@@ -875,6 +888,19 @@ if __name__ == "__main__":
                              "cross-attn memory (language is never dropped). Weakens the "
                              "~25:1 vision:language shortcut to force language reliance. "
                              "Try 0.25-0.4; 0 disables (default).")
+    parser.add_argument("--vision_dropout_prob", type=float, default=0.3,
+                        help="RobotCNN token dropout (regularizer). ALSO the FLOOR/end value of "
+                             "the curriculum when --vision_dropout_start is set. Default 0.3.")
+    parser.add_argument("--vision_dropout_start", type=float, default=-1.0,
+                        help="CURRICULUM: starting (high) RobotCNN dropout at step 0, annealed "
+                             "linearly down to --vision_dropout_prob over "
+                             "--vision_dropout_anneal_steps. <0 disables the schedule (constant "
+                             "--vision_dropout_prob). E.g. 0.9 forces the model to ground on Qwen "
+                             "vision first (no CNN shortcut), then reintroduces the CNN for spatial. "
+                             "Keep the floor (--vision_dropout_prob) ≥0.5 to avoid re-shortcutting.")
+    parser.add_argument("--vision_dropout_anneal_steps", type=int, default=0,
+                        help="Steps to anneal RobotCNN dropout from --vision_dropout_start to "
+                             "--vision_dropout_prob. 0 disables the schedule. E.g. 20000.")
     parser.add_argument("--use_chat_template", action="store_true",
                         help="Wrap the VLM input as a Qwen ChatML turn: <|im_start|>user + "
                              "<|vision_start|>[cam]<|vision_end|> per camera + task + "
