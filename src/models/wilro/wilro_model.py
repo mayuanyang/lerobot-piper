@@ -1105,28 +1105,38 @@ class WilroTransformer(nn.Module):
 
         Used by RL (GRPO): the policy is N(flow_actions_from_noise(s, x1), sigma^2)
         conditioned on the stored noise latent x1, so action log-probs are exact
-        and importance ratios are computable. Caller controls grad/no_grad and
-        autocast context. Mirrors sample_actions' integration exactly.
+        and importance ratios are computable. Mirrors sample_actions' integration
+        exactly.
+
+        NOTE: Wraps the DiT loop in autocast so the DiT linear layers (stored in
+        fp32) accept bf16 noisy_actions without dtype mismatch. Caller controls
+        grad/no_grad context.
         """
         B = x_init.shape[0]
         device = x_init.device
 
-        kv_cache, vlm_kv_pad_mask, L_vis, L_lang = self._run_vlm_and_cache_kv(batch)
-        robot_tokens = self._compute_robot_tokens(batch)
-        latents = self._generate_latents(batch, B, device, torch.bfloat16)
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if device.type == "cuda" else nullcontext()
+        )
 
-        N = int(getattr(self.config, "num_inference_steps", 10))
-        x_t = x_init.float()
-        dt = -1.0 / N
-        t = torch.ones(B, device=device, dtype=torch.float32)
-        for _ in range(N):
-            v_t = self._run_dit(
-                batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask,
-                robot_tokens, latents, action_prefix=None,
-                L_vis=L_vis, L_lang=L_lang,
-            ).float()
-            x_t = x_t + dt * v_t
-            t = t + dt
+        with autocast_ctx:
+            kv_cache, vlm_kv_pad_mask, L_vis, L_lang = self._run_vlm_and_cache_kv(batch)
+            robot_tokens = self._compute_robot_tokens(batch)
+            latents = self._generate_latents(batch, B, device, torch.bfloat16)
+
+            N = int(getattr(self.config, "num_inference_steps", 10))
+            x_t = x_init.float()
+            dt = -1.0 / N
+            t = torch.ones(B, device=device, dtype=torch.float32)
+            for _ in range(N):
+                v_t = self._run_dit(
+                    batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask,
+                    robot_tokens, latents, action_prefix=None,
+                    L_vis=L_vis, L_lang=L_lang,
+                ).float()
+                x_t = x_t + dt * v_t
+                t = t + dt
         return x_t
 
     @torch.no_grad()
