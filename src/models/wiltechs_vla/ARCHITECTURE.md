@@ -218,23 +218,26 @@ graph TB
 | **Model** | Qwen3-VL-4B-Instruct |
 | **Layers** | All 36 text layers (no truncation) |
 | **Hidden Size** | 2560 |
-| **Attention Heads** | 32 heads, 32 KV heads (MHA) |
-| **Head Dim** | 80 |
+| **Attention Heads** | 32 heads, **8 KV heads** (GQA, ratio 4:1) |
+| **Head Dim** | **128** (2560 / 32 = 80 is wrong; Qwen3-VL uses explicit head_dim=128) |
+| **Intermediate FFN** | 9728 |
 | **Vision** | Dynamic resolution, spatial_merge_size=2 |
 | **Position Encoding** | M-RoPE (3D: t, h, w for vision; monotonic for language) |
-| **KV Capture** | Last `num_dit_layers` layers (default: layers 20-35) |
+| **KV Capture** | Last `num_dit_layers` layers (default: layers 20-35, 16 layers) |
+| **KV Geometry** | Each KV: (B, 8, L_vlm, 128) — 8 KV heads, head_dim 128 |
 
 ### 2. DiT Decoder (Trainable)
 
 | Component | Details |
 |-----------|---------|
 | **Layers** | `num_dit_layers` (default: 16) |
-| **Hidden Size** | `dit_hidden_size` (default: 2560 = VLM hidden) |
-| **Self-Attention** | Causal mask over full DiT sequence |
-| **Cross-Attention** | Q from DiT, K/V from VLM cache (no RoPE on Q) |
-| **FFN** | SwiGLU |
+| **Hidden Size** | `dit_hidden_size` — **1280** (decoupled from VLM's 2560 for param savings) |
+| **Self-Attention** | 10 heads × 128 dim, **2 KV heads** (GQA 5:1), causal mask over full DiT sequence |
+| **Cross-Attention** | **32 heads × 128 dim**, 8 KV heads (matches VLM KV geometry); Q from DiT, K/V from VLM cache (no RoPE on Q) |
+| **FFN** | SwiGLU, intermediate=4864 (scaled proportionally to dit_hidden) |
 | **Modulation** | adaLN-Zero with 9 vectors per layer (3 sublayers × {shift, scale, gate}) |
-| **Time Embedding** | Sinusoidal → MLP(SiLU) → per-layer adaLN |
+| **Time Embedding** | Sinusoidal(dit_hidden) → MLP(SiLU, hidden→hidden→hidden) → per-layer adaLN |
+| **Gradient Checkpointing** | Optional — recomputes DiT layer activations in backward (saves ~5-10× activation memory) |
 
 ### 3. Input Tokens
 
@@ -298,16 +301,23 @@ Each DiT position can attend to ALL valid VLM positions:
 
 ## Parameter Count Summary
 
-| Component | Trainable | Frozen |
-|-----------|-----------|--------|
-| **VLM (Qwen3-VL-4B)** | 0 | ~4B |
-| **DiT Layers** | ~2.9B (16 layers @ 2560) | 0 |
-| **State Encoder** | ~20K | 0 |
-| **Action In/Out** | ~36K | 0 |
-| **Robot CNN** | ~5M | 0 |
-| **Latent Generator** | ~17M | 0 |
-| **Time Embedder** | ~13M | 0 |
-| **SINK + Pos Emb** | ~10K | 0 |
+With `dit_hidden_size=1280` (decoupled from VLM's 2560):
+
+| Component | Trainable | Frozen | Details |
+|-----------|-----------|--------|---------|
+| **VLM (Qwen3-VL-4B)** | 0 | ~4B | Frozen Qwen3-VL-4B-Instruct (vision + 36 text layers) |
+| **DiT Layers** | **~803M** | 0 | 16 layers @ dit_hidden=1280: self-attn (10×128, kv=2) + cross-attn (32×128, kv=8) + SwiGLU(4864) + adaLN |
+| **State Encoder** | ~13K | 0 | Linear(state_dim→1280) + RMSNorm |
+| **Action In Proj** | ~10K | 0 | Linear(action_dim→1280) |
+| **Action Out Proj** | ~10K | 0 | Linear(1280→action_dim), zero-init |
+| **Action Pos Emb** | ~82K | 0 | (1, horizon=64, 1280) |
+| **Robot CNN** | ~5M | 0 | RobotVisualEncoder (optional, per camera) |
+| **Latent QFormer** | ~17M | 0 | 8 queries, 2 layers, cross-attn to VLM KV |
+| **Time Embedder** | ~3.3M | 0 | MLP(1280→1280→1280) with SiLU |
+| **SINK Token** | ~1.3K | 0 | (1, 1, 1280) |
+| **Total Trainable** | **~803M** | | ≈ 20% of the old 2560-width DiT (~4B trainable) |
+
+> **Note**: The actual `trainable params` reported at runtime is **803,033,675** (confirmed from RL training log). This is dominated by the 16 DiT layers. The decoupled width (1280 vs 2560) saves ~75% of DiT parameters with minimal performance impact.
 
 ---
 

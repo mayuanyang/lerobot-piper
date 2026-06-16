@@ -49,8 +49,8 @@ REPHRASINGS: dict[str, str] = {
     "put both the alphabet soup and the cream cheese box in the basket":
         "put both the blue can of alphabet soup and the cream cheese box in the basket",
     # T1: PENDING cream-cheese/butter colors — uncomment once known.
-    # "put both the cream cheese box and the butter in the basket":
-    #     "put both the <C1> cream cheese box and the <C2> butter box in the basket",
+    "put both the cream cheese box and the butter in the basket":
+         "put both the silver purple cream cheese box and the red butter box in the basket",
 
     # ---- libero_spatial — "ramekin" is an ungroundable noun for the VLM ----
     # Replace ramekin -> visual description wherever it appears.

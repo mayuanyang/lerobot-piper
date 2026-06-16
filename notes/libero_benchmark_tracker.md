@@ -32,6 +32,8 @@ Format conventions:
 | **2026-06-11** | **WiltechsVLA** | **34k bs96 contrast0.1+vkvdrop0.3** | **10-12** | **64** | **87** | **83** | **73** | **58** | **75.25** | **COMPLETE avg4 = 75.25.** First WiltechsVLA with all 4 suites. Long 58% (120 episodes, 12 per task): T1 perfect (12/12), T3 near-perfect (11/12), T2/T5 67%, T9 58%, T7 50%, T4 42%, T0 25%, T6/T8 17%. avg4 75.25 trails interleaved 80k (78.5) by 3.25pts and wilro-ed-s2 69k (77.5) by 2.25pts — driven by long (-7 vs interleaved 65%, -4 vs wilro 62%). Spatial 87 ties repo-best, object 83 ties wilro-best, goal 73 matches interleaved. Long is THE bottleneck suite. T1/T3 standout wins (multi-pick same-dest + 3-step articulated); T6/T8 weakest (dual-object dual-dest + both moka pots→stove). |
 | **2026-06-11** | **WiltechsVLA** | **28k bs96 contrast0.1+vkvdrop0.3** | **10** | **64** | **76** | — | — | — | — | **Resumed 20k with contrastive_loss_weight 0.1 + vision_kv_dropout_prob 0.3 (+latents_wrong fix). T9 (cabinet) 0→5 ⭐⭐⭐ — the structural language failure BROKE after 8k steps of language-forcing.** 5 perfect tasks (T1-T4, T6). But T8 (next to plate) collapsed 8→2 and T5 (stopping bug) regressed 9→4. Total flat at 76 — redistribution, not regression: targeted fix worked, collateral on near-synonymous "next to X" / placement tasks. Needs video review of T5/T8 failures. |
 | **2026-06-10** | **WiltechsVLA** | **20k bs96 no_contrast** | **10** | **64** | **76** | — | — | — | — | **20k checkpoint (10k more steps, same config).** Spatial 76% (−3 vs 10k's 79%). **T5 (stopping bug) recovered 0→9 (+9)** ⭐⭐⭐ — the standout win. T9 (cabinet) still 0 — persistent structural failure. T0 dropped 9→7 (−2), T1 dropped 10→8 (−2), T7 improved 6→8 (+2). Per-task: T0=7, T1=8, T2=9, T3=9, T4=9, T5=9, T6=9, T7=8, T8=8, T9=0. Net −3 driven by T0/T1 regressions, but T5 recovery is significant — stopping bug was the worst failure at 10k and is now fixed. T9 cabinet bias remains the single structural failure (0 across both 10k and 20k). |
+| **2026-06-14** | **WiltechsVLA** | **59k descriptive_obj + chat_template (no hard-neg)** | **10** | **?** | — | — | — | **62.5** | — | **Long 62.5%** (120 ep, 12/task) — best WiltechsVLA long to date, +4.5 over 34k (58%). Resume SFT with `use_descriptive_objects` + `use_chat_template`, contrastive 0.1, NO hard negatives. Per-task: T0=42, T1=50, T2=83, T3=100, T4=75, T5=92, T6=50, T7=58, T8=25, T9=50. **The descriptive rewrites did NOT lift their own targets**: T0/T1/T7 (the "put both X and Y → basket" rewrite tasks) are the bottom cluster (42/50/58), and **T1 collapsed 100→50** vs 34k despite the new "silver-purple cream-cheese / red-butter box" rewrite. Gains are on non-target tasks (T4 +33, T6 +33, T5 +25) → reads as broad SFT/chat-template lift, not object grounding. Bottom cluster = compound "put both" tasks (success≈p², binary reward, step-cap starved) → horizon/control ceiling, not grounding. n=12/task ≈ ±14pp. **Cadence (n_action_steps) unconfirmed — verify before cross-run claims.** This is the baseline the hard-neg+descriptive run must beat, specifically on T0/T1/T7/T8. |
+| **2026-06-14** | **WiltechsVLA** | **descriptive_obj + chat_template + HARD-NEG** | **10** | **?** | — | — | — | **64.2** | — | **Long 64.2%** (120 ep, 12/task, `22-16-05`). Adds `contrastive_hard_negatives` to the row above (same rewrites+chat, contrastive 0.1). Per-task: T0=33, T1=83, T2=83, T3=92, T4=50, T5=83, T6=58, T7=67, T8=17, T9=75. **Aggregate flat (+1.7, within noise) but failure mode SHIFTED grounding→control** (confirmed by video review). vs desc-only Δ: **T1 +33 (50→83, the minimal-pair rescue the hard-neg was built for), T7 +9, T9 +25; T4 −25 (mug minimal-pair collateral — likely transient winner/loser, cf. spatial 28k→34k self-recovery), T0 −9, T8 −8.** Basket tasks split by visual feature: box-containing (T1,T7) recovered, color-only-cans (T0) and identical-objects (T8) stayed at floor — contrastive installs discrimination only where the frozen VLM can see a distinguishing feature. **Video review (user, 2026-06-14): model follows instructions better; T0's T1-confusion shrank to a small tail; remaining failures are NOT grounding — mostly "right object, fumbled pick/place."** → grounding essentially solved; bottleneck is now manipulation/horizon. **Next: staged/partial-credit reward for compound "put both" tasks (T0/T7/T8) + check step cap.** Cadence flag: 96.8 s/ep here vs 56.8 s/ep desc-only ⇒ likely different `n_action_steps`; confirm before trusting deltas. |
 
 ---
 
@@ -252,6 +254,123 @@ vs wilro-ed-l16 99k 84.3, interleaved 74k 84, wilro-ed-s2 69k 82.7. Goal is THE
 bottleneck suite; long not yet measured. The chat-template run's goal eval is
 its highest-stakes test — goal is where instruction-format fidelity should
 matter most.
+
+### libero_long (62.5% @ 59k descriptive_obj + chat_template; was 58% @ 34k legacy)
+
+**Measured 2026-06-14** (`10-34-50_libero_wiltechs_vla`, 56.8 s/ep, 120 episodes,
+12/task). Resume SFT with `use_descriptive_objects` + `use_chat_template`,
+contrastive 0.1, **no hard negatives**. Best WiltechsVLA long to date (+4.5 over
+34k). **Cadence note**: `n_action_steps` for this eval is unconfirmed (filename
+"long" is the suite, not the cadence) — verify before any cross-run claim; the
+34k baseline below was `n_action_steps=64`.
+
+| Bench | Description | 34k legacy | **59k desc+chat** | Δ | Notes |
+|------|------|------|------|------|------|
+| **T0** | both alphabet soup + tomato sauce → basket *(rewritten: blue/red can)* | 25 | **42** | +17 | rewrite target — still bottom cluster |
+| **T1** | both cream cheese box + butter → basket *(rewritten: silver-purple/red box)* | 100 | **50** | **−50** ⚠️⚠️ | **rewrite target COLLAPSED** from perfect; the "silver-purple" descriptor may confuse more than help |
+| T2 | turn on stove + put moka pot on it | 67 | **83** | +16 | |
+| T3 | bowl → bottom drawer + close it | 92 | **100** | +8 | **Perfect** |
+| **T4** | white mug → left, yellow+white mug → right | 42 | **75** | **+33** ⭐ | largest gain |
+| T5 | book → back compartment of caddy | 67 | **92** | +25 ⭐ | |
+| **T6** | white mug → plate, chocolate pudding → right | 17 | **50** | **+33** ⭐ | |
+| **T7** | both alphabet soup + cream cheese → basket *(rewritten)* | 50 | **58** | +8 | rewrite target — bottom cluster |
+| **T8** | both moka pots → stove | 17 | **25** | +8 | structural floor (compound, p²) |
+| T9 | yellow+white mug → microwave + close it | 58 | **50** | −8 | |
+
+**Analysis**: 58 → 62.5 (+4.5). The headline finding is diagnostic, not just the
+number: **the descriptive-object rewrites failed to lift the tasks they target.**
+T0/T1/T7 are exactly the "put both X and Y → basket" rewrite tasks, and they are
+the bottom cluster (42/50/58). T1 — the freshly-added "silver-purple cream-cheese
+box / red butter box" rewrite — collapsed from a perfect 12/12 to 6/12. All the
+gain came from *non-target* tasks (T4 +33, T6 +33, T5 +25), i.e. broad SFT /
+chat-template quality, not object grounding.
+
+This shifts the weight of evidence away from grounding and toward the **compound-task
+ceiling**: every bottom task (T0/T1/T7/T8) is a "put both …" two-stage task where
+success ≈ p², the reward is binary (no partial credit), and the step cap starves
+the second placement. Rewriting "alphabet soup" → "blue can" cannot fix a
+horizon/control limit. Config confound (59k chat-template+descriptive vs 34k legacy)
++ n=12/task (±14pp) mean per-task moves <±14 are noise; T1's −50 and the +25/+33
+gains are real.
+
+**Next**: judge the hard-neg+descriptive run against THIS 62.5%, specifically on
+T0/T1/T7/T8. If hard negatives lift those four → grounding was the gap and the
+contrastive was the missing piece. If they lift overall but leave T0/T1/T7/T8 at
+the floor → those tasks are horizon/control-bound and need partial-credit/staged
+reward or a higher step cap, not more language machinery. Also worth a quick
+ablation of the T1 "silver-purple" rewrite — it may be a net-negative descriptor.
+
+### libero_long (64.2% @ descriptive_obj + chat_template + HARD-NEG; was 62.5% no-hard-neg)
+
+**Measured 2026-06-14** (`22-16-05_libero_wiltechs_vla`, 96.8 s/ep, 120 episodes,
+12/task). Same config as the descriptive-only run **plus**
+`contrastive_hard_negatives` (contrastive 0.1). The hard-neg contrastive spiked
+to ~34% of margin on enable, then declined to ~8-21% over training (the
+spike-then-decline = it found minimal pairs not separated at the velocity level,
+then installed the discrimination).
+
+| Bench | Description | desc-only | **+hard-neg** | Δ | Notes |
+|------|------|------|------|------|------|
+| **T0** | both alphabet soup + tomato sauce → basket *(two cans, color-only)* | 42 | **33** | −9 | no shape cue — contrastive can't help. **Video (2026-06-14): ~30% still pick the WRONG can** = vision color-binding failure (language already says "blue"/"red"; vision can't locate it — vision x-attn only ~8%). The other ~37% of failures are right-can-fumbled. Mixed grounding+control; grounding half NOT solved. |
+| **T1** | both cream cheese box + butter → basket *(box + box)* | 50 | **83** | **+33** ⭐⭐ | **the minimal-pair rescue** — exactly what hard-neg was built for; revises "silver-purple is a bad descriptor" (descriptor was fine, attention pressure was missing) |
+| T2 | turn on stove + put moka pot on it | 83 | **83** | 0 | |
+| T3 | bowl → bottom drawer + close it | 100 | **92** | −8 | |
+| **T4** | white mug → left, yellow+white mug → right *(mug minimal pair)* | 75 | **50** | **−25** ⚠️ | **collateral** — likely transient winner/loser (cf. spatial T5/T8 28k→34k self-recovery); watch with more steps |
+| T5 | book → back compartment of caddy | 92 | **83** | −9 | |
+| T6 | white mug → plate, chocolate pudding → right | 50 | **58** | +8 | |
+| **T7** | both alphabet soup + cream cheese box → basket *(can + box)* | 58 | **67** | +9 | box gives a shape cue → recovered |
+| **T8** | both moka pots → stove *(identical objects)* | 25 | **17** | −8 | identical objects, both must succeed — pure horizon/p² floor, no language fix possible |
+| T9 | yellow+white mug → microwave + close it | 50 | **75** | +25 ⭐ | mirror winner of the T4 redistribution |
+
+**Analysis**: aggregate 62.5 → 64.2 (+1.7, within n=12 noise) — but the *failure
+mode changed*, which is the real result. **The basket tasks split by whether a
+groundable visual feature exists**: box-containing (T1 +33, T7 +9) recovered;
+color-only cans (T0) and identical moka pots (T8) stayed at the floor. The
+hard-negative contrastive installs discrimination **only where the frozen Qwen-VL
+can see a distinguishing feature** — it cannot manufacture a red-vs-blue-can
+distinction at low res, nor disambiguate two identical objects.
+
+**Video review (user, 2026-06-14) — the decisive observation**: the model now
+**follows instructions noticeably better**; T0's cross-task (T1) confusion shrank
+to a small tail; and **the remaining failures are NOT grounding — they are
+"right object, fumbled pick/place."** Most failed episodes go for the *correct*
+objects and fail on manipulation.
+
+**Conclusion — *language* grounding is solved; what remains is control/horizon plus
+one vision-binding holdout (T0).** The contrastive + descriptive program extracted
+the language win (coarse *and* fine language sensitivity); pushing more language
+machinery (contrastive weight — 0.1→0.2 did nothing, hinge saturated at 7-13%;
+rewrites; template) is at diminishing returns. For most tasks failures *migrated*
+from "wrong object" (perception) to "right object, bad grasp" (control) — a more
+tractable, RL-shapeable problem.
+
+**T0 exception (video, 2026-06-14): ~30% still pick the wrong can.** This is a
+*vision* color-binding failure, not language — the rewrite already supplies "blue"/
+"red", but the DiT can't locate the colored can (vision is only ~8% of x-attn). The
+contrastive is structurally blind to this (it tests language→velocity sensitivity,
+which is saturated, never whether vision resolves color), which is why weight 0.2
+left T0 untouched. Lever is a VISION one — raise `vision_input_size`, probe whether
+frozen Qwen can even distinguish the cans at input res, or fall back to explicit
+detection (repo has `box_encoder.py`/`object_detector.py`). Diagnostic first: are
+wrong-can picks same-side (position prior, ignores color) or inconsistent (can't
+resolve red/blue)? T0 differs from T8 (identical moka pots = pure horizon, nothing
+to ground).
+
+**Next experiment — pivot to manipulation:**
+1. **Staged / partial-credit reward for the compound "put both" tasks (T0, T7, T8).**
+   Highest leverage. Binary reward gives zero gradient for "picked + placed object
+   1, failed object 2," so the policy never learns the hard second half. Reward each
+   placement. This is the only lever that can move T8 (identical objects) and T0
+   (color-only) off the floor — the contrastive provably can't.
+2. **Check the step cap.** 96.8 s/ep (vs 56.8 desc-only) suggests episodes run long;
+   if "fumbled place" includes timeouts mid-recovery, raising the cap converts
+   fumbles to successes for free.
+3. **Grasp precision** is a RobotCNN-pathway question (`vision_dropout_prob 0.3`,
+   29% self-attn mass), *not* a VLM one — touch only after staged reward.
+
+**Cadence caveat**: 96.8 s/ep here vs 56.8 desc-only ⇒ the two evals likely ran at
+different `n_action_steps`; the video conclusion holds regardless, but confirm
+cadence before citing the +1.7 / per-task deltas as clean.
 
 ---
 
