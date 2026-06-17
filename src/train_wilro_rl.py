@@ -12,7 +12,7 @@ Usage:
         --policy_path outputs/train/wilro_checkpoint_10k \
         --env_task libero_goal --task_ids 3 8 9 \
         --output_dir outputs/rl/wilro_goal \
-        --group_size 8 --n_action_steps 8 --exploration_std 0.1
+        --group_size 8 --n_action_steps 8 --exploration_std 0.2
 """
 
 from __future__ import annotations
@@ -227,14 +227,21 @@ def rollout_group(
         if device.type == "cuda" else torch.autocast(device_type="cpu", enabled=False)
     )
 
+    all_idx = list(range(G))
     while active and steps_done < group.max_steps:
-        cur_obs = [obs_list[i] for i in active]
+        # Always forward the FULL group (fixed batch dim = G) so cuBLAS picks the
+        # same GEMM kernel as grpo_update's minibatches (which is why
+        # update_minibatch MUST == group_size). With matching M, per-row bf16
+        # output is reproducible at update time → rollout_drift ~0 and the
+        # importance ratio stays sane. Terminated envs are forwarded (cheap waste)
+        # but never stored/executed. Indices below are ABSOLUTE env ids (i).
+        cur_obs = [obs_list[i] for i in all_idx]
         batch = obs_list_to_model_batch(
-            cur_obs, [group.task_description] * len(active), preprocessor,
+            cur_obs, [group.task_description] * G, preprocessor,
         )
 
         # Sample flow noise (stored as latent for recomputation)
-        x1 = torch.randn(len(active), horizon, action_dim, device=device)
+        x1 = torch.randn(G, horizon, action_dim, device=device)
 
         # Run flow matching denoising from x1 (model method, differentiable).
         # Must run under the SAME autocast policy as grpo_update so rollout-time
@@ -245,30 +252,30 @@ def rollout_group(
 
         # Add exploration noise
         actions = mu + sigma * torch.randn_like(mu)
-        logp_old = gaussian_logp_per_step(actions, mu, sigma)  # (B, n_exec)
+        logp_old = gaussian_logp_per_step(actions, mu, sigma)  # (G, n_exec)
 
         # Post-process actions (denormalize)
-        env_actions = postprocessor(actions.reshape(len(active) * n_exec, action_dim))
-        env_actions = env_actions.reshape(len(active), n_exec, action_dim).numpy()
+        env_actions = postprocessor(actions.reshape(G * n_exec, action_dim))
+        env_actions = env_actions.reshape(G, n_exec, action_dim).numpy()
 
-        # Store records
-        for j, i in enumerate(list(active)):
+        # Store records — ACTIVE envs only, indexed by absolute env id i.
+        for i in active:
             result.records_per_env[i].append(ChunkRecord(
-                pixels={c: np.ascontiguousarray(v) for c, v in cur_obs[j]["pixels"].items()},
-                agent_pos=np.asarray(cur_obs[j]["agent_pos"], dtype=np.float32),
+                pixels={c: np.ascontiguousarray(v) for c, v in obs_list[i]["pixels"].items()},
+                agent_pos=np.asarray(obs_list[i]["agent_pos"], dtype=np.float32),
                 task=group.task_description,
-                x1=x1[j].cpu().numpy().astype(np.float32),
-                action=actions[j].cpu().numpy().astype(np.float32),
-                logp_old=logp_old[j].cpu().numpy().astype(np.float32),
+                x1=x1[i].cpu().numpy().astype(np.float32),
+                action=actions[i].cpu().numpy().astype(np.float32),
+                logp_old=logp_old[i].cpu().numpy().astype(np.float32),
             ))
 
-        # Execute chunk step-by-step
+        # Execute chunk step-by-step (active envs only)
         still_active = []
-        for j, i in enumerate(list(active)):
+        for i in active:
             env = group.envs[i]
             terminated = False
             for k in range(n_exec):
-                a = np.clip(env_actions[j, k], env.action_space.low, env.action_space.high)
+                a = np.clip(env_actions[i, k], env.action_space.low, env.action_space.high)
                 obs, _r, terminated, _trunc, info = env.step(a.astype(np.float32))
                 obs_list[i] = obs
                 if terminated:
@@ -476,8 +483,11 @@ def main():
                              "tasks produce gradient. True task success is still logged separately.")
     parser.add_argument("--max_episode_steps", type=int, default=0,
                         help="Cap rollout episode length (0 = suite default)")
-    parser.add_argument("--exploration_std", type=float, default=0.1,
-                        help="Gaussian exploration std in NORMALIZED action units")
+    parser.add_argument("--exploration_std", type=float, default=0.2,
+                        help="Gaussian exploration std in NORMALIZED action units. "
+                             "logp sensitivity to bf16 mu-drift scales 1/std, so values "
+                             "below ~0.15 blow up the importance ratio (ratio_max -> e^20, "
+                             "clip_frac ~0.5). Keep >= 0.15.")
     parser.add_argument("--rl_iterations", type=int, default=300)
     parser.add_argument("--lr", type=float, default=5e-6)
     parser.add_argument("--clip_low", type=float, default=0.2)
@@ -494,6 +504,15 @@ def main():
     parser.add_argument("--save_freq", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+
+    # rollout forwards a fixed batch of group_size envs; grpo_update recomputes
+    # logp in minibatches of update_minibatch. They MUST match or the bf16 GEMM
+    # kernel differs between the two forwards → mu drifts → importance ratio
+    # explodes (ratio_max -> e^20, clip_frac ~0.5). See rollout_group.
+    assert args.update_minibatch == args.group_size, (
+        f"update_minibatch ({args.update_minibatch}) must == group_size "
+        f"({args.group_size}) so rollout/update GEMM shapes match (rollout_drift)."
+    )
 
     random.seed(args.seed)
     np.random.seed(args.seed)
