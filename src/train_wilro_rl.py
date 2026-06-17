@@ -236,8 +236,11 @@ def rollout_group(
         # Sample flow noise (stored as latent for recomputation)
         x1 = torch.randn(len(active), horizon, action_dim, device=device)
 
-        # Run flow matching denoising from x1 (model method, differentiable)
-        mu_full = policy.model.flow_actions_from_noise(batch, x1)
+        # Run flow matching denoising from x1 (model method, differentiable).
+        # Must run under the SAME autocast policy as grpo_update so rollout-time
+        # and update-time logp agree numerically (controls rollout_drift).
+        with autocast_ctx:
+            mu_full = policy.model.flow_actions_from_noise(batch, x1)
         mu = mu_full[:, :n_exec].float()
 
         # Add exploration noise
@@ -328,7 +331,9 @@ def grpo_update(
         return batch, x1, actions, adv, w
 
     def forward_logp(batch, x1, actions):
-        mu_full = policy.model.flow_actions_from_noise(batch, x1)
+        # Same autocast policy as rollout_group (see rollout_drift note there).
+        with autocast_ctx:
+            mu_full = policy.model.flow_actions_from_noise(batch, x1)
         mu = mu_full[:, :args.n_action_steps].float()
         return gaussian_logp_per_step(actions, mu, args.exploration_std)
 

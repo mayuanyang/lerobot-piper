@@ -9,20 +9,28 @@ credit for HOW FAR a rollout got, so:
     fixing the p^2 binary starvation (libero_10 T0/T7/T8).
 
 Design (confirmed against the live env via src/libero_reward_probe.py):
-  reward = mean over the task's GOAL CONJUNCTS of the per-conjunct MAX stage
-           reached during the episode (transient grasps/lifts bank credit).
+  per-conjunct value = 0.5 * MAX stage reached  +  0.5 * FINAL stage held
+  reward = mean over the task's GOAL CONJUNCTS of that per-conjunct value.
+The 0.5/0.5 max+final split penalizes regressions (grasp-then-drop scores below
+grasp-and-hold) without punishing recover-and-succeed — true success is hard-set
+to 1.0 by the caller, and placed conjuncts lock to 1.0 here.
 
-Per-conjunct stage ladder (each banked as a running max over the episode):
-  0.00  untouched
-  0.25  reached   (eef within REACH_EPS of the object center)
-  0.50  grasped   (robosuite _check_grasp)
-  0.75  lifted    (grasped AND object z > rest_z + LIFT_DZ)
-  1.00  placed    (_eval_predicate(conjunct) — LIBERO's own goal test)
+Per-conjunct stage ladder — BACK-LOADED so completion dominates the gradient,
+and CONTINUOUS within the reach/lift bands so groups rarely go zero-variance
+(degenerate -> dropped -> no gradient) at an intermediate stage:
+  0.00 .. 0.10  reaching  (ramps as eef closes from REACH_FAR to REACH_EPS)
+  0.25          grasped   (robosuite _check_grasp)
+  0.25 .. 0.40  lifting   (ramps with object height from LIFT_DZ to LIFT_FULL)
+  1.00          placed    (_eval_predicate(conjunct) — LIBERO's own goal test)
 
 Conjuncts that don't name a graspable object (e.g. ['open', drawer]) get only
 the 0/1 placed test — no intermediate stages — so this generalizes across all
-libero_10 tasks. The reward is computed ONCE per rollout (a single scalar fed to
-GRPO's trajectory advantage), so there is no per-timestep shaping to game.
+libero_10 tasks. Stage is aggregated to ONE scalar per rollout (banked max+final),
+so there is no per-timestep dense reward for GRPO to game.
+
+TODO: add a continuous object->goal-region ramp in the [0.40, 1.0) band once the
+region-center API is confirmed via src/libero_reward_probe.py (lift->place is
+currently a single discrete jump).
 
 Confirmed env API (Libero_*_Tabletop_Manipulation, robosuite sim):
   sim_env.parsed_problem['goal_state'] -> [['in','alphabet_soup_1','basket_1_contain_region'], ...]
@@ -68,8 +76,15 @@ class StagedRewardTracker:
     bank stage progress; read reward() at episode end (use 1.0 on success-
     termination, since LiberoEnv auto-resets and the final state is gone)."""
 
-    REACH_EPS = 0.07   # m, eef-to-object-center
-    LIFT_DZ = 0.03     # m above the object's rest height
+    REACH_EPS = 0.07    # m, eef-to-object-center: full reach credit at/under this
+    REACH_FAR = 0.30    # m: zero reach credit at/over this (linear ramp between)
+    LIFT_DZ = 0.03      # m above rest height: lift credit starts here
+    LIFT_FULL = 0.15    # m above rest height: full lift credit at/over this
+
+    # Back-loaded band tops — completion (1.0) dominates the gradient.
+    W_REACH = 0.10
+    W_GRASP = 0.25
+    W_LIFT = 0.40
 
     def __init__(self, libero_env):
         self.sim_env = get_sim_env(libero_env)
@@ -87,6 +102,7 @@ class StagedRewardTracker:
         except Exception:
             self.gripper = None
         self.max_stage = [0.0] * len(self.goals)
+        self.final_stage = [0.0] * len(self.goals)
         # Record rest heights NOW (env just reset → objects at init pose) so a
         # first-chunk grasp can't poison the lift baseline.
         for conj in self.goals:
@@ -112,44 +128,63 @@ class StagedRewardTracker:
         except Exception:
             return False
 
+    def _current_stage(self, conj) -> float:
+        """Continuous stage in [0, 1] for ONE conjunct at the current sim state."""
+        # placed? — LIBERO's own predicate test; the ONLY signal for
+        # non-graspable conjuncts (e.g. ['open', drawer]).
+        try:
+            if self.sim_env._eval_predicate(conj):
+                return 1.0
+        except Exception:
+            pass
+        pred = conj[0] if conj else None
+        obj = conj[1] if len(conj) >= 2 else None
+        if pred not in _PLACEMENT_PREDICATES or obj not in self.obj_body_id:
+            return 0.0
+        pos = self._obj_pos(obj)
+        self.rest_z.setdefault(obj, float(pos[2]))
+        # reaching: continuous ramp 0 -> W_REACH as the eef closes in.
+        stage = 0.0
+        try:
+            eef = np.asarray(self.sim_env._eef_xpos, dtype=np.float64)
+            dist = float(np.linalg.norm(eef - pos))
+            frac = (self.REACH_FAR - dist) / (self.REACH_FAR - self.REACH_EPS)
+            stage = self.W_REACH * min(1.0, max(0.0, frac))
+        except Exception:
+            pass
+        # grasped, then lifting: continuous ramp W_GRASP -> W_LIFT with height.
+        if self._grasped(obj):
+            stage = self.W_GRASP
+            dz = pos[2] - self.rest_z[obj]
+            if dz > self.LIFT_DZ:
+                frac = (dz - self.LIFT_DZ) / (self.LIFT_FULL - self.LIFT_DZ)
+                stage = self.W_GRASP + (self.W_LIFT - self.W_GRASP) * min(1.0, max(0.0, frac))
+        return stage
+
     def update(self) -> None:
         if not self.ok:
             return
         for ci, conj in enumerate(self.goals):
             if self.max_stage[ci] >= 1.0:
+                self.final_stage[ci] = 1.0  # placement is sticky
                 continue
-            # placed? — LIBERO's own predicate test; the ONLY signal for
-            # non-graspable conjuncts (e.g. ['open', drawer]).
-            try:
-                if self.sim_env._eval_predicate(conj):
-                    self.max_stage[ci] = 1.0
-                    continue
-            except Exception:
-                pass
-            pred = conj[0] if conj else None
-            obj = conj[1] if len(conj) >= 2 else None
-            if pred not in _PLACEMENT_PREDICATES or obj not in self.obj_body_id:
-                continue
-            pos = self._obj_pos(obj)
-            self.rest_z.setdefault(obj, float(pos[2]))
-            stage = 0.0
-            try:
-                eef = np.asarray(self.sim_env._eef_xpos, dtype=np.float64)
-                if np.linalg.norm(eef - pos) < self.REACH_EPS:
-                    stage = 0.25
-            except Exception:
-                pass
-            if self._grasped(obj):
-                stage = max(stage, 0.5)
-                if pos[2] > self.rest_z[obj] + self.LIFT_DZ:
-                    stage = 0.75
-            if stage > self.max_stage[ci]:
-                self.max_stage[ci] = stage
+            cur = self._current_stage(conj)
+            self.final_stage[ci] = cur
+            if cur >= 1.0:
+                self.max_stage[ci] = 1.0
+            elif cur > self.max_stage[ci]:
+                self.max_stage[ci] = cur
 
     def reward(self) -> float:
         if not self.ok or not self.max_stage:
             return 0.0
-        return float(np.mean(self.max_stage))
+        # 0.5*max + 0.5*final per conjunct: credits how far it got AND that it
+        # held there (drops lose credit); placed conjuncts are locked to 1.0.
+        vals = [
+            1.0 if m >= 1.0 else 0.5 * m + 0.5 * f
+            for m, f in zip(self.max_stage, self.final_stage)
+        ]
+        return float(np.mean(vals))
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +243,8 @@ def _selftest() -> None:
         a = env.action_space.sample().astype(_np.float32)
         env.step(a)
         t.update()
-    print("\nafter", args.steps, "random steps — max_stage per conjunct:", t.max_stage,
+    print("\nafter", args.steps, "random steps — max_stage:", [round(s, 3) for s in t.max_stage],
+          " final_stage:", [round(s, 3) for s in t.final_stage],
           " reward:", round(t.reward(), 3))
     print("(random actions rarely grasp; the point is update() ran cleanly and "
           "the wiring above is all True.)")
