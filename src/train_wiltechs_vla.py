@@ -196,12 +196,19 @@ def _log_gradient_analysis(policy, step: int) -> None:
     print(f"\n--- Gradient Analysis at Step {step} ---")
 
     def _grad_stats(prefix: str):
-        total, count = 0.0, 0
+        total, g_norm_sq, count = 0.0, 0.0, 0
         for name, param in policy.model.named_parameters():
             if param.requires_grad and prefix in name and param.grad is not None:
                 total += param.grad.abs().mean().item() * param.numel()
+                g_norm_sq += param.grad.norm().item() ** 2
                 count += param.numel()
-        return (total / count, count) if count > 0 else (None, 0)
+        if count == 0:
+            return None, None, 0
+        # `Avg Abs Grad` = mean|grad| over ALL params — rounds to ~0 for large
+        # modules whose gradient is concentrated in a few sub-params (gates,
+        # norms), making them look dead. `RMS/param` = grad_L2_norm / sqrt(N) is
+        # scale-fair across modules of any size, so it's the honest comparison.
+        return (total / count, (g_norm_sq ** 0.5) / (count ** 0.5), count)
 
     for label, prefix in [
         ("Robot CNN",      "robot_visual_encoder"),
@@ -214,9 +221,10 @@ def _log_gradient_analysis(policy, step: int) -> None:
         ("Final Norm",     "final_norm"),
         ("Latent QFormer", "latent_qformer"),
     ]:
-        grad, n = _grad_stats(prefix)
+        grad, rms_pp, n = _grad_stats(prefix)
         if grad is not None:
-            print(f"  {label:14s} - Avg Abs Grad: {grad:.6f} ({n} params)")
+            print(f"  {label:14s} - Avg Abs Grad: {grad:.6f}   RMS/param: {rms_pp:.2e} "
+                  f"({n} params)")
         else:
             print(f"  {label:14s} - no grad")
 
