@@ -321,11 +321,16 @@ def grpo_update(
     )
     trainable = [p for p in policy.model.parameters() if p.requires_grad]
 
-    # FIXED minibatch partition
+    # FIXED minibatch partition. Drop the final partial minibatch: a tail of
+    # size < update_minibatch has a different GEMM shape than the rollout/pre-pass
+    # forwards (M=group_size), so those few chunks drift and can explode the
+    # importance ratio. order is a fresh permutation each iter, so the dropped
+    # (<=update_minibatch-1) records are random — no systematic bias.
     order = np.random.permutation(len(records))
+    n_full = (len(records) // args.update_minibatch) * args.update_minibatch
     minibatches = [
         [records[i] for i in order[s:s + args.update_minibatch]]
-        for s in range(0, len(records), args.update_minibatch)
+        for s in range(0, n_full, args.update_minibatch)
     ]
 
     def mb_tensors(mb):
