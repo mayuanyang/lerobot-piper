@@ -585,6 +585,16 @@ def main():
                              "mean over conjuncts) instead of binary success. Gives all-fail GRPO "
                              "groups within-group variance so grasp-fumble and compound 'put both' "
                              "tasks produce gradient. True task success is still logged separately.")
+    parser.add_argument("--binary_task_ids", type=int, nargs="*", default=None,
+                        help="Task ids that use BINARY (0/1 success) reward even when "
+                             "--staged_reward is on. Use for tasks where the dense reward is being "
+                             "hacked (staged reward flat while true success drops). These tasks skip "
+                             "the StagedRewardTracker entirely. Default: none (all staged).")
+    parser.add_argument("--task_sample_weights", type=str, nargs="*", default=None,
+                        help="Per-task sampling weights as 'tid:weight' (e.g. 0:1 8:2 9:1) for a "
+                             "weighted round-robin — a task with weight w is sampled w× as often, "
+                             "shifting gradient share toward it. DEFAULT: weight 1 for every task "
+                             "in --task_ids (equal sampling); any task you omit also stays at 1.")
     parser.add_argument("--max_episode_steps", type=int, default=0,
                         help="Cap rollout episode length (0 = use the LIBERO suite default, "
                              "e.g. 520 for libero_10). Shortening speeds rollout but truncates "
@@ -610,7 +620,7 @@ def main():
                              "(Ye et al. 2020). Prevents unbounded loss as ratios grow.")
     parser.add_argument("--use_8bit_adam", action="store_true")
     parser.add_argument("--gradient_checkpointing", action="store_true")
-    parser.add_argument("--save_freq", type=int, default=20, help="Iterations between checkpoints")
+    parser.add_argument("--save_freq", type=int, default=5, help="Iterations between checkpoints")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -644,6 +654,26 @@ def main():
     print(f"[rl] suite={args.env_task} task_ids={task_ids}")
     for tid in task_ids:
         print(f"  task {tid}: {suite.get_task(tid).language}")
+
+    # Per-task reward mode: tasks in binary_task_ids use 0/1 success even under
+    # --staged_reward (and skip the StagedRewardTracker in rollout).
+    binary_task_ids = set(args.binary_task_ids or [])
+    if binary_task_ids:
+        print(f"[rl] binary-reward tasks: {sorted(binary_task_ids)} "
+              f"(staged for the rest: {sorted(set(task_ids) - binary_task_ids)})")
+
+    # Weighted round-robin schedule: a task with weight w appears w× per cycle,
+    # so it is sampled w× as often (more kept groups -> larger gradient share).
+    task_weights = {tid: 1 for tid in task_ids}
+    for item in (args.task_sample_weights or []):
+        tid_str, w_str = item.split(":")
+        tid_w = int(tid_str)
+        if tid_w not in task_weights:
+            raise ValueError(f"--task_sample_weights tid {tid_w} not in task_ids {task_ids}")
+        task_weights[tid_w] = max(1, int(w_str))
+    task_schedule = [tid for tid in task_ids for _ in range(task_weights[tid])]
+    print(f"[rl] task sampling weights: {task_weights} -> schedule {task_schedule}"
+          f"{'  (default: equal)' if all(w == 1 for w in task_weights.values()) else ''}")
 
     # Cameras the policy was trained on, e.g. "observation.images.wrist_image"
     # -> env pixel key "wrist_image". Verified against actual env obs on first
@@ -681,8 +711,9 @@ def main():
         kept, attempts = 0, 0
         while kept < args.groups_per_iter and attempts < args.groups_per_iter * 6:
             attempts += 1
-            tid = task_ids[task_cycle % len(task_ids)]
+            tid = task_schedule[task_cycle % len(task_schedule)]
             task_cycle += 1
+            this_staged = args.staged_reward and tid not in binary_task_ids
             group = get_group(tid)
             isid = init_state_cycle[tid] % group.n_init_states
             init_state_cycle[tid] += 1
@@ -691,19 +722,19 @@ def main():
                 policy, preprocessor, postprocessor, group, isid,
                 args.n_action_steps, args.exploration_std, device,
                 base_seed=args.seed + 100_000 * it + 1000 * attempts,
-                staged_reward=args.staged_reward,
+                staged_reward=this_staged,
             )
             sr_track[tid].extend([float(s) for s in res.successes])
             n_succ = sum(res.successes)
             summary = {"task_id": tid, "init_state": isid, "successes": n_succ,
                        "of": len(res.successes)}
-            if args.staged_reward:
+            if this_staged:
                 summary["reward_mean"] = round(float(np.mean(res.rewards)), 3)
             group_summaries.append(summary)
 
-            # Staged reward (dense, in [0,1]) gives partial credit so all-fail
-            # groups stop being degenerate; binary success is the fallback.
-            reward_vals = (res.rewards if args.staged_reward
+            # Staged (dense, in [0,1]) for staged tasks; binary 0/1 for tasks in
+            # binary_task_ids (and whenever --staged_reward is off).
+            reward_vals = (res.rewards if this_staged
                            else [1.0 if s else 0.0 for s in res.successes])
             adv = grpo_group_advantages(reward_vals)
             if adv is None:
