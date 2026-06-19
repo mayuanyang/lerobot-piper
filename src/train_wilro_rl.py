@@ -27,6 +27,7 @@ import json
 import math
 import random
 import time
+import multiprocessing as mp
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -141,32 +142,154 @@ def obs_list_to_model_batch(obs_list: list[dict], tasks: list[str], preprocessor
 
 
 # ---------------------------------------------------------------------------
-# Environment pool — raw LiberoEnv instances, lockstep stepping
+# Environment pool — one LiberoEnv PER SUBPROCESS (each its own EGL context).
+#
+# MuJoCo offscreen rendering (MUJOCO_GL=egl) is NOT thread-safe: the GL context
+# is current-per-thread, so stepping envs in ThreadPoolExecutor workers silently
+# returns garbage frames (verified: reset frames match, every threaded step
+# diffs by 255 vs sequential). Process isolation gives each env its own context
+# and true (GIL-free) parallel physics+render. The StagedRewardTracker reads
+# deep sim state (body_xpos, _eef_xpos, _check_grasp, _eval_predicate), so it
+# MUST live inside the worker where the env object is — the main process only
+# ever sees obs/terminated/success/reward over the pipe.
 # ---------------------------------------------------------------------------
 
+def _env_worker(conn, suite_name: str, task_id: int, max_episode_steps: int,
+                env_ids: list[int]):
+    """Host len(env_ids) LiberoEnvs in ONE process, stepped sequentially within
+    the worker (shards run in parallel across workers). One EGL context per
+    process is fine for multiple envs as long as they render on this one thread.
+    Protocol over `conn` — payloads are keyed by absolute env id so the main
+    process can reassemble across shards:
+      send ("ready", meta) on startup (meta from this worker's first env); loop:
+        ("reset", init_state_id, {eid: seed})  -> {eid: obs}
+        ("make_tracker",)                      -> {eid: tracker.ok}
+        ("step", {eid: action_np})             -> {eid: (obs, term, succ, reward|None)}
+        ("reward", [eid, ...])                 -> {eid: tracker.reward()}
+        ("close",)                             -> exit
+    The worker auto-banks staged progress: tracker.update() on each non-terminal
+    step, and reward = 1.0 if success else tracker.reward() on termination."""
+    os.environ.setdefault("MUJOCO_GL", "egl")
+    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+    import numpy as _np
+    from lerobot.envs.libero import LiberoEnv, _get_suite
+
+    suite = _get_suite(suite_name)
+    envs = {
+        eid: LiberoEnv(
+            task_suite=suite, task_id=task_id, task_suite_name=suite_name,
+            obs_type="pixels_agent_pos", init_states=True, episode_index=0,
+        )
+        for eid in env_ids
+    }
+    trackers: dict[int, Any] = {eid: None for eid in env_ids}
+    bounds = {eid: (e.action_space.low, e.action_space.high) for eid, e in envs.items()}
+
+    first = envs[env_ids[0]]
+    obs, _ = first.reset(seed=0)  # populates cams/metadata for the handshake
+    conn.send(("ready", {
+        "cameras": sorted(obs["pixels"].keys()),
+        "max_episode_steps": first._max_episode_steps,
+        "n_init_states": len(first._init_states),
+        "task_description": first.task_description,
+    }))
+
+    try:
+        while True:
+            cmd = conn.recv()
+            op = cmd[0]
+            if op == "reset":
+                _, init_state_id, seeds = cmd
+                out = {}
+                for eid in env_ids:
+                    env = envs[eid]
+                    env._init_state_id = init_state_id
+                    o, _ = env.reset(seed=seeds[eid])
+                    trackers[eid] = None  # rebuilt via make_tracker AFTER reset
+                    out[eid] = o
+                conn.send(out)
+            elif op == "make_tracker":
+                from rl_staged_reward import StagedRewardTracker
+                out = {}
+                for eid in env_ids:
+                    trackers[eid] = StagedRewardTracker(envs[eid])
+                    out[eid] = trackers[eid].ok
+                conn.send(out)
+            elif op == "step":
+                out = {}
+                for eid, action in cmd[1].items():
+                    lo, hi = bounds[eid]
+                    a = _np.clip(action, lo, hi).astype(_np.float32)
+                    o, _r, terminated, _trunc, info = envs[eid].step(a)
+                    tr = trackers[eid]
+                    if terminated:
+                        succ = bool(info.get("is_success", False))
+                        # Env auto-resets on termination → final state is gone;
+                        # full success ⇒ all conjuncts placed ⇒ 1.0, else banked.
+                        rew = (1.0 if succ else tr.reward()) if tr is not None else None
+                        out[eid] = (o, True, succ, rew)
+                    else:
+                        if tr is not None:
+                            tr.update()  # bank stage on the post-action state
+                        out[eid] = (o, False, False, None)
+                conn.send(out)
+            elif op == "reward":
+                conn.send({eid: (trackers[eid].reward() if trackers[eid] is not None else 0.0)
+                           for eid in cmd[1]})
+            elif op == "close":
+                break
+    finally:
+        for e in envs.values():
+            try:
+                e.close()
+            except Exception:
+                pass
+        conn.close()
+
+
 class TaskEnvGroup:
-    """G LiberoEnv instances of ONE task."""
+    """group_size LiberoEnvs of ONE task, sharded across `n_workers` processes.
+    Envs in the same worker step sequentially; workers run in parallel. Fewer
+    workers => less per-process import RAM (torch/lerobot/mujoco are re-imported
+    per spawned process) but slower rollout (~group_size/n_workers serial steps).
+    Default n_workers == group_size (one env per process, max parallelism)."""
+
+    _ctx = mp.get_context("spawn")  # fresh interpreter per worker: no inherited
+    #                                 CUDA/EGL state from the model-holding parent
 
     def __init__(self, suite, suite_name: str, task_id: int, group_size: int,
                  expected_cams: Optional[list[str]] = None,
-                 max_episode_steps: int = 0):
-        from lerobot.envs.libero import LiberoEnv
-
+                 max_episode_steps: int = 0, n_workers: Optional[int] = None):
         self.task_id = task_id
-        self.envs = [
-            LiberoEnv(
-                task_suite=suite,
-                task_id=task_id,
-                task_suite_name=suite_name,
-                obs_type="pixels_agent_pos",
-                init_states=True,
-                episode_index=0,
+        self.group_size = group_size
+        n_workers = group_size if not n_workers else max(1, min(n_workers, group_size))
+        self.n_workers = n_workers
+        # Contiguous env-id shards, one per worker process.
+        self._shards = [[int(e) for e in s]
+                        for s in np.array_split(np.arange(group_size), n_workers)]
+        self._worker_of = {eid: w for w, shard in enumerate(self._shards) for eid in shard}
+
+        self._conns = []
+        self._procs = []
+        for shard in self._shards:
+            parent, child = self._ctx.Pipe()
+            p = self._ctx.Process(
+                target=_env_worker,
+                args=(child, suite_name, task_id, max_episode_steps, shard),
+                daemon=True,
             )
-            for _ in range(group_size)
-        ]
+            p.start()
+            child.close()  # only the worker holds the child end
+            self._conns.append(parent)
+            self._procs.append(p)
+
+        metas = [c.recv() for c in self._conns]
+        for tag, _m in metas:
+            assert tag == "ready", f"unexpected worker handshake: {tag}"
+        meta = metas[0][1]
+
         if expected_cams:
-            obs, _ = self.envs[0].reset(seed=0)
-            got = set(obs["pixels"].keys())
+            got = set(meta["cameras"])
             missing = [c for c in expected_cams if c not in got]
             if missing:
                 raise RuntimeError(
@@ -175,24 +298,71 @@ class TaskEnvGroup:
                 )
             print(f"[rl] camera check OK — env provides {sorted(got)}, "
                   f"policy expects {expected_cams}")
-        self.task_description = self.envs[0].task_description
-        suite_default = self.envs[0]._max_episode_steps
+        print(f"[rl] task {task_id}: {group_size} envs across {n_workers} worker "
+              f"process(es) (~{int(np.ceil(group_size / n_workers))} env/proc)")
+        self.task_description = meta["task_description"]
+        suite_default = meta["max_episode_steps"]
         self.max_steps = min(suite_default, max_episode_steps) if max_episode_steps else suite_default
         if self.max_steps < suite_default:
             print(f"[rl] task {task_id}: capping episode length {suite_default} -> {self.max_steps}")
-        self.n_init_states = len(self.envs[0]._init_states)
+        self.n_init_states = meta["n_init_states"]
 
     def reset_group(self, init_state_id: int, base_seed: int):
-        obs_list = []
-        for i, env in enumerate(self.envs):
-            env._init_state_id = init_state_id % self.n_init_states
-            obs, _ = env.reset(seed=base_seed + i)
-            obs_list.append(obs)
-        return obs_list
+        isid = init_state_id % self.n_init_states
+        for w, shard in enumerate(self._shards):
+            self._conns[w].send(("reset", isid, {e: base_seed + e for e in shard}))
+        obs_by_id: dict[int, Any] = {}
+        for c in self._conns:
+            obs_by_id.update(c.recv())
+        return [obs_by_id[i] for i in range(self.group_size)]
+
+    def make_trackers(self):
+        """Build a StagedRewardTracker in every worker env (AFTER reset)."""
+        for c in self._conns:
+            c.send(("make_tracker",))
+        ok: dict[int, bool] = {}
+        for c in self._conns:
+            ok.update(c.recv())
+        return [ok[i] for i in range(self.group_size)]
+
+    def _group_by_worker(self, indices):
+        per_worker: dict[int, list[int]] = {}
+        for i in indices:
+            per_worker.setdefault(self._worker_of[i], []).append(i)
+        return per_worker
+
+    def step(self, indices, env_actions, k: int) -> dict:
+        """Step envs `indices` with env_actions[i, k]. Workers handling >1 active
+        env step them sequentially; all workers run in parallel. Returns
+        {i: (obs, terminated, is_success, reward|None)}."""
+        per_worker = self._group_by_worker(indices)
+        for w, ids in per_worker.items():
+            self._conns[w].send(("step", {i: env_actions[i, k] for i in ids}))
+        out: dict[int, Any] = {}
+        for w in per_worker:
+            out.update(self._conns[w].recv())
+        return out
+
+    def get_rewards(self, indices) -> dict:
+        """Banked staged reward for timed-out (still-active) envs."""
+        per_worker = self._group_by_worker(indices)
+        for w, ids in per_worker.items():
+            self._conns[w].send(("reward", ids))
+        out: dict[int, float] = {}
+        for w in per_worker:
+            out.update(self._conns[w].recv())
+        return out
 
     def close(self):
-        for env in self.envs:
-            env.close()
+        for c in self._conns:
+            try:
+                c.send(("close",))
+            except Exception:
+                pass
+        for p in self._procs:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
 
 
 # ---------------------------------------------------------------------------
@@ -205,18 +375,17 @@ def rollout_group(
     init_state_id: int, n_exec: int, sigma: float, device, base_seed: int,
     staged_reward: bool = False,
 ) -> GroupResult:
-    G = len(group.envs)
+    G = group.group_size
     result = GroupResult(task_id=group.task_id, init_state_id=init_state_id,
                          successes=[False] * G, records_per_env=[[] for _ in range(G)],
                          rewards=[0.0] * G)
 
     policy.model.eval()
     obs_list = group.reset_group(init_state_id, base_seed)
-    # Staged-reward trackers must be built AFTER reset (objects at init pose)
-    trackers = None
+    # Staged-reward trackers live in the workers; built AFTER reset (objects at
+    # init pose). The worker auto-updates them on each step and returns reward.
     if staged_reward:
-        from rl_staged_reward import StagedRewardTracker
-        trackers = [StagedRewardTracker(group.envs[i]) for i in range(G)]
+        group.make_trackers()
     active = list(range(G))
     steps_done = 0
     horizon = policy.config.horizon
@@ -269,35 +438,27 @@ def rollout_group(
                 logp_old=logp_old[i].cpu().numpy().astype(np.float32),
             ))
 
-        # Execute chunk step-by-step (active envs only)
-        still_active = []
-        for i in active:
-            env = group.envs[i]
-            terminated = False
-            for k in range(n_exec):
-                a = np.clip(env_actions[i, k], env.action_space.low, env.action_space.high)
-                obs, _r, terminated, _trunc, info = env.step(a.astype(np.float32))
+        # Execute chunk step-by-step (active envs only) — each env steps in its
+        # own process, so the G sends fan out and run truly in parallel. Worker
+        # banks staged progress and returns reward on termination.
+        still_active = set(active)
+        for k in range(n_exec):
+            if not still_active:
+                break
+            for i, (obs, terminated, succ, rew) in group.step(still_active, env_actions, k).items():
                 obs_list[i] = obs
                 if terminated:
-                    succ = bool(info.get("is_success", False))
                     result.successes[i] = succ
-                    if trackers is not None:
-                        # Env auto-reset on termination → can't read final state;
-                        # full success ⇒ all conjuncts placed ⇒ 1.0, else use the
-                        # stage banked before this terminating step.
-                        result.rewards[i] = 1.0 if succ else trackers[i].reward()
-                    break
-                if trackers is not None:
-                    trackers[i].update()  # bank stage on the post-action state
-            if not terminated:
-                still_active.append(i)
-        active = still_active
+                    if staged_reward:
+                        result.rewards[i] = rew
+                    still_active.discard(i)
+        active = list(still_active)
         steps_done += n_exec
 
     # Timed-out envs (never terminated): state is intact, banked stage is current.
-    if trackers is not None:
-        for i in active:
-            result.rewards[i] = trackers[i].reward()
+    if staged_reward and active:
+        for i, rew in group.get_rewards(active).items():
+            result.rewards[i] = rew
 
     return result
 
@@ -518,6 +679,12 @@ def main():
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--save_freq", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--env_workers", type=int, default=None,
+                        help="Worker PROCESSES per task group (default: group_size, i.e. one "
+                             "env per process = max parallelism). Lower it to cut per-process "
+                             "import RAM (torch/lerobot/mujoco are re-imported per spawned proc) "
+                             "when RAM-limited; envs in a worker step sequentially, so rollout "
+                             "slows ~group_size/env_workers. Total env count is always group_size.")
     args = parser.parse_args()
 
     # rollout forwards a fixed batch of group_size envs; grpo_update recomputes
@@ -586,6 +753,7 @@ def main():
                 suite, args.env_task, tid, args.group_size,
                 expected_cams=expected_cams,
                 max_episode_steps=args.max_episode_steps,
+                n_workers=args.env_workers,
             )
             print(f"[rl] built {args.group_size} envs for task {tid} in {time.time()-t0:.1f}s")
         return env_pool[tid]
