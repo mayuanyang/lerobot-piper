@@ -154,6 +154,7 @@ def _log_gradient_analysis(policy, step: int) -> None:
 def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None,
           gradient_checkpointing=False, max_episode_index=None, batch_size=64,
           contrastive_loss_weight=0.1, contrastive_margin=0.05,
+          contrastive_hard_negatives=False,
           lock_joint_index: int | None = 3, kv_capture_strategy: str = "last",
           kv_capture_layers: list | None = None,
           robot_encoder_tokens: int = 49, gripper_encoder_tokens: int = 100,
@@ -267,6 +268,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         pos_decay_lambda=0.0,
         contrastive_loss_weight=contrastive_loss_weight,
         contrastive_margin=contrastive_margin,
+        contrastive_hard_negatives=contrastive_hard_negatives,
         robot_encoder_tokens=robot_encoder_tokens,
         gripper_encoder_tokens=gripper_encoder_tokens,
         gripper_camera=gripper_camera,
@@ -679,6 +681,13 @@ if __name__ == "__main__":
                         help="Hinge margin on MSE between v_t and v_wrong "
                              "(default: 0.05). Bump to ~0.2 to force the model "
                              "to differentiate velocities by language.")
+    parser.add_argument("--contrastive_hard_negatives", action="store_true",
+                        help="Pair each sample with its hardest in-batch negative (most word "
+                             "overlap, different instruction) instead of a random one, so the "
+                             "contrastive hinge pressures fine-grained object grounding (the "
+                             "confusable minimal pairs that fail at eval) rather than trivially-"
+                             "different tasks. Expect the reported contrastive value to spike "
+                             "when first enabled, then decline. Off = legacy random pairing.")
     parser.add_argument("--lock_joint_index", type=int, default=3,
                         help="Action dim with weight 0 (piper_arm joint 4 = "
                              "index 3 is mechanically locked). Pass -1 to "

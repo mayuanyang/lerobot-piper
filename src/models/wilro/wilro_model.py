@@ -103,6 +103,59 @@ def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torc
     return x * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
+def _hard_negative_perm(
+    descs: list[str], device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build a HARD-negative partner index for the contrastive language loss.
+
+    For each sample i, pick the in-batch partner j (j != i, with a DIFFERENT
+    instruction) that shares the most words with i — i.e. the most *confusable*
+    negative available, not a random one. Random batch pairing almost never
+    lands a same-template pair (e.g. two "put both ... in the basket" tasks that
+    differ only in the object nouns), so the contrastive hinge gets satisfied by
+    trivially-different instructions and never pressures fine-grained object
+    grounding. Hard negatives put the gradient exactly where eval fails.
+
+    Similarity is word-overlap (Jaccard). For LIBERO's templated strings the
+    same-template tasks share the entire template and differ only in the object
+    nouns, so the confusable minimal pair scores highest automatically; no
+    object vocabulary or extra model is needed.
+
+    Returns (perm, valid):
+      - perm[i] = chosen partner index (perm[i]=i when no partner exists)
+      - valid[i] = whether a different-instruction partner was found (False rows
+        are skipped downstream via pair_diff)
+    perm need NOT be a bijection — several samples may share the same hardest
+    negative, which is fine for the gather-based shuffle. O(B^2) set ops on CPU;
+    negligible next to the VLM forward.
+    """
+    B = len(descs)
+    word_sets = [set(d.lower().split()) for d in descs]
+    perm = list(range(B))
+    valid = [False] * B
+    for i in range(B):
+        wi = word_sets[i]
+        best_score, best = -1.0, []
+        for j in range(B):
+            if j == i or descs[j] == descs[i]:
+                continue
+            wj = word_sets[j]
+            union = len(wi | wj)
+            score = (len(wi & wj) / union) if union else 0.0
+            if score > best_score + 1e-9:
+                best_score, best = score, [j]
+            elif score > best_score - 1e-9:
+                best.append(j)
+        if best:
+            # Random pick among ties so the partner varies across steps.
+            perm[i] = best[int(torch.randint(len(best), (1,)).item())]
+            valid[i] = True
+    return (
+        torch.tensor(perm, device=device, dtype=torch.long),
+        torch.tensor(valid, device=device, dtype=torch.bool),
+    )
+
+
 # ---------------------------------------------------------------------------
 # DiT layer: self-attn + cross-attn(to VLM KV) + FFN, modulated by adaLN-Zero
 # ---------------------------------------------------------------------------
@@ -1037,19 +1090,27 @@ class WilroTransformer(nn.Module):
             self.training and contrastive_w > 0.0
             and L_lang > 0 and B >= 2
         ):
-            perm = torch.randperm(B, device=device)
-            if (perm == torch.arange(B, device=device)).any():
-                perm = torch.roll(perm, shifts=1, dims=0)
-
             descs = batch.get("task") or batch.get("task_description")
-            if descs is not None and len(descs) == B:
-                perm_cpu = perm.detach().cpu().tolist()
-                pair_diff = torch.tensor(
-                    [descs[i] != descs[perm_cpu[i]] for i in range(B)],
-                    device=device, dtype=torch.bool,
-                )
+            use_hard_neg = getattr(self.config, "contrastive_hard_negatives", False)
+
+            if (
+                use_hard_neg
+                and descs is not None and len(descs) == B
+            ):
+                perm, pair_diff = _hard_negative_perm(descs, device)
             else:
-                pair_diff = torch.ones(B, device=device, dtype=torch.bool)
+                perm = torch.randperm(B, device=device)
+                if (perm == torch.arange(B, device=device)).any():
+                    perm = torch.roll(perm, shifts=1, dims=0)
+
+                if descs is not None and len(descs) == B:
+                    perm_cpu = perm.detach().cpu().tolist()
+                    pair_diff = torch.tensor(
+                        [descs[i] != descs[perm_cpu[i]] for i in range(B)],
+                        device=device, dtype=torch.bool,
+                    )
+                else:
+                    pair_diff = torch.ones(B, device=device, dtype=torch.bool)
 
             if pair_diff.any():
                 # Treat the wrong-language prediction as a FIXED negative

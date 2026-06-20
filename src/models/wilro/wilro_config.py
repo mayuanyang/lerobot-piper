@@ -132,6 +132,7 @@ class WilroConfig(PreTrainedConfig):
     # -------- Auxiliary contrastive loss (language forcing) --------
     contrastive_loss_weight: float = 0.1
     contrastive_margin: float = 0.05
+    contrastive_hard_negatives: bool = False
 
     # -------- Action prefix for async execution (paper Sec 2.2.2) --------
     # Max number of clean action prefix steps to condition on. During training,
