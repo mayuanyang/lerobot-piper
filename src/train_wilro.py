@@ -159,7 +159,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           kv_capture_layers: list | None = None,
           robot_encoder_tokens: int = 49, gripper_encoder_tokens: int = 100,
           gripper_camera: str | None = None,
-          noise_temporal_correlation: float = 0.0):
+          noise_temporal_correlation: float = 0.0,
+          gripper_phase_weight: float = 1.0,
+          time_sampling: str = "uniform",
+          time_lognormal_mean: float = -0.5,
+          time_lognormal_std: float = 1.0):
     """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model.
 
     `dataset_id` may be a single id or a list. Multiple datasets are concatenated
@@ -273,6 +277,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         gripper_encoder_tokens=gripper_encoder_tokens,
         gripper_camera=gripper_camera,
         noise_temporal_correlation=noise_temporal_correlation,
+        gripper_phase_weight=gripper_phase_weight,
+        gripper_action_index=action_dim - 1,  # LIBERO OSC: gripper is the last dim
+        time_sampling=time_sampling,
+        time_lognormal_mean=time_lognormal_mean,
+        time_lognormal_std=time_lognormal_std,
     )
     gripper_active = cfg.gripper_camera in camera_keys
     print(f"Robot CNN tokens: {robot_encoder_tokens} per cam "
@@ -729,6 +738,21 @@ if __name__ == "__main__":
                              "smooth). Source dist changes, so this is NOT inference-only — "
                              "resume from a rho=0 checkpoint and fine-tune to adapt. Too high "
                              "(>0.95) over-smooths sharp/contact motions.")
+    parser.add_argument("--gripper_phase_weight", type=float, default=1.0,
+                        help="Up-weight the flow-matching loss on frames near a gripper "
+                             "open<->close transition (grasp/release) — the precision-critical "
+                             "moments uniform MSE dilutes. 1.0=off (default); try 2-4 to sharpen "
+                             "placement. Gripper assumed to be the last action dim (LIBERO OSC).")
+    parser.add_argument("--time_sampling", type=str, default="uniform",
+                        choices=["uniform", "lognormal"],
+                        help="Flow-matching timestep sampling. 'lognormal' (SD3 logit-normal) "
+                             "biases toward low t (x_t≈actions), spending more capacity on the "
+                             "fine-detail denoising that sets placement precision.")
+    parser.add_argument("--time_lognormal_mean", type=float, default=-0.5,
+                        help="Mean of the logit-normal (only if --time_sampling lognormal). "
+                             "More negative => more mass at low t (finer detail).")
+    parser.add_argument("--time_lognormal_std", type=float, default=1.0,
+                        help="Std of the logit-normal (only if --time_sampling lognormal).")
     args = parser.parse_args()
     for _name in ("robot_encoder_tokens", "gripper_encoder_tokens"):
         _v = getattr(args, _name)

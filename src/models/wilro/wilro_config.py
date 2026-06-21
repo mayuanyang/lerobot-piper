@@ -99,10 +99,30 @@ class WilroConfig(PreTrainedConfig):
     num_inference_steps: int = 10
     noise_temporal_correlation: float = 0.0
 
+    # Flow-matching TIME sampling. "uniform" (default) spends equal capacity at
+    # every noise level; "lognormal" (SD3-style logit-normal) biases toward LOW t
+    # — t≈0 is x_t≈actions, where the FINE action detail that sets placement
+    # precision is denoised. A negative mean shifts mass toward 0.
+    time_sampling: str = "uniform"          # "uniform" | "lognormal"
+    time_lognormal_mean: float = -0.5       # <0 => bias toward low t (fine detail)
+    time_lognormal_std: float = 1.0
+
     # Per-dimension and positional loss weights.
     action_dim_weights: list = field(default_factory=list)
     pos_decay_lambda: float = 0.1
     future_steps_weight: float = 0.3
+
+    # Phase weighting: up-weight the flow-matching loss on the precision-critical
+    # frames around a gripper open<->close transition (grasp / release). Uniform
+    # MSE dilutes those few frames among many easy transport frames; concentrating
+    # capacity there sharpens the placement the policy keeps fumbling. Weight 1.0
+    # = OFF (no behavior change). Assumes the gripper is one action channel
+    # (LIBERO OSC: last dim). Folded into the loss denominator so it reweights
+    # rather than rescales — LR is unaffected.
+    gripper_phase_weight: float = 1.0       # >1 up-weights; 1.0 disables
+    gripper_action_index: int = -1          # gripper channel in the action vector
+    gripper_transition_window: int = 2      # frames each side of a transition
+    gripper_transition_thresh: float = 0.5  # min |Δgripper| to count as a transition
 
     # -------- Training presets --------
     optimizer_lr: float = 1e-4

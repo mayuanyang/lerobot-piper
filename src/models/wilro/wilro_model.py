@@ -1014,6 +1014,13 @@ class WilroTransformer(nn.Module):
         return noise
 
     def sample_time(self, B, device):
+        # "lognormal": SD3-style logit-normal t = sigmoid(N(mean, std)). A negative
+        # mean biases toward LOW t (= x_t≈actions), spending more capacity on the
+        # fine-detail denoising that sets placement precision. Default "uniform".
+        if getattr(self.config, "time_sampling", "uniform") == "lognormal":
+            z = (torch.randn(B, device=device) * self.config.time_lognormal_std
+                 + self.config.time_lognormal_mean)
+            return torch.sigmoid(z).clamp(0.001, 0.999)
         t = torch.rand(B, device=device)
         return t * 0.998 + 0.001
 
@@ -1063,7 +1070,28 @@ class WilroTransformer(nn.Module):
         if self.config.pos_decay_lambda > 0.0:
             pos = torch.arange(H, device=loss.device, dtype=loss.dtype)
             pos_w = pos_w * torch.exp(-self.config.pos_decay_lambda * pos)
-        loss = loss * pos_w[None, :, None]
+        # Combined per-(B, H, 1) weight: chunk-position weight × optional gripper
+        # phase weight. Built once and reused in the denominator so the loss stays
+        # a weighted MEAN (reweight, not rescale) — effective LR is unchanged.
+        w_pos = pos_w[None, :, None].expand(loss.shape[0], H, 1).clone()
+
+        gpw = float(getattr(self.config, "gripper_phase_weight", 1.0))
+        if gpw != 1.0:
+            # Up-weight frames near a gripper open<->close transition (grasp /
+            # release): |Δgripper| over the chunk, dilated to a ±window, scaled to
+            # gpw. Off-window frames keep weight 1.0.
+            gidx = getattr(self.config, "gripper_action_index", -1)
+            g = actions[:, :, gidx]                                      # (B, H)
+            dg = torch.zeros_like(g)
+            dg[:, 1:] = (g[:, 1:] - g[:, :-1]).abs()
+            trans = (dg > self.config.gripper_transition_thresh).to(loss.dtype)
+            win = int(getattr(self.config, "gripper_transition_window", 2))
+            if win > 0:
+                trans = F.max_pool1d(trans.unsqueeze(1), 2 * win + 1,
+                                     stride=1, padding=win).squeeze(1)
+            phase_w = 1.0 + (gpw - 1.0) * trans                          # (B, H)
+            w_pos = w_pos * phase_w[:, :, None]
+        loss = loss * w_pos
 
         loss_dtype = loss.dtype
         Bn, Hn, Dn = loss.shape
@@ -1078,7 +1106,7 @@ class WilroTransformer(nn.Module):
 
         valid_cells = valid_t.unsqueeze(-1) * valid_d.unsqueeze(1)
         loss = loss * valid_cells
-        denom = (pos_w[None, :, None] * valid_cells).sum().clamp(min=1e-6)
+        denom = (w_pos * valid_cells).sum().clamp(min=1e-6)
         main_loss = loss.sum() / denom
 
         # ── Contrastive language loss: permute the LANGUAGE portion of
