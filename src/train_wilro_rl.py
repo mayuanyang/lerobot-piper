@@ -719,11 +719,18 @@ def main():
         print(f"  task {tid}: {suite.get_task(tid).language}")
 
     # Per-task reward mode: tasks in binary_task_ids use 0/1 success even under
-    # --staged_reward (and skip the StagedRewardTracker in rollout).
+    # --staged_reward (and skip the StagedRewardTracker in rollout). When
+    # --staged_reward is off, EVERY task is binary regardless of binary_task_ids.
     binary_task_ids = set(args.binary_task_ids or [])
-    if binary_task_ids:
-        print(f"[rl] binary-reward tasks: {sorted(binary_task_ids)} "
-              f"(staged for the rest: {sorted(set(task_ids) - binary_task_ids)})")
+    staged_ids = [tid for tid in task_ids
+                  if args.staged_reward and tid not in binary_task_ids]
+    binary_ids = [tid for tid in task_ids if tid not in staged_ids]
+    print(f"[rl] reward mode (--staged_reward={'on' if args.staged_reward else 'off'}):")
+    print(f"[rl]   STAGED (dense): {staged_ids if staged_ids else 'none'}")
+    print(f"[rl]   BINARY (0/1)  : {binary_ids if binary_ids else 'none'}")
+    for tid in task_ids:
+        mode = "staged" if tid in staged_ids else "binary"
+        print(f"[rl]   task {tid:>2} [{mode}]: {suite.get_task(tid).language}")
 
     # Weighted round-robin schedule: a task with weight w appears w× per cycle,
     # so it is sampled w× as often (more kept groups -> larger gradient share).
