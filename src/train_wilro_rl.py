@@ -13,6 +13,18 @@ Usage:
         --env_task libero_goal --task_ids 3 8 9 \
         --output_dir outputs/rl/wilro_goal \
         --group_size 8 --n_action_steps 8 --exploration_std 0.2
+
+Data-parallel rollout across N GPUs (each rank rolls out its own slice of the
+groups; rank 0 runs the GRPO update and broadcasts weights). The global batch is
+N × groups_per_iter — pass the SAME flags, just launch with torchrun:
+
+    torchrun --standalone --nproc_per_node=4 src/train_wilro_rl.py \
+        --policy_path ... --env_task libero_spatial \
+        --output_dir outputs/rl/wilro_spatial \
+        --group_size 8 --groups_per_iter 6 --n_action_steps 8
+
+(For the same gradient batch as a single GPU but ~N× faster, divide
+groups_per_iter by N. Needs ~N× the env-subprocess RAM.)
 """
 
 from __future__ import annotations
@@ -154,8 +166,39 @@ def obs_list_to_model_batch(obs_list: list[dict], tasks: list[str], preprocessor
 # ever sees obs/terminated/success/reward over the pipe.
 # ---------------------------------------------------------------------------
 
+def _patch_libero_control_freq(control_freq: int):
+    """Build LiberoEnv's OffScreenRenderEnv at `control_freq` Hz instead of
+    robosuite's 20 Hz default. The LIBERO demos (and eval) run at 10 Hz, so each
+    delta-EEF action is sized for a 1/10 s control interval; rolling out at 20 Hz
+    holds each action half as long → the same action moves a different distance,
+    taking the policy off-distribution from both the data and eval. Matching the
+    rollout freq to the dataset is required for RL gains to transfer to eval.
+
+    Applied inside each spawned worker (the class is patched per process)."""
+    import os as _os
+    from lerobot.envs.libero import LiberoEnv as _LiberoEnv
+    from libero.libero.envs import OffScreenRenderEnv
+    from libero.libero import get_libero_path
+
+    def _make_envs_task(self, task_suite, task_id: int = 0):
+        task = task_suite.get_task(task_id)
+        self.task = task.name
+        self.task_description = task.language
+        bddl = _os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
+        env = OffScreenRenderEnv(
+            bddl_file_name=bddl,
+            camera_heights=self.observation_height,
+            camera_widths=self.observation_width,
+            control_freq=control_freq,   # match dataset/eval fps (default LIBERO=20)
+        )
+        env.reset()
+        return env
+
+    _LiberoEnv._make_envs_task = _make_envs_task
+
+
 def _env_worker(conn, suite_name: str, task_id: int, max_episode_steps: int,
-                env_ids: list[int]):
+                env_ids: list[int], control_freq: int = 10):
     """Host len(env_ids) LiberoEnvs in ONE process, stepped sequentially within
     the worker (shards run in parallel across workers). One EGL context per
     process is fine for multiple envs as long as they render on this one thread.
@@ -173,6 +216,9 @@ def _env_worker(conn, suite_name: str, task_id: int, max_episode_steps: int,
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
     import numpy as _np
     from lerobot.envs.libero import LiberoEnv, _get_suite
+
+    if control_freq and control_freq > 0:
+        _patch_libero_control_freq(control_freq)
 
     suite = _get_suite(suite_name)
     envs = {
@@ -259,7 +305,8 @@ class TaskEnvGroup:
 
     def __init__(self, suite, suite_name: str, task_id: int, group_size: int,
                  expected_cams: Optional[list[str]] = None,
-                 max_episode_steps: int = 0, n_workers: Optional[int] = None):
+                 max_episode_steps: int = 0, n_workers: Optional[int] = None,
+                 control_freq: int = 10):
         self.task_id = task_id
         self.group_size = group_size
         n_workers = group_size if not n_workers else max(1, min(n_workers, group_size))
@@ -275,7 +322,7 @@ class TaskEnvGroup:
             parent, child = self._ctx.Pipe()
             p = self._ctx.Process(
                 target=_env_worker,
-                args=(child, suite_name, task_id, max_episode_steps, shard),
+                args=(child, suite_name, task_id, max_episode_steps, shard, control_freq),
                 daemon=True,
             )
             p.start()
@@ -624,6 +671,72 @@ def save_checkpoint(policy, preprocessor, postprocessor, out_dir: Path, tag: str
 
 
 # ---------------------------------------------------------------------------
+# Distributed (data-parallel ROLLOUT, single learner)
+# ---------------------------------------------------------------------------
+#
+# Rollout is 85-90% of wall-clock and embarrassingly parallel across groups
+# (each group is a self-contained (task, init_state) unit for GRPO advantage),
+# so we fan ROLLOUT out across GPUs and keep ONE learner:
+#   * each rank loads its own policy replica + env subprocesses, rolls out its
+#     own slice of the groups (init states strided by rank -> disjoint starts),
+#   * all ranks gather their records onto rank 0 (gloo; records are CPU/numpy),
+#   * rank 0 ALONE runs grpo_update (UNCHANGED -> every determinism invariant
+#     preserved: full-group-G forward, update_minibatch==group_size, the
+#     per-minibatch median-KL early stop), then broadcasts the new weights.
+# The update stays single-GPU (it is only ~12% at world_size=1); its cost grows
+# ~linearly with world_size because rank 0 sees world_size× the records, so this
+# design is best for world_size<=~4. Beyond that, scale the update too with a
+# DDP grad-average + collective early-stop (the natural follow-up).
+
+def init_distributed():
+    """Bring up data-parallel rollout when launched via torchrun.
+
+    torchrun sets RANK / WORLD_SIZE / LOCAL_RANK. Returns
+    (rank, world_size, local_rank, obj_group); obj_group is a gloo group used to
+    gather the CPU/numpy rollout records (the default NCCL group handles GPU
+    weight broadcast). No torchrun -> (0, 1, 0, None) = original single-GPU path.
+    """
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return 0, 1, 0, None
+    import torch.distributed as dist
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    # Pin this rank's MuJoCo EGL rendering to its own GPU so the env subprocesses
+    # don't all contend on GPU 0's render context. Must be set before any mujoco
+    # import / env spawn (both happen later in main).
+    os.environ["MUJOCO_EGL_DEVICE_ID"] = str(local_rank)
+    os.environ.setdefault("EGL_DEVICE_ID", str(local_rank))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+    obj_group = dist.new_group(backend="gloo")
+    print(f"[rl] distributed: rank {rank}/{world_size} local_rank {local_rank}")
+    return rank, world_size, local_rank, obj_group
+
+
+def gather_rollouts(local, rank, world_size, obj_group):
+    """Gather each rank's rollout payload onto rank 0. Returns the per-rank list
+    on rank 0, else None. world_size==1 short-circuits to [local]."""
+    if world_size == 1:
+        return [local]
+    import torch.distributed as dist
+    out = [None] * world_size if rank == 0 else None
+    dist.gather_object(local, out, dst=0, group=obj_group)
+    return out
+
+
+def broadcast_params(params, world_size):
+    """In-place broadcast of rank-0's updated weights to every rank (NCCL)."""
+    if world_size == 1:
+        return
+    import torch.distributed as dist
+    with torch.no_grad():
+        for p in params:
+            dist.broadcast(p.data, src=0)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -659,6 +772,12 @@ def main():
                              "in --task_ids (equal sampling); any task you omit also stays at 1.")
     parser.add_argument("--max_episode_steps", type=int, default=0,
                         help="Cap rollout episode length (0 = suite default)")
+    parser.add_argument("--control_freq", type=int, default=10,
+                        help="LIBERO env control frequency (Hz). MUST match the dataset "
+                             "and eval (LIBERO demos are 10 Hz). Stock lerobot uses "
+                             "robosuite's 20 Hz default, which makes each delta-EEF action "
+                             "move half as far → policy runs off-distribution. 0 = leave "
+                             "the env at its default (20 Hz). Keep at 10 to match eval.")
     parser.add_argument("--exploration_std", type=float, default=0.2,
                         help="Gaussian exploration std in NORMALIZED action units. "
                              "logp sensitivity to bf16 mu-drift scales 1/std, so values "
@@ -696,14 +815,21 @@ def main():
         f"({args.group_size}) so rollout/update GEMM shapes match (rollout_drift)."
     )
 
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    rank, world_size, local_rank, obj_group = init_distributed()
+    is_main = rank == 0
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[rl] device: {device}")
+    # Per-rank seed offset so each replica draws different exploration noise /
+    # flow noise (their init-state slices already differ).
+    random.seed(args.seed + rank)
+    np.random.seed(args.seed + rank)
+    torch.manual_seed(args.seed + rank)
+
+    device = (torch.device(f"cuda:{local_rank}") if torch.cuda.is_available()
+              else torch.device("cpu"))
+    print(f"[rl] rank {rank}/{world_size} device: {device}")
     out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if is_main:
+        out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "rl_log.jsonl"
 
     policy, preprocessor, postprocessor = load_policy_and_processors(args, device)
@@ -715,6 +841,8 @@ def main():
     suite = _get_suite(args.env_task)
     task_ids = args.task_ids if args.task_ids else list(range(len(suite.tasks)))
     print(f"[rl] suite={args.env_task} task_ids={task_ids}")
+    print(f"[rl] env control_freq={args.control_freq} Hz "
+          f"({'matches 10 Hz dataset/eval' if args.control_freq == 10 else 'WARNING: not 10 Hz — check it matches your dataset+eval'})")
     for tid in task_ids:
         print(f"  task {tid}: {suite.get_task(tid).language}")
 
@@ -761,18 +889,22 @@ def main():
                 expected_cams=expected_cams,
                 max_episode_steps=args.max_episode_steps,
                 n_workers=args.env_workers,
+                control_freq=args.control_freq,
             )
             print(f"[rl] built {args.group_size} envs for task {tid} in {time.time()-t0:.1f}s")
         return env_pool[tid]
 
     sr_track: dict[int, deque] = {tid: deque(maxlen=50) for tid in task_ids}
     task_cycle = 0
-    init_state_cycle: dict[int, int] = {tid: 0 for tid in task_ids}
+    # Init states strided by rank: rank r walks {r, r+world_size, ...} mod 50, so
+    # no two ranks ever roll the same (task, init_state). world_size==1 => {0,1,..}
+    # identical to the original single-GPU schedule.
+    init_state_cycle: dict[int, int] = {tid: rank for tid in task_ids}
 
     for it in range(args.rl_iterations):
         t_iter = time.time()
 
-        # ── Collect groups ──
+        # ── Collect groups (this rank's slice) ──
         records: list[ChunkRecord] = []
         group_summaries = []
         kept, attempts = 0, 0
@@ -783,18 +915,17 @@ def main():
             this_staged = args.staged_reward and tid not in binary_task_ids
             group = get_group(tid)
             isid = init_state_cycle[tid] % group.n_init_states
-            init_state_cycle[tid] += 1
+            init_state_cycle[tid] += world_size  # stride so ranks stay disjoint
 
             res = rollout_group(
                 policy, preprocessor, postprocessor, group, isid,
                 args.n_action_steps, args.exploration_std, device,
-                base_seed=args.seed + 100_000 * it + 1000 * attempts,
+                base_seed=args.seed + 100_000_000 * rank + 100_000 * it + 1000 * attempts,
                 staged_reward=this_staged,
             )
-            sr_track[tid].extend([float(s) for s in res.successes])
             n_succ = sum(res.successes)
             summary = {"task_id": tid, "init_state": isid,
-                       "successes": n_succ, "of": len(res.successes)}
+                       "successes": int(n_succ), "of": len(res.successes)}
             if this_staged:
                 summary["reward_mean"] = round(float(np.mean(res.rewards)), 3)
             group_summaries.append(summary)
@@ -815,46 +946,72 @@ def main():
 
         rollout_s = time.time() - t_iter
 
-        # ── Update ──
-        t_upd = time.time()
-        stats = {"loss": float("nan")}
-        if records:
-            stats = grpo_update(policy, preprocessor, optimizer, records, args, device)
-        update_s = time.time() - t_upd
-
-        sr_str = "  ".join(
-            f"T{tid}={np.mean(sr_track[tid]) * 100:.0f}%" if sr_track[tid] else f"T{tid}=–"
-            for tid in task_ids
+        # ── Gather every rank's rollouts onto rank 0 (collective: ALL ranks). ──
+        gathered = gather_rollouts(
+            {"records": records, "summaries": group_summaries, "kept": kept},
+            rank, world_size, obj_group,
         )
-        line = {
-            "iter": it,
-            "groups": group_summaries,
-            "kept_groups": kept,
-            "n_records": len(records),
-            "elapsed_s": round(time.time() - t_iter, 1),
-            "rollout_s": round(rollout_s, 1),
-            "update_s": round(update_s, 1),
-            **{k: v for k, v in stats.items() if k != "n_minibatches"},
-            "sr": {tid: (float(np.mean(sr_track[tid])) if sr_track[tid] else None) for tid in task_ids},
-        }
-        with open(log_path, "a") as f:
-            f.write(json.dumps(line) + "\n")
-        print(f"[rl] iter {it}: kept {kept}/{attempts} groups, {len(records)} chunks, "
-              f"loss={stats.get('loss', float('nan')):.4f}, "
-              f"ratio={stats.get('ratio_mean', float('nan')):.3f}, "
-              f"clip={stats.get('clip_frac', float('nan')):.2f}, "
-              f"kl={stats.get('approx_kl', float('nan')):.3f}/"
-              f"med={stats.get('approx_kl_median', float('nan')):.4f}, "
-              f"drift={stats.get('rollout_drift', float('nan')):.3f}, "
-              f"{line['elapsed_s']}s (rollout {line['rollout_s']}s / update {line['update_s']}s) "
-              f"| rolling SR: {sr_str}")
 
-        if (it + 1) % args.save_freq == 0:
-            save_checkpoint(policy, preprocessor, postprocessor, out_dir, tag=str(it + 1))
+        # ── Update on rank 0 only (grpo_update unchanged) ──
+        stats = {"loss": float("nan")}
+        update_s = 0.0
+        if is_main:
+            all_records = [r for part in gathered for r in part["records"]]
+            all_summaries = [s for part in gathered for s in part["summaries"]]
+            total_kept = sum(part["kept"] for part in gathered)
+            # SR over EVERY attempted group (degenerate groups still count toward
+            # true success rate). Order is irrelevant for the deque mean.
+            for s in all_summaries:
+                sr_track[s["task_id"]].extend(
+                    [1.0] * s["successes"] + [0.0] * (s["of"] - s["successes"]))
 
-    save_checkpoint(policy, preprocessor, postprocessor, out_dir, tag="final")
+            t_upd = time.time()
+            if all_records:
+                stats = grpo_update(policy, preprocessor, optimizer, all_records, args, device)
+            update_s = time.time() - t_upd
+
+            sr_str = "  ".join(
+                f"T{tid}={np.mean(sr_track[tid]) * 100:.0f}%" if sr_track[tid] else f"T{tid}=–"
+                for tid in task_ids
+            )
+            line = {
+                "iter": it,
+                "groups": all_summaries,
+                "kept_groups": total_kept,
+                "n_records": len(all_records),
+                "world_size": world_size,
+                "elapsed_s": round(time.time() - t_iter, 1),
+                "rollout_s": round(rollout_s, 1),
+                "update_s": round(update_s, 1),
+                **{k: v for k, v in stats.items() if k != "n_minibatches"},
+                "sr": {tid: (float(np.mean(sr_track[tid])) if sr_track[tid] else None) for tid in task_ids},
+            }
+            with open(log_path, "a") as f:
+                f.write(json.dumps(line) + "\n")
+            print(f"[rl] iter {it}: kept {total_kept} groups (×{world_size} ranks), "
+                  f"{len(all_records)} chunks, "
+                  f"loss={stats.get('loss', float('nan')):.4f}, "
+                  f"ratio={stats.get('ratio_mean', float('nan')):.3f}, "
+                  f"clip={stats.get('clip_frac', float('nan')):.2f}, "
+                  f"kl={stats.get('approx_kl', float('nan')):.3f}/"
+                  f"med={stats.get('approx_kl_median', float('nan')):.4f}, "
+                  f"drift={stats.get('rollout_drift', float('nan')):.3f}, "
+                  f"{line['elapsed_s']}s (rollout {line['rollout_s']}s / update {line['update_s']}s) "
+                  f"| rolling SR: {sr_str}")
+
+            if (it + 1) % args.save_freq == 0:
+                save_checkpoint(policy, preprocessor, postprocessor, out_dir, tag=str(it + 1))
+
+        # ── Sync rank-0's updated weights back to every actor (collective). ──
+        broadcast_params(trainable, world_size)
+
+    if is_main:
+        save_checkpoint(policy, preprocessor, postprocessor, out_dir, tag="final")
     for g in env_pool.values():
         g.close()
+    if world_size > 1:
+        import torch.distributed as dist
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
