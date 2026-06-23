@@ -624,9 +624,15 @@ def grpo_update(
 def load_policy_and_processors(args, device):
     """Load WilR SFT checkpoint and zero all dropout."""
     from models.wilro.wilro_policy import WilroPolicy
+    from lerobot.configs.policies import PreTrainedConfig
     from lerobot.policies.factory import make_pre_post_processors
 
-    policy = WilroPolicy.from_pretrained(args.policy_path)
+    # Pin the checkpoint's device to THIS process's GPU BEFORE loading. lerobot
+    # maps the safetensors weights to config.device, which is cuda:0 by default —
+    # so under torchrun every rank would otherwise load onto GPU 0 and OOM it.
+    cfg = PreTrainedConfig.from_pretrained(args.policy_path)
+    cfg.device = str(device)
+    policy = WilroPolicy.from_pretrained(args.policy_path, config=cfg)
     policy.config.pretrained_path = args.policy_path
 
     # Zero all dropout for deterministic rollout/update matching
