@@ -216,3 +216,5 @@ temp/
 notes/
 .claude/
 *.pt
+# Training console logs (run_rl_8gpu.sh)
+logs/

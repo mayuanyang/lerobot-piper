@@ -14,7 +14,14 @@ set -euo pipefail
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${ENV_NAME:-wilro}"
-cd "$(dirname "$0")/src"
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$REPO_ROOT/src"
+
+# Save a full, timestamped console log under the repo (logs/ at the repo root).
+LOG_DIR="$REPO_ROOT/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/rl_$(date +%Y%m%d_%H%M%S).log"
+echo "[run] logging console output to $LOG_FILE"
 
 # Headless EGL rendering; each rank pins MuJoCo to its own GPU inside the script.
 export MUJOCO_GL=egl
@@ -32,7 +39,6 @@ torchrun --standalone --nproc_per_node="$NPROC" train_wilro_rl.py \
     --policy_path ISdept/Wilro-ed-137k-l16 \
     --env_task libero_spatial \
     --task_ids 0 1 2 3 4 5 6 7 8 9 \
-    --task_sample_weights 4:3 5:3 8:2 9:2 \
     --control_freq 10 \
     --lr 1e-6 \
     --exploration_std 0.2 \
@@ -47,7 +53,8 @@ torchrun --standalone --nproc_per_node="$NPROC" train_wilro_rl.py \
     --max_episode_steps 300 \
     --gradient_checkpointing \
     --output_dir outputs/rl/wilro_spatial_8gpu \
-    --save_freq 5
+    --save_freq 50 \
+    2>&1 | tee "$LOG_FILE"
 
 # ---------------------------------------------------------------------------
 # NOTES — why these numbers (tune via the env vars above, e.g.
