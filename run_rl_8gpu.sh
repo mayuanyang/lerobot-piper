@@ -23,9 +23,10 @@ mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/rl_$(date +%Y%m%d_%H%M%S).log"
 echo "[run] logging console output to $LOG_FILE"
 
-# Headless EGL rendering; each rank pins MuJoCo to its own GPU inside the script.
-export MUJOCO_GL=egl
-export PYOPENGL_PLATFORM=egl
+# Headless rendering. Default EGL (GPU); override to osmesa (CPU) for the whole
+# run with: MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa bash run_rl_8gpu.sh
+export MUJOCO_GL="${MUJOCO_GL:-egl}"
+export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
 # MuJoCo is CPU-bound per env; with many env subprocesses, cap threads per proc
 # so they don't oversubscribe cores and thrash.
 export OMP_NUM_THREADS=2
