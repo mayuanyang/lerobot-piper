@@ -16,9 +16,19 @@ PY_VER="${PY_VER:-3.10}"          # 3.10 is the sweet spot for robosuite/LIBERO/
 
 echo "=== [1/9] conda env: $ENV_NAME (python $PY_VER) ==="
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda create -y -n "$ENV_NAME" python="$PY_VER"
+# Idempotent: reuse the env if it already exists so this script is safe to re-run
+# after a partial/network failure (pip below skips already-installed packages).
+if conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
+    echo "    env '$ENV_NAME' already exists — reusing it (safe to re-run)."
+else
+    conda create -y -n "$ENV_NAME" python="$PY_VER"
+fi
 conda activate "$ENV_NAME"
 python -m pip install --upgrade pip
+
+# Survive flaky networks: longer timeout + more retries on every pip call below.
+export PIP_DEFAULT_TIMEOUT=100
+export PIP_RETRIES=10
 
 # --- [2/9] System GL/EGL libs for headless MuJoCo (EGL offscreen rendering) ---
 # Needs sudo. On an NVIDIA box libEGL is usually already provided by the driver;
