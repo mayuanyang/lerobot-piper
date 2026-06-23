@@ -214,6 +214,8 @@ def _env_worker(conn, suite_name: str, task_id: int, max_episode_steps: int,
     step, and reward = 1.0 if success else tracker.reward() on termination."""
     os.environ.setdefault("MUJOCO_GL", "egl")
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+    import time as _time
+    import random as _random
     import numpy as _np
     from lerobot.envs.libero import LiberoEnv, _get_suite
 
@@ -221,13 +223,27 @@ def _env_worker(conn, suite_name: str, task_id: int, max_episode_steps: int,
         _patch_libero_control_freq(control_freq)
 
     suite = _get_suite(suite_name)
-    envs = {
-        eid: LiberoEnv(
-            task_suite=suite, task_id=task_id, task_suite_name=suite_name,
-            obs_type="pixels_agent_pos", init_states=True, episode_index=0,
-        )
-        for eid in env_ids
-    }
+
+    # Stagger the FIRST EGL context creation across the many workers that all
+    # spawn at once — concurrent eglInitialize / framebuffer creation races on
+    # some drivers ("Offscreen framebuffer is not complete, 0x8cdd").
+    _time.sleep(_random.random() * float(os.environ.get("RL_EGL_STAGGER", "3.0")))
+
+    def _make_env(eid):
+        """Create one LiberoEnv, retrying the transient EGL framebuffer race."""
+        last = None
+        for attempt in range(10):
+            try:
+                return LiberoEnv(
+                    task_suite=suite, task_id=task_id, task_suite_name=suite_name,
+                    obs_type="pixels_agent_pos", init_states=True, episode_index=0,
+                )
+            except Exception as e:  # mujoco.FatalError / EGLError under concurrency
+                last = e
+                _time.sleep(0.5 + _random.random() * (attempt + 1))
+        raise last
+
+    envs = {eid: _make_env(eid) for eid in env_ids}
     trackers: dict[int, Any] = {eid: None for eid in env_ids}
     bounds = {eid: (e.action_space.low, e.action_space.high) for eid, e in envs.items()}
 
