@@ -54,7 +54,11 @@ pip uninstall -y torchaudio || true
 
 echo "=== [7/9] LIBERO (no-deps so it can't drag versions) ==="
 [ -d LIBERO ] || git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
-pip install -e ./LIBERO --no-deps
+# editable_mode=compat: LIBERO's `libero` is a NAMESPACE package (no top-level
+# __init__.py); modern setuptools' PEP 660 import-hook editable install fails to
+# expose it ("pip show" lists it but `import libero` errors). compat mode writes
+# a plain .pth that puts the dir on sys.path, which works for namespace packages.
+pip install -e ./LIBERO --no-deps --config-settings editable_mode=compat
 
 echo "=== [8/9] clone the training repo + apply the groot import patch ==="
 [ -d lerobot-piper ] || git clone https://github.com/mayuanyang/lerobot-piper.git
