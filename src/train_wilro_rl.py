@@ -895,7 +895,10 @@ def main():
         return env_pool[tid]
 
     sr_track: dict[int, deque] = {tid: deque(maxlen=50) for tid in task_ids}
-    task_cycle = 0
+    # Phase-shift the task cursor by rank so the ranks cover DIFFERENT tasks each
+    # iter (more per-update task diversity under data-parallel rollout) rather
+    # than all picking the same task. world_size==1 => rank 0 => starts at 0.
+    task_cycle = rank
     # Init states strided by rank: rank r walks {r, r+world_size, ...} mod 50, so
     # no two ranks ever roll the same (task, init_state). world_size==1 => {0,1,..}
     # identical to the original single-GPU schedule.
