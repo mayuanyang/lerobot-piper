@@ -224,24 +224,25 @@ def _env_worker(conn, suite_name: str, task_id: int, max_episode_steps: int,
 
     suite = _get_suite(suite_name)
 
-    # Stagger the FIRST EGL context creation across the many workers that all
-    # spawn at once — concurrent eglInitialize / framebuffer creation races on
-    # some drivers ("Offscreen framebuffer is not complete, 0x8cdd").
-    _time.sleep(_random.random() * float(os.environ.get("RL_EGL_STAGGER", "3.0")))
+    # Concurrent EGL context / framebuffer creation across the many worker
+    # processes races on some drivers ("Offscreen framebuffer is not complete,
+    # 0x8cdd"), and the error is a mujoco.FatalError that poisons the process —
+    # so an in-process retry can't recover. Instead SERIALIZE creation with a
+    # cross-process file lock: only one EGL context is built at a time. The lock
+    # is per render GPU (MUJOCO_EGL_DEVICE_ID), so workers on different GPUs still
+    # initialise in parallel; only same-GPU creations queue.
+    import fcntl
+    _egl_dev = os.environ.get("MUJOCO_EGL_DEVICE_ID", "0")
+    _egl_lock_path = os.environ.get(
+        "RL_EGL_LOCK", f"/tmp/wilro_egl_init_{_egl_dev}.lock")
 
     def _make_env(eid):
-        """Create one LiberoEnv, retrying the transient EGL framebuffer race."""
-        last = None
-        for attempt in range(10):
-            try:
-                return LiberoEnv(
-                    task_suite=suite, task_id=task_id, task_suite_name=suite_name,
-                    obs_type="pixels_agent_pos", init_states=True, episode_index=0,
-                )
-            except Exception as e:  # mujoco.FatalError / EGLError under concurrency
-                last = e
-                _time.sleep(0.5 + _random.random() * (attempt + 1))
-        raise last
+        with open(_egl_lock_path, "w") as _lf:
+            fcntl.flock(_lf, fcntl.LOCK_EX)   # released when the block exits
+            return LiberoEnv(
+                task_suite=suite, task_id=task_id, task_suite_name=suite_name,
+                obs_type="pixels_agent_pos", init_states=True, episode_index=0,
+            )
 
     envs = {eid: _make_env(eid) for eid in env_ids}
     trackers: dict[int, Any] = {eid: None for eid in env_ids}
