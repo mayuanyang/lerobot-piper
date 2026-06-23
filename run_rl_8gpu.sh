@@ -37,6 +37,11 @@ export PYTHONUNBUFFERED=1
 NPROC="${NPROC:-8}"          # = number of GPUs to use
 GROUPS_PER_ITER="${GROUPS_PER_ITER:-2}"   # PER RANK -> global batch = NPROC * this
 ENV_WORKERS="${ENV_WORKERS:-3}"           # env processes per task PER RANK
+RL_ITERS="${RL_ITERS:-300}"               # number of GRPO iterations to run
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/rl/wilro_spatial_8gpu}"
+# Spread the EGL init burst across workers (raise for more ranks if you hit the
+# "framebuffer not complete" race; 8 ranks may want 6-10).
+export RL_EGL_STAGGER="${RL_EGL_STAGGER:-3}"
 
 torchrun --standalone --nproc_per_node="$NPROC" train_wilro_rl.py \
     --policy_path ISdept/Wilro-ed-137k-l16 \
@@ -55,7 +60,8 @@ torchrun --standalone --nproc_per_node="$NPROC" train_wilro_rl.py \
     --n_action_steps 4 \
     --max_episode_steps 300 \
     --gradient_checkpointing \
-    --output_dir outputs/rl/wilro_spatial_8gpu \
+    --rl_iterations "$RL_ITERS" \
+    --output_dir "$OUTPUT_DIR" \
     --save_freq 50 \
     2>&1 | tee "$LOG_FILE"
 
