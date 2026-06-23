@@ -726,10 +726,15 @@ def init_distributed():
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     # Pin this rank's MuJoCo EGL rendering to its own GPU so the env subprocesses
-    # don't all contend on GPU 0's render context. Must be set before any mujoco
+    # spread render load. On some drivers, EGL offscreen context creation on an
+    # explicitly-pinned non-zero device (while CUDA/NCCL are live on it) fails
+    # with "framebuffer not complete, 0x8cdd" — set RL_PIN_EGL=0 to skip the pin
+    # and let all workers use the DEFAULT EGL device (render concentrates on one
+    # GPU, but compute still spreads across ranks). Must be set before any mujoco
     # import / env spawn (both happen later in main).
-    os.environ["MUJOCO_EGL_DEVICE_ID"] = str(local_rank)
-    os.environ.setdefault("EGL_DEVICE_ID", str(local_rank))
+    if os.environ.get("RL_PIN_EGL", "1") == "1":
+        os.environ["MUJOCO_EGL_DEVICE_ID"] = str(local_rank)
+        os.environ.setdefault("EGL_DEVICE_ID", str(local_rank))
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
