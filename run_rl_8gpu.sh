@@ -30,6 +30,9 @@ export PYOPENGL_PLATFORM=egl
 # so they don't oversubscribe cores and thrash.
 export OMP_NUM_THREADS=2
 export MKL_NUM_THREADS=2
+# Unbuffered stdout/stderr: without this the `| tee` pipe block-buffers Python's
+# output, so nothing shows on screen / in the log until ~8 KB accumulates.
+export PYTHONUNBUFFERED=1
 
 NPROC="${NPROC:-8}"          # = number of GPUs to use
 GROUPS_PER_ITER="${GROUPS_PER_ITER:-2}"   # PER RANK -> global batch = NPROC * this
