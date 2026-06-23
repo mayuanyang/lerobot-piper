@@ -59,8 +59,10 @@ echo "=== [7/9] LIBERO (no-deps so it can't drag versions) ==="
 # expose it ("pip show" lists it but `import libero` errors). compat mode writes
 # a plain .pth that puts the dir on sys.path, which works for namespace packages.
 pip install -e ./LIBERO --no-deps --config-settings editable_mode=compat
-# LIBERO runtime deps that --no-deps skips (small, pure-Python, no version pins):
-pip install easydict thop
+# LIBERO runtime deps that --no-deps skips. gym is the OLD OpenAI gym (coexists
+# with the gymnasium lerobot uses); pin 0.25.2 (0.21 won't build on modern
+# setuptools). cloudpickle is needed by LIBERO's SubprocVectorEnv.
+pip install easydict thop "gym==0.25.2" cloudpickle
 
 echo "=== [8/9] clone the training repo + apply the groot import patch ==="
 [ -d lerobot-piper ] || git clone https://github.com/mayuanyang/lerobot-piper.git
