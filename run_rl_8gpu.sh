@@ -52,7 +52,7 @@ torchrun --standalone --nproc_per_node="$NPROC" train_wilro_rl.py \
     --control_freq 10 \
     --lr 1e-6 \
     --exploration_std 0.2 \
-    --target_kl 0.02 \
+    --target_kl 0.1 \
     --clip_low 0.2 --clip_high 0.28 \
     --update_epochs 1 \
     --group_size 6 \
