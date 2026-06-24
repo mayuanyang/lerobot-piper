@@ -68,6 +68,28 @@ def try_offscreen_fbo(device_id, w=256, h=256):
         return f"FAIL: {type(e).__name__}: {e}"
 
 
+def try_real_env(device_id):
+    """Build a REAL LIBERO OffScreenRenderEnv on device_id (full scene + cameras),
+    the exact thing the RL worker does — to tell whether non-zero GPUs can render
+    the real env or only the probe's trivial model."""
+    try:
+        from libero.libero.envs import OffScreenRenderEnv
+        from libero.libero import get_libero_path, benchmark
+        import os as _os
+        suite = benchmark.get_benchmark_dict()["libero_spatial"]()
+        task = suite.get_task(0)
+        bddl = _os.path.join(get_libero_path("bddl_files"),
+                             task.problem_folder, task.bddl_file)
+        env = OffScreenRenderEnv(bddl_file_name=bddl, camera_heights=256,
+                                 camera_widths=256, control_freq=10,
+                                 render_gpu_device_id=device_id)
+        env.reset()
+        env.close()
+        return "OK (real env)"
+    except Exception as e:
+        return f"FAIL: {type(e).__name__}: {e}"
+
+
 def main():
     import subprocess
     import sys
@@ -104,5 +126,8 @@ if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--fbo":
         idx = int(sys.argv[2])
         print("RESULT:" + try_offscreen_fbo(idx), flush=True)
+    elif len(sys.argv) == 3 and sys.argv[1] == "--realenv":
+        idx = int(sys.argv[2])
+        print(f"real LiberoEnv on device {idx}: " + try_real_env(idx), flush=True)
     else:
         main()
