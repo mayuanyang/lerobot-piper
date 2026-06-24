@@ -31,7 +31,10 @@ N_ACTION_STEPS="${N_ACTION_STEPS:-4}"
 CONTROL_FREQ="${CONTROL_FREQ:-10}"
 POLICY_PATH="${POLICY_PATH:-ISdept/Wilro-ed-137k-l16}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/rl/wilro}"
+GRAD_CKPT="${GRAD_CKPT:-1}"           # 1 = gradient checkpointing (less VRAM,
+#                                       slower update); 0 = off (faster update)
 # --------------------------------------------------------------------------
+GC_FLAG=""; [ "$GRAD_CKPT" = "1" ] && GC_FLAG="--gradient_checkpointing"
 
 if tmux has-session -t "$SESSION" 2>/dev/null; then
     echo "tmux session '$SESSION' already exists. Attach with:  tmux attach -t $SESSION"
@@ -75,7 +78,7 @@ python train_wilro_rl.py \
     --env_workers ${ENV_WORKERS} \
     --n_action_steps ${N_ACTION_STEPS} \
     --max_episode_steps ${MAX_EP_STEPS} \
-    --gradient_checkpointing \
+    ${GC_FLAG} \
     --rl_iterations ${RL_ITERS} \
     --output_dir ${OUTPUT_DIR} \
     --save_freq ${SAVE_FREQ} \
