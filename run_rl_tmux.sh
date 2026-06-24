@@ -50,6 +50,7 @@ cd "${REPO_ROOT}/src"
 export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2
 export RL_RENDER_GPUS="${RL_RENDER_GPUS}"
+export HF_ENDPOINT=https://hf-mirror.com
 # The policy is already cached locally; the box's network to HF is flaky and the
 # revalidation round-trip kept crashing startup. Use the cache (set 0 to fetch).
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
