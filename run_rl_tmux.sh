@@ -60,6 +60,9 @@ export HF_ENDPOINT=https://hf-mirror.com
 # revalidation round-trip kept crashing startup. Use the cache (set 0 to fetch).
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+# GPU 0 is nearly full (vLLM holds ~124 GB); reduce allocator fragmentation so the
+# update fits in the ~16 GB left.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 echo "[run] logging to ${LOG_FILE}"
 echo "[run] render GPUs = ${RL_RENDER_GPUS} | env_workers = ${ENV_WORKERS}"
 python train_wilro_rl.py \
