@@ -185,11 +185,17 @@ def _patch_libero_control_freq(control_freq: int):
         self.task = task.name
         self.task_description = task.language
         bddl = _os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
+        # robosuite picks the EGL render GPU from render_gpu_device_id (it ignores
+        # MUJOCO_EGL_DEVICE_ID). RL_RENDER_GPU is set per rank in init_distributed
+        # so each rank renders on its own GPU (EGL idx 0..7 are renderable here);
+        # defaults to 0 for single-GPU / non-torchrun runs.
+        _render_gpu = int(_os.environ.get("RL_RENDER_GPU", "0"))
         env = OffScreenRenderEnv(
             bddl_file_name=bddl,
             camera_heights=self.observation_height,
             camera_widths=self.observation_width,
             control_freq=control_freq,   # match dataset/eval fps (default LIBERO=20)
+            render_gpu_device_id=_render_gpu,
         )
         env.reset()
         return env
@@ -726,15 +732,20 @@ def init_distributed():
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     # Pin this rank's MuJoCo EGL rendering to its own GPU so the env subprocesses
-    # spread render load. On some drivers, EGL offscreen context creation on an
-    # explicitly-pinned non-zero device (while CUDA/NCCL are live on it) fails
-    # with "framebuffer not complete, 0x8cdd" — set RL_PIN_EGL=0 to skip the pin
-    # and let all workers use the DEFAULT EGL device (render concentrates on one
-    # GPU, but compute still spreads across ranks). Must be set before any mujoco
-    # import / env spawn (both happen later in main).
+    # spread render load across GPUs instead of piling every rank's offscreen
+    # framebuffers onto one device (which exhausts it -> "framebuffer not complete,
+    # 0x8cdd"). IMPORTANT: robosuite uses its OWN EGLGLContext selected by the
+    # `render_gpu_device_id` kwarg and IGNORES MUJOCO_EGL_DEVICE_ID — so the real
+    # knob is RL_RENDER_GPU, read in the worker and passed to OffScreenRenderEnv.
+    # (EGL device indices 0..7 are the renderable GPUs on this box; the probe in
+    # probe_egl.py confirmed 8..15 are phantom/non-renderable.) Set RL_PIN_EGL=0 to
+    # concentrate all render on EGL device 0 instead of spreading.
     if os.environ.get("RL_PIN_EGL", "1") == "1":
+        os.environ["RL_RENDER_GPU"] = str(local_rank)
         os.environ["MUJOCO_EGL_DEVICE_ID"] = str(local_rank)
         os.environ.setdefault("EGL_DEVICE_ID", str(local_rank))
+    else:
+        os.environ["RL_RENDER_GPU"] = "0"
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
