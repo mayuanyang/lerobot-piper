@@ -50,6 +50,10 @@ cd "${REPO_ROOT}/src"
 export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2
 export RL_RENDER_GPUS="${RL_RENDER_GPUS}"
+# The policy is already cached locally; the box's network to HF is flaky and the
+# revalidation round-trip kept crashing startup. Use the cache (set 0 to fetch).
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 echo "[run] logging to ${LOG_FILE}"
 echo "[run] render GPUs = ${RL_RENDER_GPUS} | env_workers = ${ENV_WORKERS}"
 python train_wilro_rl.py \
