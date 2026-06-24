@@ -69,24 +69,40 @@ def try_offscreen_fbo(device_id, w=256, h=256):
 
 
 def main():
+    import subprocess
+    import sys
     print("CUDA_VISIBLE_DEVICES =", os.environ.get("CUDA_VISIBLE_DEVICES", "(unset)"))
     print("CUDA_DEVICE_ORDER    =", os.environ.get("CUDA_DEVICE_ORDER", "(unset)"))
     print("MUJOCO_EGL_DEVICE_ID =", os.environ.get("MUJOCO_EGL_DEVICE_ID", "(unset)"))
     print()
     devs = list_egl_devices()
-    print(f"eglQueryDevicesEXT found {len(devs)} EGL device(s)\n")
-    print(f"{'egl_idx':>7}  {'cuda_gpu':>8}  result")
-    print("-" * 50)
+    n = len(devs)
+    # 1) CUDA mapping — printed from THIS process so it always shows.
+    print(f"eglQueryDevicesEXT found {n} EGL device(s); egl_idx -> cuda_gpu:")
     for i, d in enumerate(devs):
-        cuda = cuda_index_of(d)
-        # Each FBO attempt in a forked child so a FatalError can't poison the rest.
-        pid = os.fork()
-        if pid == 0:
-            res = try_offscreen_fbo(i)
-            print(f"{i:>7}  {str(cuda):>8}  {res}", flush=True)
-            os._exit(0)
-        os.waitpid(pid, 0)
+        print(f"    egl_idx {i:>2}  ->  cuda_gpu {cuda_index_of(d)}")
+    print()
+    # 2) FBO test — each index in a fully isolated subprocess so a hard C-level
+    #    abort (not a Python exception) is reported as a crash, not swallowed.
+    print(f"{'egl_idx':>7}  result")
+    print("-" * 60)
+    for i in range(n):
+        p = subprocess.run([sys.executable, __file__, "--fbo", str(i)],
+                           capture_output=True, text=True,
+                           env={**os.environ, "MUJOCO_GL": "egl",
+                                "PYOPENGL_PLATFORM": "egl"})
+        out = (p.stdout + p.stderr).strip().replace("\n", " | ")
+        if p.returncode != 0 and "RESULT:" not in p.stdout:
+            res = f"CRASH (rc={p.returncode}) {out[-200:]}"
+        else:
+            res = p.stdout.split("RESULT:", 1)[-1].strip() if "RESULT:" in p.stdout else out[-200:]
+        print(f"{i:>7}  {res}", flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) == 3 and sys.argv[1] == "--fbo":
+        idx = int(sys.argv[2])
+        print("RESULT:" + try_offscreen_fbo(idx), flush=True)
+    else:
+        main()
