@@ -741,9 +741,18 @@ def init_distributed():
     # probe_egl.py confirmed 8..15 are phantom/non-renderable.) Set RL_PIN_EGL=0 to
     # concentrate all render on EGL device 0 instead of spreading.
     if os.environ.get("RL_PIN_EGL", "1") == "1":
-        os.environ["RL_RENDER_GPU"] = str(local_rank)
-        os.environ["MUJOCO_EGL_DEVICE_ID"] = str(local_rank)
-        os.environ.setdefault("EGL_DEVICE_ID", str(local_rank))
+        # Render GPU = (local_rank + RL_RENDER_OFFSET) % RL_RENDER_NGPU. EGL FBO
+        # creation appears to fail when a live NCCL/CUDA context sits on the SAME
+        # GPU (single-GPU runs with no NCCL render fine; multi-GPU with NCCL on the
+        # render GPU hits 0x8cdd). Set RL_RENDER_OFFSET to push render onto the
+        # GPUs NOT used for compute, e.g. NPROC=4 + RL_RENDER_OFFSET=4 -> compute
+        # on 0-3, render on 4-7. EGL idx 0-7 are all renderable here (probe_egl.py).
+        _ngpu = int(os.environ.get("RL_RENDER_NGPU", "8"))
+        _off = int(os.environ.get("RL_RENDER_OFFSET", "0"))
+        _render_gpu = (local_rank + _off) % _ngpu
+        os.environ["RL_RENDER_GPU"] = str(_render_gpu)
+        os.environ["MUJOCO_EGL_DEVICE_ID"] = str(_render_gpu)
+        os.environ.setdefault("EGL_DEVICE_ID", str(_render_gpu))
     else:
         os.environ["RL_RENDER_GPU"] = "0"
     if torch.cuda.is_available():
