@@ -204,7 +204,7 @@ def _patch_libero_control_freq(control_freq: int):
 
 
 def _env_worker(conn, suite_name: str, task_id: int, max_episode_steps: int,
-                env_ids: list[int], control_freq: int = 10):
+                env_ids: list[int], control_freq: int = 10, render_gpu: int = -1):
     """Host len(env_ids) LiberoEnvs in ONE process, stepped sequentially within
     the worker (shards run in parallel across workers). One EGL context per
     process is fine for multiple envs as long as they render on this one thread.
@@ -220,6 +220,12 @@ def _env_worker(conn, suite_name: str, task_id: int, max_episode_steps: int,
     step, and reward = 1.0 if success else tracker.reward() on termination."""
     os.environ.setdefault("MUJOCO_GL", "egl")
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+    # Render this worker on its assigned GPU so EGL contexts (and their GPU memory)
+    # spread across devices instead of exhausting one. _make_envs_task reads
+    # RL_RENDER_GPU; set it here, per worker, before any env/EGL is created.
+    if render_gpu is not None and render_gpu >= 0:
+        os.environ["RL_RENDER_GPU"] = str(render_gpu)
+        os.environ["MUJOCO_EGL_DEVICE_ID"] = str(render_gpu)
     import time as _time
     import random as _random
     import numpy as _np
@@ -326,6 +332,20 @@ class TaskEnvGroup:
     _ctx = mp.get_context("spawn")  # fresh interpreter per worker: no inherited
     #                                 CUDA/EGL state from the model-holding parent
 
+    # Render GPUs to spread EGL contexts across (one offscreen FBO per env eats
+    # GPU memory; piling them all on one device hits "framebuffer not complete,
+    # 0x8cdd" once that GPU is full). Set RL_RENDER_GPUS="1,2,3,4,5,6,7" to round-
+    # robin workers across those devices. Falls back to the single RL_RENDER_GPU
+    # (default 0). Class-level counter so the round-robin spans ALL tasks' workers.
+    _render_idx = 0
+
+    @classmethod
+    def _render_gpu_list(cls):
+        raw = os.environ.get("RL_RENDER_GPUS", "").strip()
+        if raw:
+            return [int(x) for x in raw.replace(",", " ").split()]
+        return [int(os.environ.get("RL_RENDER_GPU", "0"))]
+
     def __init__(self, suite, suite_name: str, task_id: int, group_size: int,
                  expected_cams: Optional[list[str]] = None,
                  max_episode_steps: int = 0, n_workers: Optional[int] = None,
@@ -339,13 +359,17 @@ class TaskEnvGroup:
                         for s in np.array_split(np.arange(group_size), n_workers)]
         self._worker_of = {eid: w for w, shard in enumerate(self._shards) for eid in shard}
 
+        render_gpus = self._render_gpu_list()
         self._conns = []
         self._procs = []
         for shard in self._shards:
             parent, child = self._ctx.Pipe()
+            rg = render_gpus[TaskEnvGroup._render_idx % len(render_gpus)]
+            TaskEnvGroup._render_idx += 1
             p = self._ctx.Process(
                 target=_env_worker,
-                args=(child, suite_name, task_id, max_episode_steps, shard, control_freq),
+                args=(child, suite_name, task_id, max_episode_steps, shard,
+                      control_freq, rg),
                 daemon=True,
             )
             p.start()
