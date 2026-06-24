@@ -42,8 +42,10 @@ fi
 mkdir -p "$REPO_ROOT/logs"
 LOG_FILE="$REPO_ROOT/logs/rl_$(date +%Y%m%d_%H%M%S).log"
 
-# Built as one string so tmux runs it in a fresh login shell (conda available).
-read -r -d '' CMD <<EOF || true
+# Write the command to a runner script so tmux executes it WITHOUT fragile
+# single-quote wrapping (the inline form broke and the session died instantly).
+RUNNER="$REPO_ROOT/logs/.rl_runner_$$.sh"
+cat > "$RUNNER" <<EOF
 source "\$(conda info --base)/etc/profile.d/conda.sh"
 conda activate ${ENV_NAME}
 cd "${REPO_ROOT}/src"
@@ -81,8 +83,9 @@ python train_wilro_rl.py \
 echo "[run] training process exited (rc=\${PIPESTATUS[0]}). Session stays open; press enter."
 exec bash
 EOF
+chmod +x "$RUNNER"
 
-tmux new-session -d -s "$SESSION" "bash -lc '$CMD'"
+tmux new-session -d -s "$SESSION" "bash '$RUNNER'"
 
 echo "=========================================================================="
 echo "Started RL in tmux session '$SESSION'."
