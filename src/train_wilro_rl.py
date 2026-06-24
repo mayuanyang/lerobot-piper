@@ -228,13 +228,13 @@ def _env_worker(conn, suite_name: str, task_id: int, max_episode_steps: int,
     # processes races on some drivers ("Offscreen framebuffer is not complete,
     # 0x8cdd"), and the error is a mujoco.FatalError that poisons the process —
     # so an in-process retry can't recover. Instead SERIALIZE creation with a
-    # cross-process file lock: only one EGL context is built at a time. The lock
-    # is per render GPU (MUJOCO_EGL_DEVICE_ID), so workers on different GPUs still
-    # initialise in parallel; only same-GPU creations queue.
+    # cross-process file lock: only one EGL context is built at a time, BOX-WIDE.
+    # The lock MUST be global (one path for every rank+worker): a per-GPU lock
+    # lets ranks pinned to different GPUs (RL_PIN_EGL=1) build framebuffers
+    # concurrently, which is exactly the race that triggers 0x8cdd. Init is
+    # one-time at startup, so a global lock only slows env creation, not rollout.
     import fcntl
-    _egl_dev = os.environ.get("MUJOCO_EGL_DEVICE_ID", "0")
-    _egl_lock_path = os.environ.get(
-        "RL_EGL_LOCK", f"/tmp/wilro_egl_init_{_egl_dev}.lock")
+    _egl_lock_path = os.environ.get("RL_EGL_LOCK", "/tmp/wilro_egl_init.lock")
 
     def _make_env(eid):
         with open(_egl_lock_path, "w") as _lf:
