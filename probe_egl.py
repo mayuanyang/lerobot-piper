@@ -18,24 +18,33 @@ os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
 import ctypes
 from OpenGL import EGL
+# EGL extension functions are NOT on OpenGL.EGL directly — import from submodules
+# (same as robosuite's egl_context.py).
+from OpenGL.EGL.EXT.device_base import EGLDeviceEXT
+from OpenGL.EGL.EXT.device_enumeration import eglQueryDevicesEXT
+try:
+    from OpenGL.EGL.EXT.device_query import eglQueryDeviceAttribEXT
+except Exception:  # some PyOpenGL builds put it under device_base
+    eglQueryDeviceAttribEXT = getattr(EGL, "eglQueryDeviceAttribEXT", None)
 
 EGL_CUDA_DEVICE_NV = 0x323A  # from EGL_NV_device_cuda
 
 
 def list_egl_devices():
-    EGL.eglQueryDevicesEXT  # ensure extension symbol exists
     max_dev = 16
-    devices = (EGL.EGLDeviceEXT * max_dev)()
+    devices = (EGLDeviceEXT * max_dev)()
     num = EGL.EGLint()
-    if not EGL.eglQueryDevicesEXT(max_dev, devices, ctypes.byref(num)):
+    if not eglQueryDevicesEXT(max_dev, devices, ctypes.byref(num)):
         raise RuntimeError("eglQueryDevicesEXT failed")
     return [devices[i] for i in range(num.value)]
 
 
 def cuda_index_of(dev):
+    if eglQueryDeviceAttribEXT is None:
+        return "n/a (no query)"
     try:
         val = EGL.EGLAttrib()
-        if EGL.eglQueryDeviceAttribEXT(dev, EGL_CUDA_DEVICE_NV, ctypes.byref(val)):
+        if eglQueryDeviceAttribEXT(dev, EGL_CUDA_DEVICE_NV, ctypes.byref(val)):
             return int(val.value)
     except Exception as e:
         return f"n/a ({type(e).__name__})"
