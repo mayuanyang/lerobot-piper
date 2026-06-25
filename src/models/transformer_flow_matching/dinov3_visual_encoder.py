@@ -67,13 +67,9 @@ class DinoV3VisualEncoder(nn.Module):
         if pretrained:
             print(f"[DinoV3] Loading pretrained {self.MODEL_ID_SMALL} ...")
             try:
-                from transformers import AutoModel, AutoImageProcessor
+                from transformers import AutoModel
 
                 self.backbone = AutoModel.from_pretrained(
-                    self.MODEL_ID_SMALL,
-                    trust_remote_code=True,
-                )
-                self.image_processor = AutoImageProcessor.from_pretrained(
                     self.MODEL_ID_SMALL,
                     trust_remote_code=True,
                 )
@@ -86,12 +82,10 @@ class DinoV3VisualEncoder(nn.Module):
                 print("[DinoV3] Falling back to manual ViT construction")
                 dinov3_hidden = 384
                 self.backbone = self._build_vit_from_scratch()
-                self.image_processor = None
         else:
             print("[DinoV3] Building ViT-S/16 from scratch (no pretrained weights)")
             dinov3_hidden = 384
             self.backbone = self._build_vit_from_scratch()
-            self.image_processor = None
 
         # Freeze backbone if requested
         if freeze:
@@ -109,15 +103,11 @@ class DinoV3VisualEncoder(nn.Module):
         self.proj = nn.Linear(dinov3_hidden, out_dim)
         self.norm = nn.LayerNorm(out_dim)
 
-        # Adaptive pooling if out_tokens != expected_tokens
-        self.use_adaptive_pool = out_tokens != expected_tokens
-        if self.use_adaptive_pool:
-            pool_side = int(out_tokens ** 0.5)
-            assert pool_side * pool_side == out_tokens, "out_tokens must be a perfect square"
-            self.pool_side = pool_side
+        if out_tokens != expected_tokens:
+            assert int(out_tokens ** 0.5) ** 2 == out_tokens, "out_tokens must be a perfect square"
             print(f"[DinoV3] Adaptive pooling: {expected_tokens} → {out_tokens} tokens")
 
-        # DINOv3 image normalization
+        # DINOv3 image normalization (standard ImageNet mean/std)
         self.register_buffer(
             "img_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
         )
@@ -140,7 +130,12 @@ class DinoV3VisualEncoder(nn.Module):
         return ViTModel(config)
 
     def _apply_lora(self, rank: int, alpha: int, dropout: float):
-        """Apply LoRA to attention query and value projections."""
+        """Apply LoRA to the attention query and value projections.
+
+        DINOv3 (HF) names its attention projections q_proj/k_proj/v_proj/o_proj
+        — NOT the ViTModel-style query/value. Targeting the wrong names makes
+        PEFT silently attach zero adapters, so we verify something was added.
+        """
         try:
             from peft import LoraConfig, get_peft_model
 
@@ -148,11 +143,22 @@ class DinoV3VisualEncoder(nn.Module):
                 r=rank,
                 lora_alpha=alpha,
                 lora_dropout=dropout,
-                target_modules=["query", "value"],
+                target_modules=["q_proj", "v_proj"],
                 bias="none",
             )
             self.backbone = get_peft_model(self.backbone, lora_config)
             self.backbone.print_trainable_parameters()
+
+            n_lora = sum(
+                p.numel() for n, p in self.backbone.named_parameters()
+                if "lora_" in n and p.requires_grad
+            )
+            if n_lora == 0:
+                raise RuntimeError(
+                    "[DinoV3] LoRA attached 0 parameters — target_modules "
+                    f"{lora_config.target_modules} matched nothing. Check the "
+                    "backbone's attention module names."
+                )
         except ImportError:
             print("[DinoV3] peft not installed, skipping LoRA. Install with: pip install peft")
 
@@ -178,51 +184,37 @@ class DinoV3VisualEncoder(nn.Module):
         # ImageNet normalization
         x = (x - self.img_mean) / self.img_std
 
-        # DINOv3 forward pass
-        # The backbone expects pixel_values in [0, 1] with ImageNet normalization
-        if hasattr(self.backbone, 'embeddings'):
-            # transformers ViTModel / DINOv3 model
-            outputs = self.backbone(pixel_values=x, output_hidden_states=False)
-            # last_hidden_state: (B, seq_len, hidden_size)
-            # seq_len = 1 (CLS) + num_patches
-            feat = outputs.last_hidden_state  # (B, 1 + num_patches, hidden)
-            # Remove CLS token, keep only patch tokens
-            feat = feat[:, 1:, :]  # (B, num_patches, hidden)
-        else:
+        # DINOv3 forward pass. The backbone expects pixel_values in [0, 1] with
+        # ImageNet normalization. When frozen, run under no_grad so the ViT
+        # activations are not retained for backprop (called once per camera).
+        if not hasattr(self.backbone, 'embeddings'):
             raise RuntimeError("Unexpected backbone structure")
+        if self.freeze_backbone:
+            with torch.no_grad():
+                outputs = self.backbone(pixel_values=x, output_hidden_states=False)
+        else:
+            outputs = self.backbone(pixel_values=x, output_hidden_states=False)
 
-        # Adaptive pooling if needed
+        # last_hidden_state: (B, seq_len, hidden); seq_len = 1 (CLS) +
+        # num_register_tokens + num_patches. Strip the CLS and register tokens
+        # so only the spatial patch grid remains.
+        n_skip = 1 + getattr(self.backbone.config, "num_register_tokens", 0)
+        feat = outputs.last_hidden_state[:, n_skip:, :]  # (B, num_patches, hidden)
+
+        # Adaptive pooling if the requested token count differs from the grid.
         target_tokens = out_tokens if out_tokens is not None else self.out_tokens
         current_tokens = feat.shape[1]
 
         if target_tokens != current_tokens:
             target_side = int(target_tokens ** 0.5)
             assert target_side * target_side == target_tokens, "target out_tokens must be a perfect square"
-
-            # DINOv3 may include register tokens (e.g., 4 registers), so current_tokens
-            # may not be a perfect square (e.g., 196 patches + 4 registers = 200).
-            # We need to extract only the spatial patch tokens and reshape to 2D grid.
-            # Try to infer the grid size from the input image size and patch size.
-            patch_size = 16
-            expected_patches = (self.input_size // patch_size) ** 2  # 196 for 224/16
-
-            if current_tokens == expected_patches:
-                # No extra tokens, direct reshape
-                grid_side = int(expected_patches ** 0.5)
-                feat_2d = feat.transpose(1, 2).view(feat.shape[0], -1, grid_side, grid_side)
-            elif current_tokens > expected_patches:
-                # Extra tokens present (registers or other). Take only the last
-                # expected_patches tokens as spatial patches.
-                feat_spatial = feat[:, -expected_patches:, :]
-                grid_side = int(expected_patches ** 0.5)
-                feat_2d = feat_spatial.transpose(1, 2).view(feat.shape[0], -1, grid_side, grid_side)
-            else:
-                # Fewer tokens than expected — use 1D adaptive pooling as fallback
-                # (B, N, D) → (B, D, N) → pool → (B, D, target) → (B, target, D)
-                feat_1d = feat.transpose(1, 2)  # (B, D, N)
-                feat_pooled = F.adaptive_avg_pool1d(feat_1d, target_tokens)
-                return self.norm(self.proj(feat_pooled.transpose(1, 2)))
-
+            grid_side = int(current_tokens ** 0.5)
+            assert grid_side * grid_side == current_tokens, (
+                f"patch token count {current_tokens} is not a perfect square — "
+                "check register-token stripping (num_register_tokens)"
+            )
+            # (B, N, D) → (B, D, grid, grid) → pool → (B, target, D)
+            feat_2d = feat.transpose(1, 2).reshape(feat.shape[0], -1, grid_side, grid_side)
             feat_2d = F.adaptive_avg_pool2d(feat_2d, (target_side, target_side))
             feat = feat_2d.flatten(2).transpose(1, 2)  # (B, target_tokens, hidden)
 

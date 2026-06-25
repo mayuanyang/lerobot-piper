@@ -134,7 +134,8 @@ class WilroConfig(PreTrainedConfig):
     # -------- Robot visual encoder (parallel DINOv3 ViT-S/16 or ResNet-18) --------
     # Encoder type: "dinov3_vits16" (default, stronger pretrained features) or "resnet18"
     robot_encoder_type: str = "dinov3_vits16"
-    robot_encoder_tokens: int = 49
+    # 196 = native 14×14 DINOv3 patch grid (224/16) — no pooling, full spatial detail.
+    robot_encoder_tokens: int = 196
     robot_encoder_input_size: int = 224
     use_robot_cnn: bool = True
     # Give one camera a denser token grid than the rest. The gripper / wrist
@@ -143,7 +144,9 @@ class WilroConfig(PreTrainedConfig):
     # params — only the pooling grid differs). Must be a perfect square. Set
     # equal to robot_encoder_tokens to disable the per-camera difference.
     gripper_camera: str = "observation.images.gripper"
-    gripper_encoder_tokens: int = 100
+    # 196 is the native DINOv3 grid (max with input_size=224); a finer grid is
+    # not possible without raising robot_encoder_input_size.
+    gripper_encoder_tokens: int = 196
 
     # -------- DINOv3-specific settings --------
     # Whether to freeze the DINOv3 backbone (True = only train projection layer)

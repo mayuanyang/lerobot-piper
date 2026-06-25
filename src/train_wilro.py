@@ -157,13 +157,17 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           contrastive_hard_negatives=False,
           lock_joint_index: int | None = 3, kv_capture_strategy: str = "last",
           kv_capture_layers: list | None = None,
-          robot_encoder_tokens: int = 49, gripper_encoder_tokens: int = 100,
+          robot_encoder_tokens: int = 196, gripper_encoder_tokens: int = 196,
           gripper_camera: str | None = None,
           noise_temporal_correlation: float = 0.0,
           gripper_phase_weight: float = 1.0,
           time_sampling: str = "uniform",
           time_lognormal_mean: float = -0.5,
-          time_lognormal_std: float = 1.0):
+          time_lognormal_std: float = 1.0,
+          dinov3_freeze: bool = True,
+          dinov3_lora_rank: int = 0,
+          dinov3_lora_alpha: int = 16,
+          dinov3_lora_dropout: float = 0.05):
     """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model.
 
     `dataset_id` may be a single id or a list. Multiple datasets are concatenated
@@ -276,6 +280,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         robot_encoder_tokens=robot_encoder_tokens,
         gripper_encoder_tokens=gripper_encoder_tokens,
         gripper_camera=gripper_camera,
+        dinov3_freeze=dinov3_freeze,
+        dinov3_lora_rank=dinov3_lora_rank,
+        dinov3_lora_alpha=dinov3_lora_alpha,
+        dinov3_lora_dropout=dinov3_lora_dropout,
         noise_temporal_correlation=noise_temporal_correlation,
         gripper_phase_weight=gripper_phase_weight,
         gripper_action_index=action_dim - 1,  # LIBERO OSC: gripper is the last dim
@@ -283,6 +291,13 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         time_lognormal_mean=time_lognormal_mean,
         time_lognormal_std=time_lognormal_std,
     )
+    if cfg.robot_encoder_type == "dinov3_vits16":
+        if dinov3_lora_rank > 0:
+            print(f"DINOv3 adaptation: LoRA rank={dinov3_lora_rank} "
+                  f"alpha={dinov3_lora_alpha} (backbone unfrozen for LoRA)")
+        else:
+            print("DINOv3 adaptation: FROZEN (only proj/norm train) — pass "
+                  "--dinov3_lora_rank 16 to adapt the backbone.")
     gripper_active = cfg.gripper_camera in camera_keys
     print(f"Robot CNN tokens: {robot_encoder_tokens} per cam "
           f"({int(robot_encoder_tokens ** 0.5)}x{int(robot_encoder_tokens ** 0.5)} grid); "
@@ -714,13 +729,13 @@ if __name__ == "__main__":
                         help="Comma-separated 0-based VLM layer indices for "
                              "--kv_capture_strategy custom, e.g. '3,7,11,15,19,"
                              "23,27,31'. Ignored for last/stride2.")
-    parser.add_argument("--robot_encoder_tokens", type=int, default=49,
+    parser.add_argument("--robot_encoder_tokens", type=int, default=196,
                         help="Robot CNN tokens per non-gripper camera. Must be a "
-                             "perfect square (grid side = sqrt). Spatial ceiling "
-                             "is the 14x14 layer3 map (=196); 49 (7x7) or 100 "
-                             "(10x10) buy real localisation resolution over the "
-                             "default 16 (4x4 ~25%% of frame per token).")
-    parser.add_argument("--gripper_encoder_tokens", type=int, default=100,
+                             "perfect square (grid side = sqrt). 196 (14x14) is "
+                             "the native DINOv3 patch grid (no pooling, full "
+                             "spatial detail); 49 (7x7) or 100 (10x10) pool it "
+                             "down to save DiT KV memory.")
+    parser.add_argument("--gripper_encoder_tokens", type=int, default=196,
                         help="Robot CNN tokens for the gripper/wrist camera "
                              "(close-range placement precision). Perfect square; "
                              "set equal to --robot_encoder_tokens to disable the "
@@ -753,7 +768,22 @@ if __name__ == "__main__":
                              "More negative => more mass at low t (finer detail).")
     parser.add_argument("--time_lognormal_std", type=float, default=1.0,
                         help="Std of the logit-normal (only if --time_sampling lognormal).")
+    parser.add_argument("--dinov3_lora_rank", type=int, default=0,
+                        help="LoRA rank for the DINOv3 robot encoder. 0 (default) = "
+                             "backbone frozen, only the proj/norm head trains. >0 = "
+                             "unfreeze backbone and attach LoRA to attention q/v "
+                             "projections so the features adapt to robot cues. Try 16. "
+                             "Note: this disables the no_grad path, so backbone "
+                             "activations are retained — expect higher memory.")
+    parser.add_argument("--dinov3_lora_alpha", type=int, default=32,
+                        help="LoRA alpha (scaling). ~2x rank is a common sweet spot.")
+    parser.add_argument("--dinov3_lora_dropout", type=float, default=0.05,
+                        help="LoRA dropout for the DINOv3 backbone.")
     args = parser.parse_args()
+    # rank is the single source of truth: >0 unfreezes the backbone (the encoder
+    # only attaches LoRA when rank>0 AND not frozen). Avoids the silent no-op of
+    # rank>0 with a frozen backbone.
+    args.dinov3_freeze = args.dinov3_lora_rank == 0
     for _name in ("robot_encoder_tokens", "gripper_encoder_tokens"):
         _v = getattr(args, _name)
         if int(_v ** 0.5) ** 2 != _v:
