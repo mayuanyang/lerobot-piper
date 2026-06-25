@@ -41,6 +41,7 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 from .wilro_config import WilroConfig
 from ..interleaved_flow_matching.expert_layer import RMSNorm, SwiGLU
 from ..transformer_flow_matching.robot_visual_encoder import RobotVisualEncoder
+from ..transformer_flow_matching.dinov3_visual_encoder import DinoV3VisualEncoder
 
 
 # ---------------------------------------------------------------------------
@@ -428,14 +429,31 @@ class WilroTransformer(nn.Module):
         )
 
         # ─────────────────────────────────────────────────────────────
-        # 4. Robot CNN (optional parallel visual path)
+        # 4. Robot visual encoder (optional parallel visual path)
+        #    Supports: "resnet18" (original) or "dinov3_vits16" (stronger)
         # ─────────────────────────────────────────────────────────────
         if config.use_robot_cnn:
-            self.robot_visual_encoder = RobotVisualEncoder(
-                input_size=config.robot_encoder_input_size,
-                out_tokens=config.robot_encoder_tokens,
-                out_dim=self.hidden_size,
-            )
+            encoder_type = getattr(config, "robot_encoder_type", "resnet18")
+            if encoder_type == "dinov3_vits16":
+                self.robot_visual_encoder = DinoV3VisualEncoder(
+                    pretrained=True,
+                    freeze=getattr(config, "dinov3_freeze", True),
+                    lora_rank=getattr(config, "dinov3_lora_rank", 0),
+                    lora_alpha=getattr(config, "dinov3_lora_alpha", 16),
+                    lora_dropout=getattr(config, "dinov3_lora_dropout", 0.05),
+                    input_size=config.robot_encoder_input_size,
+                    out_tokens=config.robot_encoder_tokens,
+                    out_dim=self.hidden_size,
+                )
+                print(f"[wilro] Robot encoder: DINOv3 ViT-S/16 "
+                      f"(freeze={getattr(config, 'dinov3_freeze', True)})")
+            else:
+                self.robot_visual_encoder = RobotVisualEncoder(
+                    input_size=config.robot_encoder_input_size,
+                    out_tokens=config.robot_encoder_tokens,
+                    out_dim=self.hidden_size,
+                )
+                print("[wilro] Robot encoder: ResNet-18")
         else:
             self.robot_visual_encoder = None
             print("[wilro] use_robot_cnn=False — RobotVisualEncoder disabled")

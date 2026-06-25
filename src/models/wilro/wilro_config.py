@@ -131,17 +131,27 @@ class WilroConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-6
     scheduler_warmup_steps: int = 1500
 
-    # -------- Robot visual encoder (parallel ResNet-18) --------
+    # -------- Robot visual encoder (parallel DINOv3 ViT-S/16 or ResNet-18) --------
+    # Encoder type: "dinov3_vits16" (default, stronger pretrained features) or "resnet18"
+    robot_encoder_type: str = "dinov3_vits16"
     robot_encoder_tokens: int = 49
     robot_encoder_input_size: int = 224
     use_robot_cnn: bool = True
     # Give one camera a denser token grid than the rest. The gripper / wrist
     # view drives close-range placement precision, so a finer grid there buys
-    # spatial detail where it matters. Shares the same ResNet backbone (no extra
+    # spatial detail where it matters. Shares the same backbone (no extra
     # params — only the pooling grid differs). Must be a perfect square. Set
     # equal to robot_encoder_tokens to disable the per-camera difference.
     gripper_camera: str = "observation.images.gripper"
     gripper_encoder_tokens: int = 100
+
+    # -------- DINOv3-specific settings --------
+    # Whether to freeze the DINOv3 backbone (True = only train projection layer)
+    dinov3_freeze: bool = True
+    # LoRA settings for DINOv3 fine-tuning (only used when dinov3_freeze=False)
+    dinov3_lora_rank: int = 0
+    dinov3_lora_alpha: int = 16
+    dinov3_lora_dropout: float = 0.05
 
     # -------- Latent "thought" tokens --------
     num_latent_tokens: int = 8
