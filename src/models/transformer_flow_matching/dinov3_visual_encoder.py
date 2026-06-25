@@ -40,7 +40,8 @@ class DinoV3VisualEncoder(nn.Module):
     """
 
     # DINOv3 ViT-S/16 model IDs on HuggingFace
-    MODEL_ID_SMALL = "facebook/dinov3-small"  # ViT-S/16, 384 dim
+    # Pretrained on LVD-1689M dataset (1.6B images)
+    MODEL_ID_SMALL = "facebook/dinov3-vits16-pretrain-lvd1689m"  # ViT-S/16, 384 dim
 
     def __init__(
         self,
