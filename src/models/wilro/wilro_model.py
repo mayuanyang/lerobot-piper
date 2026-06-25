@@ -494,6 +494,7 @@ class WilroTransformer(nn.Module):
         self._capture_attention_stats = False
         self._last_attention_stats: Optional[dict] = None
         self._last_cross_attention_stats: Optional[dict] = None
+        self._last_latent_per_layer: list = []
 
     # =========================================================================
     # Keep frozen components in eval mode
@@ -973,29 +974,34 @@ class WilroTransformer(nn.Module):
 
         x = dit_seq
         use_ckpt = self.gradient_checkpointing and self.training
+        # Capture action-query attention mass at EVERY DiT layer's input, not
+        # just the last. A single layer's number hides depth structure — e.g.
+        # latents may be read heavily in early layers but little at the readout.
+        # We accumulate per-layer and report the layer-average plus the
+        # per-layer latent profile downstream.
+        capturing = self._capture_attention_stats
+        sa_accum: dict[str, list[float]] = {}
+        ca_accum: dict[str, list[float]] = {}
+        if capturing:
+            # one-shot: disarm now so a second _run_dit (contrastive v_wrong)
+            # doesn't re-capture.
+            self._capture_attention_stats = False
         for i, layer in enumerate(self.dit_layers):
-            # Capture attention mass at the LAST DiT layer's input. This is
-            # the "final say" before the action readout — what action queries
-            # decide to attend to here is what shapes the velocity output.
-            if (
-                i == len(self.dit_layers) - 1
-                and self._capture_attention_stats
-            ):
-                self._last_attention_stats = self._compute_attention_mass(
+            if capturing:
+                for k, v in self._compute_attention_mass(
                     x, t_emb, attn_mask, regions,
-                )
-                self._last_cross_attention_stats = self._compute_cross_attention_mass(
+                ).items():
+                    sa_accum.setdefault(k, []).append(v)
+                for k, v in self._compute_cross_attention_mass(
                     x, t_emb, kv_cache[i], vlm_kv_pad_mask,
                     action_start_idx, H_horizon, L_vis, L_lang,
-                )
-                # one-shot: don't capture again if _run_dit is called twice
-                # (e.g. for the contrastive-language v_wrong forward).
-                self._capture_attention_stats = False
-                # The no_grad capture above populated the autocast weight
-                # cache with GRAD-LESS bf16 casts of this layer's sa_q/sa_k/
-                # ca_q/adaLN weights. Clear it so the real forward below
-                # re-casts them WITH grad tracking — otherwise those weights
-                # silently receive no gradient on every capture step.
+                ).items():
+                    ca_accum.setdefault(k, []).append(v)
+                # The no_grad capture above populated the autocast weight cache
+                # with GRAD-LESS bf16 casts of this layer's sa_q/sa_k/ca_q/adaLN
+                # weights. Clear it so this layer's REAL forward below re-casts
+                # them WITH grad tracking — otherwise those weights silently
+                # receive no gradient on every capture step.
                 torch.clear_autocast_cache()
 
             vlm_k, vlm_v = kv_cache[i]
@@ -1011,6 +1017,18 @@ class WilroTransformer(nn.Module):
                     vlm_kv_pad_mask=vlm_kv_pad_mask,
                     self_attn_mask=attn_mask,
                 )
+
+        if capturing:
+            # Layer-averaged mass (replaces the old last-layer-only snapshot).
+            self._last_attention_stats = {
+                k: sum(v) / len(v) for k, v in sa_accum.items()
+            }
+            self._last_cross_attention_stats = {
+                k: sum(v) / len(v) for k, v in ca_accum.items()
+            }
+            # Per-layer action→latent profile (ascending DiT depth), so a low
+            # average doesn't hide heavy early-layer usage.
+            self._last_latent_per_layer = sa_accum.get("latent", [])
 
         H = self.config.horizon
         action_out = self.final_norm(x[:, action_start_idx:action_start_idx + H])

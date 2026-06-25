@@ -126,14 +126,21 @@ def _log_gradient_analysis(policy, step: int) -> None:
         order = ["sink", "latent", "state", "prefix", "robot", "action"]
         ordered = [(k, stats[k]) for k in order if k in stats]
         cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in ordered)
-        print(f"  Action→ self-attn : {cells}    (last DiT layer)")
+        print(f"  Action→ self-attn : {cells}    (avg over all DiT layers)")
 
     x_stats = getattr(policy.model, "_last_cross_attention_stats", None)
     if x_stats:
         order = ["vision", "language"]
         ordered = [(k, x_stats[k]) for k in order if k in x_stats]
         cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in ordered)
-        print(f"  Action→ x-attn    : {cells}    (cross-attn to VLM KV)")
+        print(f"  Action→ x-attn    : {cells}    (avg over all DiT layers)")
+
+    # Per-layer action→latent self-attn profile (ascending DiT depth). A low
+    # layer-average can hide heavy early-layer usage, so show the depth trace.
+    per_layer = getattr(policy.model, "_last_latent_per_layer", None)
+    if per_layer:
+        cells = " ".join(f"L{i}={v*100:.1f}" for i, v in enumerate(per_layer))
+        print(f"  Action→ latent/lyr: {cells}  (% self-attn mass)")
 
     comps = getattr(policy.model, "_last_loss_components", None)
     cw = getattr(policy.model.config, "contrastive_loss_weight", 0.0)
