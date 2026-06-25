@@ -1106,8 +1106,24 @@ def main():
     # identical to the original single-GPU schedule.
     init_state_cycle: dict[int, int] = {tid: rank for tid in task_ids}
 
+    # Environment pool restart interval to prevent resource exhaustion.
+    # MuJoCo EGL contexts leak memory over time; restarting clears them.
+    ENV_RESTART_INTERVAL = 5
+
     for it in range(args.rl_iterations):
         t_iter = time.time()
+
+        # Periodic env pool restart to prevent GPU memory / subprocess exhaustion
+        if it > 0 and it % ENV_RESTART_INTERVAL == 0 and is_main:
+            print(f"[rl] restarting env pool at iter {it} (preventing resource exhaustion)")
+            for tid, group in env_pool.items():
+                group.close()
+            env_pool.clear()
+            import gc
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            print(f"[rl] env pool cleared, continuing...")
 
         # ── Collect groups (this rank's slice) ──
         records: list[ChunkRecord] = []
