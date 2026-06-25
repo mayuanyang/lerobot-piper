@@ -196,16 +196,35 @@ class DinoV3VisualEncoder(nn.Module):
         current_tokens = feat.shape[1]
 
         if target_tokens != current_tokens:
-            # Reshape to 2D grid, pool, reshape back
-            grid_side = int(current_tokens ** 0.5)
             target_side = int(target_tokens ** 0.5)
-            assert grid_side * grid_side == current_tokens
-            assert target_side * target_side == target_tokens
+            assert target_side * target_side == target_tokens, "target out_tokens must be a perfect square"
 
-            # (B, N, D) → (B, D, H, W) → pool → (B, D, H', W') → (B, N', D)
-            feat = feat.transpose(1, 2).view(feat.shape[0], -1, grid_side, grid_side)
-            feat = F.adaptive_avg_pool2d(feat, (target_side, target_side))
-            feat = feat.flatten(2).transpose(1, 2)  # (B, target_tokens, hidden)
+            # DINOv3 may include register tokens (e.g., 4 registers), so current_tokens
+            # may not be a perfect square (e.g., 196 patches + 4 registers = 200).
+            # We need to extract only the spatial patch tokens and reshape to 2D grid.
+            # Try to infer the grid size from the input image size and patch size.
+            patch_size = 16
+            expected_patches = (self.input_size // patch_size) ** 2  # 196 for 224/16
+
+            if current_tokens == expected_patches:
+                # No extra tokens, direct reshape
+                grid_side = int(expected_patches ** 0.5)
+                feat_2d = feat.transpose(1, 2).view(feat.shape[0], -1, grid_side, grid_side)
+            elif current_tokens > expected_patches:
+                # Extra tokens present (registers or other). Take only the last
+                # expected_patches tokens as spatial patches.
+                feat_spatial = feat[:, -expected_patches:, :]
+                grid_side = int(expected_patches ** 0.5)
+                feat_2d = feat_spatial.transpose(1, 2).view(feat.shape[0], -1, grid_side, grid_side)
+            else:
+                # Fewer tokens than expected — use 1D adaptive pooling as fallback
+                # (B, N, D) → (B, D, N) → pool → (B, D, target) → (B, target, D)
+                feat_1d = feat.transpose(1, 2)  # (B, D, N)
+                feat_pooled = F.adaptive_avg_pool1d(feat_1d, target_tokens)
+                return self.norm(self.proj(feat_pooled.transpose(1, 2)))
+
+            feat_2d = F.adaptive_avg_pool2d(feat_2d, (target_side, target_side))
+            feat = feat_2d.flatten(2).transpose(1, 2)  # (B, target_tokens, hidden)
 
         # Project to output dimension
         return self.norm(self.proj(feat))  # (B, out_tokens, out_dim)
