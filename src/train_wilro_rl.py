@@ -425,17 +425,27 @@ class TaskEnvGroup:
             per_worker.setdefault(self._worker_of[i], []).append(i)
         return per_worker
 
-    def step(self, indices, env_actions, k: int) -> dict:
-        """Step envs `indices` with env_actions[i, k]. Workers handling >1 active
-        env step them sequentially; all workers run in parallel. Returns
-        {i: (obs, terminated, is_success, reward|None)}."""
+    def step_send(self, indices, env_actions, k: int):
+        """Fire ("step", ...) to every worker handling `indices` WITHOUT waiting.
+        Returns the per-worker id map to hand to step_recv. Splitting send/recv
+        lets several groups' steps run concurrently (see rollout_groups_concurrent):
+        send for all groups first, then recv, so the workers step in parallel."""
         per_worker = self._group_by_worker(indices)
         for w, ids in per_worker.items():
             self._conns[w].send(("step", {i: env_actions[i, k] for i in ids}))
+        return per_worker
+
+    def step_recv(self, per_worker) -> dict:
         out: dict[int, Any] = {}
         for w in per_worker:
             out.update(self._conns[w].recv())
         return out
+
+    def step(self, indices, env_actions, k: int) -> dict:
+        """Step envs `indices` with env_actions[i, k] (blocking send+recv). Workers
+        handling >1 active env step them sequentially; all workers run in parallel.
+        Returns {i: (obs, terminated, is_success, reward|None)}."""
+        return self.step_recv(self.step_send(indices, env_actions, k))
 
     def get_rewards(self, indices) -> dict:
         """Banked staged reward for timed-out (still-active) envs."""
@@ -555,6 +565,121 @@ def rollout_group(
             result.rewards[i] = rew
 
     return result
+
+
+@torch.no_grad()
+def rollout_groups_concurrent(
+    policy, preprocessor, postprocessor,
+    specs: "list[tuple[TaskEnvGroup, int]]",
+    n_exec: int, sigma: float, device, base_seeds: "list[int]",
+    staged_flags: "list[bool]",
+) -> "list[GroupResult]":
+    """Roll out several GRPO groups AT ONCE, overlapping their env stepping.
+
+    Each group's policy forward still runs at its own batch dim = group_size, so
+    the determinism invariant (update_minibatch == group_size -> rollout_drift ~0,
+    see rollout_group) is untouched. The ONLY thing shared across groups is the
+    env step: we fan out every group's worker `step_send` first, then collect with
+    `step_recv`, so the slow CPU physics+render of all groups runs in parallel
+    instead of group-by-group. GPU-0 memory is unchanged (one forward at a time).
+    `specs` MUST hold DISTINCT TaskEnvGroups (the same group's workers can't serve
+    two rollouts at once). Returns one GroupResult per spec, in input order.
+    """
+    policy.model.eval()
+    horizon = policy.config.horizon
+    action_dim = policy.config.action_dim
+    autocast_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if device.type == "cuda" else torch.autocast(device_type="cpu", enabled=False)
+    )
+
+    states = []
+    for (group, isid), seed, staged in zip(specs, base_seeds, staged_flags):
+        G = group.group_size
+        obs_list = group.reset_group(isid, seed)
+        if staged:
+            group.make_trackers()
+        states.append({
+            "group": group, "G": G, "staged": staged, "obs_list": obs_list,
+            "active": list(range(G)), "steps_done": 0,
+            "result": GroupResult(
+                task_id=group.task_id, init_state_id=isid,
+                successes=[False] * G, records_per_env=[[] for _ in range(G)],
+                rewards=[0.0] * G),
+        })
+
+    def _running(s):
+        return s["active"] and s["steps_done"] < s["group"].max_steps
+
+    while any(_running(s) for s in states):
+        # ── Phase 1: per-group forward (batch=G) + store records (GPU, one at a
+        #    time — cheap, keeps GPU-0 memory flat and the GEMM shape == G). ──
+        for s in states:
+            if not _running(s):
+                s["_chunk"] = None
+                continue
+            group, G, obs_list, active = s["group"], s["G"], s["obs_list"], s["active"]
+            cur_obs = [obs_list[i] for i in range(G)]
+            batch = obs_list_to_model_batch(
+                cur_obs, [group.task_description] * G, preprocessor)
+            x1 = torch.randn(G, horizon, action_dim, device=device)
+            with autocast_ctx:
+                mu_full = policy.model.flow_actions_from_noise(batch, x1)
+            mu = mu_full[:, :n_exec].float()
+            actions = mu + sigma * torch.randn_like(mu)
+            logp_old = gaussian_logp_per_step(actions, mu, sigma)
+            env_actions = postprocessor(
+                actions.reshape(G * n_exec, action_dim)
+            ).reshape(G, n_exec, action_dim).numpy()
+            for i in active:
+                s["result"].records_per_env[i].append(ChunkRecord(
+                    pixels={c: np.ascontiguousarray(v)
+                            for c, v in obs_list[i]["pixels"].items()},
+                    agent_pos=np.asarray(obs_list[i]["agent_pos"], dtype=np.float32),
+                    task=group.task_description,
+                    x1=x1[i].cpu().numpy().astype(np.float32),
+                    action=actions[i].cpu().numpy().astype(np.float32),
+                    logp_old=logp_old[i].cpu().numpy().astype(np.float32),
+                ))
+            s["_chunk"] = {"env_actions": env_actions, "still_active": set(active)}
+
+        # ── Phase 2: n_exec sub-steps, env stepping OVERLAPPED across groups:
+        #    send every running group's step, THEN recv them all. ──
+        for k in range(n_exec):
+            pending = []
+            for s in states:
+                ch = s.get("_chunk")
+                if not ch or not ch["still_active"]:
+                    continue
+                pw = s["group"].step_send(ch["still_active"], ch["env_actions"], k)
+                pending.append((s, pw))
+            if not pending:
+                break
+            for s, pw in pending:
+                ch = s["_chunk"]
+                for i, (obs, terminated, succ, rew) in s["group"].step_recv(pw).items():
+                    s["obs_list"][i] = obs
+                    if terminated:
+                        s["result"].successes[i] = succ
+                        if s["staged"]:
+                            s["result"].rewards[i] = rew
+                        ch["still_active"].discard(i)
+
+        # ── Phase 3: advance each group's active set / step counter. ──
+        for s in states:
+            ch = s.get("_chunk")
+            if not ch:
+                continue
+            s["active"] = list(ch["still_active"])
+            s["steps_done"] += n_exec
+
+    # Timed-out (still-active) envs: banked staged reward.
+    for s in states:
+        if s["staged"] and s["active"]:
+            for i, rew in s["group"].get_rewards(s["active"]).items():
+                s["result"].rewards[i] = rew
+
+    return [s["result"] for s in states]
 
 
 # ---------------------------------------------------------------------------
@@ -827,6 +952,11 @@ def main():
                         help="Groups collected per update iteration")
     parser.add_argument("--n_action_steps", type=int, default=8,
                         help="Executed chunk length between replans")
+    parser.add_argument("--rollout_concurrency", type=int, default=0,
+                        help="Max DISTINCT groups rolled out at once (env stepping "
+                             "overlapped across them). 0 = as many as fit in one "
+                             "groups_per_iter batch (full concurrency). Lower it if "
+                             "the box is CPU-starved and env workers oversubscribe.")
     parser.add_argument("--staged_reward", action="store_true",
                         help="Use a dense staged reward (reach/grasp/lift/place per goal object, "
                              "mean over conjuncts) instead of binary success. Gives all-fail GRPO "
@@ -983,41 +1113,58 @@ def main():
         records: list[ChunkRecord] = []
         group_summaries = []
         kept, attempts = 0, 0
+        cap = args.rollout_concurrency or args.groups_per_iter
         while kept < args.groups_per_iter and attempts < args.groups_per_iter * 6:
-            attempts += 1
-            tid = task_schedule[task_cycle % len(task_schedule)]
-            task_cycle += 1
-            this_staged = args.staged_reward and tid not in binary_task_ids
-            group = get_group(tid)
-            isid = init_state_cycle[tid] % group.n_init_states
-            init_state_cycle[tid] += world_size  # stride so ranks stay disjoint
+            # Build a batch of DISTINCT groups to roll out concurrently (the same
+            # TaskEnvGroup can't serve two rollouts at once — its workers are shared).
+            specs, batch_meta, seeds = [], [], []
+            batch_ids: set[int] = set()
+            limit = min(cap, args.groups_per_iter - kept)
+            while len(specs) < limit and attempts < args.groups_per_iter * 6:
+                tid = task_schedule[task_cycle % len(task_schedule)]
+                group = get_group(tid)
+                if id(group) in batch_ids:
+                    break  # would duplicate a group in this batch -> next batch
+                attempts += 1
+                task_cycle += 1
+                this_staged = args.staged_reward and tid not in binary_task_ids
+                isid = init_state_cycle[tid] % group.n_init_states
+                init_state_cycle[tid] += world_size  # stride so ranks stay disjoint
+                specs.append((group, isid))
+                batch_meta.append((tid, isid, this_staged))
+                seeds.append(args.seed + 100_000_000 * rank + 100_000 * it
+                             + 1000 * attempts)
+                batch_ids.add(id(group))
+            if not specs:
+                break
 
-            res = rollout_group(
-                policy, preprocessor, postprocessor, group, isid,
+            results = rollout_groups_concurrent(
+                policy, preprocessor, postprocessor, specs,
                 args.n_action_steps, args.exploration_std, device,
-                base_seed=args.seed + 100_000_000 * rank + 100_000 * it + 1000 * attempts,
-                staged_reward=this_staged,
+                base_seeds=seeds, staged_flags=[m[2] for m in batch_meta],
             )
-            n_succ = sum(res.successes)
-            summary = {"task_id": tid, "init_state": isid,
-                       "successes": int(n_succ), "of": len(res.successes)}
-            if this_staged:
-                summary["reward_mean"] = round(float(np.mean(res.rewards)), 3)
-            group_summaries.append(summary)
 
-            # Staged (dense, in [0,1]) for staged tasks; binary 0/1 for tasks in
-            # binary_task_ids (and whenever --staged_reward is off).
-            reward_vals = (res.rewards if this_staged
-                           else [1.0 if s else 0.0 for s in res.successes])
-            adv = grpo_group_advantages(reward_vals)
-            if adv is None:
-                continue  # all-success or all-fail: skip
-            kept += 1
-            for env_i, env_records in enumerate(res.records_per_env):
-                for r in env_records:
-                    r.advantage = adv[env_i]
-                    r.weight = 1.0 / max(1, len(env_records))
-                records.extend(env_records)
+            for (tid, isid, this_staged), res in zip(batch_meta, results):
+                n_succ = sum(res.successes)
+                summary = {"task_id": tid, "init_state": isid,
+                           "successes": int(n_succ), "of": len(res.successes)}
+                if this_staged:
+                    summary["reward_mean"] = round(float(np.mean(res.rewards)), 3)
+                group_summaries.append(summary)
+
+                # Staged (dense, in [0,1]) for staged tasks; binary 0/1 for tasks in
+                # binary_task_ids (and whenever --staged_reward is off).
+                reward_vals = (res.rewards if this_staged
+                               else [1.0 if s else 0.0 for s in res.successes])
+                adv = grpo_group_advantages(reward_vals)
+                if adv is None:
+                    continue  # all-success or all-fail: skip
+                kept += 1
+                for env_i, env_records in enumerate(res.records_per_env):
+                    for r in env_records:
+                        r.advantage = adv[env_i]
+                        r.weight = 1.0 / max(1, len(env_records))
+                    records.extend(env_records)
 
         rollout_s = time.time() - t_iter
 
