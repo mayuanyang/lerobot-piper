@@ -463,20 +463,24 @@ class WilroTransformer(nn.Module):
         # ─────────────────────────────────────────────────────────────
         self.num_latent_tokens = config.num_latent_tokens
         if self.num_latent_tokens > 0:
-            hidden_mid = self.hidden_size * 2
-            self.latent_generator = nn.Sequential(
-                nn.Linear(self.hidden_size, hidden_mid),
-                nn.SiLU(),
-                nn.Linear(hidden_mid, self.num_latent_tokens * self.hidden_size),
+            # Learnable "register" / query tokens (DETR-query / ViT-register style).
+            # Previously these were a deterministic MLP over MEAN-POOLED language,
+            # which (a) duplicated the DiT's direct cross-attn to the VLM language
+            # KV and (b) discarded token-level detail via pooling — so the model
+            # ignored them (~2% attn, ~0 grad) while 16.6M params sat idle.
+            #
+            # Now they are free parameters, shared across the batch, that
+            # specialize by CROSS-ATTENDING to the full VLM KV (vision + language,
+            # token-level) inside every DiT layer and are refined per flow-matching
+            # timestep via adaLN. Action tokens then read this compressed, denoised
+            # cross-modal summary through self-attention. That is a role per-token
+            # cross-attn does not already fill (a shared, reusable aggregation),
+            # rather than a redundant copy of pooled language. Small (non-zero)
+            # init avoids the zero-value-attention deadlock.
+            self.latent_tokens = nn.Parameter(
+                torch.zeros(1, self.num_latent_tokens, self.hidden_size)
             )
-            # Small std init on the output projection. Zero-init here causes
-            # latents to stay exactly 0, with K/V from latent positions also
-            # exactly 0, which gives them uniform-share but zero-value
-            # attention — gradient back to latent_generator becomes near-zero
-            # and the module never wakes up. A small random start breaks the
-            # deadlock without destabilising training.
-            nn.init.normal_(self.latent_generator[-1].weight, std=0.01)
-            nn.init.zeros_(self.latent_generator[-1].bias)
+            nn.init.normal_(self.latent_tokens, std=0.02)
 
         
         self._lang_max_len = 48
@@ -708,16 +712,10 @@ class WilroTransformer(nn.Module):
     ) -> Optional[torch.Tensor]:
         if self.num_latent_tokens == 0:
             return None
-        lang_result = self._encode_language(batch, device)
-        if lang_result is not None:
-            lang_tokens, lang_mask = lang_result
-            mask_f = lang_mask.float().unsqueeze(-1).to(lang_tokens.dtype)
-            denom = mask_f.sum(dim=1).clamp(min=1.0)
-            pooled = (lang_tokens * mask_f).sum(dim=1) / denom
-        else:
-            pooled = torch.zeros(B, self.hidden_size, device=device, dtype=dtype)
-        flat = self.latent_generator(pooled.float())
-        return flat.view(B, self.num_latent_tokens, self.hidden_size).to(dtype)
+        # Learnable query tokens, shared across the batch; they differentiate per
+        # sample by cross-attending to that sample's VLM KV inside the DiT, so no
+        # per-sample conditioning is needed here.
+        return self.latent_tokens.expand(B, -1, -1).to(dtype)
 
     def _build_dit_input(
         self,

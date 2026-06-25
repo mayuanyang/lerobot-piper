@@ -114,7 +114,7 @@ def _log_gradient_analysis(policy, step: int) -> None:
         ("Sink token",       "sink_token"),
         ("Final Norm",       "final_norm"),
         ("Time MLP",         "time_embedder"),
-        ("Latent Gen",       "latent_generator"),
+        ("Latent Tok",       "latent_tokens"),
     ]:
         grad, n = _grad_stats(prefix)
         if grad is not None:
