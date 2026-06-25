@@ -97,7 +97,6 @@ class DinoV3VisualEncoder(nn.Module):
         # Apply LoRA if requested
         if lora_rank > 0 and not freeze:
             self._apply_lora(lora_rank, lora_alpha, lora_dropout)
-            print(f"[DinoV3] LoRA applied: rank={lora_rank}, alpha={lora_alpha}")
 
         # Projection layer: DINOv3 hidden → target out_dim
         self.proj = nn.Linear(dinov3_hidden, out_dim)
@@ -135,32 +134,42 @@ class DinoV3VisualEncoder(nn.Module):
         DINOv3 (HF) names its attention projections q_proj/k_proj/v_proj/o_proj
         — NOT the ViTModel-style query/value. Targeting the wrong names makes
         PEFT silently attach zero adapters, so we verify something was added.
+
+        Raises loudly if peft is missing: LoRA was explicitly requested
+        (rank > 0), and the backbone is already unfrozen, so silently skipping
+        would full-fine-tune the entire backbone — never the intent.
         """
         try:
             from peft import LoraConfig, get_peft_model
+        except ImportError as e:
+            raise RuntimeError(
+                "[DinoV3] LoRA requested (lora_rank > 0) but peft is not "
+                "installed. Install it (pip install peft) or set lora_rank=0 to "
+                "train frozen. Refusing to silently full-fine-tune the backbone."
+            ) from e
 
-            lora_config = LoraConfig(
-                r=rank,
-                lora_alpha=alpha,
-                lora_dropout=dropout,
-                target_modules=["q_proj", "v_proj"],
-                bias="none",
-            )
-            self.backbone = get_peft_model(self.backbone, lora_config)
-            self.backbone.print_trainable_parameters()
+        lora_config = LoraConfig(
+            r=rank,
+            lora_alpha=alpha,
+            lora_dropout=dropout,
+            target_modules=["q_proj", "v_proj"],
+            bias="none",
+        )
+        self.backbone = get_peft_model(self.backbone, lora_config)
+        self.backbone.print_trainable_parameters()
 
-            n_lora = sum(
-                p.numel() for n, p in self.backbone.named_parameters()
-                if "lora_" in n and p.requires_grad
+        n_lora = sum(
+            p.numel() for n, p in self.backbone.named_parameters()
+            if "lora_" in n and p.requires_grad
+        )
+        if n_lora == 0:
+            raise RuntimeError(
+                "[DinoV3] LoRA attached 0 parameters — target_modules "
+                f"{lora_config.target_modules} matched nothing. Check the "
+                "backbone's attention module names."
             )
-            if n_lora == 0:
-                raise RuntimeError(
-                    "[DinoV3] LoRA attached 0 parameters — target_modules "
-                    f"{lora_config.target_modules} matched nothing. Check the "
-                    "backbone's attention module names."
-                )
-        except ImportError:
-            print("[DinoV3] peft not installed, skipping LoRA. Install with: pip install peft")
+        print(f"[DinoV3] LoRA applied: rank={rank}, alpha={alpha} "
+              f"({n_lora:,} trainable adapter params)")
 
     def forward(self, x: torch.Tensor, out_tokens: Optional[int] = None) -> torch.Tensor:
         """
