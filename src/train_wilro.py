@@ -159,6 +159,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           kv_capture_layers: list | None = None,
           robot_encoder_tokens: int = 49, gripper_encoder_tokens: int = 100,
           gripper_camera: str | None = None,
+          cameras: list | None = None,
           noise_temporal_correlation: float = 0.0,
           gripper_phase_weight: float = 1.0,
           time_sampling: str = "uniform",
@@ -197,7 +198,24 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     print('input_features:', input_features)
     print('output_features:', output_features)
 
-    camera_keys = sorted([key for key, ft in input_features.items() if ft.type is FeatureType.VISUAL])
+    # Detect all available cameras from dataset features
+    all_camera_keys = sorted([key for key, ft in input_features.items() if ft.type is FeatureType.VISUAL])
+    
+    # Filter cameras if --cameras is specified
+    if cameras is not None and len(cameras) > 0:
+        camera_keys = [c for c in cameras if c in all_camera_keys]
+        missing = [c for c in cameras if c not in all_camera_keys]
+        if missing:
+            print(f"WARNING: Requested cameras not found in dataset: {missing}")
+        if not camera_keys:
+            raise ValueError(
+                f"None of the requested cameras {cameras} exist in dataset. "
+                f"Available cameras: {all_camera_keys}"
+            )
+        print(f"Camera filter applied: using {camera_keys} (from available {all_camera_keys})")
+    else:
+        camera_keys = all_camera_keys
+    
     state_dim = input_features["observation.state"].shape[-1] if "observation.state" in input_features else 7
     action_dim = next(iter(output_features.values())).shape[-1]
     print(f"Detected cameras ({len(camera_keys)}): {camera_keys}")
@@ -732,6 +750,10 @@ if __name__ == "__main__":
                              "NO camera on LIBERO (image/image2) and silently disables "
                              "the dense grid. For LIBERO pass the wrist / eye-in-hand "
                              "view, e.g. --gripper_camera observation.images.image2.")
+    parser.add_argument("--cameras", type=str, nargs="+", default=None,
+                        help="Subset of cameras to use from the dataset. If not specified, "
+                             "all available cameras are used. Example: "
+                             "--cameras observation.images.chest observation.images.left_hand")
     parser.add_argument("--noise_temporal_correlation", type=float, default=0.0,
                         help="AR(1) coefficient correlating the flow-matching source "
                              "noise along the action horizon (0=white noise; ~0.9=temporally "
