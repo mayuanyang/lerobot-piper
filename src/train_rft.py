@@ -175,6 +175,24 @@ def _patch_libero_control_freq(control_freq: int):
     _LiberoEnv._make_envs_task = _make_envs_task
 
 
+def _patch_libero_task_ids(task_ids: list[int]):
+    """Inject task_ids into LiberoEnv.gym_kwargs so create_libero_envs only
+    BUILDS the selected tasks. The config's gym_kwargs property otherwise omits
+    task_ids, so make_env constructs the entire suite and we'd only be able to
+    close the extras after the fact. Must be applied BEFORE make_env. Harmless
+    on lerobot versions whose create_libero_envs ignores task_ids — the
+    post-build filter still drops any extras."""
+    from lerobot.envs.configs import LiberoEnv as _LiberoEnvCfg
+    _orig = _LiberoEnvCfg.gym_kwargs.fget
+
+    def _gym_kwargs(self):
+        d = dict(_orig(self))
+        d["task_ids"] = list(task_ids)
+        return d
+
+    _LiberoEnvCfg.gym_kwargs = property(_gym_kwargs)
+
+
 def _start_virtual_display():
     """Headless rendering for Colab (Xvfb + EGL). No-op if a display already exists."""
     try:
@@ -762,6 +780,12 @@ def main(cfg: RFTConfig):
             _patch_libero_control_freq(cfg.rft.control_freq)
             print(f"[train_rft] LIBERO control_freq patched to {cfg.rft.control_freq} Hz "
                   f"(demos are 10 Hz; stock env default is 20 Hz)")
+        _sel_tids = str(cfg.rft.task_ids or "").replace(" ", "")
+        if _sel_tids:
+            _tids = [int(t) for t in _sel_tids.split(",") if t != ""]
+            _patch_libero_task_ids(_tids)
+            print(f"[train_rft] LIBERO task filter: building only task_ids={_tids} "
+                  f"(skips constructing the other tasks in the suite)")
 
     # Env / policy / processors — identical construction to lerobot-eval.
     envs = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
