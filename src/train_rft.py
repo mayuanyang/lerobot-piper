@@ -144,6 +144,37 @@ def _apply_robosuite_patches():
         setattr(robots, "SingleArm", Robot)
 
 
+def _patch_libero_control_freq(control_freq: int):
+    """Build LiberoEnv's OffScreenRenderEnv at `control_freq` Hz instead of
+    robosuite's 20 Hz default. The LIBERO demos / eval run at 10 Hz, so each
+    delta-EEF action is sized for a 1/10 s interval; rolling out at 20 Hz holds
+    each action half as long → the same action moves a different distance,
+    taking the policy off-distribution from the demos and shrinking the real
+    time covered by --rft.max_steps. Match the rollout freq to the demo set.
+    Must be applied BEFORE make_env constructs the env."""
+    import os as _os
+    from lerobot.envs.libero import LiberoEnv as _LiberoEnv
+    from libero.libero.envs import OffScreenRenderEnv
+    from libero.libero import get_libero_path
+
+    def _make_envs_task(self, task_suite, task_id: int = 0):
+        task = task_suite.get_task(task_id)
+        self.task = task.name
+        self.task_description = task.language
+        bddl = _os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
+        env = OffScreenRenderEnv(
+            bddl_file_name=bddl,
+            camera_heights=self.observation_height,
+            camera_widths=self.observation_width,
+            control_freq=control_freq,   # match dataset/eval fps (default LIBERO=20)
+            render_gpu_device_id=int(_os.environ.get("RL_RENDER_GPU", "0")),
+        )
+        env.reset()
+        return env
+
+    _LiberoEnv._make_envs_task = _make_envs_task
+
+
 def _start_virtual_display():
     """Headless rendering for Colab (Xvfb + EGL). No-op if a display already exists."""
     try:
@@ -187,6 +218,9 @@ class RFTParams:
     save_dataset_dir: str = ""        # output dataset root (default: <output_dir>/collected_dataset)
     save_dataset_repo_id: str = "rft/collected"  # local repo_id label (no hub push)
     save_fps: int = 20                # fps stamped into the dataset (set to match your demo set)
+    control_freq: int = 10            # LIBERO sim control Hz (demos are 10; stock env default is 20). 0 = leave stock.
+    init_states_per_task: int = 0     # >0: sweep this many LIBERO init states across batches (50 = full set), so a small batch_size still covers them all. 0 = legacy (only init states 0..batch_size-1).
+    task_ids: str = ""                # comma-separated task indices within the suite to collect (e.g. "0,3,7"). Empty = all tasks.
 
 
 @dataclass
@@ -457,17 +491,39 @@ def _run_collect_only(cfg, task_envs, policy, preprocessor, postprocessor, devic
     print(f"  device     : {device}")
     print(f"  env/task   : {cfg.env.type}/{cfg.env.task}  ({len(task_envs)} task env(s))")
     print(f"  collect    : {cfg.rft.iterations} pass(es) x {cfg.rft.rollouts_per_task} rollouts/task")
+    if int(cfg.rft.init_states_per_task) > 0:
+        print(f"  init states: cycling 0..{int(cfg.rft.init_states_per_task) - 1} across batches "
+              f"(batch_size={cfg.eval.batch_size}) — full sweep per pass")
     print(f"  max_steps  : {cfg.rft.max_steps if cfg.rft.max_steps > 0 else 'env default per suite'}")
     print(f"  dataset    : {save_dir}  (fps={cfg.rft.save_fps})")
     print("=" * 64 + "\n")
 
+    cycle = int(cfg.rft.init_states_per_task)
     total_ep, total_succ, saved = 0, 0, 0
     interrupted = False
     try:
         for it in range(1, cfg.rft.iterations + 1):
             for t_idx, (label, env) in enumerate(task_envs):
-                n_batches = -(-cfg.rft.rollouts_per_task // env.num_envs)  # ceil
+                num_envs = env.num_envs
+                if cycle > 0:
+                    # Sweep init states 0..n_init-1 across batches by mutating each
+                    # sub-env's pinned _init_state_id before its reset; a small
+                    # batch_size then still covers the whole set (LIBERO has 50/task).
+                    try:
+                        n_init = min(cycle, len(env.call("_init_states")[0]))
+                    except (TypeError, AttributeError, IndexError):
+                        n_init = cycle
+                    n_batches = -(-n_init // num_envs)  # ceil: cover all init states once
+                else:
+                    n_init = 0
+                    n_batches = -(-cfg.rft.rollouts_per_task // num_envs)  # ceil
                 for b in range(n_batches):
+                    if cycle > 0:
+                        # LiberoEnv.reset() (called inside _rft_collect_episodes)
+                        # reads _init_state_id → set_init_state(_init_states[id]).
+                        # Wraps on the last batch if n_init % num_envs != 0.
+                        ids = [(b * num_envs + i) % n_init for i in range(num_envs)]
+                        env.set_attr("_init_state_id", ids)
                     desc = f"pass{it} collect {label} [{t_idx+1}/{len(task_envs)}] b{b+1}/{n_batches}"
                     episodes, n_succ, B = _rft_collect_episodes(
                         env, policy, preprocessor, postprocessor, device,
@@ -702,6 +758,10 @@ def main(cfg: RFTConfig):
         if cfg.rft.headless:
             _start_virtual_display()
         _apply_robosuite_patches()
+        if cfg.rft.control_freq and cfg.rft.control_freq > 0:
+            _patch_libero_control_freq(cfg.rft.control_freq)
+            print(f"[train_rft] LIBERO control_freq patched to {cfg.rft.control_freq} Hz "
+                  f"(demos are 10 Hz; stock env default is 20 Hz)")
 
     # Env / policy / processors — identical construction to lerobot-eval.
     envs = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
@@ -721,12 +781,30 @@ def main(cfg: RFTConfig):
     n_frozen = sum(p.numel() for p in policy.parameters() if not p.requires_grad)
     optimizer = torch.optim.Adam(trainable, lr=cfg.rft.lr, weight_decay=cfg.rft.weight_decay)
 
-    # Flatten {suite: {task_id: vec_env}} into a list of (label, env).
-    task_envs = [
-        (f"{suite}/{tid}", e)
-        for suite, by_task in envs.items()
-        for tid, e in by_task.items()
-    ]
+    # Flatten {suite: {task_id: vec_env}} into a list of (label, env), optionally
+    # filtered to specific task indices via --rft.task_ids ("0,3,7"; empty = all).
+    sel = str(getattr(cfg.rft, "task_ids", "") or "").replace(" ", "")
+    want = {int(t) for t in sel.split(",") if t != ""} if sel else None
+    task_envs, dropped = [], []
+    for suite, by_task in envs.items():
+        for tid, e in by_task.items():
+            (task_envs if (want is None or tid in want) else dropped).append(
+                (f"{suite}/{tid}", e)
+            )
+    # Free the unused task envs (subprocesses + sim memory) we won't roll out.
+    for _, e in dropped:
+        try:
+            e.close()
+        except Exception:
+            pass
+    if want is not None:
+        if not task_envs:
+            avail = sorted(tid for _, bt in envs.items() for tid in bt)
+            raise ValueError(
+                f"--rft.task_ids={sel!r} matched no tasks; available task_ids: {avail}"
+            )
+        print(f"[train_rft] task filter: collecting {[lbl for lbl, _ in task_envs]} "
+              f"(closed {len(dropped)} unused task env(s))")
 
     # Collect-only: decouple the slow sim from training. Harvest successful
     # episodes into a LeRobot dataset and stop — SFT later with train_finetune.
