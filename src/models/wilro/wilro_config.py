@@ -132,7 +132,7 @@ class WilroConfig(PreTrainedConfig):
     scheduler_warmup_steps: int = 1500
 
     # -------- Robot visual encoder (parallel ResNet-18) --------
-    robot_encoder_tokens: int = 49
+    robot_encoder_tokens: int = 100
     robot_encoder_input_size: int = 224
     use_robot_cnn: bool = True
     # Give one camera a denser token grid than the rest. The gripper / wrist
