@@ -161,6 +161,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           robot_encoder_tokens: int = 49, gripper_encoder_tokens: int = 100,
           gripper_camera: str | None = None,
           cameras: list | None = None,
+          rewrite_instructions: bool = False,
+          rewrite_augment: bool = False,
           noise_temporal_correlation: float = 0.0,
           gripper_phase_weight: float = 1.0,
           time_sampling: str = "uniform",
