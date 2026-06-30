@@ -16,6 +16,7 @@ from torch.utils.data import ConcatDataset
 from models.wilro.wilro_config import WilroConfig
 from models.wilro.wilro_policy import WilroPolicy
 from models.wilro.processor_wilro import make_pre_post_processors
+from models.wiltechs_vla.task_rewrites import rewrite_instruction
 
 from torchvision.transforms import v2
 from transformers import get_cosine_schedule_with_warmup
@@ -584,6 +585,13 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                     task_indices = task_indices[:, 0]
                 batch["task_description"] = [task_idx_to_description.get(int(ti), "") for ti in task_indices]
 
+            # Apply instruction rewriting if enabled (for LIBERO spatial grounding)
+            if args.rewrite_instructions and "task_description" in batch:
+                batch["task_description"] = [
+                    rewrite_instruction(t, random_augment=args.rewrite_augment)
+                    for t in batch["task_description"]
+                ]
+
             batch = apply_image_augmentations(batch, camera_keys, image_transforms)
             batch = apply_joint_augmentations(batch)
 
@@ -775,6 +783,15 @@ if __name__ == "__main__":
                              "More negative => more mass at low t (finer detail).")
     parser.add_argument("--time_lognormal_std", type=float, default=1.0,
                         help="Std of the logit-normal (only if --time_sampling lognormal).")
+    parser.add_argument("--rewrite_instructions", action="store_true",
+                        help="Apply instruction rewriting from task_rewrites.py for LIBERO "
+                             "spatial grounding (e.g., ramekin -> visual description, "
+                             "'between' -> 'closer to'). Rewritten instructions are used "
+                             "for both VLM encoding and contrastive hard negatives.")
+    parser.add_argument("--rewrite_augment", action="store_true",
+                        help="When --rewrite_instructions is enabled, randomly choose between "
+                             "original and rewritten instruction (50/50) for each sample. "
+                             "This trains the model to understand BOTH phrasings.")
     args = parser.parse_args()
     for _name in ("robot_encoder_tokens", "gripper_encoder_tokens"):
         _v = getattr(args, _name)

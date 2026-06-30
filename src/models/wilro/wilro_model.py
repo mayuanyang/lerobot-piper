@@ -1118,7 +1118,9 @@ class WilroTransformer(nn.Module):
             self.training and contrastive_w > 0.0
             and L_lang > 0 and B >= 2
         ):
-            descs = batch.get("task") or batch.get("task_description")
+            # Prefer task_description (may be rewritten for spatial grounding)
+            # over raw task string from dataset.
+            descs = batch.get("task_description") or batch.get("task")
             use_hard_neg = getattr(self.config, "contrastive_hard_negatives", False)
 
             if (

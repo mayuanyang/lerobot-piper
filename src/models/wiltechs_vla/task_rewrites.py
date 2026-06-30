@@ -31,6 +31,8 @@ silently no-op).
 
 from __future__ import annotations
 
+import torch
+
 # ---------------------------------------------------------------------------
 # Rephrasings: canonical original string  ->  descriptive replacement.
 # Only list tasks you want to CHANGE. Everything else is identity.
@@ -59,22 +61,37 @@ REPHRASINGS: dict[str, str] = {
     "pick up the black bowl next to the ramekin and place it on the plate":
         "pick up the black bowl next to the small round silver container and place it on the plate",
     "pick up the black bowl between the plate and the ramekin and place it on the plate":
-        "pick up the black bowl between the plate and the small round silver container and place it on the plate",
+        "pick up the black bowl that is between the plate and the ramekin (closer to the plate) and place it on the plate",
+    "pick up the black bowl next to the plate and place it on the plate":
+        "pick up the nearest black bowl and place it on the plate",
 
     # ---- libero_object (20-29) — TODO: confirm canonical strings + which need rewrite ----
     # ---- libero_goal   (10-19) — TODO: confirm canonical strings + which need rewrite ----
 }
 
 
-def rewrite_instruction(task: str) -> str:
+def rewrite_instruction(task: str, random_augment: bool = False) -> str:
     """Return the descriptive rephrasing for `task`, or `task` unchanged.
+
+    Args:
+        task: The original task instruction string.
+        random_augment: If True and a rephrasing exists, randomly choose between
+            the original and rewritten version (50/50). This allows the model to
+            learn BOTH phrasings during training, improving robustness at eval
+            time when either form may appear. Default False (always rewrite).
 
     Safe to call on any string from either tasks.parquet (training) or the
     LIBERO benchmark env (RL rollout / eval) — the canonical strings match.
     """
     if not task:
         return task
-    return REPHRASINGS.get(task.strip(), task)
+    stripped = task.strip()
+    rewritten = REPHRASINGS.get(stripped)
+    if rewritten is None:
+        return task
+    if random_augment and torch.rand(1).item() > 0.5:
+        return task  # 50% chance to keep original
+    return rewritten
 
 
 def verify_against_benchmark() -> list[str]:
