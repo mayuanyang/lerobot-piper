@@ -709,7 +709,14 @@ class WilroTransformer(nn.Module):
             h_in = layer.post_attention_layernorm(hidden)
             hidden = residual + layer.mlp(h_in)
 
-        return kv_cache, vlm_kv_pad_mask, L_vis, L_lang
+        # Extract VLM-processed language embeddings from the final hidden state.
+        # These are used as DiT sequence tokens so robot/action can self-attend
+        # to language directly (language grounding for Robot CNN features).
+        lang_embeddings = None
+        if L_lang > 0:
+            lang_embeddings = hidden[:, L_vis:L_vis + L_lang].detach()
+
+        return kv_cache, vlm_kv_pad_mask, L_vis, L_lang, lang_embeddings
 
     # =========================================================================
     # DiT-side helpers: robot CNN, latents, time, input assembly
@@ -763,9 +770,15 @@ class WilroTransformer(nn.Module):
         robot_tokens: Optional[torch.Tensor],
         latents: Optional[torch.Tensor],
         action_prefix: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, int, int, int]:
+        lang_tokens: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, int, int, int, int]:
         """
-        Layout: [SINK, (latent?), state, (action_prefix?), (robot?), action]
+        Layout: [SINK, (latent?), state, (language?), (action_prefix?), (robot?), action]
+
+        Language tokens (from VLM's final hidden state) are inserted after state
+        so that robot and action tokens can self-attend to language directly.
+        This provides language grounding for Robot CNN features — robot tokens
+        learn to condition on the task instruction through self-attention.
 
         Latents sit right after SINK so that every downstream module (state
         encoding, prefix, robot CNN, action) can self-attend to them under the
@@ -779,6 +792,7 @@ class WilroTransformer(nn.Module):
           action_start_idx:  index where noisy action tokens begin (for readout)
           prefix_start_idx:  index where the clean action prefix begins (-1 if none)
           latent_start_idx:  index where latent tokens begin (-1 if none)
+          lang_start_idx:    index where language tokens begin (-1 if none)
         """
         B, H, _ = noisy_actions.shape
         dtype = noisy_actions.dtype
@@ -796,13 +810,21 @@ class WilroTransformer(nn.Module):
         action_emb = self.action_in_proj(noisy_actions) + self.action_pos_emb[:, :H]
         action_emb = action_emb.to(dtype)
 
-        # Layout: [SINK, (latent?), state, (prefix?), (robot?), action]
+        # Layout: [SINK, (latent?), state, (language?), (prefix?), (robot?), action]
         parts = [sink]
         latent_start_idx = -1
         if latents is not None:
             latent_start_idx = sum(p.size(1) for p in parts)
             parts.append(latents.to(dtype))
         parts.append(state_tok)
+
+        # Language tokens from VLM (after all layers) — enables robot/action
+        # to self-attend to language for direct language grounding.
+        lang_start_idx = -1
+        if lang_tokens is not None and lang_tokens.shape[1] > 0:
+            lang_start_idx = sum(p.size(1) for p in parts)
+            parts.append(lang_tokens.to(dtype))
+
         prefix_start_idx = -1
         if action_prefix is not None and action_prefix.shape[1] > 0:
             prefix_start_idx = sum(p.size(1) for p in parts)
@@ -815,7 +837,7 @@ class WilroTransformer(nn.Module):
         action_start_idx = sum(p.size(1) for p in parts)
         parts.append(action_emb)
         seq = torch.cat(parts, dim=1)
-        return seq, action_start_idx, prefix_start_idx, latent_start_idx
+        return seq, action_start_idx, prefix_start_idx, latent_start_idx, lang_start_idx
 
     def _build_dit_self_attn_mask(
         self,
@@ -975,6 +997,7 @@ class WilroTransformer(nn.Module):
         robot_tokens: Optional[torch.Tensor],
         latents: Optional[torch.Tensor],
         action_prefix: Optional[torch.Tensor],
+        lang_tokens: Optional[torch.Tensor] = None,
         L_vis: int = 0,
         L_lang: int = 0,
     ) -> torch.Tensor:
@@ -986,9 +1009,9 @@ class WilroTransformer(nn.Module):
         t_emb_raw = create_sinusoidal_pos_embedding(timesteps, self.hidden_size).to(dtype)
         t_emb = self.time_embedder(t_emb_raw.float()).to(dtype)
 
-        # Build sequence
-        dit_seq, action_start_idx, prefix_start_idx, latent_start_idx = self._build_dit_input(
-            batch, noisy_actions, robot_tokens, latents, action_prefix,
+        # Build sequence (lang_tokens injected into DiT for language grounding)
+        dit_seq, action_start_idx, prefix_start_idx, latent_start_idx, lang_start_idx = self._build_dit_input(
+            batch, noisy_actions, robot_tokens, latents, action_prefix, lang_tokens,
         )
         L_dit = dit_seq.shape[1]
         prefix_len = action_prefix.shape[1] if action_prefix is not None else 0
@@ -997,9 +1020,10 @@ class WilroTransformer(nn.Module):
         )
 
         # Region boundaries (used by attention-mass diagnostic). Layout:
-        #   [SINK(1), (latent(K))?, state(1), (prefix(P))?, robot(R), action(H)]
+        #   [SINK(1), (latent(K))?, state(1), (language(L))?, (prefix(P))?, robot(R), action(H)]
         robot_len = robot_tokens.shape[1] if robot_tokens is not None else 0
         latent_len = latents.shape[1] if latents is not None else 0
+        lang_len = lang_tokens.shape[1] if lang_tokens is not None else 0
         H_horizon = self.config.horizon
         # state always sits right after sink + optional latent block
         state_idx = 1 + latent_len
@@ -1009,6 +1033,7 @@ class WilroTransformer(nn.Module):
             "sink":         (0, 1),
             "latent":       (latent_start_idx, latent_len) if latent_len > 0 else None,
             "state":        (state_idx, 1),
+            "language":     (lang_start_idx, lang_len) if lang_len > 0 else None,
             "prefix":       (prefix_start_idx, prefix_len) if prefix_len > 0 else None,
             "robot":        (robot_idx, robot_len),
             "action":       (action_start_idx, H_horizon),
@@ -1105,8 +1130,8 @@ class WilroTransformer(nn.Module):
         B = actions.shape[0]
         device = actions.device
 
-        # ── Encoder: run VLM once, cache KV ─────────────────────────
-        kv_cache, vlm_kv_pad_mask, L_vis, L_lang = self._run_vlm_and_cache_kv(batch)
+        # ── Encoder: run VLM once, cache KV + extract lang embeddings ──
+        kv_cache, vlm_kv_pad_mask, L_vis, L_lang, lang_embeddings = self._run_vlm_and_cache_kv(batch)
 
         # ── DiT-side conditioning that does NOT depend on noise ─────
         robot_tokens = self._compute_robot_tokens(batch)
@@ -1129,7 +1154,7 @@ class WilroTransformer(nn.Module):
 
         v_t = self._run_dit(
             batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask,
-            robot_tokens, latents, action_prefix,
+            robot_tokens, latents, action_prefix, lang_embeddings,
             L_vis=L_vis, L_lang=L_lang,
         ).float()
 
@@ -1236,11 +1261,13 @@ class WilroTransformer(nn.Module):
                         shuffled_cache.append((K_shuf, V_shuf))
                     shuffled_pad_mask = vlm_kv_pad_mask.clone()
                     shuffled_pad_mask[:, L_vis:L_vis + L_lang] = vlm_kv_pad_mask[perm][:, L_vis:L_vis + L_lang]
+                    # Shuffle lang_embeddings for the contrastive forward
+                    shuffled_lang = lang_embeddings[perm] if lang_embeddings is not None else None
 
                     v_wrong = self._run_dit(
                         batch, x_t.to(torch.bfloat16), t,
                         shuffled_cache, shuffled_pad_mask,
-                        robot_tokens, latents, action_prefix,
+                        robot_tokens, latents, action_prefix, shuffled_lang,
                         L_vis=L_vis, L_lang=L_lang,
                     ).float()
 
@@ -1288,7 +1315,7 @@ class WilroTransformer(nn.Module):
         )
 
         with autocast_ctx:
-            kv_cache, vlm_kv_pad_mask, L_vis, L_lang = self._run_vlm_and_cache_kv(batch)
+            kv_cache, vlm_kv_pad_mask, L_vis, L_lang, lang_embeddings = self._run_vlm_and_cache_kv(batch)
             robot_tokens = self._compute_robot_tokens(batch)
             latents = self._generate_latents(batch, B, device, torch.bfloat16)
 
@@ -1299,7 +1326,7 @@ class WilroTransformer(nn.Module):
             for _ in range(N):
                 v_t = self._run_dit(
                     batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask,
-                    robot_tokens, latents, action_prefix=None,
+                    robot_tokens, latents, action_prefix=None, lang_tokens=lang_embeddings,
                     L_vis=L_vis, L_lang=L_lang,
                 ).float()
                 x_t = x_t + dt * v_t
@@ -1317,7 +1344,7 @@ class WilroTransformer(nn.Module):
         )
 
         with autocast_ctx:
-            kv_cache, vlm_kv_pad_mask, L_vis, L_lang = self._run_vlm_and_cache_kv(batch)
+            kv_cache, vlm_kv_pad_mask, L_vis, L_lang, lang_embeddings = self._run_vlm_and_cache_kv(batch)
             robot_tokens = self._compute_robot_tokens(batch)
             latents = self._generate_latents(batch, B, device, torch.bfloat16)
 
@@ -1331,7 +1358,7 @@ class WilroTransformer(nn.Module):
             for _ in range(N):
                 v_t = self._run_dit(
                     batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask,
-                    robot_tokens, latents, action_prefix=None,
+                    robot_tokens, latents, action_prefix=None, lang_tokens=lang_embeddings,
                     L_vis=L_vis, L_lang=L_lang,
                 ).float()
                 x_t = x_t + dt * v_t
