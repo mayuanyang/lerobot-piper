@@ -110,6 +110,12 @@ Also emitted by Stage A:
   language tokens; False at padded language slots. Used by the DiT's
   cross-attention to mask padded keys.
 
+- `lang_embeddings`: `(B, L_lang, h)` — VLM-processed language embeddings
+  extracted from the **final hidden state** (after all VLM layers). These are
+  injected into the DiT sequence as tokens so that robot and action tokens can
+  **self-attend** to language directly, providing language grounding for Robot
+  CNN features. Detached from the VLM graph (no gradient flows back to VLM).
+
 
 ## Stage B — DiT decoder (trainable, runs N times)
 
@@ -121,22 +127,29 @@ Also emitted by Stage A:
   x_t (B,H,7) ─► action_in_proj + action_pos_emb ─► action_emb (B,H,h)
   prefix?  ───► action_in_proj.detach()  ─────────► prefix_emb (B,P,h)
   sink_token ─► learned 1-token parameter (B,1,h)
+  lang_emb ───► from VLM final hidden state ──────► lang_tok (B, L_lang, h)
 
   DiT sequence (concatenated):
 
-  ┌──────┬───────┬────────────┬─────────┬─────────────────┐
-  │ SINK │ state │ prefix(P)? │ robot   │  action(H)      │
-  │  1   │   1   │     P      │  3·R    │       H         │
-  └──────┴───────┴────────────┴─────────┴─────────────────┘
-                                         ▲
-                                         │
-                             action_start_idx = 1 + 1 + P + 3·R
-                                         │
+  ┌──────┬───────┬──────────────┬────────────┬─────────┬─────────────────┐
+  │ SINK │ state │ language(L)? │ prefix(P)? │ robot   │  action(H)      │
+  │  1   │   1   │      L       │     P      │  3·R    │       H         │
+  └──────┴───────┴──────────────┴────────────┴─────────┴─────────────────┘
+                                                           ▲
+                                                           │
+                             action_start_idx = 1 + 1 + L + P + 3·R
+                                                           │
                              readout slice for v_t
 
+  Language tokens (from VLM's final hidden state, detached) are inserted
+  AFTER state so that robot and action tokens can self-attend to language
+  directly. This provides language grounding for Robot CNN features —
+  robot tokens learn to condition on the task instruction through
+  self-attention, complementing the VLM cross-attention path.
+
   Note: latent tokens are DISABLED (num_latent_tokens=0). Robot CNN
-  spatial grounding replaces the role of latent thought tokens — action
-  queries directly attend to high-res Robot CNN features via cross-attn.
+  spatial grounding + language self-attention replaces the role of latent
+  thought tokens.
 ```
 
 Self-attention mask: full lower-triangular causal. When `action_prefix` is
@@ -328,6 +341,7 @@ velocities for different task instructions ("language forcing").
 | `N`     | DiT depth = `config.num_vlm_layers`           | 16      |
 | `R`     | tokens per robot CNN view                     | 100     |
 | `K`     | latent thought tokens                         | **0**   |
+| `L`     | language tokens in DiT sequence (from VLM)    | ≤48     |
 | `P`     | action prefix length (0 in synchronous mode)  | 0       |
 
 
@@ -343,6 +357,7 @@ velocities for different task instructions ("language forcing").
 | Action position in DiT seq     | n/a              | last             | **last**          |
 | Contrastive loss path          | full re-forward  | KV permute       | **KV permute**    |
 | Robot CNN cross-attn           | n/a (joint)      | no               | **yes (NEW)**     |
+| Language in DiT sequence       | yes (joint)      | no               | **yes (NEW)**     |
 | Latent tokens                  | yes (dynamic)    | yes              | **no (disabled)** |
 | GPU memory (relative)          | high             | very high        | low               |
 
