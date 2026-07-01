@@ -110,7 +110,14 @@ def _log_gradient_analysis(policy, step: int) -> None:
         ("Text (frozen)",    "text_model"),
         ("State Enc",        "state_encoder"),
         ("Robot CNN",        "robot_visual_encoder"),
+        ("Robot CA K/V Proj","robot_ca_k_proj"),
+        ("Robot CA V Proj",  "robot_ca_v_proj"),
+        ("Robot CA Norm",    "robot_ca_norm"),
         ("DiT layers",       "dit_layers"),
+        ("  ├─ Self-attn",   "sa_"),
+        ("  ├─ VLM CA",      "ca_"),
+        ("  ├─ Robot CA",    "robot_ca_"),
+        ("  └─ FFN",         "ffn"),
         ("Action In/Out",    "action_"),
         ("Sink token",       "sink_token"),
         ("Final Norm",       "final_norm"),
@@ -119,7 +126,7 @@ def _log_gradient_analysis(policy, step: int) -> None:
     ]:
         grad, n = _grad_stats(prefix)
         if grad is not None:
-            print(f"  {label:18s} - Avg Abs Grad: {grad:.6f} ({n} params)")
+            print(f"  {label:22s} - Avg Abs Grad: {grad:.6f} ({n:,} params)")
 
     stats = getattr(policy.model, "_last_attention_stats", None)
     if stats:
@@ -131,10 +138,17 @@ def _log_gradient_analysis(policy, step: int) -> None:
 
     x_stats = getattr(policy.model, "_last_cross_attention_stats", None)
     if x_stats:
-        order = ["vision", "language"]
-        ordered = [(k, x_stats[k]) for k in order if k in x_stats]
-        cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in ordered)
-        print(f"  Action→ x-attn    : {cells}    (cross-attn to VLM KV)")
+        # VLM cross-attention: vision vs language
+        vlm_order = ["vision", "language"]
+        vlm_ordered = [(k, x_stats[k]) for k in vlm_order if k in x_stats]
+        vlm_cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in vlm_ordered)
+        print(f"  Action→ VLM x-attn  : {vlm_cells}    (cross-attn to VLM KV)")
+
+    # Robot cross-attention stats (if captured)
+    robot_ca_stats = getattr(policy.model, "_last_robot_cross_attention_stats", None)
+    if robot_ca_stats:
+        robot_cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in robot_ca_stats.items())
+        print(f"  Action→ Robot x-attn: {robot_cells}    (cross-attn to Robot CNN)")
 
     comps = getattr(policy.model, "_last_loss_components", None)
     cw = getattr(policy.model.config, "contrastive_loss_weight", 0.0)
