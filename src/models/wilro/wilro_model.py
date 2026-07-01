@@ -170,12 +170,14 @@ class DiTLayer(nn.Module):
         intermediate_size: int,
         rms_norm_eps: float = 1e-5,
         dropout: float = 0.1,
+        use_robot_ca: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        self.use_robot_ca = use_robot_ca
 
         # ── Self-attention (over DiT sequence) ──────────────────────────
         self.sa_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -191,22 +193,30 @@ class DiTLayer(nn.Module):
         self.ca_o = nn.Linear(num_heads * head_dim, hidden_size, bias=False)
         self.ca_drop = nn.Dropout(dropout)
 
+        # ── Robot CNN cross-attention (Q from DiT, K/V from Robot CNN) ──
+        # This enables direct high-resolution spatial grounding: action
+        # queries can attend to Robot CNN's fine-grained feature map
+        # (14x14 @ 224x224) instead of only VLM's coarse SigLIP patches
+        # (~729 patches @ 384x384). Critical for precise object localization
+        # in spatial reasoning tasks (e.g., "bowl closer to plate").
+        if use_robot_ca:
+            self.robot_ca_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+            self.robot_ca_q = nn.Linear(hidden_size, num_heads * head_dim, bias=False)
+            self.robot_ca_o = nn.Linear(num_heads * head_dim, hidden_size, bias=False)
+            self.robot_ca_drop = nn.Dropout(dropout)
+
         # ── FFN ─────────────────────────────────────────────────────────
         self.ffn_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.ffn = SwiGLU(hidden_size, intermediate_size)
         self.ffn_drop = nn.Dropout(dropout)
 
-        # ── adaLN-Zero: 9 modulation vectors (shift/scale/gate × 3) ─────
-        # Zero-init the modulation linear so gates start at 0 → each block
-        # is an identity on the residual stream at init. The sublayer output
-        # projections (sa_o / ca_o / ffn.down_proj) are LEFT AT DEFAULT INIT.
-        # Zero-init'ing them in addition to the modulator creates a dead-init
-        # deadlock: residual = x + gate · sublayer_out, with gate=0 AND
-        # sublayer_out=0 the backward gradient on BOTH sides is 0·(…) = 0, so
-        # neither side can ever escape.
+        # ── adaLN-Zero: 12 modulation vectors (shift/scale/gate × 4) ────
+        # With robot_ca: 4 sublayers (sa, ca, robot_ca, ffn) × 3 = 12
+        # Without robot_ca: 3 sublayers (sa, ca, ffn) × 3 = 9
+        adaLN_dim = 12 * hidden_size if use_robot_ca else 9 * hidden_size
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 9 * hidden_size, bias=True),
+            nn.Linear(hidden_size, adaLN_dim, bias=True),
         )
         nn.init.zeros_(self.adaLN_modulation[1].weight)
         nn.init.zeros_(self.adaLN_modulation[1].bias)
@@ -219,6 +229,8 @@ class DiTLayer(nn.Module):
         vlm_v: torch.Tensor,
         vlm_kv_pad_mask: Optional[torch.Tensor],
         self_attn_mask: torch.Tensor,
+        robot_k: Optional[torch.Tensor] = None,
+        robot_v: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         x:               (B, L_dit, H)
@@ -226,15 +238,27 @@ class DiTLayer(nn.Module):
         vlm_k, vlm_v:    (B, num_kv_heads, L_vlm, head_dim) — frozen VLM cache
         vlm_kv_pad_mask: (B, L_vlm) bool, True at valid VLM positions
         self_attn_mask:  (1, 1, L_dit, L_dit) additive mask
+        robot_k, robot_v: (B, num_kv_heads, R, head_dim) — Robot CNN K/V for
+                         high-resolution spatial cross-attention (optional)
         """
         B, L_dit, _ = x.shape
 
         mod = self.adaLN_modulation(t_emb)
-        (
-            s_sa, sc_sa, g_sa,
-            s_ca, sc_ca, g_ca,
-            s_ff, sc_ff, g_ff,
-        ) = mod.chunk(9, dim=-1)
+        if self.use_robot_ca and robot_k is not None:
+            # 12 chunks: sa(3), ca(3), robot_ca(3), ffn(3)
+            (
+                s_sa, sc_sa, g_sa,
+                s_ca, sc_ca, g_ca,
+                s_rca, sc_rca, g_rca,
+                s_ff, sc_ff, g_ff,
+            ) = mod.chunk(12, dim=-1)
+        else:
+            # 9 chunks: sa(3), ca(3), ffn(3)
+            (
+                s_sa, sc_sa, g_sa,
+                s_ca, sc_ca, g_ca,
+                s_ff, sc_ff, g_ff,
+            ) = mod.chunk(9, dim=-1)
 
         # ── Self-attention ───────────────────────────────────────────
         h = _modulate(self.sa_norm(x), s_sa, sc_sa)
@@ -269,6 +293,20 @@ class DiTLayer(nn.Module):
         ca = ca.transpose(1, 2).contiguous().view(B, L_dit, self.num_heads * self.head_dim)
         ca = self.ca_drop(self.ca_o(ca))
         x = x + g_ca.unsqueeze(1) * ca
+
+        # ── Robot CNN cross-attention (high-res spatial grounding) ───
+        if self.use_robot_ca and robot_k is not None:
+            h = _modulate(self.robot_ca_norm(x), s_rca, sc_rca)
+            Q = self.robot_ca_q(h).view(B, L_dit, self.num_heads, self.head_dim).transpose(1, 2)
+            Kr, Vr = robot_k, robot_v
+            if self.num_kv_heads != self.num_heads:
+                r = self.num_heads // self.num_kv_heads
+                Kr = Kr.repeat_interleave(r, dim=1)
+                Vr = Vr.repeat_interleave(r, dim=1)
+            robot_ca = F.scaled_dot_product_attention(Q, Kr, Vr, is_causal=False)
+            robot_ca = robot_ca.transpose(1, 2).contiguous().view(B, L_dit, self.num_heads * self.head_dim)
+            robot_ca = self.robot_ca_drop(self.robot_ca_o(robot_ca))
+            x = x + g_rca.unsqueeze(1) * robot_ca
 
         # ── FFN ──────────────────────────────────────────────────────
         h = _modulate(self.ffn_norm(x), s_ff, sc_ff)
@@ -388,6 +426,12 @@ class WilroTransformer(nn.Module):
         print(f"DiT: {self.num_dit_layers} layers, kv_capture_strategy={strategy!r}, "
               f"sourcing KV from VLM layers {self.capture_indices}")
 
+        # Robot CNN cross-attention config
+        self.use_robot_ca = getattr(config, "use_robot_ca", False)
+        if self.use_robot_ca:
+            print(f"[wilro] Robot CNN cross-attention ENABLED — action queries will "
+                  f"directly attend to high-res Robot CNN features for spatial grounding")
+
         self.dit_layers = nn.ModuleList([
             DiTLayer(
                 hidden_size=self.hidden_size,
@@ -397,8 +441,19 @@ class WilroTransformer(nn.Module):
                 intermediate_size=self.intermediate_size,
                 rms_norm_eps=self.rms_norm_eps,
                 dropout=config.dropout,
+                use_robot_ca=self.use_robot_ca,
             ) for _ in range(self.num_dit_layers)
         ])
+
+        # ── Robot CNN K/V projections for cross-attention ────────────────
+        # Projects Robot CNN tokens into K/V format matching the DiT's
+        # cross-attention heads. This allows action queries to directly
+        # attend to high-resolution spatial features (14x14 grid) instead
+        # of only VLM's coarse SigLIP patches (~729 patches).
+        if self.use_robot_ca:
+            self.robot_ca_k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+            self.robot_ca_v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+            self.robot_ca_norm = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
 
         # ─────────────────────────────────────────────────────────────
         # 3. DiT-side embeddings: SINK, state, action, time MLP
@@ -955,6 +1010,21 @@ class WilroTransformer(nn.Module):
             "action":       (action_start_idx, H_horizon),
         }
 
+        # ── Robot CNN K/V projections for cross-attention ────────────────
+        # Project robot tokens into K/V format matching DiT's cross-attention
+        # heads. This enables action queries to directly attend to high-res
+        # spatial features (14x14 grid) for precise object localization.
+        robot_k, robot_v = None, None
+        if self.use_robot_ca and robot_tokens is not None:
+            robot_normed = self.robot_ca_norm(robot_tokens)
+            B_r, R, _ = robot_normed.shape
+            robot_k = self.robot_ca_k_proj(robot_normed).view(
+                B_r, R, self.num_kv_heads, self.head_dim
+            ).transpose(1, 2)  # (B, num_kv_heads, R, head_dim)
+            robot_v = self.robot_ca_v_proj(robot_normed).view(
+                B_r, R, self.num_kv_heads, self.head_dim
+            ).transpose(1, 2)
+
         x = dit_seq
         use_ckpt = self.gradient_checkpointing and self.training
         for i, layer in enumerate(self.dit_layers):
@@ -986,6 +1056,7 @@ class WilroTransformer(nn.Module):
             if use_ckpt:
                 x = torch.utils.checkpoint.checkpoint(
                     layer, x, t_emb, vlm_k, vlm_v, vlm_kv_pad_mask, attn_mask,
+                    robot_k, robot_v,
                     use_reentrant=False,
                 )
             else:
@@ -994,6 +1065,7 @@ class WilroTransformer(nn.Module):
                     vlm_k=vlm_k, vlm_v=vlm_v,
                     vlm_kv_pad_mask=vlm_kv_pad_mask,
                     self_attn_mask=attn_mask,
+                    robot_k=robot_k, robot_v=robot_v,
                 )
 
         H = self.config.horizon

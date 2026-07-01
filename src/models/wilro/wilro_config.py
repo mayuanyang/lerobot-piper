@@ -144,7 +144,27 @@ class WilroConfig(PreTrainedConfig):
     gripper_encoder_tokens: int = 100
 
     # -------- Latent "thought" tokens --------
-    num_latent_tokens: int = 8
+    # Task-conditional latent tokens generated from pooled language.
+    # 0 disables (no latent tokens in DiT sequence).
+    num_latent_tokens: int = 0
+
+    # -------- Robot CNN cross-attention (spatial grounding) --------
+    # When True, each DiT layer has an ADDITIONAL cross-attention sublayer
+    # where action queries attend directly to Robot CNN's high-resolution
+    # feature map (14x14 grid @ 224x224). This provides fine-grained spatial
+    # grounding beyond VLM's coarse SigLIP patches (~729 patches @ 384x384).
+    # Critical for precise object localization in spatial reasoning tasks
+    # (e.g., "pick up the bowl closer to the plate" where the bowl is not
+    # exactly at the geometric midpoint).
+    #
+    # Architecture change:
+    #   - DiT layer: self-attn + VLM cross-attn + Robot cross-attn + FFN
+    #   - adaLN-Zero: 12 modulation vectors (4 sublayers × 3) vs 9 (3 × 3)
+    #   - Additional params: robot_ca_q/k/v/o_proj per DiT layer
+    #   - Robot tokens are projected to K/V format matching DiT's cross-attn
+    #
+    # Requires use_robot_cnn=True (RobotVisualEncoder must be active).
+    use_robot_ca: bool = True
 
     # -------- Vision token dropout (regularizer) --------
     vision_dropout_prob: float = 0.15
