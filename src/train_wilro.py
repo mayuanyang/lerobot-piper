@@ -130,8 +130,8 @@ def _log_gradient_analysis(policy, step: int) -> None:
 
     stats = getattr(policy.model, "_last_attention_stats", None)
     if stats:
-        # Match DiT sequence order: [SINK, latent, state, prefix, robot, action]
-        order = ["sink", "latent", "state", "prefix", "robot", "action"]
+        # Match DiT sequence order: [SINK, latent, state, language, prefix, robot, action]
+        order = ["sink", "latent", "state", "language", "prefix", "robot", "action"]
         ordered = [(k, stats[k]) for k in order if k in stats]
         cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in ordered)
         print(f"  Action→ self-attn : {cells}    (last DiT layer)")
