@@ -874,7 +874,9 @@ class WilroTransformer(nn.Module):
             return {}
         layer = self.dit_layers[-1]
         mod = layer.adaLN_modulation(t_emb)
-        chunks = mod.chunk(9, dim=-1)
+        # Chunk count depends on use_robot_ca: 12 (4 sublayers × 3) or 9 (3 × 3)
+        n_chunks = 12 if layer.use_robot_ca else 9
+        chunks = mod.chunk(n_chunks, dim=-1)
         s_ca, sc_ca = chunks[3], chunks[4]
         h = _modulate(layer.ca_norm(x), s_ca, sc_ca)
 
@@ -925,7 +927,9 @@ class WilroTransformer(nn.Module):
         """
         layer = self.dit_layers[-1]
         mod = layer.adaLN_modulation(t_emb)
-        chunks = mod.chunk(9, dim=-1)
+        # Chunk count depends on use_robot_ca: 12 (4 sublayers × 3) or 9 (3 × 3)
+        n_chunks = 12 if layer.use_robot_ca else 9
+        chunks = mod.chunk(n_chunks, dim=-1)
         s_sa, sc_sa = chunks[0], chunks[1]
         h = _modulate(layer.sa_norm(x), s_sa, sc_sa)
 
