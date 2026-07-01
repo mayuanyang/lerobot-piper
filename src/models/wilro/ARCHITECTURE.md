@@ -8,41 +8,41 @@ Mixture-of-Transformers (MoT) layout — the VLM never sees state/action tokens.
   memory for the DiT.
 - **Decoder** = a `num_dit_layers`-deep DiT. Runs **N times per observation**
   during the flow-matching denoising loop. Each DiT layer cross-attends to one
-  matched VLM KV pair.
+  matched VLM KV pair **and** to Robot CNN's high-resolution feature map.
 
 ```
 ╔════════════════════════════════════════════════════════════════════════════╗
 ║                    Top-level forward pass (inference)                      ║
 ╚════════════════════════════════════════════════════════════════════════════╝
 
-  cameras     task string    state(ℝ⁷)    horizon×ℝ⁷ noise x_T
-     │            │             │              │
-     │            │             │              │
-     ▼            ▼             │              │
- ┌──────────────────────┐       │              │
- │  STAGE A: Encoder    │       │              │
- │  (frozen SmolVLM2)   │       │              │
- │  runs ONCE           │       │              │
- │                      │       │              │
- │  output: per-layer   │       │              │
- │  K/V cache (last N   │       │              │
- │  text layers)        │       │              │
- └──────────┬───────────┘       │              │
-            │ kv_cache          │              │
-            │ [(K₀,V₀)..(K_{N-1},V_{N-1})]     │
-            │                   │              │
-            ▼                   ▼              ▼
-        ┌──────────────────────────────────────────┐
-        │  STAGE B: Decoder (trainable DiT)        │
-        │                                          │
-        │  for step in range(num_inference_steps): │
-        │     v_t = DiT(x_t, t, kv_cache, state,   │
-        │              robot, latent)              │
-        │     x_t = x_t + dt · v_t                 │
-        │     t  += dt                             │
-        └──────────────────┬───────────────────────┘
-                           ▼
-                  actions[:, :n_action_steps]
+   cameras     task string    state(ℝ⁷)    horizon×ℝ⁷ noise x_T
+      │            │             │              │
+      │            │             │              │
+      ▼            ▼             │              │
+  ┌──────────────────────┐       │              │
+  │  STAGE A: Encoder    │       │              │
+  │  (frozen SmolVLM2)   │       │              │
+  │  runs ONCE           │       │              │
+  │                      │       │              │
+  │  output: per-layer   │       │              │
+  │  K/V cache (last N   │       │              │
+  │  text layers)        │       │              │
+  └──────────┬───────────┘       │              │
+             │ kv_cache          │              │
+             │ [(K₀,V₀)..(K_{N-1},V_{N-1})]     │
+             │                   │              │
+             ▼                   ▼              ▼
+         ┌──────────────────────────────────────────┐
+         │  STAGE B: Decoder (trainable DiT)        │
+         │                                          │
+         │  for step in range(num_inference_steps): │
+         │     v_t = DiT(x_t, t, kv_cache, state,   │
+         │              robot, robot_k, robot_v)    │
+         │     x_t = x_t + dt · v_t                 │
+         │     t  += dt                             │
+         └──────────────────┬───────────────────────┘
+                            ▼
+                   actions[:, :n_action_steps]
 ```
 
 
@@ -118,29 +118,25 @@ Also emitted by Stage A:
 ```
   state(B,7) ──► state_encoder ──► state_tok (B,1,h)
   cameras   ──► RobotVisualEncoder x3 ─► robot_tok (B, 3·R, h)
-  language  ──► masked-mean pool ──► latent_generator ─► latents (B,K,h)
   x_t (B,H,7) ─► action_in_proj + action_pos_emb ─► action_emb (B,H,h)
   prefix?  ───► action_in_proj.detach()  ─────────► prefix_emb (B,P,h)
   sink_token ─► learned 1-token parameter (B,1,h)
 
   DiT sequence (concatenated):
 
-  ┌──────┬─────────┬───────┬────────────┬─────────┬─────────────────┐
-  │ SINK │ latents │ state │ prefix(P)? │ robot   │  action(H)      │
-  │  1   │    K    │   1   │     P      │  3·R    │       H         │
-  └──────┴─────────┴───────┴────────────┴─────────┴─────────────────┘
-                                                   ▲
-                                                   │
-                                       action_start_idx = 1 + K + 1 + P + 3·R
-                                                   │
-                                       readout slice for v_t
+  ┌──────┬───────┬────────────┬─────────┬─────────────────┐
+  │ SINK │ state │ prefix(P)? │ robot   │  action(H)      │
+  │  1   │   1   │     P      │  3·R    │       H         │
+  └──────┴───────┴────────────┴─────────┴─────────────────┘
+                                         ▲
+                                         │
+                             action_start_idx = 1 + 1 + P + 3·R
+                                         │
+                             readout slice for v_t
 
-Why latents come first: in DiT self-attention with causal mask, every token
-at later positions can attend to earlier ones. Placing latents right after
-SINK lets state, prefix, robot, and action all read the pooled-language
-task summary during their self-attn at every DiT layer. This broadcasts
-language conditioning to the visual / motor path (top-down attention),
-instead of restricting it to the action readout only.
+  Note: latent tokens are DISABLED (num_latent_tokens=0). Robot CNN
+  spatial grounding replaces the role of latent thought tokens — action
+  queries directly attend to high-res Robot CNN features via cross-attn.
 ```
 
 Self-attention mask: full lower-triangular causal. When `action_prefix` is
@@ -157,9 +153,10 @@ copying nearby clean steps.
                                        ▼
                        ┌─────────────────────────────────┐
                        │  adaLN_modulation(t_emb)        │
-                       │  → 9 vectors, chunked into:     │
+                       │  → 12 vectors, chunked into:    │
                        │   (s_sa, sc_sa, g_sa,           │
                        │    s_ca, sc_ca, g_ca,           │
+                       │    s_rca, sc_rca, g_rca,        │  ← NEW
                        │    s_ff, sc_ff, g_ff)           │
                        └─────────────────────────────────┘
                                        │
@@ -177,6 +174,14 @@ copying nearby clean steps.
       ├───────────────────────────────►(+)
       │
       ▼
+   x ─┬─► RMSNorm ─► shift/scale ─► Robot cross-attn     ─┐  ← NEW
+      │                              (Q = x,               │
+      │                               K,V = robot_k/v,     │
+      │                               no mask)             │
+      │           ◄────── gate · ───────────────────────── ◄
+      ├───────────────────────────────►(+)
+      │
+      ▼
    x ─┬─► RMSNorm ─► shift/scale ─► SwiGLU FFN          ─┐
       │                                                   │
       │           ◄────── gate · ───────────────────────── ◄
@@ -185,10 +190,37 @@ copying nearby clean steps.
                                        ▼  next DiT layer
 ```
 
-All three output projections (`sa_o`, `ca_o`, `ffn.down_proj`) are **zero-init**
-so each layer starts as the identity transform on the residual stream. The
-`adaLN_modulation` last-linear is also zero-init, so at step 0 the model
-behaves exactly like a stack of residual no-ops on top of the input embedding.
+**NEW: Robot CNN cross-attention** — action queries directly attend to
+Robot CNN's high-resolution feature map (14×14 grid @ 224×224) instead
+of only VLM's coarse SigLIP patches (~729 patches @ 384×384). This
+provides fine-grained spatial grounding for precise object localization
+in spatial reasoning tasks (e.g., "pick up the bowl closer to the plate").
+
+All four output projections (`sa_o`, `ca_o`, `robot_ca_o`, `ffn.down_proj`)
+are **zero-init** so each layer starts as the identity transform on the
+residual stream. The `adaLN_modulation` last-linear is also zero-init, so
+at step 0 the model behaves exactly like a stack of residual no-ops on
+top of the input embedding.
+
+### Robot CNN K/V projections
+
+```
+  robot_tokens (B, 3·R, h)
+       │
+       ▼
+  robot_ca_norm (RMSNorm)
+       │
+       ├─────────────────────────────────────┐
+       ▼                                     ▼
+  robot_ca_k_proj                        robot_ca_v_proj
+  Linear(h → kv_heads·head_dim)          Linear(h → kv_heads·head_dim)
+       │                                     │
+       ▼                                     ▼
+  reshape → (B, kv_heads, 3·R, head_dim)    same
+       │                                     │
+       └──────────► robot_k, robot_v ────────┘
+                    passed to every DiT layer's Robot cross-attn
+```
 
 ### DiT stack and readout
 
@@ -198,10 +230,14 @@ behaves exactly like a stack of residual no-ops on top of the input embedding.
        ▼
   ┌──────────────────────────────────────────────┐
   │ DiTLayer 0  ── cross-attn → kv_cache[0]      │
+  │            ── robot-ca  → robot_k, robot_v   │  ← NEW
   │ DiTLayer 1  ── cross-attn → kv_cache[1]      │
+  │            ── robot-ca  → robot_k, robot_v   │  ← NEW
   │ DiTLayer 2  ── cross-attn → kv_cache[2]      │
+  │            ── robot-ca  → robot_k, robot_v   │  ← NEW
   │     …                                        │
   │ DiTLayer N-1 ── cross-attn → kv_cache[N-1]   │
+  │             ── robot-ca → robot_k, robot_v   │  ← NEW
   └──────────────────────┬───────────────────────┘
                          ▼
               slice rows [action_start : action_start + H]
@@ -265,12 +301,15 @@ velocities for different task instructions ("language forcing").
 | `lang_adaptor`           | ✅        | Zero-init residual on language embeddings        |
 | `state_encoder`          | ✅        | Linear + RMSNorm                                 |
 | `robot_visual_encoder`   | ✅        | Parallel ResNet-18 per camera                    |
+| `robot_ca_k_proj`        | ✅        | **NEW** Robot CNN → K projection for cross-attn  |
+| `robot_ca_v_proj`        | ✅        | **NEW** Robot CNN → V projection for cross-attn  |
+| `robot_ca_norm`          | ✅        | **NEW** RMSNorm before Robot K/V projection      |
 | `sink_token`             | ✅        | Single learnable token, attention anchor         |
 | `action_in_proj`         | ✅        | Linear: action_dim → h                           |
 | `action_pos_emb`         | ✅        | Learned position embedding for action positions  |
 | `time_embedder`          | ✅        | Sinusoidal → MLP → t_emb for adaLN               |
-| `latent_generator`       | ✅        | Pooled language → K thought tokens (zero-init)   |
-| `dit_layers` × N         | ✅        | Self-attn + cross-attn + FFN + adaLN-Zero        |
+| `latent_generator`       | ✅        | **DISABLED** (num_latent_tokens=0)               |
+| `dit_layers` × N         | ✅        | Self-attn + VLM cross-attn + **Robot cross-attn** + FFN + adaLN-Zero |
 | `final_norm`             | ✅        | RMSNorm before readout                           |
 | `action_out_proj`        | ✅        | Linear: h → action_dim (zero-init)               |
 
@@ -287,8 +326,8 @@ velocities for different task instructions ("language forcing").
 | `L_vlm` | `L_vis + L_lang`                              | —       |
 | `M`     | total SmolVLM2 text layers                    | depends |
 | `N`     | DiT depth = `config.num_vlm_layers`           | 16      |
-| `R`     | tokens per robot CNN view                     | 16      |
-| `K`     | latent thought tokens                         | 8       |
+| `R`     | tokens per robot CNN view                     | 100     |
+| `K`     | latent thought tokens                         | **0**   |
 | `P`     | action prefix length (0 in synchronous mode)  | 0       |
 
 
@@ -303,4 +342,53 @@ velocities for different task instructions ("language forcing").
 | Time conditioning              | fused into emb   | adaLN-Zero       | **adaLN-Zero**    |
 | Action position in DiT seq     | n/a              | last             | **last**          |
 | Contrastive loss path          | full re-forward  | KV permute       | **KV permute**    |
+| Robot CNN cross-attn           | n/a (joint)      | no               | **yes (NEW)**     |
+| Latent tokens                  | yes (dynamic)    | yes              | **no (disabled)** |
 | GPU memory (relative)          | high             | very high        | low               |
+
+
+## Robot CNN Cross-Attention Detail
+
+### Why Robot CNN cross-attention?
+
+The VLM's SigLIP ViT produces ~729 patches at 384×384 resolution — each patch
+covers ~16×16 pixels. For spatial reasoning tasks like "pick up the bowl closer
+to the plate", this coarse resolution is insufficient: the model learns to go
+to the geometric midpoint between landmarks rather than the actual object position.
+
+Robot CNN (ResNet-18) produces a 14×14 feature map at 224×224 — each token
+covers ~16×16 pixels but with **much finer spatial structure** because:
+1. ResNet preserves spatial locality through convolutions (vs ViT's global attention)
+2. The feature map is directly projected to K/V without going through VLM's connector
+3. Action queries can attend to specific spatial locations without VLM's abstraction
+
+### Architecture change
+
+**Before** (3 sublayers per DiT layer):
+```
+self-attn → VLM cross-attn → FFN
+adaLN: 9 vectors (3 × 3)
+```
+
+**After** (4 sublayers per DiT layer):
+```
+self-attn → VLM cross-attn → Robot cross-attn → FFN
+adaLN: 12 vectors (4 × 3)
+```
+
+### Parameter cost
+
+Per DiT layer:
+- `robot_ca_q`: Linear(960 → 960) = 921K params
+- `robot_ca_o`: Linear(960 → 960) = 921K params
+- `robot_ca_norm`: RMSNorm(960) = 960 params
+- `robot_ca_k_proj` (shared): Linear(960 → 960) = 921K params
+- `robot_ca_v_proj` (shared): Linear(960 → 960) = 921K params
+
+Total: ~59M additional params across 16 DiT layers + shared projections.
+
+### Compatibility
+
+**NOT compatible with old checkpoints** — the adaLN modulation dimension changes
+from 9×960=8640 to 12×960=11520, and new projection layers are added. Must
+train from scratch or fine-tune with shape-matched weight loading.
