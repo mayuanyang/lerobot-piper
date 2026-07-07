@@ -131,54 +131,33 @@ class WilroConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-6
     scheduler_warmup_steps: int = 1500
 
-    # -------- Robot visual encoder --------
-    # Source of high-resolution spatial features for Robot CA:
-    #   "resnet"  — parallel ResNet-18 (ImageNet pretrained, trainable).
-    #               256-dim features projected to d_model. No language alignment.
-    #   "vlm_vision" — reuse VLM's SigLIP ViT intermediate hidden states.
-    #               Features are naturally language-vision aligned (SigLIP
-    #               contrastive pretraining). No extra model, no extra params.
-    #               The layer index is controlled by robot_vlm_layer_offset.
-    robot_encoder_source: str = "vlm_vision"
-    robot_encoder_tokens: int = 100
-    robot_encoder_input_size: int = 224
-    use_robot_cnn: bool = True
-    # Give one camera a denser token grid than the rest. The gripper / wrist
-    # view drives close-range placement precision, so a finer grid there buys
-    # spatial detail where it matters. Shares the same backbone (no extra
-    # params — only the pooling grid differs). Must be a perfect square. Set
-    # equal to robot_encoder_tokens to disable the per-camera difference.
-    gripper_camera: str = "observation.images.gripper"
-    gripper_encoder_tokens: int = 100
-    # When robot_encoder_source="vlm_vision", this controls which intermediate
-    # layer's hidden state is used. -1 = last layer (most semantic, coarsest),
-    # -2 = second-to-last, -3 = third-to-last (more spatial detail).
-    # SigLIP ViT has ~27 layers in SmolVLM2-500M. -3 typically gives the best
-    # trade-off between spatial resolution and semantic richness.
+    # -------- Robot visual cross-attention (spatial grounding) --------
+    # Robot CA uses intermediate hidden states from the VLM's own SigLIP ViT
+    # encoder (with LoRA adapters for robot-domain adaptation). No separate
+    # ResNet model — features are extracted during the VLM forward pass, with
+    # natural language-vision alignment from SigLIP's contrastive pretraining.
+    #
+    # When True, each DiT layer has an ADDITIONAL cross-attention sublayer
+    # where action queries attend directly to high-resolution SigLIP features
+    # (~729 tokens @ 384x384). This provides fine-grained spatial grounding
+    # for precise object localization in spatial reasoning tasks.
+    #
+    # Architecture:
+    #   - DiT layer: self-attn + VLM cross-attn + Robot cross-attn + FFN
+    #   - adaLN-Zero: 12 modulation vectors (4 sublayers × 3) vs 9 (3 × 3)
+    #   - Additional params: robot_ca_q/k/v/o_proj per DiT layer
+    #   - Robot features from SigLIP ViT intermediate layer (layer_offset)
+    use_robot_ca: bool = True
+    # Which intermediate layer of SigLIP ViT to use for Robot CA features.
+    # -1 = last layer (most semantic), -3 = third-to-last (more spatial detail).
+    # SigLIP ViT has ~27 layers in SmolVLM2-500M. -3 gives the best trade-off
+    # between spatial resolution and semantic richness.
     robot_vlm_layer_offset: int = -3
 
     # -------- Latent "thought" tokens --------
     # Task-conditional latent tokens generated from pooled language.
     # 0 disables (no latent tokens in DiT sequence).
     num_latent_tokens: int = 0
-
-    # -------- Robot CNN cross-attention (spatial grounding) --------
-    # When True, each DiT layer has an ADDITIONAL cross-attention sublayer
-    # where action queries attend directly to Robot CNN's high-resolution
-    # feature map (14x14 grid @ 224x224). This provides fine-grained spatial
-    # grounding beyond VLM's coarse SigLIP patches (~729 patches @ 384x384).
-    # Critical for precise object localization in spatial reasoning tasks
-    # (e.g., "pick up the bowl closer to the plate" where the bowl is not
-    # exactly at the geometric midpoint).
-    #
-    # Architecture change:
-    #   - DiT layer: self-attn + VLM cross-attn + Robot cross-attn + FFN
-    #   - adaLN-Zero: 12 modulation vectors (4 sublayers × 3) vs 9 (3 × 3)
-    #   - Additional params: robot_ca_q/k/v/o_proj per DiT layer
-    #   - Robot tokens are projected to K/V format matching DiT's cross-attn
-    #
-    # Requires use_robot_cnn=True (RobotVisualEncoder must be active).
-    use_robot_ca: bool = True
 
     # -------- Vision token dropout (regularizer) --------
     vision_dropout_prob: float = 0.15
@@ -200,12 +179,17 @@ class WilroConfig(PreTrainedConfig):
     # and language signals. (paper Fig 4)
     lambda_mask_window: int = 3
 
-    # -------- LoRA (vision; text stays frozen — single-task) --------
+    # -------- LoRA (SigLIP ViT vision; text stays frozen — single-task) --------
+    # LoRA adapters on the last N layers of SigLIP ViT enable the vision
+    # encoder to adapt to robot-domain features (gripper aperture, object
+    # distance, contact state) while preserving SigLIP's contrastive
+    # language-vision alignment. Base weights stay frozen; only LoRA params
+    # are trainable (~2-5M params for rank=16, 5 layers).
     lora_rank: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
     lora_target_modules: list = field(default_factory=lambda: ["q_proj", "v_proj"])
-    vision_lora_num_layers: int = 0
+    vision_lora_num_layers: int = 5  # Last 5 layers of SigLIP ViT get LoRA
 
     # -------- Resume bookkeeping --------
     training_step: int = 0

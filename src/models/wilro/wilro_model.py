@@ -40,7 +40,71 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 
 from .wilro_config import WilroConfig
 from ..interleaved_flow_matching.expert_layer import RMSNorm, SwiGLU
-from ..transformer_flow_matching.robot_visual_encoder import RobotVisualEncoder
+
+
+# ---------------------------------------------------------------------------
+# LoRA adapter for SigLIP ViT layers (trainable vision adaptation)
+# ---------------------------------------------------------------------------
+
+class LoRALinear(nn.Module):
+    """LoRA adapter wrapping a frozen nn.Linear.
+
+    W (frozen) + B @ A (trainable, rank r)
+    Forward: x @ W^T + (x @ A^T) @ B^T * (alpha / r)
+    """
+    def __init__(self, base: nn.Linear, rank: int = 8, alpha: float = 16.0):
+        super().__init__()
+        self.base = base  # frozen original
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+
+        in_dim = base.in_features
+        out_dim = base.out_features
+
+        # LoRA A: (rank, in_dim) — init with normal
+        self.lora_A = nn.Parameter(torch.randn(rank, in_dim) * 0.02)
+        # LoRA B: (out_dim, rank) — init with zero (so adapter starts as identity)
+        self.lora_B = nn.Parameter(torch.zeros(out_dim, rank))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Base forward (frozen)
+        base_out = self.base(x)
+        # LoRA: x @ A^T @ B^T * scaling
+        lora_out = (x @ self.lora_A.T) @ self.lora_B.T * self.scaling
+        return base_out + lora_out
+
+
+def apply_lora_to_vision_layers(
+    vision_model,
+    num_layers: int,
+    rank: int = 8,
+    alpha: float = 16.0,
+) -> int:
+    """Apply LoRA adapters to the last `num_layers` of a SigLIP ViT encoder.
+
+    Modifies vision_model.encoder.layers in-place, wrapping q_proj and v_proj
+    with LoRALinear adapters. Base weights are frozen; LoRA params are trainable.
+
+    Returns the number of trainable parameters added.
+    """
+    encoder_layers = vision_model.encoder.layers
+    total_layers = len(encoder_layers)
+    start_idx = max(0, total_layers - num_layers)
+
+    trainable_params = 0
+    for i in range(start_idx, total_layers):
+        layer = encoder_layers[i]
+        # Wrap q_proj and v_proj with LoRA
+        for name in ["q_proj", "v_proj"]:
+            original = getattr(layer.self_attn, name)
+            if isinstance(original, LoRALinear):
+                continue  # already wrapped
+            lora = LoRALinear(original, rank=rank, alpha=alpha)
+            setattr(layer.self_attn, name, lora)
+            trainable_params += lora.lora_A.numel() + lora.lora_B.numel()
+
+    return trainable_params
 
 
 # ---------------------------------------------------------------------------
@@ -364,12 +428,34 @@ class WilroTransformer(nn.Module):
             print(f"[wilro] forcing d_model {config.d_model} → {self.hidden_size} to match VLM")
             config.d_model = self.hidden_size
 
-        # Freeze VLM
+        # Freeze VLM components (base weights only — LoRA adapters stay trainable)
         for component in (self.vision_model, self.connector, self.text_model):
             for p in component.parameters():
                 p.requires_grad = False
             component.eval()
         del vlm
+
+        # ── Apply LoRA to SigLIP ViT last layers for trainable vision ──────
+        # The vision encoder's base weights stay frozen, but LoRA adapters on
+        # the last N layers allow the model to adapt visual features to the
+        # robot domain (gripper aperture, object distance, contact state).
+        # SigLIP's contrastive pretraining provides natural language-vision
+        # alignment; LoRA adds robot-specific adaptation.
+        vision_lora_layers = getattr(config, "vision_lora_num_layers", 5)
+        vision_lora_rank = getattr(config, "lora_rank", 16)
+        vision_lora_alpha = getattr(config, "lora_alpha", 32)
+        if vision_lora_layers > 0:
+            lora_params = apply_lora_to_vision_layers(
+                self.vision_model,
+                num_layers=vision_lora_layers,
+                rank=vision_lora_rank,
+                alpha=vision_lora_alpha,
+            )
+            print(f"[wilro] SigLIP ViT LoRA: {vision_lora_layers} layers, "
+                  f"rank={vision_lora_rank}, alpha={vision_lora_alpha}, "
+                  f"{lora_params:,} trainable params")
+        else:
+            print("[wilro] SigLIP ViT LoRA: disabled (vision_lora_num_layers=0)")
 
         # ─────────────────────────────────────────────────────────────
         # 2. DiT (trainable) — N layers cross-attending to last N VLM KV pairs
@@ -483,31 +569,17 @@ class WilroTransformer(nn.Module):
         )
 
         # ─────────────────────────────────────────────────────────────
-        # 4. Robot visual encoder (parallel high-res spatial path)
+        # 4. Robot visual features from SigLIP ViT intermediate layers
         # ─────────────────────────────────────────────────────────────
-        self.robot_encoder_source = getattr(config, "robot_encoder_source", "resnet")
-        if config.use_robot_cnn:
-            if self.robot_encoder_source == "resnet":
-                self.robot_visual_encoder = RobotVisualEncoder(
-                    input_size=config.robot_encoder_input_size,
-                    out_tokens=config.robot_encoder_tokens,
-                    out_dim=self.hidden_size,
-                )
-                print("[wilro] Robot encoder: ResNet-18 (ImageNet pretrained, trainable)")
-            elif self.robot_encoder_source == "vlm_vision":
-                # Reuse VLM's SigLIP ViT intermediate hidden states.
-                # No extra model needed — features extracted during VLM forward.
-                self.robot_visual_encoder = None
-                layer_offset = getattr(config, "robot_vlm_layer_offset", -3)
-                print(f"[wilro] Robot encoder: VLM Vision intermediate layer "
-                      f"(offset={layer_offset}, SigLIP features, language-aligned)")
-            else:
-                raise ValueError(f"Unknown robot_encoder_source: {self.robot_encoder_source!r}. "
-                                 f"Expected 'resnet' or 'vlm_vision'.")
-        else:
-            self.robot_visual_encoder = None
-            self.robot_encoder_source = "none"
-            print("[wilro] use_robot_cnn=False — Robot visual encoder disabled")
+        # Robot CA uses intermediate hidden states from the VLM's own SigLIP
+        # ViT encoder (with LoRA adapters for robot-domain adaptation).
+        # No separate ResNet model — features are extracted during the VLM
+        # forward pass, with natural language-vision alignment from SigLIP's
+        # contrastive pretraining.
+        self.robot_vlm_layer_offset = getattr(config, "robot_vlm_layer_offset", -3)
+        if self.use_robot_ca:
+            print(f"[wilro] Robot CA: SigLIP ViT intermediate layer "
+                  f"(offset={self.robot_vlm_layer_offset}, LoRA-adapted, language-aligned)")
 
         # ─────────────────────────────────────────────────────────────
         # 5. Latent "thought" tokens — task-conditional, zero-init output
@@ -543,11 +615,14 @@ class WilroTransformer(nn.Module):
         self._last_cross_attention_stats: Optional[dict] = None
 
     # =========================================================================
-    # Keep frozen components in eval mode
+    # Train mode: LoRA adapters need grad, frozen base stays in eval
     # =========================================================================
     def train(self, mode: bool = True):
         super().train(mode)
-        self.vision_model.eval()
+        # Vision model: base weights frozen (eval), but LoRA adapters need train
+        # mode for dropout/BN. We set the whole model to train mode so LoRA
+        # adapters receive gradients, but the frozen base params don't update.
+        # Connector and text model stay fully frozen.
         self.connector.eval()
         self.text_model.eval()
         return self
@@ -676,15 +751,15 @@ class WilroTransformer(nn.Module):
           lang_embeddings: (B, L_lang, H) — VLM-processed language embeddings
                            from final hidden state (for DiT sequence injection).
           robot_features:  (B, L_vis, H) — intermediate vision features for
-                           Robot CA (only when robot_encoder_source="vlm_vision",
-                           else None). These are SigLIP features that are
-                           naturally language-vision aligned.
+                           Robot CA from SigLIP ViT (with LoRA adaptation).
+                           These features are naturally language-vision aligned
+                           through SigLIP's contrastive pretraining.
         """
         B = batch["observation.state"].shape[0]
         device = batch["observation.state"].device
 
-        # Extract intermediate features when using VLM vision as Robot CA source
-        need_intermediate = (self.robot_encoder_source == "vlm_vision" and self.use_robot_ca)
+        # Extract intermediate features for Robot CA (SigLIP ViT intermediate layers)
+        need_intermediate = self.use_robot_ca
         vis_tokens, intermediate_features = self._encode_images(batch, B, return_intermediate=need_intermediate)
         L_vis = vis_tokens.shape[1]
 
@@ -790,48 +865,20 @@ class WilroTransformer(nn.Module):
     # =========================================================================
     def _compute_robot_tokens(
         self,
-        batch: dict,
-        vlm_robot_features: Optional[torch.Tensor] = None,
+        vlm_robot_features: Optional[torch.Tensor],
     ) -> Optional[torch.Tensor]:
-        """Compute robot visual tokens for DiT sequence and Robot CA.
+        """Compute robot visual tokens from SigLIP ViT intermediate features.
 
         Args:
-            batch: input batch (used for ResNet source)
             vlm_robot_features: pre-extracted VLM vision intermediate features
-                (used when robot_encoder_source="vlm_vision")
+                from SigLIP ViT (with LoRA adaptation)
 
         Returns:
             robot_tokens: (B, R, hidden_size) — robot visual tokens
         """
-        # VLM vision source: use pre-extracted intermediate features directly
-        if self.robot_encoder_source == "vlm_vision" and vlm_robot_features is not None:
-            toks = vlm_robot_features
-            vp = float(getattr(self.config, "vision_dropout_prob", 0.0)) if self.training else 0.0
-            if vp > 0:
-                B, R, _ = toks.shape
-                keep = torch.rand(B, R, device=toks.device) > vp
-                toks = toks * keep.unsqueeze(-1).to(toks.dtype)
-            return toks
-
-        # ResNet source: use parallel ResNet-18 encoder
-        if self.robot_visual_encoder is None:
+        if vlm_robot_features is None:
             return None
-        toks_list = []
-        for cam_key in self.config.cameras_for_vision_state_concat:
-            if cam_key not in batch:
-                continue
-            img = batch[cam_key]
-            if img.dim() == 5:
-                img = img[:, -1]
-            n_tok = (
-                self.config.gripper_encoder_tokens
-                if cam_key == self.config.gripper_camera
-                else self.config.robot_encoder_tokens
-            )
-            toks_list.append(self.robot_visual_encoder(img.float(), out_tokens=n_tok))
-        if not toks_list:
-            return None
-        toks = torch.cat(toks_list, dim=1)
+        toks = vlm_robot_features
         vp = float(getattr(self.config, "vision_dropout_prob", 0.0)) if self.training else 0.0
         if vp > 0:
             B, R, _ = toks.shape
@@ -1227,7 +1274,7 @@ class WilroTransformer(nn.Module):
          lang_embeddings, robot_features) = self._run_vlm_and_cache_kv(batch)
 
         # ── DiT-side conditioning that does NOT depend on noise ─────
-        robot_tokens = self._compute_robot_tokens(batch, vlm_robot_features=robot_features)
+        robot_tokens = self._compute_robot_tokens(robot_features)
         latents = self._generate_latents(batch, B, device, torch.bfloat16)
 
         # ── Action prefix for async execution training ──────────────
@@ -1410,7 +1457,7 @@ class WilroTransformer(nn.Module):
         with autocast_ctx:
             (kv_cache, vlm_kv_pad_mask, L_vis, L_lang,
              lang_embeddings, robot_features) = self._run_vlm_and_cache_kv(batch)
-            robot_tokens = self._compute_robot_tokens(batch, vlm_robot_features=robot_features)
+            robot_tokens = self._compute_robot_tokens(robot_features)
             latents = self._generate_latents(batch, B, device, torch.bfloat16)
 
             N = int(getattr(self.config, "num_inference_steps", 10))
@@ -1440,7 +1487,7 @@ class WilroTransformer(nn.Module):
         with autocast_ctx:
             (kv_cache, vlm_kv_pad_mask, L_vis, L_lang,
              lang_embeddings, robot_features) = self._run_vlm_and_cache_kv(batch)
-            robot_tokens = self._compute_robot_tokens(batch, vlm_robot_features=robot_features)
+            robot_tokens = self._compute_robot_tokens(robot_features)
             latents = self._generate_latents(batch, B, device, torch.bfloat16)
 
             N = int(getattr(self.config, "num_inference_steps", 10))
