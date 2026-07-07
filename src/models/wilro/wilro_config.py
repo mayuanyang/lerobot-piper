@@ -131,17 +131,31 @@ class WilroConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-6
     scheduler_warmup_steps: int = 1500
 
-    # -------- Robot visual encoder (parallel ResNet-18) --------
+    # -------- Robot visual encoder --------
+    # Source of high-resolution spatial features for Robot CA:
+    #   "resnet"  — parallel ResNet-18 (ImageNet pretrained, trainable).
+    #               256-dim features projected to d_model. No language alignment.
+    #   "vlm_vision" — reuse VLM's SigLIP ViT intermediate hidden states.
+    #               Features are naturally language-vision aligned (SigLIP
+    #               contrastive pretraining). No extra model, no extra params.
+    #               The layer index is controlled by robot_vlm_layer_offset.
+    robot_encoder_source: str = "vlm_vision"
     robot_encoder_tokens: int = 100
     robot_encoder_input_size: int = 224
     use_robot_cnn: bool = True
     # Give one camera a denser token grid than the rest. The gripper / wrist
     # view drives close-range placement precision, so a finer grid there buys
-    # spatial detail where it matters. Shares the same ResNet backbone (no extra
+    # spatial detail where it matters. Shares the same backbone (no extra
     # params — only the pooling grid differs). Must be a perfect square. Set
     # equal to robot_encoder_tokens to disable the per-camera difference.
     gripper_camera: str = "observation.images.gripper"
     gripper_encoder_tokens: int = 100
+    # When robot_encoder_source="vlm_vision", this controls which intermediate
+    # layer's hidden state is used. -1 = last layer (most semantic, coarsest),
+    # -2 = second-to-last, -3 = third-to-last (more spatial detail).
+    # SigLIP ViT has ~27 layers in SmolVLM2-500M. -3 typically gives the best
+    # trade-off between spatial resolution and semantic richness.
+    robot_vlm_layer_offset: int = -3
 
     # -------- Latent "thought" tokens --------
     # Task-conditional latent tokens generated from pooled language.

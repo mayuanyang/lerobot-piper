@@ -483,17 +483,31 @@ class WilroTransformer(nn.Module):
         )
 
         # ─────────────────────────────────────────────────────────────
-        # 4. Robot CNN (optional parallel visual path)
+        # 4. Robot visual encoder (parallel high-res spatial path)
         # ─────────────────────────────────────────────────────────────
+        self.robot_encoder_source = getattr(config, "robot_encoder_source", "resnet")
         if config.use_robot_cnn:
-            self.robot_visual_encoder = RobotVisualEncoder(
-                input_size=config.robot_encoder_input_size,
-                out_tokens=config.robot_encoder_tokens,
-                out_dim=self.hidden_size,
-            )
+            if self.robot_encoder_source == "resnet":
+                self.robot_visual_encoder = RobotVisualEncoder(
+                    input_size=config.robot_encoder_input_size,
+                    out_tokens=config.robot_encoder_tokens,
+                    out_dim=self.hidden_size,
+                )
+                print("[wilro] Robot encoder: ResNet-18 (ImageNet pretrained, trainable)")
+            elif self.robot_encoder_source == "vlm_vision":
+                # Reuse VLM's SigLIP ViT intermediate hidden states.
+                # No extra model needed — features extracted during VLM forward.
+                self.robot_visual_encoder = None
+                layer_offset = getattr(config, "robot_vlm_layer_offset", -3)
+                print(f"[wilro] Robot encoder: VLM Vision intermediate layer "
+                      f"(offset={layer_offset}, SigLIP features, language-aligned)")
+            else:
+                raise ValueError(f"Unknown robot_encoder_source: {self.robot_encoder_source!r}. "
+                                 f"Expected 'resnet' or 'vlm_vision'.")
         else:
             self.robot_visual_encoder = None
-            print("[wilro] use_robot_cnn=False — RobotVisualEncoder disabled")
+            self.robot_encoder_source = "none"
+            print("[wilro] use_robot_cnn=False — Robot visual encoder disabled")
 
         # ─────────────────────────────────────────────────────────────
         # 5. Latent "thought" tokens — task-conditional, zero-init output
@@ -551,9 +565,33 @@ class WilroTransformer(nn.Module):
     # =========================================================================
     # Vision / language encoding (no gradient, frozen VLM components)
     # =========================================================================
-    def _encode_images(self, batch: dict, B: int) -> torch.Tensor:
+    def _encode_images(
+        self,
+        batch: dict,
+        B: int,
+        return_intermediate: bool = False,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Encode images through VLM vision encoder.
+
+        Args:
+            batch: input batch with camera images
+            B: batch size
+            return_intermediate: if True, also return intermediate hidden states
+                from the vision encoder (for VLM-vision Robot CA source)
+
+        Returns:
+            vis_tokens: (B, L_vis, hidden_size) — connector-projected vision tokens
+                for VLM text input
+            intermediate_features: (B, L_vis, hidden_size) — intermediate layer
+                features from vision encoder (only if return_intermediate=True,
+                else None). These are SigLIP features that are naturally
+                language-vision aligned.
+        """
         vlm_dtype = next(self.vision_model.parameters()).dtype
+        layer_offset = getattr(self.config, "robot_vlm_layer_offset", -3)
         all_vis: list[torch.Tensor] = []
+        all_intermediate: list[torch.Tensor] = []
+
         for cam_key in self.config.cameras_for_vision_state_concat:
             if cam_key not in batch:
                 continue
@@ -576,13 +614,33 @@ class WilroTransformer(nn.Module):
             else:
                 img = img.to(vlm_dtype)
 
-            vis_hidden = self.vision_model(pixel_values=img).last_hidden_state
+            # Forward through vision encoder
+            if return_intermediate:
+                vis_output = self.vision_model(
+                    pixel_values=img, output_hidden_states=True
+                )
+                vis_hidden = vis_output.last_hidden_state
+                # Extract intermediate layer features (before connector)
+                # hidden_states[0] = embedding output, hidden_states[1..N] = layer outputs
+                # layer_offset=-3 means third-to-last transformer layer
+                intermediate = vis_output.hidden_states[layer_offset]
+                # Project intermediate features through connector to match text dim
+                intermediate_proj = self.connector(intermediate)
+                all_intermediate.append(intermediate_proj)
+            else:
+                vis_hidden = self.vision_model(pixel_values=img).last_hidden_state
+
             vis_tokens = self.connector(vis_hidden)
             all_vis.append(vis_tokens)
+
         if not all_vis:
             device = batch["observation.state"].device
-            return torch.zeros(B, 0, self.hidden_size, device=device, dtype=torch.bfloat16)
-        return torch.cat(all_vis, dim=1)
+            empty = torch.zeros(B, 0, self.hidden_size, device=device, dtype=torch.bfloat16)
+            return empty, None
+
+        vis_tokens = torch.cat(all_vis, dim=1)
+        intermediate_features = torch.cat(all_intermediate, dim=1) if all_intermediate else None
+        return vis_tokens, intermediate_features
 
     def _encode_language(self, batch: dict, device: torch.device) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         descs = batch.get("task_description")
@@ -605,7 +663,8 @@ class WilroTransformer(nn.Module):
     @torch.no_grad()
     def _run_vlm_and_cache_kv(
         self, batch: dict,
-    ) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor, int, int]:
+    ) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor, int, int,
+               Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Returns:
           kv_cache:        list of length num_dit_layers, each entry is (K, V)
@@ -614,11 +673,19 @@ class WilroTransformer(nn.Module):
           vlm_kv_pad_mask: (B, L_vlm) bool — True at non-padded positions.
           L_vis:           number of vision tokens.
           L_lang:          number of language tokens.
+          lang_embeddings: (B, L_lang, H) — VLM-processed language embeddings
+                           from final hidden state (for DiT sequence injection).
+          robot_features:  (B, L_vis, H) — intermediate vision features for
+                           Robot CA (only when robot_encoder_source="vlm_vision",
+                           else None). These are SigLIP features that are
+                           naturally language-vision aligned.
         """
         B = batch["observation.state"].shape[0]
         device = batch["observation.state"].device
 
-        vis_tokens = self._encode_images(batch, B)
+        # Extract intermediate features when using VLM vision as Robot CA source
+        need_intermediate = (self.robot_encoder_source == "vlm_vision" and self.use_robot_ca)
+        vis_tokens, intermediate_features = self._encode_images(batch, B, return_intermediate=need_intermediate)
         L_vis = vis_tokens.shape[1]
 
         # Vision token dropout (regularizer). Disabled in eval / sampling.
@@ -716,12 +783,37 @@ class WilroTransformer(nn.Module):
         if L_lang > 0:
             lang_embeddings = hidden[:, L_vis:L_vis + L_lang].detach()
 
-        return kv_cache, vlm_kv_pad_mask, L_vis, L_lang, lang_embeddings
+        return kv_cache, vlm_kv_pad_mask, L_vis, L_lang, lang_embeddings, intermediate_features
 
     # =========================================================================
     # DiT-side helpers: robot CNN, latents, time, input assembly
     # =========================================================================
-    def _compute_robot_tokens(self, batch: dict) -> Optional[torch.Tensor]:
+    def _compute_robot_tokens(
+        self,
+        batch: dict,
+        vlm_robot_features: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Compute robot visual tokens for DiT sequence and Robot CA.
+
+        Args:
+            batch: input batch (used for ResNet source)
+            vlm_robot_features: pre-extracted VLM vision intermediate features
+                (used when robot_encoder_source="vlm_vision")
+
+        Returns:
+            robot_tokens: (B, R, hidden_size) — robot visual tokens
+        """
+        # VLM vision source: use pre-extracted intermediate features directly
+        if self.robot_encoder_source == "vlm_vision" and vlm_robot_features is not None:
+            toks = vlm_robot_features
+            vp = float(getattr(self.config, "vision_dropout_prob", 0.0)) if self.training else 0.0
+            if vp > 0:
+                B, R, _ = toks.shape
+                keep = torch.rand(B, R, device=toks.device) > vp
+                toks = toks * keep.unsqueeze(-1).to(toks.dtype)
+            return toks
+
+        # ResNet source: use parallel ResNet-18 encoder
         if self.robot_visual_encoder is None:
             return None
         toks_list = []
@@ -1130,11 +1222,12 @@ class WilroTransformer(nn.Module):
         B = actions.shape[0]
         device = actions.device
 
-        # ── Encoder: run VLM once, cache KV + extract lang embeddings ──
-        kv_cache, vlm_kv_pad_mask, L_vis, L_lang, lang_embeddings = self._run_vlm_and_cache_kv(batch)
+        # ── Encoder: run VLM once, cache KV + extract lang + robot features ──
+        (kv_cache, vlm_kv_pad_mask, L_vis, L_lang,
+         lang_embeddings, robot_features) = self._run_vlm_and_cache_kv(batch)
 
         # ── DiT-side conditioning that does NOT depend on noise ─────
-        robot_tokens = self._compute_robot_tokens(batch)
+        robot_tokens = self._compute_robot_tokens(batch, vlm_robot_features=robot_features)
         latents = self._generate_latents(batch, B, device, torch.bfloat16)
 
         # ── Action prefix for async execution training ──────────────
@@ -1315,8 +1408,9 @@ class WilroTransformer(nn.Module):
         )
 
         with autocast_ctx:
-            kv_cache, vlm_kv_pad_mask, L_vis, L_lang, lang_embeddings = self._run_vlm_and_cache_kv(batch)
-            robot_tokens = self._compute_robot_tokens(batch)
+            (kv_cache, vlm_kv_pad_mask, L_vis, L_lang,
+             lang_embeddings, robot_features) = self._run_vlm_and_cache_kv(batch)
+            robot_tokens = self._compute_robot_tokens(batch, vlm_robot_features=robot_features)
             latents = self._generate_latents(batch, B, device, torch.bfloat16)
 
             N = int(getattr(self.config, "num_inference_steps", 10))
@@ -1344,8 +1438,9 @@ class WilroTransformer(nn.Module):
         )
 
         with autocast_ctx:
-            kv_cache, vlm_kv_pad_mask, L_vis, L_lang, lang_embeddings = self._run_vlm_and_cache_kv(batch)
-            robot_tokens = self._compute_robot_tokens(batch)
+            (kv_cache, vlm_kv_pad_mask, L_vis, L_lang,
+             lang_embeddings, robot_features) = self._run_vlm_and_cache_kv(batch)
+            robot_tokens = self._compute_robot_tokens(batch, vlm_robot_features=robot_features)
             latents = self._generate_latents(batch, B, device, torch.bfloat16)
 
             N = int(getattr(self.config, "num_inference_steps", 10))
