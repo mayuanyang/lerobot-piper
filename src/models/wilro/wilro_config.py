@@ -192,7 +192,7 @@ class WilroConfig(PreTrainedConfig):
     lora_dropout: float = 0.05
     lora_target_modules: list = field(default_factory=lambda: ["q_proj", "v_proj"])
     vision_lora_num_layers: int = 8  # Last 8 layers of SigLIP ViT get LoRA
-    text_lora_num_layers: int = 8    # Last 8 layers of text_model get LoRA (0=disable)
+    text_lora_num_layers: int = 0    # DISABLED — encoder-decoder requires detached VLM outputs
 
     # -------- Resume bookkeeping --------
     training_step: int = 0
