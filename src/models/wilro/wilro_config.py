@@ -179,17 +179,20 @@ class WilroConfig(PreTrainedConfig):
     # and language signals. (paper Fig 4)
     lambda_mask_window: int = 3
 
-    # -------- LoRA (SigLIP ViT vision; text stays frozen — single-task) --------
+    # -------- LoRA (SigLIP ViT vision + text_model) --------
     # LoRA adapters on the last N layers of SigLIP ViT enable the vision
     # encoder to adapt to robot-domain features (gripper aperture, object
     # distance, contact state) while preserving SigLIP's contrastive
-    # language-vision alignment. Base weights stay frozen; only LoRA params
-    # are trainable (~2-5M params for rank=16, 5 layers).
+    # language-vision alignment.
+    # LoRA adapters on text_model layers enable language adaptation for
+    # robot-specific instructions and spatial grounding.
+    # Base weights stay frozen; only LoRA params are trainable.
     lora_rank: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
     lora_target_modules: list = field(default_factory=lambda: ["q_proj", "v_proj"])
-    vision_lora_num_layers: int = 5  # Last 5 layers of SigLIP ViT get LoRA
+    vision_lora_num_layers: int = 8  # Last 8 layers of SigLIP ViT get LoRA
+    text_lora_num_layers: int = 8    # Last 8 layers of text_model get LoRA (0=disable)
 
     # -------- Resume bookkeeping --------
     training_step: int = 0

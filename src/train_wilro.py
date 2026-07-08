@@ -105,11 +105,10 @@ def _log_gradient_analysis(policy, step: int) -> None:
         return (total / count, count) if count > 0 else (None, 0)
 
     for label, prefix in [
-        ("Vision (frozen)",  "vision_model"),
+        ("Vision LoRA",      "vision_model.encoder.layers"),  # SigLIP ViT LoRA (trainable)
+        ("Text LoRA",        "text_model.layers"),            # Text model LoRA (trainable)
         ("Connector (frzn)", "connector"),
-        ("Text (frozen)",    "text_model"),
         ("State Enc",        "state_encoder"),
-        ("Robot CNN",        "robot_visual_encoder"),
         ("Robot CA K/V Proj","robot_ca_k_proj"),
         ("Robot CA V Proj",  "robot_ca_v_proj"),
         ("Robot CA Norm",    "robot_ca_norm"),
@@ -308,9 +307,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         contrastive_loss_weight=contrastive_loss_weight,
         contrastive_margin=contrastive_margin,
         contrastive_hard_negatives=contrastive_hard_negatives,
-        robot_encoder_tokens=robot_encoder_tokens,
-        gripper_encoder_tokens=gripper_encoder_tokens,
-        gripper_camera=gripper_camera,
         noise_temporal_correlation=noise_temporal_correlation,
         gripper_phase_weight=gripper_phase_weight,
         gripper_action_index=action_dim - 1,  # LIBERO OSC: gripper is the last dim
@@ -318,19 +314,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         time_lognormal_mean=time_lognormal_mean,
         time_lognormal_std=time_lognormal_std,
     )
-    gripper_active = cfg.gripper_camera in camera_keys
-    print(f"Robot CNN tokens: {robot_encoder_tokens} per cam "
-          f"({int(robot_encoder_tokens ** 0.5)}x{int(robot_encoder_tokens ** 0.5)} grid); "
-          f"gripper cam '{cfg.gripper_camera}': {gripper_encoder_tokens} "
-          f"({int(gripper_encoder_tokens ** 0.5)}x{int(gripper_encoder_tokens ** 0.5)} grid)")
-    if gripper_active:
-        print(f"  gripper grid ACTIVE on '{cfg.gripper_camera}' "
-              f"→ {gripper_encoder_tokens} tokens; other cams → {robot_encoder_tokens}.")
-    else:
-        print(f"  WARNING: gripper_camera '{cfg.gripper_camera}' matches NONE of "
-              f"{camera_keys} → gripper_encoder_tokens is INERT; every camera gets "
-              f"robot_encoder_tokens={robot_encoder_tokens}. Pass --gripper_camera "
-              f"<one of {camera_keys}> (the wrist view) to activate the dense grid.")
 
     # Model + checkpoint loading
     if resume_from_checkpoint is not None:

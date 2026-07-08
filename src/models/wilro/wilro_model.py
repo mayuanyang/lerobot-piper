@@ -107,6 +107,41 @@ def apply_lora_to_vision_layers(
     return trainable_params
 
 
+def apply_lora_to_text_layers(
+    text_model,
+    num_layers: int,
+    rank: int = 8,
+    alpha: float = 16.0,
+) -> int:
+    """Apply LoRA adapters to the last `num_layers` of a Llama-style text model.
+
+    Modifies text_model.layers in-place, wrapping q_proj and v_proj with
+    LoRALinear adapters. Base weights are frozen; LoRA params are trainable.
+
+    This enables the text encoder to adapt to robot-specific instructions
+    and spatial grounding while preserving the pretrained language model.
+
+    Returns the number of trainable parameters added.
+    """
+    layers = text_model.layers
+    total_layers = len(layers)
+    start_idx = max(0, total_layers - num_layers)
+
+    trainable_params = 0
+    for i in range(start_idx, total_layers):
+        layer = layers[i]
+        # Wrap q_proj and v_proj with LoRA
+        for name in ["q_proj", "v_proj"]:
+            original = getattr(layer.self_attn, name)
+            if isinstance(original, LoRALinear):
+                continue  # already wrapped
+            lora = LoRALinear(original, rank=rank, alpha=alpha)
+            setattr(layer.self_attn, name, lora)
+            trainable_params += lora.lora_A.numel() + lora.lora_B.numel()
+
+    return trainable_params
+
+
 # ---------------------------------------------------------------------------
 # Sinusoidal time embedding (flow matching)
 # ---------------------------------------------------------------------------
@@ -457,6 +492,28 @@ class WilroTransformer(nn.Module):
         else:
             print("[wilro] SigLIP ViT LoRA: disabled (vision_lora_num_layers=0)")
 
+        # ── Apply LoRA to text_model last layers for trainable language ────
+        # The text model's base weights stay frozen, but LoRA adapters on the
+        # last N layers allow adaptation to robot-specific instructions and
+        # spatial grounding (e.g., LIBERO's templated task descriptions).
+        # This enables the VLM encoder to produce better-conditioned KV caches
+        # for the DiT's cross-attention.
+        text_lora_layers = getattr(config, "text_lora_num_layers", 8)
+        text_lora_rank = getattr(config, "lora_rank", 16)
+        text_lora_alpha = getattr(config, "lora_alpha", 32)
+        if text_lora_layers > 0:
+            text_lora_params = apply_lora_to_text_layers(
+                self.text_model,
+                num_layers=text_lora_layers,
+                rank=text_lora_rank,
+                alpha=text_lora_alpha,
+            )
+            print(f"[wilro] Text model LoRA: {text_lora_layers} layers, "
+                  f"rank={text_lora_rank}, alpha={text_lora_alpha}, "
+                  f"{text_lora_params:,} trainable params")
+        else:
+            print("[wilro] Text model LoRA: disabled (text_lora_num_layers=0)")
+
         # ─────────────────────────────────────────────────────────────
         # 2. DiT (trainable) — N layers cross-attending to last N VLM KV pairs
         # ─────────────────────────────────────────────────────────────
@@ -622,9 +679,16 @@ class WilroTransformer(nn.Module):
         # Vision model: base weights frozen (eval), but LoRA adapters need train
         # mode for dropout/BN. We set the whole model to train mode so LoRA
         # adapters receive gradients, but the frozen base params don't update.
-        # Connector and text model stay fully frozen.
+        # Connector stays fully frozen.
         self.connector.eval()
-        self.text_model.eval()
+        # Text model: if text LoRA is enabled, keep it in train mode so LoRA
+        # adapters receive gradients. Base weights are frozen (requires_grad=False)
+        # so they won't update. If no text LoRA, keep it in eval mode.
+        text_lora_layers = getattr(self.config, "text_lora_num_layers", 0)
+        if text_lora_layers > 0:
+            self.text_model.train(mode)
+        else:
+            self.text_model.eval()
         return self
 
     def gradient_checkpointing_enable(self):
@@ -700,7 +764,9 @@ class WilroTransformer(nn.Module):
                 # layer_offset=-3 means third-to-last transformer layer
                 intermediate = vis_output.hidden_states[layer_offset]
                 # Project intermediate features through connector to match text dim
-                intermediate_proj = self.connector(intermediate)
+                # .contiguous() required: connector's pixel_shuffle uses .view() which
+                # fails on non-contiguous tensors (hidden_states may have stride gaps)
+                intermediate_proj = self.connector(intermediate.contiguous())
                 all_intermediate.append(intermediate_proj)
             else:
                 vis_hidden = self.vision_model(pixel_values=img).last_hidden_state
@@ -735,7 +801,10 @@ class WilroTransformer(nn.Module):
     # =========================================================================
     # VLM encoder: run all layers, cache K/V from the trailing num_dit_layers
     # =========================================================================
-    @torch.no_grad()
+    # NOTE: No @torch.no_grad() here — vision_model LoRA adapters need gradient
+    # flow through: loss → DiT → robot_tokens → intermediate_features → connector
+    # → vision_model (LoRA). The text_model portion runs under no_grad context
+    # below since KV caches are detached and text weights are frozen.
     def _run_vlm_and_cache_kv(
         self, batch: dict,
     ) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor, int, int,
@@ -812,51 +881,64 @@ class WilroTransformer(nn.Module):
             L_vlm, self.head_dim, self.rope_theta, device, vlm_seq.dtype,
         )
 
-        # Layer-by-layer forward, capturing K/V from the selected layers.
-        hidden = vlm_seq
-        kv_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+        # ── Text model forward ──────────────────────────────────────────────
+        # When text LoRA is enabled, we need gradient flow through text_model
+        # so LoRA adapters receive gradients. KV caches are NOT detached.
+        # When text LoRA is disabled, run under no_grad to save memory.
+        text_lora_enabled = getattr(self.config, "text_lora_num_layers", 0) > 0
+        text_ctx = nullcontext() if text_lora_enabled else torch.no_grad()
 
-        for i, layer in enumerate(self.text_model.layers):
-            residual = hidden
-            h_in = layer.input_layernorm(hidden)
+        with text_ctx:
+            hidden = vlm_seq
+            kv_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
 
-            Q = layer.self_attn.q_proj(h_in)
-            K = layer.self_attn.k_proj(h_in)
-            V = layer.self_attn.v_proj(h_in)
+            for i, layer in enumerate(self.text_model.layers):
+                residual = hidden
+                h_in = layer.input_layernorm(hidden)
 
-            Bn, Ln, _ = Q.shape
-            Q = Q.view(Bn, Ln, self.num_heads, self.head_dim).transpose(1, 2)
-            K = K.view(Bn, Ln, self.num_kv_heads, self.head_dim).transpose(1, 2)
-            V = V.view(Bn, Ln, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                Q = layer.self_attn.q_proj(h_in)
+                K = layer.self_attn.k_proj(h_in)
+                V = layer.self_attn.v_proj(h_in)
 
-            Q, K = _apply_rope(Q, K, cos, sin)
+                Bn, Ln, _ = Q.shape
+                Q = Q.view(Bn, Ln, self.num_heads, self.head_dim).transpose(1, 2)
+                K = K.view(Bn, Ln, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                V = V.view(Bn, Ln, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-            # Capture post-RoPE K and V for the DiT cross-attn memory.
-            if i in self._capture_set:
-                kv_cache.append((K.detach(), V.detach()))
+                Q, K = _apply_rope(Q, K, cos, sin)
 
-            if self.num_kv_heads != self.num_heads:
-                r = self.num_heads // self.num_kv_heads
-                K_x = K.repeat_interleave(r, dim=1)
-                V_x = V.repeat_interleave(r, dim=1)
-            else:
-                K_x, V_x = K, V
+                # Capture post-RoPE K and V for the DiT cross-attn memory.
+                # When text LoRA is enabled, keep gradient flow (no detach).
+                # When disabled, detach to break the graph (saves memory).
+                if i in self._capture_set:
+                    if text_lora_enabled:
+                        kv_cache.append((K, V))  # gradient flows to text LoRA
+                    else:
+                        kv_cache.append((K.detach(), V.detach()))
 
-            attn = F.scaled_dot_product_attention(Q, K_x, V_x, attn_mask=full_mask, is_causal=False)
-            attn = attn.transpose(1, 2).contiguous().view(Bn, Ln, self.num_heads * self.head_dim)
-            attn = layer.self_attn.o_proj(attn)
-            hidden = residual + attn
+                if self.num_kv_heads != self.num_heads:
+                    r = self.num_heads // self.num_kv_heads
+                    K_x = K.repeat_interleave(r, dim=1)
+                    V_x = V.repeat_interleave(r, dim=1)
+                else:
+                    K_x, V_x = K, V
 
-            residual = hidden
-            h_in = layer.post_attention_layernorm(hidden)
-            hidden = residual + layer.mlp(h_in)
+                attn = F.scaled_dot_product_attention(Q, K_x, V_x, attn_mask=full_mask, is_causal=False)
+                attn = attn.transpose(1, 2).contiguous().view(Bn, Ln, self.num_heads * self.head_dim)
+                attn = layer.self_attn.o_proj(attn)
+                hidden = residual + attn
 
-        # Extract VLM-processed language embeddings from the final hidden state.
-        # These are used as DiT sequence tokens so robot/action can self-attend
-        # to language directly (language grounding for Robot CNN features).
-        lang_embeddings = None
-        if L_lang > 0:
-            lang_embeddings = hidden[:, L_vis:L_vis + L_lang].detach()
+                residual = hidden
+                h_in = layer.post_attention_layernorm(hidden)
+                hidden = residual + layer.mlp(h_in)
+
+            # Extract VLM-processed language embeddings from the final hidden state.
+            # These are used as DiT sequence tokens so robot/action can self-attend
+            # to language directly (language grounding for Robot CNN features).
+            # Always detached — lang_tokens in DiT are conditioning, not targets.
+            lang_embeddings = None
+            if L_lang > 0:
+                lang_embeddings = hidden[:, L_vis:L_vis + L_lang].detach()
 
         return kv_cache, vlm_kv_pad_mask, L_vis, L_lang, lang_embeddings, intermediate_features
 
