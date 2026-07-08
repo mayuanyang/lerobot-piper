@@ -882,9 +882,14 @@ class WilroTransformer(nn.Module):
         )
 
         # ── Text model forward ──────────────────────────────────────────────
-        # When text LoRA is enabled, we need gradient flow through text_model
-        # so LoRA adapters receive gradients. KV caches are NOT detached.
-        # When text LoRA is disabled, run under no_grad to save memory.
+        # KV cache is ALWAYS detached for numerical stability. The gradient path
+        # through 16 DiT layers → cross-attn → KV cache → 8 text LoRA layers is
+        # too deep and causes gradient explosion (NaN).
+        #
+        # Text LoRA still receives gradients through lang_embeddings (NOT detached
+        # when text LoRA is enabled), which flows through DiT self-attention:
+        #   loss → DiT → self-attn(lang_tokens) → lang_embeddings → text_model LoRA
+        # This is a much shorter, more stable gradient path.
         text_lora_enabled = getattr(self.config, "text_lora_num_layers", 0) > 0
         text_ctx = nullcontext() if text_lora_enabled else torch.no_grad()
 
@@ -907,14 +912,9 @@ class WilroTransformer(nn.Module):
 
                 Q, K = _apply_rope(Q, K, cos, sin)
 
-                # Capture post-RoPE K and V for the DiT cross-attn memory.
-                # When text LoRA is enabled, keep gradient flow (no detach).
-                # When disabled, detach to break the graph (saves memory).
+                # KV cache ALWAYS detached — cross-attn gradient path is too deep.
                 if i in self._capture_set:
-                    if text_lora_enabled:
-                        kv_cache.append((K, V))  # gradient flows to text LoRA
-                    else:
-                        kv_cache.append((K.detach(), V.detach()))
+                    kv_cache.append((K.detach(), V.detach()))
 
                 if self.num_kv_heads != self.num_heads:
                     r = self.num_heads // self.num_kv_heads
@@ -935,10 +935,15 @@ class WilroTransformer(nn.Module):
             # Extract VLM-processed language embeddings from the final hidden state.
             # These are used as DiT sequence tokens so robot/action can self-attend
             # to language directly (language grounding for Robot CNN features).
-            # Always detached — lang_tokens in DiT are conditioning, not targets.
+            # When text LoRA is enabled, keep gradient flow through lang_embeddings
+            # (shorter, more stable path via DiT self-attention).
+            # When text LoRA is disabled, detach to save memory.
             lang_embeddings = None
             if L_lang > 0:
-                lang_embeddings = hidden[:, L_vis:L_vis + L_lang].detach()
+                if text_lora_enabled:
+                    lang_embeddings = hidden[:, L_vis:L_vis + L_lang]  # gradient flows to text LoRA
+                else:
+                    lang_embeddings = hidden[:, L_vis:L_vis + L_lang].detach()
 
         return kv_cache, vlm_kv_pad_mask, L_vis, L_lang, lang_embeddings, intermediate_features
 
