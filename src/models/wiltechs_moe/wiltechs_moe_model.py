@@ -1,0 +1,395 @@
+"""WiltechsMoE - Mixture-of-Experts encoder-decoder flow matching policy."""
+import math
+from contextlib import nullcontext
+from typing import Optional
+import numpy as np
+from PIL import Image
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+from .wiltechs_moe_config import WiltechsMoEConfig
+from ..wiltechs_vla.task_rewrites import rewrite_instruction
+from ..interleaved_flow_matching.expert_layer import RMSNorm, SwiGLU
+from ..transformer_flow_matching.robot_visual_encoder import RobotVisualEncoder
+from ..wiltechs_vla.wiltechs_vla_model import (
+    DiTLayer, LatentQFormer, create_sinusoidal_pos_embedding,
+    preprocess_camera_to_pixels, vlm_pixels_key, vlm_grid_key,
+    _apply_rope, _build_mrope_position_ids, _modulate, _hard_negative_perm,
+)
+
+class MoERouter(nn.Module):
+    def __init__(self, hidden_size, num_experts, temperature=1.0, top_k=0):
+        super().__init__()
+        self.num_experts = num_experts
+        self.temperature = temperature
+        self.top_k = top_k
+        self.router = nn.Sequential(
+            nn.Linear(4 * hidden_size, hidden_size), nn.SiLU(),
+            nn.Linear(hidden_size, num_experts))
+        nn.init.zeros_(self.router[-1].weight)
+        nn.init.zeros_(self.router[-1].bias)
+    def forward(self, state_emb, latent_emb, time_emb, action_emb):
+        B, H = state_emb.shape[0], state_emb.shape[-1]
+        latent_pool = latent_emb.mean(dim=1) if latent_emb is not None else torch.zeros(B, H, device=state_emb.device, dtype=state_emb.dtype)
+        action_pool = action_emb.mean(dim=1)
+        state_flat = state_emb.squeeze(1) if state_emb.dim() == 3 else state_emb
+        logits = self.router(torch.cat([state_flat, latent_pool, time_emb, action_pool], dim=-1)) / max(self.temperature, 1e-6)
+        if self.top_k > 0 and self.top_k < self.num_experts:
+            _, topk_idx = logits.topk(self.top_k, dim=-1)
+            mask = torch.zeros_like(logits).scatter_(-1, topk_idx, 1.0)
+            weights = F.softmax(logits, dim=-1) * mask
+            weights = weights / (weights.sum(dim=-1, keepdim=True).clamp(min=1e-8))
+        else:
+            weights = F.softmax(logits, dim=-1)
+        return weights, weights.mean(dim=0)
+
+class ExpertDecoder(nn.Module):
+    def __init__(self, hidden_size, num_layers, sa_num_heads, sa_num_kv_heads, sa_head_dim,
+                 ca_num_heads, ca_num_kv_heads, ca_head_dim, intermediate_size, rms_norm_eps=1e-5, dropout=0.1):
+        super().__init__()
+        self.num_layers = num_layers
+        self.layers = nn.ModuleList([
+            DiTLayer(hidden_size=hidden_size, sa_num_heads=sa_num_heads, sa_num_kv_heads=sa_num_kv_heads,
+                     sa_head_dim=sa_head_dim, ca_num_heads=ca_num_heads, ca_num_kv_heads=ca_num_kv_heads,
+                     ca_head_dim=ca_head_dim, intermediate_size=intermediate_size,
+                     rms_norm_eps=rms_norm_eps, dropout=dropout)
+            for _ in range(num_layers)])
+    def forward(self, x, t_emb, expert_kv_cache, vlm_kv_pad_mask, self_attn_mask):
+        for i, layer in enumerate(self.layers):
+            vlm_k, vlm_v = expert_kv_cache[i % len(expert_kv_cache)]
+            x = layer(x, t_emb=t_emb, vlm_k=vlm_k, vlm_v=vlm_v,
+                      vlm_kv_pad_mask=vlm_kv_pad_mask, self_attn_mask=self_attn_mask)
+        return x
+
+class WiltechsMoETransformer(nn.Module):
+    VLM_MODEL_ID = "Qwen/Qwen3-VL-4B-Instruct"
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        print(f"Loading {self.VLM_MODEL_ID} ...")
+        vlm = Qwen3VLForConditionalGeneration.from_pretrained(self.VLM_MODEL_ID, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
+        self.processor = AutoProcessor.from_pretrained(self.VLM_MODEL_ID)
+        self.vlm_model = vlm.model
+        self.visual = self.vlm_model.visual
+        self.language_model = self.vlm_model.language_model
+        self.num_vlm_layers = len(self.language_model.layers)
+        text_cfg = self.language_model.config
+        self.hidden_size = int(text_cfg.hidden_size)
+        self.num_heads = int(text_cfg.num_attention_heads)
+        self.num_kv_heads = int(getattr(text_cfg, "num_key_value_heads", self.num_heads))
+        self.head_dim = int(getattr(text_cfg, "head_dim", None) or (self.hidden_size // self.num_heads))
+        self.intermediate_size = int(text_cfg.intermediate_size)
+        self.rms_norm_eps = float(getattr(text_cfg, "rms_norm_eps", 1e-5))
+        vis_cfg = getattr(vlm.config, "vision_config", None)
+        self.spatial_merge_size = int(getattr(vis_cfg, "spatial_merge_size", 2))
+        if config.d_model != self.hidden_size: config.d_model = self.hidden_size
+        if not hasattr(self.language_model, "rotary_emb"): raise RuntimeError("language_model.rotary_emb not found.")
+        for p in self.visual.parameters(): p.requires_grad = False
+        for p in self.language_model.parameters(): p.requires_grad = False
+        self.visual.eval(); self.language_model.eval(); del vlm
+        num_experts = int(config.num_experts)
+        expert_depth = int(config.expert_num_layers)
+        if config.vlm_capture_layers:
+            capture_layers = sorted(config.vlm_capture_layers)
+        else:
+            total_needed = num_experts * expert_depth
+            if total_needed > self.num_vlm_layers: raise ValueError(f"num_experts({num_experts}) * expert_num_layers({expert_depth}) = {total_needed} > VLM layers ({self.num_vlm_layers})")
+            capture_layers = list(range(self.num_vlm_layers)) if total_needed == self.num_vlm_layers else np.linspace(0, self.num_vlm_layers - 1, total_needed, dtype=int).tolist()
+        self.capture_layers = capture_layers
+        print(f"[wiltechs_moe] VLM capture layers ({len(capture_layers)}): {capture_layers}")
+        if len(capture_layers) % num_experts != 0: raise ValueError(f"capture_layers count ({len(capture_layers)}) not divisible by num_experts ({num_experts})")
+        layers_per_expert = len(capture_layers) // num_experts
+        self.expert_kv_blocks = [capture_layers[e * layers_per_expert:(e + 1) * layers_per_expert] for e in range(num_experts)]
+        for e, block in enumerate(self.expert_kv_blocks): print(f"  Expert {e}: VLM layers {block}")
+        self.dit_hidden = int(getattr(config, "dit_hidden_size", 0)) or self.hidden_size
+        if self.dit_hidden % self.head_dim != 0: raise ValueError(f"dit_hidden_size ({self.dit_hidden}) must be divisible by head_dim ({self.head_dim}).")
+        ca_nh, ca_nkv, ca_hd = self.num_heads, self.num_kv_heads, self.head_dim
+        if self.dit_hidden == self.hidden_size:
+            sa_nh, sa_nkv, sa_hd = self.num_heads, self.num_kv_heads, self.head_dim; dit_intermediate = self.intermediate_size
+        else:
+            sa_hd = self.head_dim; sa_nh = self.dit_hidden // sa_hd
+            gqa_ratio = max(1, self.num_heads // max(1, self.num_kv_heads))
+            sa_nkv = max(1, sa_nh // gqa_ratio)
+            while sa_nh % sa_nkv != 0: sa_nkv -= 1
+            dit_intermediate = int(round(self.intermediate_size * self.dit_hidden / self.hidden_size))
+        self.experts = nn.ModuleList([ExpertDecoder(hidden_size=self.dit_hidden, num_layers=expert_depth, sa_num_heads=sa_nh, sa_num_kv_heads=sa_nkv, sa_head_dim=sa_hd, ca_num_heads=ca_nh, ca_num_kv_heads=ca_nkv, ca_head_dim=ca_hd, intermediate_size=dit_intermediate, rms_norm_eps=self.rms_norm_eps, dropout=config.dropout) for _ in range(num_experts)])
+        self.router = MoERouter(hidden_size=self.dit_hidden, num_experts=num_experts, temperature=float(config.router_temperature), top_k=int(config.router_top_k))
+        self.sink_token = nn.Parameter(torch.zeros(1, 1, self.dit_hidden)); nn.init.normal_(self.sink_token, std=0.02)
+        self.state_encoder = nn.Sequential(nn.Linear(config.state_dim, self.dit_hidden), RMSNorm(self.dit_hidden, eps=self.rms_norm_eps))
+        self.action_in_proj = nn.Linear(config.action_dim, self.dit_hidden)
+        self.action_pos_emb = nn.Parameter(torch.zeros(1, config.horizon, self.dit_hidden)); nn.init.normal_(self.action_pos_emb, std=0.02)
+        self.final_norm = RMSNorm(self.dit_hidden, eps=self.rms_norm_eps)
+        self.action_out_proj = nn.Linear(self.dit_hidden, config.action_dim); nn.init.zeros_(self.action_out_proj.weight); nn.init.zeros_(self.action_out_proj.bias)
+        self.time_embedder = nn.Sequential(nn.Linear(self.dit_hidden, self.dit_hidden), nn.SiLU(), nn.Linear(self.dit_hidden, self.dit_hidden))
+        if config.use_robot_cnn: self.robot_visual_encoder = RobotVisualEncoder(input_size=config.robot_encoder_input_size, out_tokens=config.robot_encoder_tokens, out_dim=self.dit_hidden)
+        else: self.robot_visual_encoder = None
+        self.num_latent_tokens = config.num_latent_tokens
+        if self.num_latent_tokens > 0:
+            self.latent_qformer = LatentQFormer(dim=self.dit_hidden, num_queries=self.num_latent_tokens, n_layers=int(getattr(config, "num_latent_qformer_layers", 2)), ca_num_heads=self.num_heads, ca_num_kv_heads=self.num_kv_heads, ca_head_dim=self.head_dim, intermediate_size=self.dit_hidden, rms_norm_eps=self.rms_norm_eps)
+        self._lang_max_len = 48; self._template_ids_cpu = None; self._template_format_printed = False; self.gradient_checkpointing = False
+    def train(self, mode=True):
+        super().train(mode); self.visual.eval(); self.language_model.eval(); return self
+    def gradient_checkpointing_enable(self): self.gradient_checkpointing = True; print("[wiltechs_moe] Expert gradient checkpointing ENABLED")
+    def gradient_checkpointing_disable(self): self.gradient_checkpointing = False
+    def _find_visual_merger(self):
+        for owner in (self.visual, self.vlm_model):
+            for attr in ("merger", "patch_merger", "visual_merger", "merger_module"):
+                candidate = getattr(owner, attr, None)
+                if candidate is not None: return candidate
+        return None
+    def _encode_images(self, batch, B):
+        device = batch["observation.state"].device; all_vis = []; grid_thw_list = []
+        for cam_key in self.config.cameras_for_vision_state_concat:
+            pvk, thwk = vlm_pixels_key(cam_key), vlm_grid_key(cam_key)
+            with torch.no_grad():
+                if pvk in batch:
+                    pv = batch[pvk]; image_grid_thw = batch[thwk]
+                    if pv.dim() == 3: pv = pv.reshape(-1, pv.shape[-1])
+                    if image_grid_thw.dim() == 1: image_grid_thw = image_grid_thw.unsqueeze(0)
+                    pixel_values = pv.to(device=device); image_grid_thw = image_grid_thw.to(device=device)
+                elif cam_key in batch:
+                    imgs = batch[cam_key]; img = imgs[:, -1] if imgs.dim() == 5 else imgs
+                    pixel_values, image_grid_thw = preprocess_camera_to_pixels(self.processor.image_processor, img)
+                    pixel_values = pixel_values.to(device=device); image_grid_thw = image_grid_thw.to(device=device)
+                else: continue
+                try: vis_tokens = self.visual(pixel_values, grid_thw=image_grid_thw)
+                except TypeError: vis_tokens = self.visual(pixel_values, image_thw=image_grid_thw)
+                vis_tokens = getattr(vis_tokens, "last_hidden_state", vis_tokens)
+                if vis_tokens.shape[-1] != self.hidden_size:
+                    merger = self._find_visual_merger()
+                    if merger is None: raise RuntimeError("No merger found.")
+                    try: vis_tokens = merger(vis_tokens)
+                    except TypeError: vis_tokens = merger(vis_tokens, image_grid_thw)
+                    vis_tokens = getattr(vis_tokens, "last_hidden_state", vis_tokens)
+            if vis_tokens.dim() == 2:
+                if vis_tokens.shape[0] % B != 0: raise RuntimeError(f"Cannot unpack vis_tokens shape {tuple(vis_tokens.shape)} with B={B}.")
+                vis_tokens = vis_tokens.reshape(B, -1, self.hidden_size)
+            all_vis.append(vis_tokens); grid_thw_list.append(image_grid_thw[0].detach())
+        if not all_vis: return torch.zeros(B, 0, self.hidden_size, device=device, dtype=torch.bfloat16), []
+        return torch.cat(all_vis, dim=1), grid_thw_list
+    def _resolve_descs(self, batch):
+        descs = batch.get("task_description") or batch.get("task")
+        if descs and getattr(self.config, "use_descriptive_objects", False): descs = [rewrite_instruction(d) for d in descs]
+        return descs
+    def _encode_language(self, batch, device):
+        descs = self._resolve_descs(batch)
+        if not descs or not any(descs): return None
+        inputs = self.processor.tokenizer(descs, return_tensors="pt", padding=True, truncation=True, max_length=self._lang_max_len, add_special_tokens=True)
+        input_ids = inputs["input_ids"].to(device); lang_mask = inputs["attention_mask"].bool().to(device)
+        lang_tokens = self.language_model.get_input_embeddings()(input_ids)
+        return lang_tokens, lang_mask
+    def _get_template_ids(self, device):
+        if self._template_ids_cpu is None:
+            tok = self.processor.tokenizer
+            prefix_ids = tok("<|im_start|>user\n", add_special_tokens=False, return_tensors="pt")["input_ids"][0].long()
+            vs = tok.convert_tokens_to_ids("<|vision_start|>"); ve = tok.convert_tokens_to_ids("<|vision_end|>")
+            self._template_ids_cpu = (prefix_ids, torch.tensor([vs], dtype=torch.long), torch.tensor([ve], dtype=torch.long))
+        return tuple(t.to(device) for t in self._template_ids_cpu)
+    @torch.no_grad()
+    def _run_vlm_and_cache_kv(self, batch):
+        B = batch["observation.state"].shape[0]; device = batch["observation.state"].device
+        vis_tokens, grid_thw_list = self._encode_images(batch, B); L_vis = vis_tokens.shape[1]
+        descs = self._resolve_descs(batch); have_lang = bool(descs) and any(descs)
+        use_template = bool(getattr(self.config, "use_chat_template", False)) and have_lang
+        embed_tokens = self.language_model.get_input_embeddings()
+        if use_template:
+            m = self.spatial_merge_size
+            cam_sizes = [int(g[0].item()) * (int(g[1].item()) // m) * (int(g[2].item()) // m) for g in grid_thw_list]
+            cam_tokens = list(vis_tokens.split(cam_sizes, dim=1)) if cam_sizes else []
+            directive = str(getattr(self.config, "chat_directive", "") or "").strip()
+            texts = [(f"{directive} {d}" if directive else str(d)) + "<|im_end|>\n<|im_start|>assistant\n" for d in descs]
+            suf = self.processor.tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=self._lang_max_len + 24, add_special_tokens=False)
+            suffix_ids = suf["input_ids"].to(device); suffix_mask = suf["attention_mask"].bool().to(device)
+            suffix_emb = embed_tokens(suffix_ids); suffix_emb = torch.where(suffix_mask.unsqueeze(-1), suffix_emb, torch.zeros_like(suffix_emb))
+            prefix_ids, vs_id, ve_id = self._get_template_ids(device)
+            prefix_emb = embed_tokens(prefix_ids).unsqueeze(0).expand(B, -1, -1)
+            vs_emb = embed_tokens(vs_id).unsqueeze(0).expand(B, -1, -1); ve_emb = embed_tokens(ve_id).unsqueeze(0).expand(B, -1, -1)
+            parts = [prefix_emb]; segments = [("text", prefix_ids.shape[0])]; vis_flags = [False] * prefix_ids.shape[0]
+            for ct, g in zip(cam_tokens, grid_thw_list):
+                parts += [vs_emb, ct, ve_emb]; segments += [("text", 1), ("image", g), ("text", 1)]
+                vis_flags += [False] + [True] * ct.shape[1] + [False]
+            parts.append(suffix_emb); segments.append(("text", suffix_ids.shape[1])); vis_flags += [False] * suffix_ids.shape[1]
+            vlm_seq = torch.cat(parts, dim=1).to(torch.bfloat16); L_vlm = vlm_seq.shape[1]
+            text_start = L_vlm - suffix_ids.shape[1]; vis_mask = torch.tensor(vis_flags, device=device, dtype=torch.bool)
+            vlm_kv_pad_mask = torch.cat([torch.ones(B, text_start, device=device, dtype=torch.bool), suffix_mask], dim=1)
+            if not self._template_format_printed: self._template_format_printed = True; print(f"[wiltechs_moe] chat template ON - L_vlm={L_vlm}")
+        else:
+            lang_result = self._encode_language(batch, device)
+            if lang_result is not None:
+                lang_tokens, lang_mask = lang_result; lang_tokens = lang_tokens.to(vis_tokens.dtype)
+                lang_tokens = torch.where(lang_mask.unsqueeze(-1), lang_tokens, torch.zeros_like(lang_tokens)); L_lang = lang_tokens.shape[1]
+            else: lang_tokens, lang_mask, L_lang = None, None, 0
+            parts = [vis_tokens]
+            if lang_tokens is not None: parts.append(lang_tokens)
+            vlm_seq = torch.cat(parts, dim=1).to(torch.bfloat16); L_vlm = vlm_seq.shape[1]; text_start = L_vis
+            vis_mask = torch.zeros(L_vlm, device=device, dtype=torch.bool); vis_mask[:L_vis] = True
+            segments = [("image", g) for g in grid_thw_list]
+            if L_lang > 0: segments.append(("text", L_lang))
+            if lang_mask is not None: vlm_kv_pad_mask = torch.cat([torch.ones(B, L_vis, device=device, dtype=torch.bool), lang_mask], dim=1)
+            else: vlm_kv_pad_mask = torch.ones(B, L_vlm, device=device, dtype=torch.bool)
+        position_ids = _build_mrope_position_ids(segments, B=B, spatial_merge_size=self.spatial_merge_size, device=device)
+        cos, sin = self.language_model.rotary_emb(vlm_seq, position_ids)
+        causal = torch.triu(torch.full((L_vlm, L_vlm), float("-inf"), device=device, dtype=vlm_seq.dtype), diagonal=1)
+        full_mask = causal.unsqueeze(0).unsqueeze(0).expand(B, 1, L_vlm, L_vlm).clone()
+        full_mask.masked_fill_((~vlm_kv_pad_mask).unsqueeze(1).unsqueeze(1), float("-inf"))
+        capture_set = set(self.capture_layers); hidden = vlm_seq; kv_cache = {}
+        for i, layer in enumerate(self.language_model.layers):
+            residual = hidden; h_in = layer.input_layernorm(hidden)
+            Q = layer.self_attn.q_proj(h_in); K = layer.self_attn.k_proj(h_in); V = layer.self_attn.v_proj(h_in)
+            Bn, Ln, _ = Q.shape
+            Q = Q.view(Bn, Ln, self.num_heads, self.head_dim).transpose(1, 2)
+            K = K.view(Bn, Ln, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            V = V.view(Bn, Ln, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            Q, K = _apply_rope(Q, K, cos, sin)
+            if i in capture_set: kv_cache[i] = (K.detach(), V.detach())
+            if self.num_kv_heads != self.num_heads:
+                r = self.num_heads // self.num_kv_heads; K_x = K.repeat_interleave(r, dim=1); V_x = V.repeat_interleave(r, dim=1)
+            else: K_x, V_x = K, V
+            attn = F.scaled_dot_product_attention(Q, K_x, V_x, attn_mask=full_mask, is_causal=False)
+            attn = attn.transpose(1, 2).contiguous().view(Bn, Ln, self.num_heads * self.head_dim)
+            attn = layer.self_attn.o_proj(attn); hidden = residual + attn
+            residual = hidden; h_in = layer.post_attention_layernorm(hidden); hidden = residual + layer.mlp(h_in)
+        return kv_cache, vlm_kv_pad_mask, vis_mask, text_start
+    def _compute_robot_tokens(self, batch):
+        if self.robot_visual_encoder is None: return None
+        toks_list = []; cnn_cams = getattr(self.config, "robot_cnn_cameras", None) or self.config.cameras_for_vision_state_concat
+        for cam_key in cnn_cams:
+            if cam_key not in batch: continue
+            img = batch[cam_key]
+            if img.dim() == 5: img = img[:, -1]
+            toks_list.append(self.robot_visual_encoder(img.float()))
+        if not toks_list: return None
+        toks = torch.cat(toks_list, dim=1)
+        vp = float(getattr(self.config, "vision_dropout_prob", 0.0)) if self.training else 0.0
+        if vp > 0:
+            B, R, _ = toks.shape; keep = torch.rand(B, R, device=toks.device) > vp; toks = toks * keep.unsqueeze(-1).to(toks.dtype)
+        return toks
+    def _generate_latents(self, kv_cache, vlm_kv_pad_mask):
+        if self.num_latent_tokens == 0: return None
+        vlm_k, vlm_v = kv_cache[max(self.capture_layers)]; return self.latent_qformer(vlm_k, vlm_v, vlm_kv_pad_mask)
+    def _build_expert_input(self, batch, noisy_actions, robot_tokens, latents):
+        B, H, _ = noisy_actions.shape; dtype = noisy_actions.dtype
+        sink = self.sink_token.expand(B, -1, -1).to(dtype)
+        state = batch["observation.state"].float()
+        if state.dim() == 2: state = state.unsqueeze(1)
+        state = state.nan_to_num(0.0).clamp(-10.0, 10.0); state_tok = self.state_encoder(state).to(dtype)
+        if state_tok.shape[1] > 1: state_tok = state_tok[:, -1:]
+        action_emb = (self.action_in_proj(noisy_actions) + self.action_pos_emb[:, :H]).to(dtype)
+        parts = [sink, state_tok]
+        if robot_tokens is not None: parts.append(robot_tokens.to(dtype))
+        if latents is not None: parts.append(latents.to(dtype))
+        parts.append(action_emb); seq = torch.cat(parts, dim=1)
+        return seq, seq.shape[1] - H, state_tok, action_emb
+    def _run_moe_dit(self, batch, noisy_actions, timesteps, kv_cache, vlm_kv_pad_mask, robot_tokens, latents):
+        device, dtype = noisy_actions.device, noisy_actions.dtype
+        t_emb = self.time_embedder(create_sinusoidal_pos_embedding(timesteps, self.dit_hidden).to(dtype).float()).to(dtype)
+        dit_seq, action_start_idx, state_tok, action_emb = self._build_expert_input(batch, noisy_actions, robot_tokens, latents)
+        L_dit = dit_seq.shape[1]
+        causal_mask = torch.triu(torch.full((L_dit, L_dit), float("-inf"), device=device, dtype=dtype), diagonal=1)
+        weights, usage = self.router(state_tok, latents, t_emb, action_emb)
+        expert_outputs = []
+        for e, expert in enumerate(self.experts):
+            expert_kv = [kv_cache[idx] for idx in self.expert_kv_blocks[e]]; x = dit_seq
+            if self.gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(expert, x, t_emb, expert_kv, vlm_kv_pad_mask, causal_mask, use_reentrant=False)
+            else:
+                x = expert(x, t_emb=t_emb, expert_kv_cache=expert_kv, vlm_kv_pad_mask=vlm_kv_pad_mask, self_attn_mask=causal_mask)
+            expert_outputs.append(self.action_out_proj(self.final_norm(x[:, action_start_idx:])))
+        stacked = torch.stack(expert_outputs, dim=1)
+        v_t = (weights.unsqueeze(-1).unsqueeze(-1) * stacked).sum(dim=1)
+        self._last_router_usage = usage; return v_t.float()
+    def sample_noise(self, shape, device):
+        rho = self.config.noise_temporal_correlation; noise = torch.randn(shape, device=device)
+        if rho == 0.0 or shape[1] == 1: return noise
+        scale = math.sqrt(1.0 - rho * rho)
+        for t in range(1, shape[1]): noise[:, t] = rho * noise[:, t - 1] + scale * noise[:, t]
+        return noise
+    def sample_time(self, B, device): return torch.rand(B, device=device) * 0.998 + 0.001
+    def compute_loss(self, batch):
+        actions = batch["action"].float().nan_to_num(0.0).clamp(-10.0, 10.0); B = actions.shape[0]; device = actions.device
+        kv_cache, vlm_kv_pad_mask, vis_mask, text_start = self._run_vlm_and_cache_kv(batch)
+        vkv_p = float(getattr(self.config, "vision_kv_dropout_prob", 0.0)); n_vis = int(vis_mask.sum().item())
+        if self.training and vkv_p > 0.0 and n_vis > 0:
+            vis_idx = vis_mask.nonzero(as_tuple=True)[0]; keep = torch.rand(B, n_vis, device=device) > vkv_p
+            dead = ~keep.any(dim=1)
+            if dead.any(): keep[dead, 0] = True
+            vlm_kv_pad_mask = vlm_kv_pad_mask.clone(); vlm_kv_pad_mask[:, vis_idx] &= keep
+        robot_tokens = self._compute_robot_tokens(batch); latents = self._generate_latents(kv_cache, vlm_kv_pad_mask)
+        noise = self.sample_noise(actions.shape, device); t = self.sample_time(B, device); t_exp = t[:, None, None]
+        x_t = t_exp * noise + (1.0 - t_exp) * actions; u_t = noise - actions; x_t_bf16 = x_t.to(torch.bfloat16)
+        v_t = self._run_moe_dit(batch, x_t_bf16, t, kv_cache, vlm_kv_pad_mask, robot_tokens, latents)
+        loss = F.mse_loss(v_t, u_t, reduction="none")
+        if self.config.action_dim_weights:
+            dim_w = torch.tensor(self.config.action_dim_weights, device=loss.device, dtype=loss.dtype); loss = loss * dim_w[None, None, :]
+        H = loss.shape[1]; n_exec = self.config.n_action_steps; pos_w = torch.ones(H, device=loss.device, dtype=loss.dtype)
+        pos_w[n_exec:] = self.config.future_steps_weight
+        if self.config.pos_decay_lambda > 0.0:
+            pos = torch.arange(H, device=loss.device, dtype=loss.dtype); pos_w = pos_w * torch.exp(-self.config.pos_decay_lambda * pos)
+        loss = loss * pos_w[None, :, None]; loss_dtype = loss.dtype; Bn, Hn, Dn = loss.shape
+        is_pad = batch.get("action_is_pad", batch.get("actions_id_pad"))
+        valid_t = (~is_pad.bool()).to(loss_dtype) if is_pad is not None else torch.ones(Bn, Hn, device=loss.device, dtype=loss_dtype)
+        dim_pad = batch.get("action_dim_pad")
+        valid_d = (~dim_pad.bool()).to(loss_dtype) if dim_pad is not None else torch.ones(Bn, Dn, device=loss.device, dtype=loss_dtype)
+        valid_cells = valid_t.unsqueeze(-1) * valid_d.unsqueeze(1); loss = loss * valid_cells
+        main_loss = loss.sum() / (pos_w[None, :, None] * valid_cells).sum().clamp(min=1e-6)
+        balance_w = float(getattr(self.config, "router_balance_weight", 0.0)); balance_loss_val = 0.0
+        if balance_w > 0.0 and hasattr(self, "_last_router_usage"):
+            usage = self._last_router_usage; cv_sq = (usage.std() / usage.mean().clamp(min=1e-8)).pow(2)
+            main_loss = main_loss + balance_w * cv_sq; balance_loss_val = float(cv_sq.detach())
+        contrastive_w = float(getattr(self.config, "contrastive_loss_weight", 0.0)); contrastive_v = 0.0
+        L_lang_total = vlm_kv_pad_mask.shape[-1] - text_start
+        if self.training and contrastive_w > 0.0 and L_lang_total > 0 and B >= 2:
+            descs = self._resolve_descs(batch)
+            if getattr(self.config, "contrastive_hard_negatives", False) and descs is not None and len(descs) == B:
+                perm, pair_diff = _hard_negative_perm(descs, device)
+            else:
+                perm = torch.randperm(B, device=device)
+                if (perm == torch.arange(B, device=device)).any(): perm = torch.roll(perm, shifts=1, dims=0)
+                if descs is not None and len(descs) == B:
+                    perm_cpu = perm.detach().cpu().tolist(); pair_diff = torch.tensor([descs[i] != descs[perm_cpu[i]] for i in range(B)], device=device, dtype=torch.bool)
+                else: pair_diff = torch.ones(B, device=device, dtype=torch.bool)
+            if pair_diff.any():
+                shuffled_cache = {}
+                for layer_idx, (K, V) in kv_cache.items():
+                    K_shuf, V_shuf = K.clone(), V.clone()
+                    K_shuf[:, :, text_start:, :] = K[perm, :, text_start:, :]; V_shuf[:, :, text_start:, :] = V[perm, :, text_start:, :]
+                    shuffled_cache[layer_idx] = (K_shuf, V_shuf)
+                shuffled_pad_mask = vlm_kv_pad_mask.clone(); shuffled_pad_mask[:, text_start:] = vlm_kv_pad_mask[perm][:, text_start:]
+                latents_wrong = self._generate_latents(shuffled_cache, shuffled_pad_mask)
+                v_wrong = self._run_moe_dit(batch, x_t_bf16, t, shuffled_cache, shuffled_pad_mask, robot_tokens, latents_wrong)
+                diff_sq = (v_t - v_wrong).pow(2).mean(dim=[1, 2]); margin = float(getattr(self.config, "contrastive_margin", 0.05))
+                hinge = F.relu(margin - diff_sq) * pair_diff.float(); loss_contrastive = hinge.sum() / pair_diff.float().sum().clamp(min=1.0)
+                contrastive_v = float(loss_contrastive.detach()); main_loss = main_loss + contrastive_w * loss_contrastive
+        self._last_loss_components = {"main": float(main_loss.detach() - contrastive_w * contrastive_v - balance_w * balance_loss_val), "contrastive": contrastive_v, "balance": balance_loss_val}
+        return main_loss
+    def forward(self, batch):
+        if self.training: return self.compute_loss(batch), {}
+        return self.sample_actions(batch), {}
+    def flow_actions_from_noise(self, batch, x_init):
+        B = x_init.shape[0]; device = x_init.device
+        kv_cache, vlm_kv_pad_mask, _, _ = self._run_vlm_and_cache_kv(batch)
+        robot_tokens = self._compute_robot_tokens(batch); latents = self._generate_latents(kv_cache, vlm_kv_pad_mask)
+        N = int(getattr(self.config, "num_inference_steps", 5)); x_t = x_init.float(); dt = -1.0 / N; t = torch.ones(B, device=device, dtype=torch.float32)
+        for _ in range(N):
+            v_t = self._run_moe_dit(batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask, robot_tokens, latents).float()
+            x_t = x_t + dt * v_t; t = t + dt
+        return x_t
+    @torch.no_grad()
+    def sample_actions(self, batch):
+        B = batch["observation.state"].shape[0]; device = batch["observation.state"].device
+        autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
+        with autocast_ctx:
+            kv_cache, vlm_kv_pad_mask, _, _ = self._run_vlm_and_cache_kv(batch)
+            robot_tokens = self._compute_robot_tokens(batch); latents = self._generate_latents(kv_cache, vlm_kv_pad_mask)
+            N = int(getattr(self.config, "num_inference_steps", 5))
+            x_t = self.sample_noise((B, self.config.horizon, self.config.action_dim), device=device)
+            dt = -1.0 / N; t = torch.ones(B, device=device, dtype=torch.float32)
+            for _ in range(N):
+                v_t = self._run_moe_dit(batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask, robot_tokens, latents).float()
+                x_t = x_t + dt * v_t; t = t + dt
+        return x_t[:, :self.config.n_action_steps]
+    def count_parameters(self):
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        frozen = sum(p.numel() for p in self.parameters() if not p.requires_grad)
+        return {"trainable": trainable, "frozen": frozen, "total": trainable + frozen}
