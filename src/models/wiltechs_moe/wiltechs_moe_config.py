@@ -82,7 +82,9 @@ class WiltechsMoEConfig(PreTrainedConfig):
     robot_cnn_cameras: list[str] = field(default_factory=list)
 
     # -------- Latent "thought" tokens --------
-    num_latent_tokens: int = 4
+    # Disabled in MoE: each expert cross-attends to VLM KV directly,
+    # no Q-Former compression needed.
+    num_latent_tokens: int = 0
     num_latent_qformer_layers: int = 2
 
     # -------- Vision token dropout --------

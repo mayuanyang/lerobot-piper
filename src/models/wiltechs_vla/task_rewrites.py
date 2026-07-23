@@ -19,6 +19,31 @@ DESIGN
   alike. As long as every path runs the raw task string through it, train and
   deploy can never diverge on phrasing.
 
+CHAIN-OF-THOUGHT (CoT) REWRITES
+-------------------------------
+For tasks where the model mis-grounds the target object (e.g. grasping the
+midpoint between two reference objects instead of the actual target), a
+flat descriptive rephrase is insufficient — the model needs an explicit
+reasoning trace that:
+
+  1. Names the TARGET object and its visual signature (color/shape/material).
+  2. Locates the target RELATIVE to the anchors (spatial relation + which side).
+  3. Resolves common confusions (e.g. "not the midpoint", "not the anchor").
+  4. States the ACTION to perform on the resolved target.
+
+Because the VLM (Qwen3-VL) is frozen and does NOT autoregressively generate
+text at inference time, the CoT cannot be "generated" by the model itself.
+Instead, the CoT is PRE-WRITTEN in this table and injected as the language
+input the VLM encodes. The VLM's KV cache then carries the structured
+grounding trace, which the trainable DiT decoder cross-attends to at every
+denoising step. Training on these CoT strings teaches the DiT to *use* the
+trace; at eval/RL-rollout time the identical string flows through
+`rewrite_instruction`, so the model sees the same reasoning it was trained on
+— no runtime generation required.
+
+This is analogous to "pre-filled assistant reasoning" in VLA literature: the
+reasoning is provided as context, not produced online.
+
 USAGE
 -----
     from models.wiltechs_vla.task_rewrites import rewrite_instruction
@@ -34,14 +59,71 @@ from __future__ import annotations
 import torch
 
 # ---------------------------------------------------------------------------
-# Rephrasings: canonical original string  ->  descriptive replacement.
-# Only list tasks you want to CHANGE. Everything else is identity.
+# Rephrasings: canonical original string  ->  replacement (may include CoT).
+#
+# Two value styles are supported (both are plain strings):
+#
+#   (a) Flat descriptive rephrase  —  original nouns swapped for visual
+#       primitives, no reasoning trace. Backwards compatible.
+#
+#   (b) Chain-of-thought rephrase  —  a multi-clause string that first
+#       identifies the target, then locates it, then states the action. Use
+#       the helper `cot(...)` (defined below) to keep the format consistent.
+#
+# The model does NOT differentiate between (a) and (b): both are just the
+# language string the VLM encodes. The CoT form is strictly richer and tends
+# to help on tasks where flat rephrasing still leaves spatial ambiguity.
 #
 # Pending visual discriminators (leave commented until confirmed):
 #   - cream cheese / butter: both rectangular labeled boxes -> need a color or
 #     other cue to disambiguate when they co-occur (libero_10 task "…cream
 #     cheese box and the butter…").
 # ---------------------------------------------------------------------------
+
+def cot(
+    target: str,
+    location: str,
+    action: str,
+    *,
+    not_the: str = "",
+    visual: str = "",
+) -> str:
+    """Format a chain-of-thought grounding trace as a single instruction string.
+
+    The output is a compact, declarative trace the frozen VLM can encode and
+    the trainable DiT can cross-attend to. It is NOT free-form generation —
+    it is a pre-written reasoning template filled per task.
+
+    Args:
+        target:   The object to grasp, with visual discriminators
+                  (e.g. "the black bowl" or "the blue can of alphabet soup").
+        location: Spatial relation to anchor objects, INCLUDING which side /
+                  which one when the relation is ambiguous
+                  (e.g. "between the plate and the ramekin, closer to the plate").
+        action:   The action to perform, phrased as an imperative
+                  (e.g. "grasp the black bowl and place it on the plate").
+        not_the:  Optional explicit anti-grounding cue for the most likely
+                  confusion (e.g. "not the midpoint between them").
+        visual:   Optional extra visual signature for the target
+                  (e.g. "a round dark ceramic object").
+
+    Returns:
+        A single string. Example:
+        "Target: the black bowl — a round dark ceramic object. Location:
+        between the plate and the ramekin, closer to the plate; not the
+        midpoint between them. Action: grasp the black bowl and place it on
+        the plate."
+    """
+    parts = [f"Target: {target}"]
+    if visual:
+        parts.append(f" — {visual}")
+    parts.append(f". Location: {location}")
+    if not_the:
+        parts.append(f"; {not_the}")
+    parts.append(f". Action: {action}.")
+    return "".join(parts)
+
+
 REPHRASINGS: dict[str, str] = {
     # ---- libero_10 (long) — object-identity grounding ----
     # T0: two round cans, distinguished only by color (red vs blue).
@@ -55,15 +137,45 @@ REPHRASINGS: dict[str, str] = {
          "put both the silver purple cream cheese box and the red butter box in the basket",
 
     # ---- libero_spatial — "ramekin" is an ungroundable noun for the VLM ----
-    # Replace ramekin -> visual description wherever it appears.
+    # These tasks fail because the model grounds the SPATIAL RELATION
+    # (between/next-to/on) to the GEOMETRIC MIDPOINT of the anchors rather
+    # than to the actual target object that happens to satisfy the relation.
+    # A flat rephrase ("between the plate and the ramekin, closer to the
+    # plate") still leaves the midpoint as a strong attractor. The CoT form
+    # below explicitly names the target first, so the DiT learns to attend to
+    # the object identity, then the relation.
     "pick up the black bowl on the ramekin and place it on the plate":
-        "pick up the black bowl on the small round silver container and place it on the plate",
+        cot(
+            target="the black bowl",
+            location="on top of the small round silver container (ramekin)",
+            action="grasp the black bowl and place it on the plate",
+            visual="a round dark bowl",
+            not_the="not the container itself",
+        ),
     "pick up the black bowl next to the ramekin and place it on the plate":
-        "pick up the black bowl next to the small round silver container and place it on the plate",
+        cot(
+            target="the black bowl",
+            location="next to the small round silver container (ramekin)",
+            action="grasp the black bowl and place it on the plate",
+            visual="a round dark bowl",
+            not_the="not the container itself",
+        ),
     "pick up the black bowl between the plate and the ramekin and place it on the plate":
-        "pick up the black bowl that is between the plate and the ramekin (closer to the plate) and place it on the plate",
+        cot(
+            target="the black bowl",
+            location="between the plate and the ramekin, closer to the plate",
+            action="grasp the black bowl and place it on the plate",
+            visual="a round dark bowl",
+            not_the="not the midpoint between the plate and the ramekin — the bowl is a distinct object, not the geometric center",
+        ),
     "pick up the black bowl next to the plate and place it on the plate":
-        "pick up the nearest black bowl and place it on the plate",
+        cot(
+            target="the nearest black bowl",
+            location="next to the plate",
+            action="grasp the nearest black bowl and place it on the plate",
+            visual="a round dark bowl",
+            not_the="not the plate itself",
+        ),
 
     # ---- libero_object (20-29) — TODO: confirm canonical strings + which need rewrite ----
     # ---- libero_goal   (10-19) — TODO: confirm canonical strings + which need rewrite ----
@@ -71,7 +183,7 @@ REPHRASINGS: dict[str, str] = {
 
 
 def rewrite_instruction(task: str, random_augment: bool = False) -> str:
-    """Return the descriptive rephrasing for `task`, or `task` unchanged.
+    """Return the (possibly CoT-enriched) rephrasing for `task`, or `task` unchanged.
 
     Args:
         task: The original task instruction string.
@@ -82,6 +194,13 @@ def rewrite_instruction(task: str, random_augment: bool = False) -> str:
 
     Safe to call on any string from either tasks.parquet (training) or the
     LIBERO benchmark env (RL rollout / eval) — the canonical strings match.
+
+    NOTE ON INFERENCE-TIME CoT: because the VLM is frozen and does not
+    generate text, the chain-of-thought is NOT produced at inference time —
+    it is pre-written in this table and injected as the language input. The
+    model is trained on these CoT strings, so at eval it simply receives the
+    same CoT-enriched instruction via this function. No VLM autoregression,
+    no separate "reasoning model" call, no extra latency at inference.
     """
     if not task:
         return task

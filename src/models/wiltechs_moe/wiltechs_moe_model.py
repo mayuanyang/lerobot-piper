@@ -125,8 +125,8 @@ class WiltechsMoETransformer(nn.Module):
         if config.use_robot_cnn: self.robot_visual_encoder = RobotVisualEncoder(input_size=config.robot_encoder_input_size, out_tokens=config.robot_encoder_tokens, out_dim=self.dit_hidden)
         else: self.robot_visual_encoder = None
         self.num_latent_tokens = config.num_latent_tokens
-        if self.num_latent_tokens > 0:
-            self.latent_qformer = LatentQFormer(dim=self.dit_hidden, num_queries=self.num_latent_tokens, n_layers=int(getattr(config, "num_latent_qformer_layers", 2)), ca_num_heads=self.num_heads, ca_num_kv_heads=self.num_kv_heads, ca_head_dim=self.head_dim, intermediate_size=self.dit_hidden, rms_norm_eps=self.rms_norm_eps)
+        # MoE: Q-Former disabled — each expert cross-attends to VLM KV directly.
+        self.latent_qformer = None
         self._lang_max_len = 48; self._template_ids_cpu = None; self._template_format_printed = False; self.gradient_checkpointing = False
     def train(self, mode=True):
         super().train(mode); self.visual.eval(); self.language_model.eval(); return self

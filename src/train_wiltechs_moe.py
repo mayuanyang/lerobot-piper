@@ -279,7 +279,6 @@ def train(
     router_temperature: float = 1.0,
     router_balance_weight: float = 0.01,
     router_top_k: int = 0,
-    num_latent_tokens: int = 4,
     vlm_capture_layers: Optional[list] = None,
 ):
     """Train WiltechsMoE on one or more HOMOGENEOUS LeRobot datasets.
@@ -398,7 +397,6 @@ def train(
         robot_cnn_cameras=robot_cnn_camera_keys,
         action_dim_weights=action_dim_weights,
         pos_decay_lambda=0.0,
-        num_latent_tokens=num_latent_tokens,
         contrastive_loss_weight=contrastive_loss_weight,
         contrastive_margin=contrastive_margin,
         contrastive_hard_negatives=contrastive_hard_negatives,
@@ -847,9 +845,6 @@ if __name__ == "__main__":
                         help="Top-k sparse routing: only the top-k experts get nonzero weight. "
                              "0 (default) = dense (all experts active). Set to e.g. 2 for top-2 "
                              "routing (saves compute with many experts).")
-    parser.add_argument("--num_latent_tokens", type=int, default=4,
-                        help="Number of learned latent 'thought' tokens from the Q-Former. "
-                             "0 disables latents. Default 4.")
     parser.add_argument("--vlm_capture_layers", type=int, nargs="+", default=None,
                         help="Explicit VLM layer indices to capture KV from. If omitted, "
                              "layers are auto-selected: num_experts x expert_num_layers layers "
