@@ -19,22 +19,31 @@ from ..wiltechs_vla.wiltechs_vla_model import (
 )
 
 class MoERouter(nn.Module):
-    def __init__(self, hidden_size, num_experts, temperature=1.0, top_k=0):
+    def __init__(self, hidden_size, num_experts, vlm_hidden_size, temperature=1.0, top_k=0):
         super().__init__()
         self.num_experts = num_experts
         self.temperature = temperature
         self.top_k = top_k
+        # Project pooled VLM KV (vlm_hidden_size) -> dit_hidden for router input.
+        # The VLM KV contains BOTH vision and language information (they are
+        # processed together through the VLM's causal attention), so a single
+        # pool of the last captured layer gives the Router access to the full
+        # multimodal context: what the scene looks like + what the instruction says.
+        self.vlm_proj = nn.Linear(vlm_hidden_size, hidden_size)
+        # Input: [state, vlm_semantic, time, action] each hidden_size
         self.router = nn.Sequential(
             nn.Linear(4 * hidden_size, hidden_size), nn.SiLU(),
             nn.Linear(hidden_size, num_experts))
         nn.init.zeros_(self.router[-1].weight)
         nn.init.zeros_(self.router[-1].bias)
-    def forward(self, state_emb, latent_emb, time_emb, action_emb):
+    def forward(self, state_emb, vlm_semantic_emb, time_emb, action_emb):
+        """vlm_semantic_emb: pooled VLM KV (B, vlm_hidden_size), contains both
+        vision and language context from the VLM's last captured layer."""
         B, H = state_emb.shape[0], state_emb.shape[-1]
-        latent_pool = latent_emb.mean(dim=1) if latent_emb is not None else torch.zeros(B, H, device=state_emb.device, dtype=state_emb.dtype)
+        vlm_proj = self.vlm_proj(vlm_semantic_emb)  # (B, hidden_size)
         action_pool = action_emb.mean(dim=1)
         state_flat = state_emb.squeeze(1) if state_emb.dim() == 3 else state_emb
-        logits = self.router(torch.cat([state_flat, latent_pool, time_emb, action_pool], dim=-1)) / max(self.temperature, 1e-6)
+        logits = self.router(torch.cat([state_flat, vlm_proj, time_emb, action_pool], dim=-1)) / max(self.temperature, 1e-6)
         if self.top_k > 0 and self.top_k < self.num_experts:
             _, topk_idx = logits.topk(self.top_k, dim=-1)
             mask = torch.zeros_like(logits).scatter_(-1, topk_idx, 1.0)
