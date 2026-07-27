@@ -24,11 +24,11 @@ class MoERouter(nn.Module):
         self.num_experts = num_experts
         self.temperature = temperature
         self.top_k = top_k
-        # Project pooled VLM KV (vlm_hidden_size) -> dit_hidden for router input.
-        # The VLM KV contains BOTH vision and language information (they are
+        # Project pooled VLM hidden state (vlm_hidden_size) -> dit_hidden for router input.
+        # The VLM hidden state contains BOTH vision and language information (they are
         # processed together through the VLM's causal attention), so a single
-        # pool of the last captured layer gives the Router access to the full
-        # multimodal context: what the scene looks like + what the instruction says.
+        # pool of the final layer gives the Router access to the full multimodal
+        # context: what the scene looks like + what the instruction says.
         self.vlm_proj = nn.Linear(vlm_hidden_size, hidden_size)
         # Input: [state, vlm_semantic, time, action] each hidden_size
         self.router = nn.Sequential(
@@ -37,8 +37,8 @@ class MoERouter(nn.Module):
         nn.init.zeros_(self.router[-1].weight)
         nn.init.zeros_(self.router[-1].bias)
     def forward(self, state_emb, vlm_semantic_emb, time_emb, action_emb):
-        """vlm_semantic_emb: pooled VLM KV (B, vlm_hidden_size), contains both
-        vision and language context from the VLM's last captured layer."""
+        """vlm_semantic_emb: pooled VLM hidden state (B, vlm_hidden_size), contains both
+        vision and language context from the VLM's final layer."""
         B, H = state_emb.shape[0], state_emb.shape[-1]
         vlm_proj = self.vlm_proj(vlm_semantic_emb)  # (B, hidden_size)
         action_pool = action_emb.mean(dim=1)
@@ -123,7 +123,7 @@ class WiltechsMoETransformer(nn.Module):
             while sa_nh % sa_nkv != 0: sa_nkv -= 1
             dit_intermediate = int(round(self.intermediate_size * self.dit_hidden / self.hidden_size))
         self.experts = nn.ModuleList([ExpertDecoder(hidden_size=self.dit_hidden, num_layers=expert_depth, sa_num_heads=sa_nh, sa_num_kv_heads=sa_nkv, sa_head_dim=sa_hd, ca_num_heads=ca_nh, ca_num_kv_heads=ca_nkv, ca_head_dim=ca_hd, intermediate_size=dit_intermediate, rms_norm_eps=self.rms_norm_eps, dropout=config.dropout) for _ in range(num_experts)])
-        self.router = MoERouter(hidden_size=self.dit_hidden, num_experts=num_experts, temperature=float(config.router_temperature), top_k=int(config.router_top_k))
+        self.router = MoERouter(hidden_size=self.dit_hidden, num_experts=num_experts, vlm_hidden_size=self.hidden_size, temperature=float(config.router_temperature), top_k=int(config.router_top_k))
         self.sink_token = nn.Parameter(torch.zeros(1, 1, self.dit_hidden)); nn.init.normal_(self.sink_token, std=0.02)
         self.state_encoder = nn.Sequential(nn.Linear(config.state_dim, self.dit_hidden), RMSNorm(self.dit_hidden, eps=self.rms_norm_eps))
         self.action_in_proj = nn.Linear(config.action_dim, self.dit_hidden)
@@ -259,7 +259,7 @@ class WiltechsMoETransformer(nn.Module):
             attn = attn.transpose(1, 2).contiguous().view(Bn, Ln, self.num_heads * self.head_dim)
             attn = layer.self_attn.o_proj(attn); hidden = residual + attn
             residual = hidden; h_in = layer.post_attention_layernorm(hidden); hidden = residual + layer.mlp(h_in)
-        return kv_cache, vlm_kv_pad_mask, vis_mask, text_start
+        return kv_cache, vlm_kv_pad_mask, vis_mask, text_start, hidden
     def _compute_robot_tokens(self, batch):
         if self.robot_visual_encoder is None: return None
         toks_list = []; cnn_cams = getattr(self.config, "robot_cnn_cameras", None) or self.config.cameras_for_vision_state_concat
@@ -290,13 +290,26 @@ class WiltechsMoETransformer(nn.Module):
         if latents is not None: parts.append(latents.to(dtype))
         parts.append(action_emb); seq = torch.cat(parts, dim=1)
         return seq, seq.shape[1] - H, state_tok, action_emb
-    def _run_moe_dit(self, batch, noisy_actions, timesteps, kv_cache, vlm_kv_pad_mask, robot_tokens, latents):
+    def _pool_vlm_semantic(self, vlm_hidden, vlm_kv_pad_mask):
+        """Pool the VLM's final hidden state over valid tokens -> (B, hidden_size).
+
+        The VLM hidden state contains BOTH vision and language information (processed
+        together through the VLM's causal attention), so mean-pooling the final layer
+        gives the Router access to the full multimodal context. Using hidden states
+        (not KV cache V) avoids GQA head-count mismatches since hidden_size is always
+        the model's hidden_size."""
+        mask = vlm_kv_pad_mask.unsqueeze(-1).to(vlm_hidden.dtype)  # (B, L_vlm, 1)
+        pooled = (vlm_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)  # (B, hidden_size)
+        return pooled
+
+    def _run_moe_dit(self, batch, noisy_actions, timesteps, kv_cache, vlm_kv_pad_mask, robot_tokens, latents, vlm_hidden):
         device, dtype = noisy_actions.device, noisy_actions.dtype
         t_emb = self.time_embedder(create_sinusoidal_pos_embedding(timesteps, self.dit_hidden).to(dtype).float()).to(dtype)
         dit_seq, action_start_idx, state_tok, action_emb = self._build_expert_input(batch, noisy_actions, robot_tokens, latents)
         L_dit = dit_seq.shape[1]
         causal_mask = torch.triu(torch.full((L_dit, L_dit), float("-inf"), device=device, dtype=dtype), diagonal=1)
-        weights, usage = self.router(state_tok, latents, t_emb, action_emb)
+        vlm_semantic = self._pool_vlm_semantic(vlm_hidden, vlm_kv_pad_mask).to(dtype)
+        weights, usage = self.router(state_tok, vlm_semantic, t_emb, action_emb)
         expert_outputs = []
         for e, expert in enumerate(self.experts):
             expert_kv = [kv_cache[idx] for idx in self.expert_kv_blocks[e]]; x = dit_seq
@@ -317,7 +330,7 @@ class WiltechsMoETransformer(nn.Module):
     def sample_time(self, B, device): return torch.rand(B, device=device) * 0.998 + 0.001
     def compute_loss(self, batch):
         actions = batch["action"].float().nan_to_num(0.0).clamp(-10.0, 10.0); B = actions.shape[0]; device = actions.device
-        kv_cache, vlm_kv_pad_mask, vis_mask, text_start = self._run_vlm_and_cache_kv(batch)
+        kv_cache, vlm_kv_pad_mask, vis_mask, text_start, vlm_hidden = self._run_vlm_and_cache_kv(batch)
         vkv_p = float(getattr(self.config, "vision_kv_dropout_prob", 0.0)); n_vis = int(vis_mask.sum().item())
         if self.training and vkv_p > 0.0 and n_vis > 0:
             vis_idx = vis_mask.nonzero(as_tuple=True)[0]; keep = torch.rand(B, n_vis, device=device) > vkv_p
@@ -327,7 +340,7 @@ class WiltechsMoETransformer(nn.Module):
         robot_tokens = self._compute_robot_tokens(batch); latents = self._generate_latents(kv_cache, vlm_kv_pad_mask)
         noise = self.sample_noise(actions.shape, device); t = self.sample_time(B, device); t_exp = t[:, None, None]
         x_t = t_exp * noise + (1.0 - t_exp) * actions; u_t = noise - actions; x_t_bf16 = x_t.to(torch.bfloat16)
-        v_t = self._run_moe_dit(batch, x_t_bf16, t, kv_cache, vlm_kv_pad_mask, robot_tokens, latents)
+        v_t = self._run_moe_dit(batch, x_t_bf16, t, kv_cache, vlm_kv_pad_mask, robot_tokens, latents, vlm_hidden)
         loss = F.mse_loss(v_t, u_t, reduction="none")
         if self.config.action_dim_weights:
             dim_w = torch.tensor(self.config.action_dim_weights, device=loss.device, dtype=loss.dtype); loss = loss * dim_w[None, None, :]
@@ -366,7 +379,7 @@ class WiltechsMoETransformer(nn.Module):
                     shuffled_cache[layer_idx] = (K_shuf, V_shuf)
                 shuffled_pad_mask = vlm_kv_pad_mask.clone(); shuffled_pad_mask[:, text_start:] = vlm_kv_pad_mask[perm][:, text_start:]
                 latents_wrong = self._generate_latents(shuffled_cache, shuffled_pad_mask)
-                v_wrong = self._run_moe_dit(batch, x_t_bf16, t, shuffled_cache, shuffled_pad_mask, robot_tokens, latents_wrong)
+                v_wrong = self._run_moe_dit(batch, x_t_bf16, t, shuffled_cache, shuffled_pad_mask, robot_tokens, latents_wrong, vlm_hidden)
                 diff_sq = (v_t - v_wrong).pow(2).mean(dim=[1, 2]); margin = float(getattr(self.config, "contrastive_margin", 0.05))
                 hinge = F.relu(margin - diff_sq) * pair_diff.float(); loss_contrastive = hinge.sum() / pair_diff.float().sum().clamp(min=1.0)
                 contrastive_v = float(loss_contrastive.detach()); main_loss = main_loss + contrastive_w * loss_contrastive
@@ -377,11 +390,11 @@ class WiltechsMoETransformer(nn.Module):
         return self.sample_actions(batch), {}
     def flow_actions_from_noise(self, batch, x_init):
         B = x_init.shape[0]; device = x_init.device
-        kv_cache, vlm_kv_pad_mask, _, _ = self._run_vlm_and_cache_kv(batch)
+        kv_cache, vlm_kv_pad_mask, _, _, vlm_hidden = self._run_vlm_and_cache_kv(batch)
         robot_tokens = self._compute_robot_tokens(batch); latents = self._generate_latents(kv_cache, vlm_kv_pad_mask)
         N = int(getattr(self.config, "num_inference_steps", 5)); x_t = x_init.float(); dt = -1.0 / N; t = torch.ones(B, device=device, dtype=torch.float32)
         for _ in range(N):
-            v_t = self._run_moe_dit(batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask, robot_tokens, latents).float()
+            v_t = self._run_moe_dit(batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask, robot_tokens, latents, vlm_hidden).float()
             x_t = x_t + dt * v_t; t = t + dt
         return x_t
     @torch.no_grad()
@@ -389,13 +402,13 @@ class WiltechsMoETransformer(nn.Module):
         B = batch["observation.state"].shape[0]; device = batch["observation.state"].device
         autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
         with autocast_ctx:
-            kv_cache, vlm_kv_pad_mask, _, _ = self._run_vlm_and_cache_kv(batch)
+            kv_cache, vlm_kv_pad_mask, _, _, vlm_hidden = self._run_vlm_and_cache_kv(batch)
             robot_tokens = self._compute_robot_tokens(batch); latents = self._generate_latents(kv_cache, vlm_kv_pad_mask)
             N = int(getattr(self.config, "num_inference_steps", 5))
             x_t = self.sample_noise((B, self.config.horizon, self.config.action_dim), device=device)
             dt = -1.0 / N; t = torch.ones(B, device=device, dtype=torch.float32)
             for _ in range(N):
-                v_t = self._run_moe_dit(batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask, robot_tokens, latents).float()
+                v_t = self._run_moe_dit(batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask, robot_tokens, latents, vlm_hidden).float()
                 x_t = x_t + dt * v_t; t = t + dt
         return x_t[:, :self.config.n_action_steps]
     def count_parameters(self):
