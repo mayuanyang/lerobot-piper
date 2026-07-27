@@ -127,18 +127,32 @@
                     │                                     │
                     │  Input:                             │
                     │    state_emb      (B, 1, 1280)     │
+                    │    vlm_semantic   (B, 2560)  NEW    │
                     │    time_emb       (B, 1280)        │
                     │    action_emb     (B, 64, 1280)    │
-                    │    [latent=None -> zeros]           │
                     │                                     │
-                    │  Concat -> Linear(5120->1280) ->SiLU│
-                    │         -> Linear(1280->4)          │
-                    │         -> /temperature             │
-                    │         -> softmax                  │
+                    │  vlm_semantic = mean_pool(          │
+                    │    KV_cache[last_capture_layer])    │
+                    │  Contains BOTH vision + language    │
+                    │  (VLM causal attention mixes them)  │
+                    │                                     │
+                    │  vlm_proj: Linear(2560->1280)       │
+                    │  Concat [state|vlm_proj|time|action]│
+                    │    -> Linear(5120->1280) -> SiLU    │
+                    │    -> Linear(1280->4)               │
+                    │    -> /temperature                  │
+                    │    -> softmax                       │
                     │                                     │
                     │  Output: weights (B, 4)             │
                     │    w0, w1, w2, w3                   │
                     └─────────────────────────────────────┘
+
+  NEW: Why VLM semantic input?
+    - Before: Router only saw joint angles + noise level
+      -> could not distinguish task types -> uniform routing
+    - Now: Router sees what the VLM understands about the
+      scene and instruction -> can route to deeper experts
+      for complex reasoning, shallower for precise control
 ```
 
 ## VLM KV Cache Flow (4 experts x 8 layers = 32 layers captured)

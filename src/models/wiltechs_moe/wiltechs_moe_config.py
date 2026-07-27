@@ -55,9 +55,9 @@ class WiltechsMoEConfig(PreTrainedConfig):
 
     # -------- Expert architecture --------
     num_experts: int = 4
-    expert_num_layers: int = 4
+    expert_num_layers: int = 9
     d_model: int = 2560
-    dit_hidden_size: int = 1280
+    dit_hidden_size: int = 640
     dropout: float = 0.1
 
     # -------- Flow matching sampling --------
