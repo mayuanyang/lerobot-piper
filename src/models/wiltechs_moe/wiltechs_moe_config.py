@@ -103,7 +103,7 @@ class WiltechsMoEConfig(PreTrainedConfig):
 
     # -------- MoE router --------
     router_temperature: float = 1.0
-    router_balance_weight: float = 0.01
+    router_balance_weight: float = 0.1
     router_top_k: int = 0
 
     # -------- Resume bookkeeping --------

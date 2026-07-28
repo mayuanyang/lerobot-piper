@@ -277,7 +277,7 @@ def train(
     robot_cnn_wrist_only: bool = False,
     preprocess_in_workers: bool = False,
     router_temperature: float = 1.0,
-    router_balance_weight: float = 0.01,
+    router_balance_weight: float = 0.1,
     router_top_k: int = 0,
     vlm_capture_layers: Optional[list] = None,
 ):
@@ -837,10 +837,10 @@ if __name__ == "__main__":
     parser.add_argument("--router_temperature", type=float, default=1.0,
                         help="Temperature for the MoE router softmax. Higher = more uniform "
                              "expert usage; lower = more peaked/sparse routing. Default 1.0.")
-    parser.add_argument("--router_balance_weight", type=float, default=0.01,
+    parser.add_argument("--router_balance_weight", type=float, default=0.1,
                         help="Weight for the router load-balancing loss (CV^2 of expert usage). "
-                             "Prevents expert collapse. 0.01 is mild; increase to 0.05-0.1 if "
-                             "some experts go unused. 0 disables.")
+                             "Prevents expert collapse. 0.1 is the default; 0.01 is too weak and "
+                             "allows expert collapse within ~100 steps. 0 disables.")
     parser.add_argument("--router_top_k", type=int, default=0,
                         help="Top-k sparse routing: only the top-k experts get nonzero weight. "
                              "0 (default) = dense (all experts active). Set to e.g. 2 for top-2 "

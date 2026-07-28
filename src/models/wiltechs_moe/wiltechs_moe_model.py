@@ -34,8 +34,14 @@ class MoERouter(nn.Module):
         self.router = nn.Sequential(
             nn.Linear(4 * hidden_size, hidden_size), nn.SiLU(),
             nn.Linear(hidden_size, num_experts))
-        nn.init.zeros_(self.router[-1].weight)
-        nn.init.zeros_(self.router[-1].bias)
+        # Small random init (NOT zeros). Zero init makes all logits identical at
+        # step 0; any tiny perturbation from the data gradient then tips one
+        # expert slightly ahead, and the positive-feedback softmax loop
+        # collapses to a single expert within ~100 steps (observed: E3=100% by
+        # step 200).  std=0.02 gives near-uniform but non-degenerate starting
+        # logits so the router can learn to differentiate.
+        nn.init.normal_(self.router[-1].weight, std=0.02)
+        nn.init.normal_(self.router[-1].bias, std=0.02)
     def forward(self, state_emb, vlm_semantic_emb, time_emb, action_emb):
         """vlm_semantic_emb: pooled VLM hidden state (B, vlm_hidden_size), contains both
         vision and language context from the VLM's final layer."""
@@ -44,6 +50,13 @@ class MoERouter(nn.Module):
         action_pool = action_emb.mean(dim=1)
         state_flat = state_emb.squeeze(1) if state_emb.dim() == 3 else state_emb
         logits = self.router(torch.cat([state_flat, vlm_proj, time_emb, action_pool], dim=-1)) / max(self.temperature, 1e-6)
+        # Inject noise during training to prevent router collapse.  The noise
+        # keeps "dead" experts receiving exploration signal early in training,
+        # breaking the winner-take-all positive feedback loop.  Scaled to the
+        # logit magnitude so it matters at init (small logits) but washes out
+        # as the router learns confident routing.
+        if self.training:
+            logits = logits + torch.randn_like(logits) * 0.5
         if self.top_k > 0 and self.top_k < self.num_experts:
             _, topk_idx = logits.topk(self.top_k, dim=-1)
             mask = torch.zeros_like(logits).scatter_(-1, topk_idx, 1.0)
