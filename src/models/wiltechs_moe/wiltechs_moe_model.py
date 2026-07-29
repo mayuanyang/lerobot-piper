@@ -194,7 +194,7 @@ class WiltechsMoETransformer(nn.Module):
                 ca_num_heads=ca_qformer_nh,
                 ca_num_kv_heads=ca_nkv,
                 ca_head_dim=sa_hd,
-                intermediate_size=dit_intermediate,
+                intermediate_size=self.dit_hidden,
                 rms_norm_eps=self.rms_norm_eps,
             )
         else:
