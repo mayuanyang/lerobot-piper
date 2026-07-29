@@ -147,8 +147,57 @@ class WiltechsMoETransformer(nn.Module):
         if config.use_robot_cnn: self.robot_visual_encoder = RobotVisualEncoder(input_size=config.robot_encoder_input_size, out_tokens=config.robot_encoder_tokens, out_dim=self.dit_hidden)
         else: self.robot_visual_encoder = None
         self.num_latent_tokens = config.num_latent_tokens
-        # MoE: Q-Former disabled — each expert cross-attends to VLM KV directly.
+        # MoE: Q-Former disabled -- each expert cross-attends to VLM KV directly.
         self.latent_qformer = None
+
+        # ------------------------------------------------------------------
+        # Thought tokens -- spatial reasoning bottleneck
+        # ------------------------------------------------------------------
+        # A learned-query Q-Former distills the DEEPEST captured VLM layer's
+        # KV cache into K "thought" tokens.  The deepest layer has the most
+        # semantic fusion of vision + language (the VLM's causal attention
+        # has fully mixed "what the scene looks like" with "what the
+        # instruction says to do"), so cross-attending here extracts spatial
+        # reasoning: target object location, gripper-to-target relative
+        # position, goal placement, etc.
+        #
+        # These thought tokens are prepended to the expert input sequence
+        # (before action tokens) so that in causal self-attention every
+        # action token can read the thought.  They are noise-independent
+        # (depend only on the observation, not the diffusion timestep), so
+        # they are computed ONCE per forward and shared across all N
+        # denoising steps -- zero added cost in the denoising loop.
+        #
+        # This complements (does NOT replace) per-expert cross-attention:
+        # experts still cross-attend to their own VLM KV blocks, but the
+        # thought tokens provide a compressed, query-focused summary that
+        # acts as an explicit reasoning bottleneck -- forcing the model to
+        # "think about where things are" before generating actions.
+        self.num_thought_tokens = int(getattr(config, "num_thought_tokens", 0))
+        if self.num_thought_tokens > 0:
+            # Resolve which VLM layer to read KV from for thought generation.
+            thought_layer_cfg = int(getattr(config, "thought_vlm_layer_idx", -1))
+            if thought_layer_cfg < 0:
+                self.thought_vlm_layer = max(self.capture_layers)
+            else:
+                self.thought_vlm_layer = thought_layer_cfg
+            print(f"[wiltechs_moe] Thought tokens: {self.num_thought_tokens} tokens, "
+                  f"Q-Former layers={int(getattr(config, 'thought_qformer_layers', 2))}, "
+                  f"VLM layer={self.thought_vlm_layer}")
+            self.thought_qformer = LatentQFormer(
+                dim=self.dit_hidden,
+                num_queries=self.num_thought_tokens,
+                n_layers=int(getattr(config, "thought_qformer_layers", 2)),
+                ca_num_heads=ca_nh,
+                ca_num_kv_heads=ca_nkv,
+                ca_head_dim=ca_hd,
+                intermediate_size=dit_intermediate,
+                rms_norm_eps=self.rms_norm_eps,
+            )
+        else:
+            self.thought_qformer = None
+            self.thought_vlm_layer = -1
+
         self._lang_max_len = 48; self._template_ids_cpu = None; self._template_format_printed = False; self.gradient_checkpointing = False
     def train(self, mode=True):
         super().train(mode); self.visual.eval(); self.language_model.eval(); return self
@@ -290,7 +339,24 @@ class WiltechsMoETransformer(nn.Module):
     def _generate_latents(self, kv_cache, vlm_kv_pad_mask):
         if self.num_latent_tokens == 0: return None
         vlm_k, vlm_v = kv_cache[max(self.capture_layers)]; return self.latent_qformer(vlm_k, vlm_v, vlm_kv_pad_mask)
-    def _build_expert_input(self, batch, noisy_actions, robot_tokens, latents):
+
+    def _generate_thoughts(self, kv_cache, vlm_kv_pad_mask):
+        """Generate spatial-reasoning "thought" tokens from the deepest captured
+        VLM layer's KV cache via a learned-query Q-Former.
+
+        The deepest layer has maximum semantic fusion of vision + language
+        (causal attention has fully mixed scene appearance with the
+        instruction), so cross-attending here distills spatial reasoning:
+        target object location, gripper-to-target relative position, goal
+        placement, etc.  Noise-independent -> computed once per forward,
+        shared across all N denoising steps (zero added loop cost).
+        Returns (B, K, dit_hidden) or None if disabled."""
+        if self.num_thought_tokens == 0 or self.thought_qformer is None:
+            return None
+        vlm_k, vlm_v = kv_cache[self.thought_vlm_layer]
+        return self.thought_qformer(vlm_k, vlm_v, vlm_kv_pad_mask)
+
+    def _build_expert_input(self, batch, noisy_actions, robot_tokens, latents, thoughts=None):
         B, H, _ = noisy_actions.shape; dtype = noisy_actions.dtype
         sink = self.sink_token.expand(B, -1, -1).to(dtype)
         state = batch["observation.state"].float()
@@ -298,11 +364,16 @@ class WiltechsMoETransformer(nn.Module):
         state = state.nan_to_num(0.0).clamp(-10.0, 10.0); state_tok = self.state_encoder(state).to(dtype)
         if state_tok.shape[1] > 1: state_tok = state_tok[:, -1:]
         action_emb = (self.action_in_proj(noisy_actions) + self.action_pos_emb[:, :H]).to(dtype)
+        # Sequence: [sink, state, robot_cnn, (legacy latents), thoughts, action]
+        # Thought tokens go BEFORE action tokens so causal self-attention lets
+        # every action token read the spatial reasoning distilled from the VLM.
         parts = [sink, state_tok]
         if robot_tokens is not None: parts.append(robot_tokens.to(dtype))
         if latents is not None: parts.append(latents.to(dtype))
+        if thoughts is not None: parts.append(thoughts.to(dtype))
         parts.append(action_emb); seq = torch.cat(parts, dim=1)
         return seq, seq.shape[1] - H, state_tok, action_emb
+
     def _pool_vlm_semantic(self, vlm_hidden, vlm_kv_pad_mask):
         """Pool the VLM's final hidden state over valid tokens -> (B, hidden_size).
 
@@ -315,10 +386,10 @@ class WiltechsMoETransformer(nn.Module):
         pooled = (vlm_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)  # (B, hidden_size)
         return pooled
 
-    def _run_moe_dit(self, batch, noisy_actions, timesteps, kv_cache, vlm_kv_pad_mask, robot_tokens, latents, vlm_hidden):
+    def _run_moe_dit(self, batch, noisy_actions, timesteps, kv_cache, vlm_kv_pad_mask, robot_tokens, latents, vlm_hidden, thoughts=None):
         device, dtype = noisy_actions.device, noisy_actions.dtype
         t_emb = self.time_embedder(create_sinusoidal_pos_embedding(timesteps, self.dit_hidden).to(dtype).float()).to(dtype)
-        dit_seq, action_start_idx, state_tok, action_emb = self._build_expert_input(batch, noisy_actions, robot_tokens, latents)
+        dit_seq, action_start_idx, state_tok, action_emb = self._build_expert_input(batch, noisy_actions, robot_tokens, latents, thoughts)
         L_dit = dit_seq.shape[1]
         causal_mask = torch.triu(torch.full((L_dit, L_dit), float("-inf"), device=device, dtype=dtype), diagonal=1)
         vlm_semantic = self._pool_vlm_semantic(vlm_hidden, vlm_kv_pad_mask).to(dtype)
@@ -334,6 +405,7 @@ class WiltechsMoETransformer(nn.Module):
         stacked = torch.stack(expert_outputs, dim=1)
         v_t = (weights.unsqueeze(-1).unsqueeze(-1) * stacked).sum(dim=1)
         self._last_router_usage = usage; return v_t.float()
+
     def sample_noise(self, shape, device):
         rho = self.config.noise_temporal_correlation; noise = torch.randn(shape, device=device)
         if rho == 0.0 or shape[1] == 1: return noise
@@ -341,6 +413,7 @@ class WiltechsMoETransformer(nn.Module):
         for t in range(1, shape[1]): noise[:, t] = rho * noise[:, t - 1] + scale * noise[:, t]
         return noise
     def sample_time(self, B, device): return torch.rand(B, device=device) * 0.998 + 0.001
+
     def compute_loss(self, batch):
         actions = batch["action"].float().nan_to_num(0.0).clamp(-10.0, 10.0); B = actions.shape[0]; device = actions.device
         kv_cache, vlm_kv_pad_mask, vis_mask, text_start, vlm_hidden = self._run_vlm_and_cache_kv(batch)
@@ -350,10 +423,13 @@ class WiltechsMoETransformer(nn.Module):
             dead = ~keep.any(dim=1)
             if dead.any(): keep[dead, 0] = True
             vlm_kv_pad_mask = vlm_kv_pad_mask.clone(); vlm_kv_pad_mask[:, vis_idx] &= keep
-        robot_tokens = self._compute_robot_tokens(batch); latents = self._generate_latents(kv_cache, vlm_kv_pad_mask)
+        robot_tokens = self._compute_robot_tokens(batch)
+        latents = self._generate_latents(kv_cache, vlm_kv_pad_mask)
+        # Generate spatial-reasoning thought tokens (noise-independent, once per forward)
+        thoughts = self._generate_thoughts(kv_cache, vlm_kv_pad_mask)
         noise = self.sample_noise(actions.shape, device); t = self.sample_time(B, device); t_exp = t[:, None, None]
         x_t = t_exp * noise + (1.0 - t_exp) * actions; u_t = noise - actions; x_t_bf16 = x_t.to(torch.bfloat16)
-        v_t = self._run_moe_dit(batch, x_t_bf16, t, kv_cache, vlm_kv_pad_mask, robot_tokens, latents, vlm_hidden)
+        v_t = self._run_moe_dit(batch, x_t_bf16, t, kv_cache, vlm_kv_pad_mask, robot_tokens, latents, vlm_hidden, thoughts)
         loss = F.mse_loss(v_t, u_t, reduction="none")
         if self.config.action_dim_weights:
             dim_w = torch.tensor(self.config.action_dim_weights, device=loss.device, dtype=loss.dtype); loss = loss * dim_w[None, None, :]
@@ -392,38 +468,49 @@ class WiltechsMoETransformer(nn.Module):
                     shuffled_cache[layer_idx] = (K_shuf, V_shuf)
                 shuffled_pad_mask = vlm_kv_pad_mask.clone(); shuffled_pad_mask[:, text_start:] = vlm_kv_pad_mask[perm][:, text_start:]
                 latents_wrong = self._generate_latents(shuffled_cache, shuffled_pad_mask)
-                v_wrong = self._run_moe_dit(batch, x_t_bf16, t, shuffled_cache, shuffled_pad_mask, robot_tokens, latents_wrong, vlm_hidden)
+                # Also recompute thoughts from wrong-language cache so the thought
+                # path is language-forced too.
+                thoughts_wrong = self._generate_thoughts(shuffled_cache, shuffled_pad_mask)
+                v_wrong = self._run_moe_dit(batch, x_t_bf16, t, shuffled_cache, shuffled_pad_mask, robot_tokens, latents_wrong, vlm_hidden, thoughts_wrong)
                 diff_sq = (v_t - v_wrong).pow(2).mean(dim=[1, 2]); margin = float(getattr(self.config, "contrastive_margin", 0.05))
                 hinge = F.relu(margin - diff_sq) * pair_diff.float(); loss_contrastive = hinge.sum() / pair_diff.float().sum().clamp(min=1.0)
                 contrastive_v = float(loss_contrastive.detach()); main_loss = main_loss + contrastive_w * loss_contrastive
         self._last_loss_components = {"main": float(main_loss.detach() - contrastive_w * contrastive_v - balance_w * balance_loss_val), "contrastive": contrastive_v, "balance": balance_loss_val}
         return main_loss
+
     def forward(self, batch):
         if self.training: return self.compute_loss(batch), {}
         return self.sample_actions(batch), {}
+
     def flow_actions_from_noise(self, batch, x_init):
         B = x_init.shape[0]; device = x_init.device
         kv_cache, vlm_kv_pad_mask, _, _, vlm_hidden = self._run_vlm_and_cache_kv(batch)
-        robot_tokens = self._compute_robot_tokens(batch); latents = self._generate_latents(kv_cache, vlm_kv_pad_mask)
+        robot_tokens = self._compute_robot_tokens(batch)
+        latents = self._generate_latents(kv_cache, vlm_kv_pad_mask)
+        thoughts = self._generate_thoughts(kv_cache, vlm_kv_pad_mask)
         N = int(getattr(self.config, "num_inference_steps", 5)); x_t = x_init.float(); dt = -1.0 / N; t = torch.ones(B, device=device, dtype=torch.float32)
         for _ in range(N):
-            v_t = self._run_moe_dit(batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask, robot_tokens, latents, vlm_hidden).float()
+            v_t = self._run_moe_dit(batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask, robot_tokens, latents, vlm_hidden, thoughts).float()
             x_t = x_t + dt * v_t; t = t + dt
         return x_t
+
     @torch.no_grad()
     def sample_actions(self, batch):
         B = batch["observation.state"].shape[0]; device = batch["observation.state"].device
         autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
         with autocast_ctx:
             kv_cache, vlm_kv_pad_mask, _, _, vlm_hidden = self._run_vlm_and_cache_kv(batch)
-            robot_tokens = self._compute_robot_tokens(batch); latents = self._generate_latents(kv_cache, vlm_kv_pad_mask)
+            robot_tokens = self._compute_robot_tokens(batch)
+            latents = self._generate_latents(kv_cache, vlm_kv_pad_mask)
+            thoughts = self._generate_thoughts(kv_cache, vlm_kv_pad_mask)
             N = int(getattr(self.config, "num_inference_steps", 5))
             x_t = self.sample_noise((B, self.config.horizon, self.config.action_dim), device=device)
             dt = -1.0 / N; t = torch.ones(B, device=device, dtype=torch.float32)
             for _ in range(N):
-                v_t = self._run_moe_dit(batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask, robot_tokens, latents, vlm_hidden).float()
+                v_t = self._run_moe_dit(batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask, robot_tokens, latents, vlm_hidden, thoughts).float()
                 x_t = x_t + dt * v_t; t = t + dt
         return x_t[:, :self.config.n_action_steps]
+
     def count_parameters(self):
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         frozen = sum(p.numel() for p in self.parameters() if not p.requires_grad)

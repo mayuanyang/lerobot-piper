@@ -99,7 +99,7 @@ def cot(
                   (e.g. "the black bowl" or "the blue can of alphabet soup").
         location: Spatial relation to anchor objects, INCLUDING which side /
                   which one when the relation is ambiguous
-                  (e.g. "between the plate and the ramekin, closer to the plate").
+                  (e.g. "on the table surface, in the gap between the plate and the ramekin, physically touching neither - it is a separate round dark object resting on the table, closer to the plate side").
         action:   The action to perform, phrased as an imperative
                   (e.g. "grasp the black bowl and place it on the plate").
         not_the:  Optional explicit anti-grounding cue for the most likely
@@ -149,7 +149,7 @@ REPHRASINGS: dict[str, str] = {
             target="the black bowl",
             location="on top of the small round silver container (ramekin)",
             action="grasp the black bowl and place it on the plate",
-            visual="a round dark bowl",
+            visual="a round dark bowl, distinct from the flat plate and the small silver ramekin",
             not_the="not the container itself",
         ),
     "pick up the black bowl next to the ramekin and place it on the plate":
@@ -163,7 +163,7 @@ REPHRASINGS: dict[str, str] = {
     "pick up the black bowl between the plate and the ramekin and place it on the plate":
         cot(
             target="the black bowl",
-            location="between the plate and the ramekin, closer to the plate",
+            location="on the table surface, in the gap between the plate and the ramekin, physically touching neither - it is a separate round dark object resting on the table, closer to the plate side",
             action="grasp the black bowl and place it on the plate",
             visual="a round dark bowl",
             not_the="not the midpoint between the plate and the ramekin — the bowl is a distinct object, not the geometric center",

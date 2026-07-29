@@ -81,9 +81,30 @@ class WiltechsMoEConfig(PreTrainedConfig):
     use_robot_cnn: bool = True
     robot_cnn_cameras: list[str] = field(default_factory=list)
 
-    # -------- Latent "thought" tokens --------
-    # Disabled in MoE: each expert cross-attends to VLM KV directly,
-    # no Q-Former compression needed.
+    # -------- Thought tokens (spatial reasoning bottleneck) --------
+    # Learned-query Q-Former cross-attends to the DEEPEST captured VLM layer's
+    # KV cache (most semantic: fuses vision + language instruction) to produce
+    # K "thought" tokens.  These tokens distill spatial reasoning — "where is
+    # the target object", "relative position of gripper to target", "goal
+    # placement coordinates" — into a compact representation prepended to the
+    # expert input sequence so every action token can attend to the thought.
+    #
+    # Unlike the old num_latent_tokens (which is kept at 0 for backward compat),
+    # thought tokens target the DEEPEST layer (max semantic reasoning) rather
+    # than a single arbitrary layer, and serve as an explicit reasoning
+    # bottleneck that complements (not replaces) per-expert cross-attention.
+    num_thought_tokens: int = 8
+    thought_qformer_layers: int = 2
+    # Which VLM layer to read KV from for thought generation.
+    # -1  → deepest captured layer (max semantic fusion of vision+language)
+    # >=0 → specific layer index
+    thought_vlm_layer_idx: int = -1
+    # Weight for auxiliary "thought consistency" loss: encourages thought
+    # tokens to be similar across denoising timesteps (they are noise-
+    # independent by design, so this is a regularizer). 0 disables.
+    thought_consistency_weight: float = 0.0
+
+    # -------- Legacy latent tokens (kept for backward compat, unused) --------
     num_latent_tokens: int = 0
     num_latent_qformer_layers: int = 2
 
