@@ -211,7 +211,7 @@ def _log_gradient_analysis(policy, step: int) -> None:
         ("Router",         "router"),
         ("Action In/Out",  "action_"),
         ("Final Norm",     "final_norm"),
-        ("Latent QFormer", "latent_qformer"),
+        ("Thought QFormer", "thought_qformer"),
     ]:
         grad, rms_pp, n = _grad_stats(prefix)
         if grad is not None:
