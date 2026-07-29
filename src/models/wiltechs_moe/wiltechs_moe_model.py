@@ -188,9 +188,9 @@ class WiltechsMoETransformer(nn.Module):
                 dim=self.dit_hidden,
                 num_queries=self.num_thought_tokens,
                 n_layers=int(getattr(config, "thought_qformer_layers", 2)),
-                ca_num_heads=ca_nh,
-                ca_num_kv_heads=ca_nkv,
-                ca_head_dim=ca_hd,
+                ca_num_heads=sa_nh,
+                ca_num_kv_heads=sa_nkv,
+                ca_head_dim=sa_hd,
                 intermediate_size=dit_intermediate,
                 rms_norm_eps=self.rms_norm_eps,
             )
