@@ -280,6 +280,10 @@ def train(
     router_balance_weight: float = 0.1,
     router_top_k: int = 0,
     vlm_capture_layers: Optional[list] = None,
+    num_thought_tokens: int = 8,
+    thought_qformer_layers: int = 2,
+    thought_vlm_layer_idx: int = -1,
+    thought_consistency_weight: float = 0.0,
 ):
     """Train WiltechsMoE on one or more HOMOGENEOUS LeRobot datasets.
 
@@ -411,6 +415,10 @@ def train(
         router_balance_weight=router_balance_weight,
         router_top_k=router_top_k,
         vlm_capture_layers=vlm_capture_layers if vlm_capture_layers else [],
+        num_thought_tokens=num_thought_tokens,
+        thought_qformer_layers=thought_qformer_layers,
+        thought_vlm_layer_idx=thought_vlm_layer_idx,
+        thought_consistency_weight=thought_consistency_weight,
     )
 
     # ── Model setup ──────────────────────────────────────────────────────
@@ -849,6 +857,14 @@ if __name__ == "__main__":
                         help="Explicit VLM layer indices to capture KV from. If omitted, "
                              "layers are auto-selected: num_experts x expert_num_layers layers "
                              "uniformly sampled from 0..35.")
+    parser.add_argument("--num_thought_tokens", type=int, default=8,
+                        help="Number of learned thought tokens for spatial reasoning. 0 disables.")
+    parser.add_argument("--thought_qformer_layers", type=int, default=2,
+                        help="Number of cross-attention layers in the thought Q-Former.")
+    parser.add_argument("--thought_vlm_layer_idx", type=int, default=-1,
+                        help="VLM layer to read KV from for thought generation. -1 = deepest captured layer.")
+    parser.add_argument("--thought_consistency_weight", type=float, default=0.0,
+                        help="Weight for thought consistency loss across denoising timesteps. 0 disables.")
     args = parser.parse_args()
 
     _v = args.robot_encoder_tokens
