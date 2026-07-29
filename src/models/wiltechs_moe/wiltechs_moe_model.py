@@ -134,6 +134,9 @@ class WiltechsMoETransformer(nn.Module):
             gqa_ratio = max(1, self.num_heads // max(1, self.num_kv_heads))
             sa_nkv = max(1, sa_nh // gqa_ratio)
             while sa_nh % sa_nkv != 0: sa_nkv -= 1
+            # QFormer cross-attn: ca_num_heads must be divisible by VLM ca_nkv
+            ca_qformer_nh = (sa_nh // ca_nkv) * ca_nkv
+            if ca_qformer_nh == 0: ca_qformer_nh = ca_nkv
             dit_intermediate = int(round(self.intermediate_size * self.dit_hidden / self.hidden_size))
         self.experts = nn.ModuleList([ExpertDecoder(hidden_size=self.dit_hidden, num_layers=expert_depth, sa_num_heads=sa_nh, sa_num_kv_heads=sa_nkv, sa_head_dim=sa_hd, ca_num_heads=ca_nh, ca_num_kv_heads=ca_nkv, ca_head_dim=ca_hd, intermediate_size=dit_intermediate, rms_norm_eps=self.rms_norm_eps, dropout=config.dropout) for _ in range(num_experts)])
         self.router = MoERouter(hidden_size=self.dit_hidden, num_experts=num_experts, vlm_hidden_size=self.hidden_size, temperature=float(config.router_temperature), top_k=int(config.router_top_k))
@@ -188,8 +191,8 @@ class WiltechsMoETransformer(nn.Module):
                 dim=self.dit_hidden,
                 num_queries=self.num_thought_tokens,
                 n_layers=int(getattr(config, "thought_qformer_layers", 2)),
-                ca_num_heads=sa_nh,
-                ca_num_kv_heads=sa_nkv,
+                ca_num_heads=ca_qformer_nh,
+                ca_num_kv_heads=ca_nkv,
                 ca_head_dim=sa_hd,
                 intermediate_size=dit_intermediate,
                 rms_norm_eps=self.rms_norm_eps,
