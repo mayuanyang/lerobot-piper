@@ -436,7 +436,7 @@ class WiltechsMoETransformer(nn.Module):
         if self.num_latent_tokens == 0: return None
         vlm_k, vlm_v = kv_cache[max(self.capture_layers)]; return self.latent_qformer(vlm_k, vlm_v, vlm_kv_pad_mask)
 
-    def _generate_thoughts(self, kv_cache, vlm_kv_pad_mask):
+    def _generate_thoughts(self, kv_cache, vlm_kv_pad_mask, record=True):
         """Generate spatial-reasoning "thought" tokens from the deepest captured
         VLM layer's KV cache via a learned-query Q-Former.
 
@@ -450,7 +450,13 @@ class WiltechsMoETransformer(nn.Module):
         if self.num_thought_tokens == 0 or self.thought_qformer is None:
             return None
         vlm_k, vlm_v = kv_cache[self.thought_vlm_layer]
-        return self.thought_qformer(vlm_k, vlm_v, vlm_kv_pad_mask)
+        thoughts = self.thought_qformer(vlm_k, vlm_v, vlm_kv_pad_mask)
+        # Magnitude of the thought tokens as they enter the DiT sequence. Read
+        # against _last_action_emb_rms: the expert's first RMSNorm renormalises
+        # per token, so a tiny ratio does not mean "inert", but a ratio that
+        # never moves off its init does.
+        if record: self._last_thought_rms = float(thoughts.detach().float().pow(2).mean().sqrt())
+        return thoughts
 
     def _build_expert_input(self, batch, noisy_actions, robot_tokens, latents, thoughts=None):
         B, H, _ = noisy_actions.shape; dtype = noisy_actions.dtype
@@ -460,6 +466,7 @@ class WiltechsMoETransformer(nn.Module):
         state = state.nan_to_num(0.0).clamp(-10.0, 10.0); state_tok = self.state_encoder(state).to(dtype)
         if state_tok.shape[1] > 1: state_tok = state_tok[:, -1:]
         action_emb = (self.action_in_proj(noisy_actions) + self.action_pos_emb[:, :H]).to(dtype)
+        self._last_action_emb_rms = float(action_emb.detach().float().pow(2).mean().sqrt())
         # Sequence: [sink, state, robot_cnn, (legacy latents), thoughts, action]
         # Thought tokens go BEFORE action tokens so causal self-attention lets
         # every action token read the spatial reasoning distilled from the VLM.
@@ -589,7 +596,7 @@ class WiltechsMoETransformer(nn.Module):
                 latents_wrong = self._generate_latents(shuffled_cache, shuffled_pad_mask)
                 # Also recompute thoughts from wrong-language cache so the thought
                 # path is language-forced too.
-                thoughts_wrong = self._generate_thoughts(shuffled_cache, shuffled_pad_mask)
+                thoughts_wrong = self._generate_thoughts(shuffled_cache, shuffled_pad_mask, record=False)
                 v_wrong = self._run_moe_dit(batch, x_t_bf16, t, shuffled_cache, shuffled_pad_mask, robot_tokens, latents_wrong, vlm_hidden, thoughts_wrong)
                 diff_sq = (v_t - v_wrong).pow(2).mean(dim=[1, 2]); margin = float(getattr(self.config, "contrastive_margin", 0.05))
                 hinge = F.relu(margin - diff_sq) * pair_diff.float(); loss_contrastive = hinge.sum() / pair_diff.float().sum().clamp(min=1.0)

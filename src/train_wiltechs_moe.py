@@ -228,6 +228,25 @@ def _log_gradient_analysis(policy, step: int) -> None:
         cv_sq = (usage_cpu.std() / usage_cpu.mean().clamp(min=1e-8)).pow(2).item()
         print(f"  Router usage    : {cells}    CV²={cv_sq:.4f}")
 
+    # Thought Q-Former residual gates — the model's OWN "how much do I use the
+    # thought tokens" knob (init 0.1 each). Four scalars, no batch noise: a far
+    # lower-variance signal than the gradient RMS above, which swings 2-3x
+    # between adjacent readings. Growing => the DiT is leaning on the thoughts;
+    # pinned near 0.100 after thousands of steps => it is ignoring them, and the
+    # module is dead weight regardless of what its gradient looks like.
+    qf = getattr(policy.model, "thought_qformer", None)
+    gates = getattr(qf, "gates", None) if qf is not None else None
+    if gates is not None:
+        cells = "  ".join(f"L{i}[ca={g[0].item():+.3f} ffn={g[1].item():+.3f}]"
+                          for i, g in enumerate(gates))
+        print(f"  Thought gates   : {cells}   (init +0.100)")
+    t_rms = getattr(policy.model, "_last_thought_rms", None)
+    a_rms = getattr(policy.model, "_last_action_emb_rms", None)
+    if t_rms is not None:
+        ratio = f"   ratio: {t_rms / a_rms:.3f}" if a_rms else ""
+        print(f"  Thought tok RMS : {t_rms:.4f}   action_emb RMS: {a_rms:.4f}{ratio}"
+              if a_rms else f"  Thought tok RMS : {t_rms:.4f}")
+
     comps = getattr(policy.model, "_last_loss_components", None)
     if comps is not None:
         main_v = comps.get("main", float("nan"))
