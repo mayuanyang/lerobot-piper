@@ -117,6 +117,27 @@ class WiltechsMoEConfig(PreTrainedConfig):
     chat_directive: str = ""
     use_descriptive_objects: bool = False
 
+    # -------- Language placement in the VLM sequence --------
+    # The VLM is CAUSAL. With the legacy layout ([images..., instruction]) a
+    # vision token's K/V never attends to the instruction, so every vision KV
+    # the experts cross-attend to is language-BLIND: referring-expression
+    # disambiguation ("the black bowl BETWEEN the plate and the ramekin")
+    # survives only in the ~50 trailing text positions, which then compete in
+    # a softmax against ~590 vision positions.  The model degenerates to using
+    # language as a coarse location prior (reaching for the midpoint) instead
+    # of as an object selector.
+    #
+    # text_first=True moves the instruction BEFORE the images, so every patch's
+    # K/V at every layer is conditioned on the instruction and the experts
+    # cross-attend to a language-grounded feature map.
+    #
+    # NOTE: this changes the contrastive branch's cost. With text_first the
+    # language is baked into the vision KV, so swapping only the language KV
+    # slice is self-inconsistent; the frozen VLM's language model is re-run
+    # with permuted instructions instead (ViT output is reused, so the extra
+    # cost is the 36 LM layers only, under no_grad).
+    text_first: bool = True
+
     # -------- Auxiliary contrastive loss --------
     contrastive_loss_weight: float = 0.1
     contrastive_margin: float = 0.05

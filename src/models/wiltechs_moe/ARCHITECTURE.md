@@ -1,5 +1,11 @@
 # WiltechsMoE Architecture (num_experts=4, expert_num_layers=9, thought_tokens=8)
 
+> **Layout change:** the instruction now goes **before** the images in the VLM
+> sequence (`text_first=True`) and the language budget is **128 tokens**
+> (was 48). See [VLM Input Layout](#vlm-input-layout-text_first-new---default-true).
+> This changes what the captured KV contains, so an existing checkpoint will
+> see a distribution shift on resume.
+
 ## Overview
 
 ```
@@ -27,7 +33,7 @@
 │  │  Language Model (36 layers)   │  │    │  ├──────────────────────┤   │
 │  │  (frozen)                     │  │    │  │ Camera 2 -> CNN      │   │
 │  │                               │  │    │  │  -> SpatialSoftmax   │   │
-│  │  Input: [vision | language]   │  │    │  │  -> 16 tokens (1280d)│   │
+│  │  Input: [INSTRUCTION | vision]│  │    │  │  -> 16 tokens (1280d)│   │
 │  │  L0 -> L1 -> ... -> L35       │  │    │  └──────────┬───────────┘   │
 │  │                               │  │    │             │               │
 │  │  Captures KV at 36 layers:    │  │    │  Training-time dropout     │
@@ -113,6 +119,64 @@
 │                        (velocity field)                                    │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+## VLM Input Layout: text_first (NEW - default True)
+
+The VLM is **causal**. Token order therefore decides what the captured KV
+actually contains, and it is the single biggest lever on referring-expression
+grounding.
+
+```
+LEGACY (text_first=False)                  CURRENT (text_first=True, default)
+─────────────────────────                  ──────────────────────────────────
+[<|im_start|>user\n]                       [<|im_start|>user\n]
+[<vis> cam0 </vis>]                        [ INSTRUCTION  (<=128 tokens) ]
+[<vis> cam1 </vis>]                        [<vis> cam0 </vis>]
+[<vis> cam2 </vis>]                        [<vis> cam1 </vis>]
+[ INSTRUCTION ]                            [<vis> cam2 </vis>]
+[<|im_end|> assistant]                     [<|im_end|> assistant]
+
+   Under the causal mask:                     Under the causal mask:
+   vision KV attends to                       vision KV attends to
+   -> images only                             -> images AND the instruction
+   = LANGUAGE-BLIND                           = LANGUAGE-GROUNDED
+
+   ~590 vision positions carry                every one of the ~590 vision
+   no language; the referring                 positions is conditioned on
+   expression survives only in                "the black bowl BETWEEN the
+   the ~50 trailing text KV,                  plate and the ramekin", so the
+   which the experts' cross-attn              experts cross-attend to a
+   softmax dilutes to ~8%.                    language-grounded feature map.
+```
+
+**Failure mode this fixes.** With the legacy layout the cheapest thing the
+DiT can learn is to treat the language embedding as a coarse *location prior*
+("somewhere near the plate and the ramekin") rather than as an *object
+selector*. Observed behaviour on
+`pick up the black bowl between the plate and the ramekin ...`: the gripper
+descends on the geometric midpoint between the two anchors, where no object
+exists.
+
+**Token budget.** `_lang_max_len = 128` (was 48). The CoT rewrites emitted by
+`task_rewrites.cot()` under `--use_descriptive_objects` run ~110 tokens; at 48
+they were truncated mid-Location, silently dropping both the anti-grounding
+cue (`not the midpoint between the plate and the ramekin`) and the entire
+`Action:` clause — the model was trained on a prompt that literally ended with
+"in the gap between the plate and the ramekin". The model prints the longest
+instruction, the kept text, and any dropped tail once at startup:
+
+```
+[wiltechs_moe] lang budget: max_len=128, longest instruction in batch=108 tokens, kept=108
+[wiltechs_moe]   kept: 'Target: the black bowl — a round dark bowl. Location: ... Action: ...'
+```
+
+**Cost.** Padded instruction positions sit mid-sequence; they are masked out as
+attention *keys*, so the images never read them. M-RoPE positions are built
+from the padded length uniformly across the batch — a constant offset on the
+image block, which RoPE is invariant to. Forward cost is unchanged except for
+the contrastive branch (see Training Losses).
+
+Set `--text_last` to restore the legacy layout.
 
 ## Thought QFormer Detail (NEW - Trainable, ~12.3M params)
 
@@ -405,6 +469,25 @@ t=0.0 (action)  <---------------------------+
   contrastive:     Hinge loss on action difference when language is shuffled
                    (ensures thought tokens are language-grounded)
   balance:         CV² of router usage (prevents expert collapse)
+
+  How the "wrong language" negative is built depends on the layout:
+
+    text_first=False   swap the KV slice [lang_start:] between batch members.
+    (legacy)           Valid because vision KV is language-blind, so only the
+                       trailing text positions carry the instruction.
+                       Cost: 0 extra VLM forwards.
+
+    text_first=True    the instruction is baked into EVERY vision KV, so there
+    (default)          is no slice to swap -- swapping only the text span would
+                       leave the vision KV still carrying the correct language
+                       and the negative would be a lie. Instead the frozen LM
+                       is re-run with permuted instructions.
+                       Cost: +1 LM forward (36 layers, no_grad). The ViT output
+                       is reused via vis_pack, so the image encoder does NOT
+                       re-run. Expect roughly +25-40% step time while
+                       contrastive_loss_weight > 0.
+                       The same vision-KV-dropout mask is re-applied to the
+                       negative, so the hinge measures language, not dropout.
 
   Defaults:
     contrastive_loss_weight = 0.1

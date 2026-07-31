@@ -268,6 +268,7 @@ def train(
     use_chat_template: bool = False,
     chat_directive: str = "",
     use_descriptive_objects: bool = False,
+    text_first: bool = True,
     robot_encoder_tokens: int = 16,
     noise_temporal_correlation: float = 0.0,
     vision_dropout_prob: float = 0.3,
@@ -409,6 +410,7 @@ def train(
         use_chat_template=use_chat_template,
         chat_directive=chat_directive,
         use_descriptive_objects=use_descriptive_objects,
+        text_first=text_first,
         robot_encoder_tokens=robot_encoder_tokens,
         noise_temporal_correlation=noise_temporal_correlation,
         router_temperature=router_temperature,
@@ -830,6 +832,10 @@ if __name__ == "__main__":
     parser.add_argument("--use_descriptive_objects", action="store_true",
                         help="Rewrite ambiguous object/region names into visually-groundable "
                              "descriptions via task_rewrites.py.")
+    parser.add_argument("--text_last", dest="text_first", action="store_false", default=True,
+                        help="Legacy VLM layout: instruction AFTER the images. Under the VLM's "
+                             "causal mask this leaves every vision KV language-blind. Default is "
+                             "text-first (instruction before images).")
     parser.add_argument("--robot_encoder_tokens", type=int, default=16,
                         help="Robot CNN tokens per camera. Must be a perfect square. Default: 16 (4x4).")
     parser.add_argument("--robot_cnn_cameras", type=str, nargs="+", default=None,

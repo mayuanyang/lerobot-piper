@@ -202,7 +202,16 @@ class WiltechsMoETransformer(nn.Module):
             self.thought_qformer = None
             self.thought_vlm_layer = -1
 
-        self._lang_max_len = 48; self._template_ids_cpu = None; self._template_format_printed = False; self.gradient_checkpointing = False
+        # 128, not 48: the CoT rewrites from task_rewrites.py (enabled by
+        # --use_descriptive_objects) run ~110 tokens.  At 48 they were cut
+        # mid-Location, silently dropping the anti-grounding cue ("not the
+        # midpoint between the plate and the ramekin") and the entire Action
+        # clause -- i.e. the model was trained on a prompt that ENDED with
+        # "in the gap between the plate and the ramekin".
+        self._lang_max_len = 128
+        self.text_first = bool(getattr(config, "text_first", True))
+        self._template_ids_cpu = None; self._template_format_printed = False
+        self._lang_len_printed = False; self.gradient_checkpointing = False
     def train(self, mode=True):
         super().train(mode); self.visual.eval(); self.language_model.eval(); return self
     def gradient_checkpointing_enable(self): self.gradient_checkpointing = True; print("[wiltechs_moe] Expert gradient checkpointing ENABLED")
@@ -243,8 +252,10 @@ class WiltechsMoETransformer(nn.Module):
             all_vis.append(vis_tokens); grid_thw_list.append(image_grid_thw[0].detach())
         if not all_vis: return torch.zeros(B, 0, self.hidden_size, device=device, dtype=torch.bfloat16), []
         return torch.cat(all_vis, dim=1), grid_thw_list
-    def _resolve_descs(self, batch):
-        descs = batch.get("task_description") or batch.get("task")
+    def _resolve_descs(self, batch, descs_override=None):
+        descs = descs_override if descs_override is not None else (batch.get("task_description") or batch.get("task"))
+        # rewrite_instruction is idempotent (a rewritten string is not a key in
+        # REPHRASINGS), so re-resolving an already-rewritten override is safe.
         if descs and getattr(self.config, "use_descriptive_objects", False): descs = [rewrite_instruction(d) for d in descs]
         return descs
     def _encode_language(self, batch, device):
@@ -252,23 +263,102 @@ class WiltechsMoETransformer(nn.Module):
         if not descs or not any(descs): return None
         inputs = self.processor.tokenizer(descs, return_tensors="pt", padding=True, truncation=True, max_length=self._lang_max_len, add_special_tokens=True)
         input_ids = inputs["input_ids"].to(device); lang_mask = inputs["attention_mask"].bool().to(device)
+        self._report_lang_budget(descs, input_ids, lang_mask)
         lang_tokens = self.language_model.get_input_embeddings()(input_ids)
         return lang_tokens, lang_mask
+    def _report_lang_budget(self, texts, lang_ids, lang_mask):
+        """One-time print of the token budget vs. the longest instruction.
+
+        Truncation here is silent and destroys exactly the disambiguating tail
+        of the CoT rewrites, so make it visible at startup instead of leaving
+        it to be inferred from rollout behaviour."""
+        if self._lang_len_printed: return
+        self._lang_len_printed = True
+        tok = self.processor.tokenizer
+        lens = [len(tok(t, add_special_tokens=False)["input_ids"]) for t in texts]
+        i = int(np.argmax(lens)); full = tok(texts[i], add_special_tokens=False)["input_ids"]
+        print(f"[wiltechs_moe] lang budget: max_len={self._lang_max_len}, longest instruction in batch={lens[i]} tokens, kept={int(lang_mask[i].sum().item())}")
+        print(f"[wiltechs_moe]   kept: {tok.decode(lang_ids[i][lang_mask[i]])!r}")
+        if lens[i] > self._lang_max_len:
+            print(f"[wiltechs_moe]   *** TRUNCATED *** dropped tail: {tok.decode(full[self._lang_max_len:])!r}")
     def _get_template_ids(self, device):
         if self._template_ids_cpu is None:
             tok = self.processor.tokenizer
             prefix_ids = tok("<|im_start|>user\n", add_special_tokens=False, return_tensors="pt")["input_ids"][0].long()
+            asst_ids = tok("<|im_end|>\n<|im_start|>assistant\n", add_special_tokens=False, return_tensors="pt")["input_ids"][0].long()
             vs = tok.convert_tokens_to_ids("<|vision_start|>"); ve = tok.convert_tokens_to_ids("<|vision_end|>")
-            self._template_ids_cpu = (prefix_ids, torch.tensor([vs], dtype=torch.long), torch.tensor([ve], dtype=torch.long))
+            self._template_ids_cpu = (prefix_ids, torch.tensor([vs], dtype=torch.long), torch.tensor([ve], dtype=torch.long), asst_ids)
         return tuple(t.to(device) for t in self._template_ids_cpu)
     @torch.no_grad()
-    def _run_vlm_and_cache_kv(self, batch):
+    def _run_vlm_and_cache_kv(self, batch, descs_override=None, vis_pack=None):
+        """Run the frozen VLM and capture per-layer K/V.
+
+        Returns (kv_cache, vlm_kv_pad_mask, vis_mask, lang_span, hidden, vis_pack)
+        where lang_span is the (start, end) index range of the per-sample
+        instruction tokens inside the VLM sequence, and vis_pack is the
+        (vis_tokens, grid_thw_list) ViT output so a second call with a
+        different instruction can skip re-encoding the images.
+        """
         B = batch["observation.state"].shape[0]; device = batch["observation.state"].device
-        vis_tokens, grid_thw_list = self._encode_images(batch, B); L_vis = vis_tokens.shape[1]
-        descs = self._resolve_descs(batch); have_lang = bool(descs) and any(descs)
+        if vis_pack is not None: vis_tokens, grid_thw_list = vis_pack
+        else: vis_tokens, grid_thw_list = self._encode_images(batch, B)
+        vis_pack_out = (vis_tokens, grid_thw_list); L_vis = vis_tokens.shape[1]
+        descs = self._resolve_descs(batch, descs_override); have_lang = bool(descs) and any(descs)
         use_template = bool(getattr(self.config, "use_chat_template", False)) and have_lang
+        text_first = self.text_first and have_lang
         embed_tokens = self.language_model.get_input_embeddings()
-        if use_template:
+        if text_first:
+            # ---- instruction BEFORE images ------------------------------
+            # Under the VLM's causal mask this makes every vision patch's K/V
+            # at every layer conditioned on the instruction, so the experts'
+            # cross-attention reads a language-grounded feature map rather
+            # than a language-blind one.
+            m = self.spatial_merge_size
+            cam_sizes = [int(g[0].item()) * (int(g[1].item()) // m) * (int(g[2].item()) // m) for g in grid_thw_list]
+            cam_tokens = list(vis_tokens.split(cam_sizes, dim=1)) if cam_sizes else []
+            directive = str(getattr(self.config, "chat_directive", "") or "").strip()
+            texts = [(f"{directive} {d}" if directive else str(d)) for d in descs]
+            lang = self.processor.tokenizer(texts, return_tensors="pt", padding=True, truncation=True,
+                                            max_length=self._lang_max_len, add_special_tokens=not use_template)
+            lang_ids = lang["input_ids"].to(device); lang_mask = lang["attention_mask"].bool().to(device)
+            L_lang = lang_ids.shape[1]
+            self._report_lang_budget(texts, lang_ids, lang_mask)
+            lang_emb = embed_tokens(lang_ids)
+            lang_emb = torch.where(lang_mask.unsqueeze(-1), lang_emb, torch.zeros_like(lang_emb))
+            parts = []; segments = []; vis_flags = []; head_len = 0; asst_ids = None
+            if use_template:
+                prefix_ids, vs_id, ve_id, asst_ids = self._get_template_ids(device)
+                head_len = prefix_ids.shape[0]
+                parts.append(embed_tokens(prefix_ids).unsqueeze(0).expand(B, -1, -1))
+                segments.append(("text", head_len)); vis_flags += [False] * head_len
+            parts.append(lang_emb); segments.append(("text", L_lang)); vis_flags += [False] * L_lang
+            for ct, g in zip(cam_tokens, grid_thw_list):
+                if use_template:
+                    vs_emb = embed_tokens(vs_id).unsqueeze(0).expand(B, -1, -1)
+                    ve_emb = embed_tokens(ve_id).unsqueeze(0).expand(B, -1, -1)
+                    parts += [vs_emb, ct, ve_emb]; segments += [("text", 1), ("image", g), ("text", 1)]
+                    vis_flags += [False] + [True] * ct.shape[1] + [False]
+                else:
+                    parts.append(ct); segments.append(("image", g)); vis_flags += [True] * ct.shape[1]
+            if use_template:
+                parts.append(embed_tokens(asst_ids).unsqueeze(0).expand(B, -1, -1))
+                segments.append(("text", asst_ids.shape[0])); vis_flags += [False] * asst_ids.shape[0]
+            vlm_seq = torch.cat(parts, dim=1).to(torch.bfloat16); L_vlm = vlm_seq.shape[1]
+            lang_span = (head_len, head_len + L_lang)
+            vis_mask = torch.tensor(vis_flags, device=device, dtype=torch.bool)
+            # Padded instruction positions sit mid-sequence; they are masked out
+            # as attention KEYS, so the images never read them. M-RoPE positions
+            # are built from the padded length uniformly across the batch, which
+            # is a constant offset for the image block -- harmless under RoPE.
+            vlm_kv_pad_mask = torch.cat([
+                torch.ones(B, head_len, device=device, dtype=torch.bool), lang_mask,
+                torch.ones(B, L_vlm - head_len - L_lang, device=device, dtype=torch.bool),
+            ], dim=1)
+            if not self._template_format_printed:
+                self._template_format_printed = True
+                print(f"[wiltechs_moe] TEXT-FIRST layout ON (chat_template={use_template}) - "
+                      f"L_vlm={L_vlm}, lang span={lang_span}, L_vis={L_vis}")
+        elif use_template:
             m = self.spatial_merge_size
             cam_sizes = [int(g[0].item()) * (int(g[1].item()) // m) * (int(g[2].item()) // m) for g in grid_thw_list]
             cam_tokens = list(vis_tokens.split(cam_sizes, dim=1)) if cam_sizes else []
@@ -277,7 +367,7 @@ class WiltechsMoETransformer(nn.Module):
             suf = self.processor.tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=self._lang_max_len + 24, add_special_tokens=False)
             suffix_ids = suf["input_ids"].to(device); suffix_mask = suf["attention_mask"].bool().to(device)
             suffix_emb = embed_tokens(suffix_ids); suffix_emb = torch.where(suffix_mask.unsqueeze(-1), suffix_emb, torch.zeros_like(suffix_emb))
-            prefix_ids, vs_id, ve_id = self._get_template_ids(device)
+            prefix_ids, vs_id, ve_id, _ = self._get_template_ids(device)
             prefix_emb = embed_tokens(prefix_ids).unsqueeze(0).expand(B, -1, -1)
             vs_emb = embed_tokens(vs_id).unsqueeze(0).expand(B, -1, -1); ve_emb = embed_tokens(ve_id).unsqueeze(0).expand(B, -1, -1)
             parts = [prefix_emb]; segments = [("text", prefix_ids.shape[0])]; vis_flags = [False] * prefix_ids.shape[0]
@@ -288,7 +378,8 @@ class WiltechsMoETransformer(nn.Module):
             vlm_seq = torch.cat(parts, dim=1).to(torch.bfloat16); L_vlm = vlm_seq.shape[1]
             text_start = L_vlm - suffix_ids.shape[1]; vis_mask = torch.tensor(vis_flags, device=device, dtype=torch.bool)
             vlm_kv_pad_mask = torch.cat([torch.ones(B, text_start, device=device, dtype=torch.bool), suffix_mask], dim=1)
-            if not self._template_format_printed: self._template_format_printed = True; print(f"[wiltechs_moe] chat template ON - L_vlm={L_vlm}")
+            lang_span = (text_start, L_vlm)
+            if not self._template_format_printed: self._template_format_printed = True; print(f"[wiltechs_moe] chat template ON (text-last) - L_vlm={L_vlm}")
         else:
             lang_result = self._encode_language(batch, device)
             if lang_result is not None:
@@ -303,6 +394,7 @@ class WiltechsMoETransformer(nn.Module):
             if L_lang > 0: segments.append(("text", L_lang))
             if lang_mask is not None: vlm_kv_pad_mask = torch.cat([torch.ones(B, L_vis, device=device, dtype=torch.bool), lang_mask], dim=1)
             else: vlm_kv_pad_mask = torch.ones(B, L_vlm, device=device, dtype=torch.bool)
+            lang_span = (text_start, L_vlm)
         position_ids = _build_mrope_position_ids(segments, B=B, spatial_merge_size=self.spatial_merge_size, device=device)
         cos, sin = self.language_model.rotary_emb(vlm_seq, position_ids)
         causal = torch.triu(torch.full((L_vlm, L_vlm), float("-inf"), device=device, dtype=vlm_seq.dtype), diagonal=1)
@@ -325,7 +417,7 @@ class WiltechsMoETransformer(nn.Module):
             attn = attn.transpose(1, 2).contiguous().view(Bn, Ln, self.num_heads * self.head_dim)
             attn = layer.self_attn.o_proj(attn); hidden = residual + attn
             residual = hidden; h_in = layer.post_attention_layernorm(hidden); hidden = residual + layer.mlp(h_in)
-        return kv_cache, vlm_kv_pad_mask, vis_mask, text_start, hidden
+        return kv_cache, vlm_kv_pad_mask, vis_mask, lang_span, hidden, vis_pack_out
     def _compute_robot_tokens(self, batch):
         if self.robot_visual_encoder is None: return None
         toks_list = []; cnn_cams = getattr(self.config, "robot_cnn_cameras", None) or self.config.cameras_for_vision_state_concat
@@ -420,13 +512,18 @@ class WiltechsMoETransformer(nn.Module):
 
     def compute_loss(self, batch):
         actions = batch["action"].float().nan_to_num(0.0).clamp(-10.0, 10.0); B = actions.shape[0]; device = actions.device
-        kv_cache, vlm_kv_pad_mask, vis_mask, text_start, vlm_hidden = self._run_vlm_and_cache_kv(batch)
+        kv_cache, vlm_kv_pad_mask, vis_mask, lang_span, vlm_hidden, vis_pack = self._run_vlm_and_cache_kv(batch)
         vkv_p = float(getattr(self.config, "vision_kv_dropout_prob", 0.0)); n_vis = int(vis_mask.sum().item())
+        vkv_drop = None
         if self.training and vkv_p > 0.0 and n_vis > 0:
             vis_idx = vis_mask.nonzero(as_tuple=True)[0]; keep = torch.rand(B, n_vis, device=device) > vkv_p
             dead = ~keep.any(dim=1)
             if dead.any(): keep[dead, 0] = True
             vlm_kv_pad_mask = vlm_kv_pad_mask.clone(); vlm_kv_pad_mask[:, vis_idx] &= keep
+            # Remembered so the contrastive negative gets the SAME vision KV
+            # dropout -- otherwise v_t and v_wrong differ because of dropout,
+            # not because of the language, and the hinge measures the wrong thing.
+            vkv_drop = (vis_idx, keep)
         robot_tokens = self._compute_robot_tokens(batch)
         latents = self._generate_latents(kv_cache, vlm_kv_pad_mask)
         # Generate spatial-reasoning thought tokens (noise-independent, once per forward)
@@ -453,24 +550,42 @@ class WiltechsMoETransformer(nn.Module):
             usage = self._last_router_usage; cv_sq = (usage.std() / usage.mean().clamp(min=1e-8)).pow(2)
             main_loss = main_loss + balance_w * cv_sq; balance_loss_val = float(cv_sq.detach())
         contrastive_w = float(getattr(self.config, "contrastive_loss_weight", 0.0)); contrastive_v = 0.0
-        L_lang_total = vlm_kv_pad_mask.shape[-1] - text_start
-        if self.training and contrastive_w > 0.0 and L_lang_total > 0 and B >= 2:
-            descs = self._resolve_descs(batch)
-            if getattr(self.config, "contrastive_hard_negatives", False) and descs is not None and len(descs) == B:
+        lang_start, lang_end = lang_span
+        L_lang_total = lang_end - lang_start
+        descs = self._resolve_descs(batch)
+        have_descs = descs is not None and len(descs) == B
+        # With text_first the instruction is baked into the vision KV, so the
+        # negative has to come from a real re-run of the VLM with permuted
+        # instructions -- there is no valid KV slice to swap.
+        can_contrast = have_descs if self.text_first else True
+        if self.training and contrastive_w > 0.0 and L_lang_total > 0 and B >= 2 and can_contrast:
+            if getattr(self.config, "contrastive_hard_negatives", False) and have_descs:
                 perm, pair_diff = _hard_negative_perm(descs, device)
             else:
                 perm = torch.randperm(B, device=device)
                 if (perm == torch.arange(B, device=device)).any(): perm = torch.roll(perm, shifts=1, dims=0)
-                if descs is not None and len(descs) == B:
+                if have_descs:
                     perm_cpu = perm.detach().cpu().tolist(); pair_diff = torch.tensor([descs[i] != descs[perm_cpu[i]] for i in range(B)], device=device, dtype=torch.bool)
                 else: pair_diff = torch.ones(B, device=device, dtype=torch.bool)
             if pair_diff.any():
-                shuffled_cache = {}
-                for layer_idx, (K, V) in kv_cache.items():
-                    K_shuf, V_shuf = K.clone(), V.clone()
-                    K_shuf[:, :, text_start:, :] = K[perm, :, text_start:, :]; V_shuf[:, :, text_start:, :] = V[perm, :, text_start:, :]
-                    shuffled_cache[layer_idx] = (K_shuf, V_shuf)
-                shuffled_pad_mask = vlm_kv_pad_mask.clone(); shuffled_pad_mask[:, text_start:] = vlm_kv_pad_mask[perm][:, text_start:]
+                if self.text_first:
+                    # Re-run the frozen LM with permuted instructions. The ViT
+                    # output is reused via vis_pack, so the extra cost is the 36
+                    # LM layers only (no_grad, no activations retained).
+                    perm_cpu = perm.detach().cpu().tolist()
+                    descs_perm = [descs[i] for i in perm_cpu]
+                    shuffled_cache, shuffled_pad_mask, _, _, _, _ = self._run_vlm_and_cache_kv(
+                        batch, descs_override=descs_perm, vis_pack=vis_pack)
+                    if vkv_drop is not None:
+                        v_idx, v_keep = vkv_drop
+                        shuffled_pad_mask = shuffled_pad_mask.clone(); shuffled_pad_mask[:, v_idx] &= v_keep
+                else:
+                    shuffled_cache = {}
+                    for layer_idx, (K, V) in kv_cache.items():
+                        K_shuf, V_shuf = K.clone(), V.clone()
+                        K_shuf[:, :, lang_start:, :] = K[perm, :, lang_start:, :]; V_shuf[:, :, lang_start:, :] = V[perm, :, lang_start:, :]
+                        shuffled_cache[layer_idx] = (K_shuf, V_shuf)
+                    shuffled_pad_mask = vlm_kv_pad_mask.clone(); shuffled_pad_mask[:, lang_start:] = vlm_kv_pad_mask[perm][:, lang_start:]
                 latents_wrong = self._generate_latents(shuffled_cache, shuffled_pad_mask)
                 # Also recompute thoughts from wrong-language cache so the thought
                 # path is language-forced too.
@@ -488,7 +603,7 @@ class WiltechsMoETransformer(nn.Module):
 
     def flow_actions_from_noise(self, batch, x_init):
         B = x_init.shape[0]; device = x_init.device
-        kv_cache, vlm_kv_pad_mask, _, _, vlm_hidden = self._run_vlm_and_cache_kv(batch)
+        kv_cache, vlm_kv_pad_mask, _, _, vlm_hidden, _ = self._run_vlm_and_cache_kv(batch)
         robot_tokens = self._compute_robot_tokens(batch)
         latents = self._generate_latents(kv_cache, vlm_kv_pad_mask)
         thoughts = self._generate_thoughts(kv_cache, vlm_kv_pad_mask)
@@ -503,7 +618,7 @@ class WiltechsMoETransformer(nn.Module):
         B = batch["observation.state"].shape[0]; device = batch["observation.state"].device
         autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
         with autocast_ctx:
-            kv_cache, vlm_kv_pad_mask, _, _, vlm_hidden = self._run_vlm_and_cache_kv(batch)
+            kv_cache, vlm_kv_pad_mask, _, _, vlm_hidden, _ = self._run_vlm_and_cache_kv(batch)
             robot_tokens = self._compute_robot_tokens(batch)
             latents = self._generate_latents(kv_cache, vlm_kv_pad_mask)
             thoughts = self._generate_thoughts(kv_cache, vlm_kv_pad_mask)
