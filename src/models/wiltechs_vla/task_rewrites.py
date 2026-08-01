@@ -97,22 +97,31 @@ def cot(
     Args:
         target:   The object to grasp, with visual discriminators
                   (e.g. "the black bowl" or "the blue can of alphabet soup").
-        location: Spatial relation to anchor objects, INCLUDING which side /
-                  which one when the relation is ambiguous
-                  (e.g. "on the table surface, in the gap between the plate and the ramekin, physically touching neither - it is a separate round dark object resting on the table, closer to the plate side").
+        location: How to FIND the target. Use the spatial relation only to pick
+                  WHICH object among look-alikes; never to describe where in the
+                  frame to reach. Phrasings that parameterise a position on the
+                  anchor axis ("in the gap between A and B", "closer to the A
+                  side", "the midpoint of") are read literally by the policy and
+                  make it interpolate between the anchors instead of localising
+                  the object — see the "between" entry below. Prefer
+                  "among the <look-alikes>, the target is the one that <relation>"
+                  plus "aim at the center of the <object> itself".
         action:   The action to perform, phrased as an imperative
                   (e.g. "grasp the black bowl and place it on the plate").
-        not_the:  Optional explicit anti-grounding cue for the most likely
-                  confusion (e.g. "not the midpoint between them").
+        not_the:  Optional anti-grounding cue for the most likely confusion, and
+                  only when the confusion is another OBJECT ("not the container
+                  itself"). Do not use it against a POSITION: negation is a weak
+                  signal for a frozen encoder, so "not the midpoint between A and
+                  B" mostly just injects "midpoint between A and B".
         visual:   Optional extra visual signature for the target
                   (e.g. "a round dark ceramic object").
 
     Returns:
         A single string. Example:
-        "Target: the black bowl — a round dark ceramic object. Location:
-        between the plate and the ramekin, closer to the plate; not the
-        midpoint between them. Action: grasp the black bowl and place it on
-        the plate."
+        "Target: the black bowl — a round dark ceramic object. Location: among
+        the black bowls in the scene, the target is the one whose position falls
+        between the plate and the ramekin. Aim at the center of the bowl itself.
+        Action: grasp the black bowl and place it on the plate."
     """
     parts = [f"Target: {target}"]
     if visual:
@@ -160,13 +169,31 @@ REPHRASINGS: dict[str, str] = {
             visual="a round dark bowl",
             not_the="not the container itself",
         ),
+    # "between" is a SELECTOR, not a position. The previous wording described a
+    # 1-D parametric point on the plate->ramekin axis ("in the gap between ...,
+    # closer to the plate side") and the policy executed it literally: after the
+    # text-first fix it stopped aiming at the midpoint but started aiming
+    # somewhere ON the line joining the two anchors, while the real bowl sits
+    # off that line (the three objects are not collinear).
+    #
+    # Two deliberate removals:
+    #   - every positional cue on the anchor axis (gap / side / midpoint), so
+    #     the relation can only be used to pick WHICH bowl, never WHERE;
+    #   - the not_the clause. Negation is a weak signal for a frozen encoder,
+    #     and "not the midpoint between the plate and the ramekin" still injects
+    #     the tokens "midpoint between the plate and the ramekin". It did its
+    #     job in the midpoint era; here it works against us.
+    #
+    # Do NOT encode the observed rightward offset: LIBERO randomises object
+    # placement per episode, so a hard-coded direction overfits one layout.
     "pick up the black bowl between the plate and the ramekin and place it on the plate":
         cot(
             target="the black bowl",
-            location="on the table surface, in the gap between the plate and the ramekin, physically touching neither - it is a separate round dark object resting on the table, closer to the plate side",
+            location="sitting on the table as a separate object; among the black bowls "
+                     "in the scene, the target is the one whose position falls between "
+                     "the plate and the ramekin. Aim at the center of the bowl itself",
             action="grasp the black bowl and place it on the plate",
             visual="a round dark bowl",
-            not_the="not the midpoint between the plate and the ramekin — the bowl is a distinct object, not the geometric center",
         ),
     "pick up the black bowl next to the plate and place it on the plate":
         cot(
