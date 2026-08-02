@@ -51,6 +51,37 @@ QUESTION_SETS = {
         "Describe the position of each black bowl relative to the white plate and "
         "to the silver ramekin.",
     ],
+    # Same scene, same discrimination, but with LIBERO's vocabulary removed.
+    # The "spatial" set above showed the nouns themselves are the problem: asked
+    # about "black bowls", Qwen answered "there are 0 black bowls ... two
+    # metallic, possibly aluminum, bowls that are silver in color" at 2x and
+    # called the ramekin a "small silver tray" at native. The referring
+    # expression cannot resolve when the noun does not match what the encoder
+    # sees, at any resolution.
+    #
+    # So: no "black", no "ramekin", no colour words at all. The containers are
+    # separated by the properties Qwen actually reported -- depth, size,
+    # emptiness, speckled contents. Open questions first; nothing presupposes a
+    # count, because presupposing "there are two black bowls" made the model
+    # play along with a premise it had just rejected.
+    #
+    # If this set lands at 2x, the fix is the CoT wording plus 512px input.
+    # If it still fails at 4x, the encoder cannot do this discrimination at all
+    # and the answer is explicit detection (box_encoder.py), not more pixels.
+    "spatial_visual": [
+        "There are several bowl-like containers on the table. For each one, "
+        "describe its size, how deep it is, what it is made of, and what is "
+        "inside it.",
+        "One container is noticeably smaller, shallower and empty. Where is it? "
+        "Describe its position relative to the other containers.",
+        "Two of the containers are deeper and hold speckled granular contents. "
+        "One of them sits immediately next to the small shallow empty one; the "
+        "other is far away from it. Which is which? Answer in terms of "
+        "left/right and near/far from the camera.",
+        "I want to pick up the deeper speckled bowl that is NOT the one touching "
+        "the small shallow empty container. Which bowl should I pick up, and "
+        "where is it on the table?",
+    ],
 }
 
 
@@ -171,12 +202,19 @@ def main() -> None:
             print(f"\nQ: {q}\nA: {ask(im, q)}")
 
     print("\nDONE. Read the answers:")
-    print("  - colors correct at native  -> info is THERE; fix = make DiT use it "
+    print("  - correct at native         -> info is THERE; fix = make DiT use it "
           "(RobotCNN dropout / detection), NOT resolution.")
     print("  - native wrong but upscale right -> processor downsampling is the "
           "bottleneck -> raise vision_input_size / camera render size.")
     print("  - wrong at all resolutions  -> encoder can't resolve it; use explicit "
           "detection (box_encoder.py).")
+    if args.probe in ("spatial", "spatial_visual"):
+        print("\n  Watch the NOUNS, not just the geometry. If the model rejects the "
+              "premise\n  ('there are 0 black bowls', 'a small silver tray'), the "
+              "referring expression\n  cannot resolve no matter how many pixels you "
+              "give it -- fix the CoT wording\n  in task_rewrites.py first. Compare "
+              "--probe spatial against --probe spatial_visual\n  at the SAME "
+              "resolution to separate a vocabulary failure from a resolution one.")
 
 
 if __name__ == "__main__":
