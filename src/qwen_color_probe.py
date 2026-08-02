@@ -82,6 +82,44 @@ QUESTION_SETS = {
         "the small shallow empty container. Which bowl should I pick up, and "
         "where is it on the table?",
     ],
+    # Same discrimination again, but anchored on the PLATE instead of the
+    # ramekin. spatial_visual fixed the vocabulary -- the model stopped
+    # rejecting the premise -- and 2x was enough to localise the ramekin itself.
+    # What stayed broken at every resolution, 4x included, was the relation:
+    # asked which deep bowl sits next to the shallow empty one, it answered
+    # backwards at native and 2x and openly self-contradicted at 4x.
+    #
+    # The reason is not margin, it is anchor localisability. The ramekin shares
+    # a vision token with the distractor bowl, so "distance to the ramekin"
+    # asks the model to measure from a landmark it cannot separate from one of
+    # the things being measured. Every plate-anchored judgement in that run was
+    # correct from 2x up -- the plate is large, uniquely coloured, and far from
+    # both bowls.
+    #
+    # GROUND TRUTH for grading (agentview, fractions of image width/height):
+    #   target bowl   (0.15, 0.47)  left,  near camera   ~30% from the plate
+    #   distractor    (0.33, 0.39)  right, far           ~40% from the plate
+    #   ramekin       (0.31, 0.46)  adjacent to the distractor
+    #   plate         (0.20, 0.77)
+    # So "nearest the plate" selects the TARGET -- the anchor swap keeps the
+    # relation pointing at the right bowl.
+    "spatial_plate": [
+        "Where is the round white plate with the red rim? Describe its position "
+        "relative to everything else on the table.",
+        "There are two deeper bowls with speckled granular contents. Which one is "
+        "closer to the round white plate with the red rim, and which one is "
+        "farther from it? Answer in terms of left/right and near/far from the "
+        "camera.",
+        # Deliberately inverted. If this disagrees with the previous answer the
+        # model is guessing and neither reading is usable -- the earlier run
+        # produced a confident "pick the left bowl" that contradicted its own
+        # adjacency answer, which is exactly the failure this catches.
+        "Of the two deeper speckled bowls, which one is the FARTHEST from the "
+        "round white plate with the red rim?",
+        "I want to pick up the deeper speckled bowl that is nearest to the round "
+        "white plate with the red rim. Which bowl is it, and where is it on the "
+        "table?",
+    ],
 }
 
 
@@ -208,13 +246,19 @@ def main() -> None:
           "bottleneck -> raise vision_input_size / camera render size.")
     print("  - wrong at all resolutions  -> encoder can't resolve it; use explicit "
           "detection (box_encoder.py).")
-    if args.probe in ("spatial", "spatial_visual"):
+    if args.probe.startswith("spatial"):
         print("\n  Watch the NOUNS, not just the geometry. If the model rejects the "
               "premise\n  ('there are 0 black bowls', 'a small silver tray'), the "
               "referring expression\n  cannot resolve no matter how many pixels you "
               "give it -- fix the CoT wording\n  in task_rewrites.py first. Compare "
               "--probe spatial against --probe spatial_visual\n  at the SAME "
               "resolution to separate a vocabulary failure from a resolution one.")
+    if args.probe == "spatial_plate":
+        print("\n  Check the two middle answers AGAINST EACH OTHER first. 'closer' "
+              "and 'FARTHEST'\n  must name opposite bowls; if they name the same one, "
+              "the model is guessing and\n  a correct-looking final answer means "
+              "nothing. Only if they are consistent does\n  it matter whether they "
+              "match ground truth (target = left, near camera).")
 
 
 if __name__ == "__main__":
