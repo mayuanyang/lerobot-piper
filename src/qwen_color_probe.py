@@ -25,25 +25,48 @@ from __future__ import annotations
 import argparse
 
 
-QUESTIONS = [
-    "Look at the table. List each item you can see and its color.",
-    "There are two cans on the table: a can of alphabet soup and a can of "
-    "tomato sauce. What color is the alphabet soup can, and what color is the "
-    "tomato sauce can?",
-    "One can is blue and one can is red. Is the BLUE can on the left or the "
-    "right? Is the RED can on the left or the right?",
-    "Describe the exact location of the blue can relative to the other objects.",
-]
+QUESTION_SETS = {
+    # libero_10 T0: two cans separable only by colour.
+    "color": [
+        "Look at the table. List each item you can see and its color.",
+        "There are two cans on the table: a can of alphabet soup and a can of "
+        "tomato sauce. What color is the alphabet soup can, and what color is the "
+        "tomato sauce can?",
+        "One can is blue and one can is red. Is the BLUE can on the left or the "
+        "right? Is the RED can on the left or the right?",
+        "Describe the exact location of the blue can relative to the other objects.",
+    ],
+    # libero_spatial "between the plate and the ramekin": two IDENTICAL black
+    # bowls, separable only by which one is adjacent to the ramekin. On a
+    # 256x256 frame the near bowl and the ramekin are ~19px apart, i.e. inside
+    # one 32x32-px vision token at the policy's current 8x8 grid. These
+    # questions ask exactly the comparison the policy has to make.
+    "spatial": [
+        "Look at the table. List every object you can see and where it is.",
+        "How many black bowls are on the table?",
+        "There are two black bowls and one small silver ramekin. Which black bowl "
+        "is closer to the silver ramekin, and which one is farther from it? "
+        "Answer in terms of left/right and front/back.",
+        "Is the silver ramekin directly beside one of the black bowls? Which one?",
+        "Describe the position of each black bowl relative to the white plate and "
+        "to the silver ramekin.",
+    ],
+}
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--suite", default="libero_10")
     ap.add_argument("--task_id", type=int, default=0)
+    ap.add_argument("--probe", choices=sorted(QUESTION_SETS), default="color",
+                    help="which question set to ask")
     ap.add_argument("--camera", default="image",
                     help="env pixel key to probe (image=agentview, image2=wrist)")
     ap.add_argument("--max_new_tokens", type=int, default=160)
+    ap.add_argument("--list_tasks", action="store_true",
+                    help="print every task id + description in --suite and exit")
     args = ap.parse_args()
+    QUESTIONS = QUESTION_SETS[args.probe]
 
     import numpy as np
     import torch
@@ -51,8 +74,15 @@ def main() -> None:
     from lerobot.envs.libero import LiberoEnv, _get_suite
     from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
-    # 1. Real env frame -------------------------------------------------------
+    # 0. Task lookup ----------------------------------------------------------
     suite = _get_suite(args.suite)
+    if args.list_tasks:
+        n = suite.n_tasks if hasattr(suite, "n_tasks") else len(suite.tasks)
+        for tid in range(n):
+            print(f"  task_id={tid}: {suite.get_task(tid).language}")
+        return
+
+    # 1. Real env frame -------------------------------------------------------
     env = LiberoEnv(task_suite=suite, task_id=args.task_id, task_suite_name=args.suite,
                     obs_type="pixels_agent_pos", init_states=True, episode_index=0)
     obs, _ = env.reset(seed=0)
@@ -84,22 +114,59 @@ def main() -> None:
     ).to(device).eval()
     processor = AutoProcessor.from_pretrained(model_id)
 
-    @torch.no_grad()
-    def ask(img: Image.Image, question: str) -> str:
+    merge = int(getattr(getattr(model.config, "vision_config", None),
+                        "spatial_merge_size", 2) or 2)
+
+    def _build(img: Image.Image, question: str):
+        """Tokenise one (image, question). Forces min/max_pixels to the image's
+        own area so the processor's smart-resize CANNOT clamp an upscaled
+        variant back down to its default budget -- without this the 2x/4x rows
+        can silently collapse to the same token count as native and the whole
+        comparison is void."""
         messages = [{"role": "user", "content": [
             {"type": "image", "image": img},
             {"type": "text", "text": question},
         ]}]
         text = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True)
-        inputs = processor(text=[text], images=[img], return_tensors="pt").to(device)
+        px = img.size[0] * img.size[1]
+        try:
+            return processor(text=[text], images=[img], return_tensors="pt",
+                             min_pixels=px, max_pixels=px)
+        except (TypeError, ValueError):
+            return processor(text=[text], images=[img], return_tensors="pt")
+
+    def vision_tokens(inputs) -> tuple:
+        thw = inputs.get("image_grid_thw")
+        if thw is None:
+            return (None, None)
+        g = thw[0].tolist()
+        gh, gw = int(g[1]) // merge, int(g[2]) // merge
+        return (f"{gh}x{gw}", gh * gw)
+
+    @torch.no_grad()
+    def ask(img: Image.Image, question: str) -> str:
+        inputs = _build(img, question).to(device)
         gen = model.generate(**inputs, max_new_tokens=args.max_new_tokens, do_sample=False)
         trimmed = gen[:, inputs.input_ids.shape[1]:]
         return processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
 
     # 3. Ask, at each resolution ---------------------------------------------
+    # Report the token grid FIRST. If these numbers do not differ across the
+    # three rows, the resolution comparison never happened -- read nothing into
+    # the answers.
+    print("\n" + "=" * 70 + "\nVISION TOKEN GRID PER VARIANT (must differ!)\n" + "=" * 70)
+    grids = {}
     for vname, im in variants.items():
-        print("\n" + "=" * 70 + f"\nRESOLUTION: {vname}\n" + "=" * 70)
+        grid, ntok = vision_tokens(_build(im, "x"))
+        grids[vname] = ntok
+        print(f"  {vname:<18} {im.size[0]}x{im.size[1]}px -> {grid} merged = {ntok} vision tokens")
+    if len(set(grids.values())) < len(grids):
+        print("\n  !! WARNING: token counts collapsed -- the processor clamped the "
+              "upscales.\n     The resolution comparison below is INVALID.")
+
+    for vname, im in variants.items():
+        print("\n" + "=" * 70 + f"\nRESOLUTION: {vname}  ({grids[vname]} vision tokens)\n" + "=" * 70)
         for q in QUESTIONS:
             print(f"\nQ: {q}\nA: {ask(im, q)}")
 
