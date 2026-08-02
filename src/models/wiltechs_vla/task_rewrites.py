@@ -169,31 +169,44 @@ REPHRASINGS: dict[str, str] = {
             visual="a round dark bowl",
             not_the="not the container itself",
         ),
-    # "between" is a SELECTOR, not a position. The previous wording described a
-    # 1-D parametric point on the plate->ramekin axis ("in the gap between ...,
-    # closer to the plate side") and the policy executed it literally: after the
-    # text-first fix it stopped aiming at the midpoint but started aiming
-    # somewhere ON the line joining the two anchors, while the real bowl sits
-    # off that line (the three objects are not collinear).
+    # "between" is a SELECTOR, not a position. The scene holds TWO identical
+    # black bowls; one sits directly beside the ramekin (the target of the
+    # "next to the ramekin" task) and the other sits out in the open. The
+    # relation exists only to pick which one -- the three objects are not
+    # collinear, so nothing about the target's coordinates follows from it.
     #
-    # Two deliberate removals:
-    #   - every positional cue on the anchor axis (gap / side / midpoint), so
-    #     the relation can only be used to pick WHICH bowl, never WHERE;
-    #   - the not_the clause. Negation is a weak signal for a frozen encoder,
-    #     and "not the midpoint between the plate and the ramekin" still injects
-    #     the tokens "midpoint between the plate and the ramekin". It did its
-    #     job in the midpoint era; here it works against us.
+    # The old wording described a 1-D parametric point on the plate->ramekin
+    # axis ("in the gap between ..., closer to the plate side") and the policy
+    # executed it literally: after the text-first fix it stopped aiming at the
+    # midpoint and started aiming somewhere ON the line joining the anchors,
+    # landing on bare table ~16% of the image width from the real bowl.
     #
-    # Do NOT encode the observed rightward offset: LIBERO randomises object
-    # placement per episode, so a hard-coded direction overfits one layout.
+    # Hence the contrastive phrasing below: name both candidates, discriminate
+    # by a binary comparison ("farther from the ramekin") that survives LIBERO's
+    # per-episode placement randomisation, and emit no coordinate the policy can
+    # interpolate. Every positional cue on the anchor axis (gap / side /
+    # midpoint) is gone, as is the not_the clause -- negation is a weak signal
+    # for a frozen encoder and "not the midpoint between the plate and the
+    # ramekin" still injects "midpoint between the plate and the ramekin". It
+    # earned its place in the midpoint era; here it worked against us.
+    #
+    # Do NOT encode the observed offset direction: placement is randomised per
+    # episode, so a hard-coded "to the right" overfits one layout.
+    #
+    # CAVEAT: at the current 8x8 vision grid this task is likely unresolvable no
+    # matter how it is phrased -- bowl B and the ramekin are ~6.8% of the image
+    # width apart, i.e. inside a SINGLE vision token (12.5% wide). The model
+    # cannot compare distances to a landmark it cannot separate from the
+    # distractor. Expect this rewrite to pay off only once the grid is >=16x16.
     "pick up the black bowl between the plate and the ramekin and place it on the plate":
         cot(
             target="the black bowl",
-            location="sitting on the table as a separate object; among the black bowls "
-                     "in the scene, the target is the one whose position falls between "
-                     "the plate and the ramekin. Aim at the center of the bowl itself",
-            action="grasp the black bowl and place it on the plate",
-            visual="a round dark bowl",
+            location="there are two identical black bowls in the scene; the target is the "
+                     "one farther from the small silver ramekin. The other black bowl sits "
+                     "directly beside the ramekin and is not the target. Aim at the center "
+                     "of the target bowl",
+            action="grasp that black bowl and place it on the white plate",
+            visual="a round dark bowl with granular contents",
         ),
     "pick up the black bowl next to the plate and place it on the plate":
         cot(
