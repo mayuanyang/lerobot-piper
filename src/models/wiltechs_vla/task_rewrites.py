@@ -181,32 +181,59 @@ REPHRASINGS: dict[str, str] = {
     # midpoint and started aiming somewhere ON the line joining the anchors,
     # landing on bare table ~16% of the image width from the real bowl.
     #
-    # Hence the contrastive phrasing below: name both candidates, discriminate
-    # by a binary comparison ("farther from the ramekin") that survives LIBERO's
-    # per-episode placement randomisation, and emit no coordinate the policy can
-    # interpolate. Every positional cue on the anchor axis (gap / side /
-    # midpoint) is gone, as is the not_the clause -- negation is a weak signal
-    # for a frozen encoder and "not the midpoint between the plate and the
-    # ramekin" still injects "midpoint between the plate and the ramekin". It
-    # earned its place in the midpoint era; here it worked against us.
+    # The wording below is not guesswork -- qwen_color_probe.py was run on the
+    # real env frame at 64 / 256 / 1024 vision tokens with three question sets,
+    # and only one combination survived (see --probe spatial{,_visual,_plate}):
+    #
+    #   probe           vocabulary   anchor    @256 tok (= --vision_input_size 512)
+    #   spatial         LIBERO       ramekin   FAIL "there are 0 black bowls"
+    #   spatial_visual  perceptual   ramekin   FAIL relation answered backwards
+    #   spatial_plate   perceptual   plate     PASS consistent + matches truth
+    #
+    # Two independent defects, both of which had to go:
+    #
+    # 1. VOCABULARY. Qwen does not see a "black bowl". At 256 tokens it replies
+    #    "there are 0 black bowls ... two metallic, possibly aluminum, bowls
+    #    that are silver in color", and it calls the ramekin a "small silver
+    #    tray". Higher resolution makes this WORSE, since it resolves the
+    #    speckled contents and reads them as metal. A referring expression whose
+    #    nouns the encoder rejects cannot resolve at any resolution. So: no
+    #    colour words, no "ramekin" -- the containers are separated by depth,
+    #    size, emptiness and contents, which is how Qwen itself described them.
+    #
+    # 2. ANCHOR. The ramekin shares a vision token with the distractor bowl
+    #    (~19 native px apart on a 256px frame, one token spans 32px), so
+    #    "distance to the ramekin" asks the policy to measure from a landmark it
+    #    cannot separate from one of the things being measured. The plate is
+    #    large, uniquely coloured and far from both bowls, and every
+    #    plate-anchored judgement in the probe was correct from 256 tokens up.
+    #    The swap is safe: the target is ~30% of the frame from the plate against
+    #    the distractor's ~40%, so "nearest the plate" still selects the target.
+    #
+    # Still no coordinate the policy can interpolate -- "whichever of those two"
+    # is a binary choice over discrete candidates, not a position. "Aim at the
+    # center of the target bowl itself" pins the last step to vision. The
+    # not_the clause stays gone: negation is weak for a frozen encoder, and the
+    # old "not the midpoint between the plate and the ramekin" merely injected
+    # "midpoint between the plate and the ramekin".
     #
     # Do NOT encode the observed offset direction: placement is randomised per
     # episode, so a hard-coded "to the right" overfits one layout.
     #
-    # CAVEAT: at the current 8x8 vision grid this task is likely unresolvable no
-    # matter how it is phrased -- bowl B and the ramekin are ~6.8% of the image
-    # width apart, i.e. inside a SINGLE vision token (12.5% wide). The model
-    # cannot compare distances to a landmark it cannot separate from the
-    # distractor. Expect this rewrite to pay off only once the grid is >=16x16.
+    # REQUIRES --vision_input_size 512 (16x16 grid). At the default 8x8 the
+    # probe FAILED its own consistency control, naming the same bowl as both
+    # nearest and farthest from the plate. This wording buys nothing at 64
+    # tokens; the two changes ship together or not at all.
     "pick up the black bowl between the plate and the ramekin and place it on the plate":
         cot(
-            target="the black bowl",
-            location="there are two identical black bowls in the scene; the target is the "
-                     "one farther from the small silver ramekin. The other black bowl sits "
-                     "directly beside the ramekin and is not the target. Aim at the center "
-                     "of the target bowl",
-            action="grasp that black bowl and place it on the white plate",
-            visual="a round dark bowl with granular contents",
+            target="the deep speckled bowl",
+            location="two deep bowls hold speckled granular contents; the target is "
+                     "whichever of those two is nearer to the round white plate with the "
+                     "red rim, and the other one is not the target. Aim at the center of "
+                     "the target bowl itself",
+            action="grasp that bowl and place it on the round white plate with the red rim",
+            visual="a bowl with a dark rim and speckled granular contents, clearly deeper "
+                   "than the small shallow empty cup",
         ),
     "pick up the black bowl next to the plate and place it on the plate":
         cot(
