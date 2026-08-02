@@ -211,7 +211,8 @@ class WiltechsMoETransformer(nn.Module):
         self._lang_max_len = 128
         self.text_first = bool(getattr(config, "text_first", True))
         self._template_ids_cpu = None; self._template_format_printed = False
-        self._lang_len_printed = False; self.gradient_checkpointing = False
+        self._lang_len_printed = False; self._vision_grid_printed = set()
+        self.gradient_checkpointing = False
     def train(self, mode=True):
         super().train(mode); self.visual.eval(); self.language_model.eval(); return self
     def gradient_checkpointing_enable(self): self.gradient_checkpointing = True; print("[wiltechs_moe] Expert gradient checkpointing ENABLED")
@@ -222,6 +223,27 @@ class WiltechsMoETransformer(nn.Module):
                 candidate = getattr(owner, attr, None)
                 if candidate is not None: return candidate
         return None
+    def cam_target_size(self, cam_key):
+        """Square input side length for this camera's Qwen preprocessing, or 0
+        for the processor default. Shared with the DataLoader-worker path so
+        both produce identical grids."""
+        vs = int(getattr(self.config, "vision_input_size", 0) or 0)
+        if vs <= 0: return 0
+        hires = list(getattr(self.config, "vision_hires_cameras", None) or [])
+        return vs if (not hires or cam_key in hires) else 0
+
+    def _report_vision_grid(self, cam_key, image_grid_thw):
+        """One line per camera at startup. The pixel-bound plumbing in
+        preprocess_camera_to_pixels varies by transformers version, so this is
+        the ONLY trustworthy confirmation that a resolution change took."""
+        if cam_key in self._vision_grid_printed: return
+        self._vision_grid_printed.add(cam_key)
+        g = image_grid_thw[0].tolist() if image_grid_thw.dim() > 1 else image_grid_thw.tolist()
+        m = self.spatial_merge_size
+        gh, gw = int(g[1]) // m, int(g[2]) // m
+        print(f"[wiltechs_moe] vision grid {cam_key}: patch_thw={g} -> {gh}x{gw} merged "
+              f"= {gh * gw} tokens/frame (target_size={self.cam_target_size(cam_key) or 'processor default'})")
+
     def _encode_images(self, batch, B):
         device = batch["observation.state"].device; all_vis = []; grid_thw_list = []
         for cam_key in self.config.cameras_for_vision_state_concat:
@@ -234,9 +256,11 @@ class WiltechsMoETransformer(nn.Module):
                     pixel_values = pv.to(device=device); image_grid_thw = image_grid_thw.to(device=device)
                 elif cam_key in batch:
                     imgs = batch[cam_key]; img = imgs[:, -1] if imgs.dim() == 5 else imgs
-                    pixel_values, image_grid_thw = preprocess_camera_to_pixels(self.processor.image_processor, img)
+                    pixel_values, image_grid_thw = preprocess_camera_to_pixels(
+                        self.processor.image_processor, img, target_size=self.cam_target_size(cam_key))
                     pixel_values = pixel_values.to(device=device); image_grid_thw = image_grid_thw.to(device=device)
                 else: continue
+                self._report_vision_grid(cam_key, image_grid_thw)
                 try: vis_tokens = self.visual(pixel_values, grid_thw=image_grid_thw)
                 except TypeError: vis_tokens = self.visual(pixel_values, image_thw=image_grid_thw)
                 vis_tokens = getattr(vis_tokens, "last_hidden_state", vis_tokens)

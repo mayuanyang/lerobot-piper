@@ -72,15 +72,55 @@ def vlm_grid_key(cam_key: str) -> str:
     return f"{_VLM_PIX_PREFIX}thw::{cam_key}"
 
 
-def preprocess_camera_to_pixels(image_processor, img: torch.Tensor):
+def preprocess_camera_to_pixels(image_processor, img: torch.Tensor, target_size: int = 0):
     """img: (B, 3, H, W) or (3, H, W) float in [0, 1]. Returns
-    (pixel_values, image_grid_thw) on CPU from the Qwen image_processor."""
+    (pixel_values, image_grid_thw) on CPU from the Qwen image_processor.
+
+    target_size > 0 forces a square input of that side length, which is what
+    sets the vision token count (Qwen3-VL: one merged token per 32x32 input px,
+    so 512 -> 16x16 tokens). Both the explicit resize AND the min/max_pixels
+    bounds are applied, because the processor's smart-resize would otherwise
+    clamp the upscaled image straight back down to its default budget.
+    0 leaves the processor on its defaults.
+
+    Different transformers versions accept the pixel bounds either as call
+    kwargs or only as instance attributes, so try the kwargs first and fall
+    back to a save/set/restore around the call. Do not trust either path to
+    have worked -- read the grid_thw the caller prints at startup.
+    """
     if img.dim() == 3:
         img = img.unsqueeze(0)
     B = img.shape[0]
     img_np = (img.permute(0, 2, 3, 1).detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
     pil_images = [Image.fromarray(img_np[i]) for i in range(B)]
-    proc_out = image_processor(images=pil_images, return_tensors="pt")
+    if not target_size:
+        proc_out = image_processor(images=pil_images, return_tensors="pt")
+        return proc_out["pixel_values"], proc_out["image_grid_thw"]
+
+    ts = int(target_size); px = ts * ts
+    pil_images = [im.resize((ts, ts), Image.BICUBIC) for im in pil_images]
+    try:
+        proc_out = image_processor(images=pil_images, return_tensors="pt",
+                                   min_pixels=px, max_pixels=px)
+    except (TypeError, ValueError):
+        keys = ("min_pixels", "max_pixels")
+        saved = {k: getattr(image_processor, k, None) for k in keys}
+        size_saved = getattr(image_processor, "size", None)
+        try:
+            for k in keys:
+                if saved[k] is not None:
+                    setattr(image_processor, k, px)
+            if isinstance(size_saved, dict):
+                image_processor.size = {**size_saved,
+                                        **{k: px for k in ("shortest_edge", "longest_edge")
+                                           if k in size_saved}}
+            proc_out = image_processor(images=pil_images, return_tensors="pt")
+        finally:
+            for k in keys:
+                if saved[k] is not None:
+                    setattr(image_processor, k, saved[k])
+            if isinstance(size_saved, dict):
+                image_processor.size = size_saved
     return proc_out["pixel_values"], proc_out["image_grid_thw"]
 
 

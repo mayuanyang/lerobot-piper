@@ -36,7 +36,32 @@ class WiltechsMoEConfig(PreTrainedConfig):
     )
 
     # -------- Image processing --------
-    vision_input_size: int = 448
+    # Side length (px) fed to the Qwen image processor. 0 = leave the processor
+    # on its own smart-resize defaults (the historical behaviour -- note the
+    # old `vision_input_size = 448` was NEVER passed anywhere, so 0 and 448 are
+    # the same run).
+    #
+    # Qwen3-VL uses patch=16 with spatial_merge=2, so one merged vision token
+    # covers a 32x32 block of whatever the processor emits:
+    #
+    #   input 256 -> 8x8 grid  =  64 tok/cam   (32x32 native px per token)
+    #   input 512 -> 16x16 grid = 256 tok/cam  (16x16 native px per token)
+    #   input 1024 -> 32x32 grid = 1024 tok/cam ( 8x8  native px per token)
+    #
+    # With 256x256 source frames, 512 is NOT empty upsampling: the detail is
+    # already in the source, the 32px-per-token quantisation is what discards
+    # it. libero_spatial needs to separate the distractor bowl from the ramekin,
+    # ~17 native px apart -- 0.54 of a token at 8x8 (same token, unresolvable),
+    # 1.09 tokens at 16x16.
+    #
+    # COST: L_vlm is also the K/V length of every expert's cross-attention, so
+    # it multiplies through num_experts x expert_num_layers, not just the VLM.
+    vision_input_size: int = 0
+    # Cameras that get vision_input_size. Empty = all of them. Restricting this
+    # to the third-person view is usually the right trade: the spatial relations
+    # that need the resolution are not resolvable at the wrist camera's scale
+    # anyway, and it roughly halves the added cost.
+    vision_hires_cameras: list[str] = field(default_factory=list)
 
     # -------- VLM backbone --------
     num_cameras: int = 3

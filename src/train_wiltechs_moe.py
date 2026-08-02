@@ -149,11 +149,16 @@ class VLMImagePreprocDataset(torch.utils.data.Dataset):
     CNN still consumes them. Assumes a uniform camera resolution (true for a
     single homogeneous dataset) so pixel_values collate cleanly to (B, P, dim)."""
 
-    def __init__(self, dataset, image_processor, camera_keys, augment=None):
+    def __init__(self, dataset, image_processor, camera_keys, augment=None,
+                 cam_target_sizes=None):
         self.dataset = dataset
         self.image_processor = image_processor
         self.camera_keys = list(camera_keys)
         self.augment = augment  # torchvision transform, or None (e.g. eval)
+        # {cam_key: square input side length}; 0/missing = processor default.
+        # Must match the model's cam_target_size() or the two paths would build
+        # different grids depending on --preprocess_in_workers.
+        self.cam_target_sizes = dict(cam_target_sizes or {})
 
     def __len__(self):
         return len(self.dataset)
@@ -178,7 +183,9 @@ class VLMImagePreprocDataset(torch.utils.data.Dataset):
                 sample[k] = imgs3[i].unsqueeze(0) if had_t[i] else imgs3[i]
 
         for i, k in enumerate(present):
-            pv, thw = preprocess_camera_to_pixels(self.image_processor, imgs3[i])
+            pv, thw = preprocess_camera_to_pixels(
+                self.image_processor, imgs3[i],
+                target_size=self.cam_target_sizes.get(k, 0))
             sample[vlm_pixels_key(k)] = pv         # (P, dim)
             sample[vlm_grid_key(k)] = thw[0]       # (3,)
         return sample
@@ -288,6 +295,8 @@ def train(
     chat_directive: str = "",
     use_descriptive_objects: bool = False,
     text_first: bool = True,
+    vision_input_size: int = 0,
+    vision_hires_cameras: Optional[list] = None,
     robot_encoder_tokens: int = 16,
     noise_temporal_correlation: float = 0.0,
     vision_dropout_prob: float = 0.3,
@@ -342,6 +351,20 @@ def train(
     action_dim = next(iter(output_features.values())).shape[-1]
     print(f"Detected cameras ({len(camera_keys)}): {camera_keys}")
     print(f"State dim: {state_dim}, Action dim: {action_dim}")
+
+    # Validate eagerly: a mistyped key would otherwise silently resolve to
+    # "no camera gets the higher resolution" and the run would look normal.
+    if vision_hires_cameras:
+        missing = [c for c in vision_hires_cameras if c not in camera_keys]
+        if missing:
+            raise ValueError(
+                f"--vision_hires_cameras {missing} not in detected cameras {camera_keys}")
+    if vision_input_size:
+        targeted = list(vision_hires_cameras) if vision_hires_cameras else list(camera_keys)
+        print(f"Vision input size {vision_input_size}px -> "
+              f"{(vision_input_size // 32) ** 2} tokens/frame for {targeted}; "
+              f"other cameras keep the processor default. "
+              f"Confirm with the '[wiltechs_moe] vision grid ...' lines below.")
 
     # ── Resolve the RobotCNN camera list ────────────────────────────────
     robot_cnn_camera_keys: list[str] = []
@@ -430,6 +453,8 @@ def train(
         chat_directive=chat_directive,
         use_descriptive_objects=use_descriptive_objects,
         text_first=text_first,
+        vision_input_size=vision_input_size,
+        vision_hires_cameras=list(vision_hires_cameras or []),
         robot_encoder_tokens=robot_encoder_tokens,
         noise_temporal_correlation=noise_temporal_correlation,
         router_temperature=router_temperature,
@@ -603,6 +628,7 @@ def train(
         dataset = VLMImagePreprocDataset(
             dataset, policy.model.processor.image_processor, camera_keys,
             augment=image_transforms,
+            cam_target_sizes={k: policy.model.cam_target_size(k) for k in camera_keys},
         )
         print("Image preprocessing moved into DataLoader workers "
               "(augment + Qwen image_processor per-sample, parallel + overlapped).")
@@ -851,6 +877,19 @@ if __name__ == "__main__":
     parser.add_argument("--use_descriptive_objects", action="store_true",
                         help="Rewrite ambiguous object/region names into visually-groundable "
                              "descriptions via task_rewrites.py.")
+    parser.add_argument("--vision_input_size", type=int, default=0,
+                        help="Square side length (px) fed to the Qwen image processor. "
+                             "Qwen3-VL emits one merged vision token per 32x32 input px, so "
+                             "256->8x8=64 tok/cam, 512->16x16=256, 1024->32x32=1024. "
+                             "0 (default) = processor smart-resize defaults. NOTE L_vlm is also "
+                             "the K/V length of every expert's cross-attention, so the cost "
+                             "multiplies through num_experts x expert_num_layers.")
+    parser.add_argument("--vision_hires_cameras", type=str, nargs="+", default=None,
+                        help="Camera key(s) that get --vision_input_size; the rest keep the "
+                             "processor default. Empty = all cameras. Restricting this to the "
+                             "third-person view roughly halves the added cost, since the "
+                             "relations that need the resolution are not resolvable at the "
+                             "wrist camera's scale anyway.")
     parser.add_argument("--text_last", dest="text_first", action="store_false", default=True,
                         help="Legacy VLM layout: instruction AFTER the images. Under the VLM's "
                              "causal mask this leaves every vision KV language-blind. Default is "
