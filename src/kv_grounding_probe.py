@@ -245,27 +245,43 @@ def main() -> None:
         pix = project_points_from_world_to_camera(
             np.stack([pos[n] for n in names]), T, H, W)  # (N, 2) as [row, col]
 
-        for flip in (False, True):
-            im = Image.fromarray(f).convert("RGB")
-            dr = ImageDraw.Draw(im)
-            for n, (r, c) in zip(names, pix):
-                r = (H - 1 - r) if flip else r
-                r, c = int(round(r)), int(round(c))
-                hit = 0 <= r < H and 0 <= c < W
-                col = (255, 40, 40) if "bowl_1" in n else (
-                    (40, 120, 255) if "bowl_2" in n else (40, 200, 40))
-                dr.ellipse([c - 5, r - 5, c + 5, r + 5], outline=col, width=2)
-                dr.text((c + 8, r - 6), n.replace("_1", "_1 ").replace("akita_black_", ""),
-                        fill=col)
-                print(f"  {n:<34} -> row={r:4d} col={c:4d}{'' if hit else '   OFF-FRAME'}"
-                      f"{'   [flipped]' if flip else ''}")
-            path = f"annotated_t{args.task_id}{'_flipped' if flip else ''}.png"
-            im.save(path)
-            print("saved", path)
-        print("\nBoth vertical conventions are saved because robosuite renders "
-              "bottom-up and LIBERO may or may not flip before handing the frame "
-              "over. Open both; exactly one will put the labels on the objects.")
+        try:
+            cams = [se.sim.model.camera_id2name(i)
+                    for i in range(se.sim.model.ncam)]
+            print("cameras in this sim:", cams)
+        except Exception:
+            pass
+
+        # Save every row/col mirror combination rather than reasoning about the
+        # convention. robosuite renders bottom-up, LIBERO may flip before handing
+        # the frame over, and the projection helper's own axis order is one more
+        # place to be wrong -- four small PNGs settle it by eye in one look,
+        # which guessing demonstrably did not.
+        for fr in (False, True):
+            for fc in (False, True):
+                im = Image.fromarray(f).convert("RGB")
+                dr = ImageDraw.Draw(im)
+                rows = []
+                for n, (r, c) in zip(names, pix):
+                    r = (H - 1 - r) if fr else r
+                    c = (W - 1 - c) if fc else c
+                    r, c = int(round(r)), int(round(c))
+                    colr = (255, 40, 40) if "bowl_1" in n else (
+                        (40, 120, 255) if "bowl_2" in n else (40, 200, 40))
+                    dr.ellipse([c - 5, r - 5, c + 5, r + 5], outline=colr, width=2)
+                    dr.text((c + 8, r - 6), n.replace("akita_black_", ""), fill=colr)
+                    rows.append((n, r, c))
+                tag = ("_flipR" if fr else "") + ("_flipC" if fc else "")
+                path = f"annotated_t{args.task_id}_s{args.init_state_id}{tag or '_raw'}.png"
+                im.save(path)
+                print(f"saved {path}   " + "  ".join(f"{n.split('_')[-2][:4]}=({r},{c})"
+                                                     for n, r, c in rows[:3]))
+        print("\nFour variants saved: raw, flipR (rows mirrored), flipC (columns "
+              "mirrored), flipR_flipC (both). Open them and keep the one whose "
+              "circles land on the objects; tell me which and I will pin it.")
         print("RED = akita_black_bowl_1 (the BDDL target).  BLUE = bowl_2 (distractor).")
+        print("If NONE line up, --camera_name is probably wrong -- try another "
+              "entry from the camera list above.")
         env.close()
         return
 
