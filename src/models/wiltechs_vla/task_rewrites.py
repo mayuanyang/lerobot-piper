@@ -133,6 +133,55 @@ def cot(
     return "".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# libero_spatial shared vocabulary
+# ---------------------------------------------------------------------------
+# All ten libero_spatial tasks share ONE scene and ONE object set, so they must
+# share ONE set of nouns. Before this was factored out, the same ramekin was
+# "the small shallow empty cup" in the between task and "the small round silver
+# container" in the two ramekin tasks, and a bare "black bowl" in the six that
+# had no rewrite at all -- three mutually inconsistent descriptions, two of them
+# perceptually contradictory, for objects sitting side by side in one frame.
+# Constants make that drift structurally impossible rather than a thing to
+# remember.
+#
+# The wording is the one qwen_color_probe.py validated (see the block below):
+# no colour words, no "ramekin", containers separated by depth/size/emptiness
+# and contents, which is how Qwen itself described them.
+_SP_BOWL = "the deep speckled bowl"
+_SP_BOWLS = "there are two such bowls"
+_SP_PLATE = "the round white plate with the red rim"
+_SP_CUP = "the small shallow empty cup"
+_SP_VISUAL = ("a bowl with a dark rim and speckled granular contents, clearly "
+              "deeper than the small shallow empty cup")
+
+
+def _spatial(selector: str) -> str:
+    """Build one libero_spatial rewrite from the shared vocabulary.
+
+    `selector` completes "the target is whichever of those two ..." and is the
+    ONLY thing that varies between tasks -- each keeps its own canonical
+    relation, because those were measured and nine of ten separate the two bowls
+    by >=2x. Phrase it positively: negation is weak for a frozen encoder, and
+    the old "not the midpoint between the plate and the ramekin" only succeeded
+    in injecting "midpoint between the plate and the ramekin".
+
+    Kept terse on purpose: _lang_max_len is 128 and the longest of these renders
+    to ~105 tokens. `visual` already spells out the contents and the depth
+    contrast, so `target` and the location opener must not repeat them -- an
+    earlier draft said "speckled granular contents" three times in one string
+    and cost ~10 tokens of headroom for nothing. The real count is printed every
+    run by _report_lang_budget; if it ever says TRUNCATED, shorten here.
+    """
+    return cot(
+        target=_SP_BOWL,
+        location=f"{_SP_BOWLS}; the target is whichever of those two {selector}. "
+                 f"Aim at the center of the target bowl itself",
+        action=f"grasp that bowl and place it on {_SP_PLATE}",
+        visual=_SP_VISUAL,
+    )
+
+
 REPHRASINGS: dict[str, str] = {
     # ---- libero_10 (long) — object-identity grounding ----
     # T0: two round cans, distinguished only by color (red vs blue).
@@ -153,9 +202,10 @@ REPHRASINGS: dict[str, str] = {
     # form names the target first, so the DiT attends to object identity, then
     # relation.
     #
-    # ONLY REWRITE WHAT FAILS. In every one of the 10 tasks the BDDL target is
-    # akita_black_bowl_1 and the distractor akita_black_bowl_2, so the referring
-    # expression's whole job is to separate two bowls. Measured on init state 0
+    # KEEP EVERY TASK'S OWN RELATION; SHARE ONE VOCABULARY. In every one of the
+    # 10 tasks the BDDL target is akita_black_bowl_1 and the distractor
+    # akita_black_bowl_2, so the referring expression's whole job is to separate
+    # two bowls. Measured on init state 0
     # (src/kv_grounding_probe.py --list_bodies), distance ratio between the two
     # bowls under each task's OWN named anchor:
     #
@@ -176,32 +226,26 @@ REPHRASINGS: dict[str, str] = {
     # line changes every episode. That -- not vocabulary -- is why this one task
     # fails while libero_spatial as a whole sits at ~87%.
     #
-    # Two corollaries, both learned by getting them wrong first:
+    # Which separates the two axes, and they need opposite treatment:
     #
-    #  * Do NOT unify the tasks onto the plate anchor. It is the right anchor for
-    #    t0 (2.30x vs the ramekin's 1.20x) and for t8, and useless elsewhere --
-    #    for t1 the plate separates the bowls 1.01x, a coin flip.
-    #  * Do NOT rewrite the nine working tasks to purge "black"/"ramekin". The
-    #    qwen_color_probe evidence that Qwen cannot see a "black bowl" comes from
-    #    its GENERATIVE path; the policy only ever reads cross-attention KV, and
-    #    ~87% success is direct evidence that path grounds these nouns fine.
-    #    Rewriting working tasks risks the minimal-pair collateral for no gain.
-    "pick up the black bowl on the ramekin and place it on the plate":
-        cot(
-            target="the black bowl",
-            location="on top of the small round silver container (ramekin)",
-            action="grasp the black bowl and place it on the plate",
-            visual="a round dark bowl, distinct from the flat plate and the small silver ramekin",
-            not_the="not the container itself",
-        ),
-    "pick up the black bowl next to the ramekin and place it on the plate":
-        cot(
-            target="the black bowl",
-            location="next to the small round silver container (ramekin)",
-            action="grasp the black bowl and place it on the plate",
-            visual="a round dark bowl",
-            not_the="not the container itself",
-        ),
+    #  * RELATIONS stay per-task. Do NOT unify onto the plate anchor -- it is
+    #    right for t0 (2.30x vs the ramekin's 1.20x) and t8, and useless
+    #    elsewhere: for t1 the plate separates the bowls 1.01x, a coin flip.
+    #  * VOCABULARY is global. An earlier note here argued the nine working tasks
+    #    should keep "black bowl"/"ramekin", on the grounds that ~87% suite
+    #    success shows the cross-attention path grounds those nouns even though
+    #    qwen_color_probe's GENERATIVE path rejects them. That reasoning is
+    #    sound about the nouns and wrong about the outcome, because the
+    #    alternative was not "canonical everywhere" but a three-way split: the
+    #    ramekin described as a shallow empty cup in one task, a small round
+    #    silver container in two more, and left as "ramekin" in six. Two of those
+    #    contradict each other about an object the model sees in every frame.
+    #    Consistency has to win somewhere; it wins on the probe-validated
+    #    wording, since that is the only one with evidence behind it.
+    #
+    # If the nine previously-working tasks regress on the next eval, this is the
+    # change to revert -- and reverting means moving ALL ten to canonical nouns,
+    # not restoring the split.
     # "between" is a SELECTOR, not a position. The scene holds TWO identical
     # black bowls: akita_black_bowl_1 is the target, akita_black_bowl_2 the
     # distractor (also the target of the "next to the ramekin" task).
@@ -272,25 +316,29 @@ REPHRASINGS: dict[str, str] = {
     # probe FAILED its own consistency control, naming the same bowl as both
     # nearest and farthest from the plate. This wording buys nothing at 64
     # tokens; the two changes ship together or not at all.
+    # All ten entries below share _spatial()'s vocabulary and differ ONLY in the
+    # selector, which keeps each task's own canonical relation. The ratio after
+    # each is that relation's measured separation between the two bowls.
     "pick up the black bowl between the plate and the ramekin and place it on the plate":
-        cot(
-            target="the deep speckled bowl",
-            location="two deep bowls hold speckled granular contents; the target is "
-                     "whichever of those two is nearer to the round white plate with the "
-                     "red rim, and the other one is not the target. Aim at the center of "
-                     "the target bowl itself",
-            action="grasp that bowl and place it on the round white plate with the red rim",
-            visual="a bowl with a dark rim and speckled granular contents, clearly deeper "
-                   "than the small shallow empty cup",
-        ),
+        _spatial(f"is nearer to {_SP_PLATE}, and the other one is not the target"),   # 2.30x
     "pick up the black bowl next to the plate and place it on the plate":
-        cot(
-            target="the nearest black bowl",
-            location="next to the plate",
-            action="grasp the nearest black bowl and place it on the plate",
-            visual="a round dark bowl",
-            not_the="not the plate itself",
-        ),
+        _spatial(f"is closest to {_SP_PLATE}"),                                       # 2.19x
+    "pick up the black bowl next to the ramekin and place it on the plate":
+        _spatial(f"sits beside {_SP_CUP}"),                                           # 3.61x
+    "pick up the black bowl on the ramekin and place it on the plate":
+        _spatial(f"is resting on top of {_SP_CUP}"),                                  # 20.8x
+    "pick up the black bowl from table center and place it on the plate":
+        _spatial("sits in the middle of the open table, away from the edges"),        # 4.02x
+    "pick up the black bowl on the cookie box and place it on the plate":
+        _spatial("is resting on top of the cookie box"),                              # stacked
+    "pick up the black bowl next to the cookie box and place it on the plate":
+        _spatial("sits beside the cookie box, on the table surface"),                 # 3.33x
+    "pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate":
+        _spatial("is inside the open top drawer of the wooden cabinet"),              # 13.3x
+    "pick up the black bowl on the wooden cabinet and place it on the plate":
+        _spatial("is resting on top of the wooden cabinet"),                          # 17.8x
+    "pick up the black bowl on the stove and place it on the plate":
+        _spatial("is resting on the stove"),                                          # 2.91x
 
     # ---- libero_object (20-29) — the confusable pairs only ----
     # Every libero_object scene holds ALL of these props at once and the task
