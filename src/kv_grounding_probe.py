@@ -145,10 +145,36 @@ def main() -> None:
 
     if args.list_bodies:
         pos0 = obj_positions(env)
-        print("\nobjects (pick --target_body / --distractor_body from these):")
+        print("\nobjects:")
         for k, v in pos0.items():
             print(f"    {k:<34} xyz={np.round(v, 3)}")
         print("\ntask language:", repr(getattr(env, 'task_description', '')))
+
+        # AUTHORITATIVE target. The BDDL goal state names the object the task
+        # actually scores on -- do NOT infer the target by reading the English
+        # relation geometrically off the coordinates above. Two identical bowls
+        # make that inference look reasonable and be wrong.
+        pp = getattr(sim_env, "parsed_problem", None)
+        goal = (pp or {}).get("goal_state") if isinstance(pp, dict) else None
+        print("\nBDDL goal_state (this is what defines the target):")
+        if goal:
+            for conj in goal:
+                print("   ", conj)
+            objs = {c[1] for c in goal if len(c) > 1 and c[1] in pos0}
+            if len(objs) == 1:
+                tgt = objs.pop()
+                other = [k for k in pos0 if k.startswith(tgt.rsplit("_", 1)[0]) and k != tgt]
+                print(f"\n  => --target_body {tgt}")
+                if other:
+                    print(f"     --distractor_body {other[0]}")
+            elif objs:
+                print(f"\n  goal mentions several objects: {sorted(objs)} -- pick by hand")
+        else:
+            print("    (not exposed; try `python src/libero_reward_probe.py` "
+                  "which dumps parsed_problem in full)")
+        ooi = getattr(sim_env, "obj_of_interest", None)
+        if ooi:
+            print("\nobj_of_interest:", list(ooi))
         env.close()
         return
     if not args.target_body or not args.distractor_body:
