@@ -53,6 +53,7 @@ defaults to on. Or subclass explicitly with FixedOrderLiberoEnv.
 import os
 
 _ORIGINAL_RESET = None
+_INIT_FROM_SEED = False
 
 
 def _fixed_reset(self, seed=None, **kwargs):
@@ -62,6 +63,17 @@ def _fixed_reset(self, seed=None, **kwargs):
 
     gym.Env.reset(self, seed=seed)
     self._env.seed(seed)
+    if (_INIT_FROM_SEED and seed is not None and self.init_states
+            and self._init_states is not None):
+        # Opt-in, eval only. create_libero_envs pins _init_state_id to the
+        # sub-env's episode_index for its whole life, so an eval with
+        # batch_size=6 would only ever visit states 0..5 no matter how many
+        # episodes it runs. lerobot_eval hands each episode a unique seed
+        # (start_seed + batch_ix*num_envs + i), which makes a good index.
+        # NOT for RL: TaskEnvGroup gives each group member a different seed on
+        # purpose, so deriving the state from it would put every member on a
+        # different layout -- the very thing the ordering fix repairs.
+        self._init_state_id = int(seed) % len(self._init_states)
     raw_obs = self._env.reset()
     if self.init_states and self._init_states is not None:
         # Overwrites whatever the placement sampler just produced. Must come
@@ -75,19 +87,30 @@ def _fixed_reset(self, seed=None, **kwargs):
     return self._format_raw_obs(raw_obs), {"is_success": False}
 
 
-def patch_lerobot_libero(enable: bool | None = None) -> bool:
+def _flag(name: str, default: str) -> bool:
+    return os.environ.get(name, default) not in ("0", "false", "False")
+
+
+def patch_lerobot_libero(enable: bool | None = None,
+                         init_from_seed: bool | None = None) -> bool:
     """Swap LiberoEnv.reset in place. Returns whether the fix is now active.
 
     Idempotent, and reversible by calling with enable=False -- so an A/B can run
     in one process. Patching the class rather than exposing a subclass means
     code that builds LiberoEnv itself (lerobot.envs.libero.make_libero_envs, and
     whatever your eval notebook does) picks it up without edits.
+
+    init_from_seed derives _init_state_id from the per-episode seed so an eval
+    covers more than batch_size layouts. Off by default; see _fixed_reset for
+    why it must stay off for RL. Reads LIBERO_INIT_FROM_SEED (default 0).
     """
-    global _ORIGINAL_RESET
+    global _ORIGINAL_RESET, _INIT_FROM_SEED
     from lerobot.envs.libero import LiberoEnv
 
     if enable is None:
-        enable = os.environ.get("LIBERO_FIXED_INIT", "1") not in ("0", "false", "False")
+        enable = _flag("LIBERO_FIXED_INIT", "1")
+    _INIT_FROM_SEED = (_flag("LIBERO_INIT_FROM_SEED", "0")
+                       if init_from_seed is None else init_from_seed)
 
     if _ORIGINAL_RESET is None:
         _ORIGINAL_RESET = LiberoEnv.reset
@@ -96,6 +119,9 @@ def patch_lerobot_libero(enable: bool | None = None) -> bool:
         LiberoEnv.reset = _fixed_reset
         print("[libero] init-state ordering: FIXED (reset -> set_init_state). "
               "Layouts are the canonical 50 and _init_state_id selects them.")
+        if _INIT_FROM_SEED:
+            print("[libero] _init_state_id derived from the per-episode seed "
+                  "(eval only -- do NOT use for RL group rollouts).")
     else:
         LiberoEnv.reset = _ORIGINAL_RESET
         print("[libero] init-state ordering: STOCK (set_init_state -> reset). "
