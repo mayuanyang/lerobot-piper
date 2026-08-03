@@ -531,7 +531,20 @@ class WiltechsMoETransformer(nn.Module):
             expert_outputs.append(self.action_out_proj(self.final_norm(x[:, action_start_idx:])))
         stacked = torch.stack(expert_outputs, dim=1)
         v_t = (weights.unsqueeze(-1).unsqueeze(-1) * stacked).sum(dim=1)
-        self._last_router_usage = usage; return v_t.float()
+        self._last_router_usage = usage
+        # usage is the BATCH MEAN, so a perfectly uniform CV^2 is ambiguous: it
+        # is produced both by healthy per-sample specialisation that averages
+        # out, and by a router that has learned to emit uniform weights for
+        # every input -- which zeroes the CV^2 balance penalty for free and
+        # turns the MoE into a fixed 4-way average, killing the one module that
+        # conditions expert choice on the instruction. These two per-sample
+        # statistics separate them: with num_experts=4, uniform-per-sample means
+        # max_w -> 0.25 and entropy -> ln(4)=1.386.
+        with torch.no_grad():
+            w = weights.detach().float()
+            self._last_router_max_w = float(w.max(dim=-1).values.mean())
+            self._last_router_entropy = float(-(w.clamp_min(1e-9).log() * w).sum(-1).mean())
+        return v_t.float()
 
     def sample_noise(self, shape, device):
         rho = self.config.noise_temporal_correlation; noise = torch.randn(shape, device=device)

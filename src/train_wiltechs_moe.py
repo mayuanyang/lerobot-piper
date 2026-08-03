@@ -256,6 +256,17 @@ def _log_gradient_analysis(policy, step: int) -> None:
         cells = "  ".join(f"E{i}={v*100:5.1f}%" for i, v in enumerate(usage_cpu.tolist()))
         cv_sq = (usage_cpu.std() / usage_cpu.mean().clamp(min=1e-8)).pow(2).item()
         print(f"  Router usage    : {cells}    CV²={cv_sq:.4f}")
+        # Per-sample shape. CV² is a batch mean and reads the same whether the
+        # router specialises per sample or has collapsed to uniform-for-everything
+        # (which satisfies the balance penalty for free and makes the MoE a fixed
+        # average). max_w at 1/E and entropy at ln(E) is that collapse.
+        mw = getattr(policy.model, "_last_router_max_w", None)
+        ent = getattr(policy.model, "_last_router_entropy", None)
+        if mw is not None and ent is not None:
+            E = int(usage_cpu.numel())
+            import math
+            print(f"  Router per-samp : max_w={mw:.3f} (uniform={1/E:.3f})   "
+                  f"entropy={ent:.3f} (uniform={math.log(E):.3f})")
 
     # Thought Q-Former residual gates — the model's OWN "how much do I use the
     # thought tokens" knob (init 0.1 each). Four scalars, no batch noise: a far
