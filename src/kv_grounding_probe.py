@@ -184,13 +184,8 @@ def main() -> None:
             print("\nobj_of_interest:", list(ooi))
         env.close()
         return
-    if not args.target_body or not args.distractor_body:
-        ap.error("--target_body and --distractor_body are required (see --list_bodies)")
-    known = set(obj_positions(env))
-    for b in (args.target_body, args.distractor_body):
-        if b not in known:
-            ap.error(f"object {b!r} not in this task. Known: {sorted(known)}")
-
+    # --annotate labels every object, so it needs no target/distractor: keep it
+    # ahead of the required-args check.
     if args.annotate:
         # Project each object's sim xyz into the frame and label it. Every
         # confusion in this investigation so far has come from reading object
@@ -236,6 +231,13 @@ def main() -> None:
         print("RED = akita_black_bowl_1 (the BDDL target).  BLUE = bowl_2 (distractor).")
         env.close()
         return
+
+    if not args.target_body or not args.distractor_body:
+        ap.error("--target_body and --distractor_body are required (see --list_bodies)")
+    known = set(obj_positions(env))
+    for b in (args.target_body, args.distractor_body):
+        if b not in known:
+            ap.error(f"object {b!r} not in this task. Known: {sorted(known)}")
 
     # 1. Collect frames + ground-truth object positions -----------------------
     frames, pos_t, pos_d = [], [], []
