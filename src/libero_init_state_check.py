@@ -47,7 +47,10 @@ def main():
     ap.add_argument("--suite", default="libero_spatial")
     ap.add_argument("--task_id", type=int, required=True)
     ap.add_argument("--n", type=int, default=12, help="layouts per mode")
-    ap.add_argument("--camera", default="agentview")
+    ap.add_argument("--camera", default="image",
+                    help="key inside obs['pixels']. LiberoEnv remaps the raw "
+                         "robosuite names, so it is 'image' (agentview) / "
+                         "'image2' (wrist), NOT 'agentview'.")
     ap.add_argument("--sheet", action="store_true",
                     help="save a contact sheet png per mode")
     args = ap.parse_args()
@@ -80,7 +83,12 @@ def main():
         return {k: np.array(sim_env.sim.data.body_xpos[v]) for k, v in bid.items()}
 
     def frame(obs):
-        f = np.asarray(obs["pixels"][args.camera])
+        pix = obs["pixels"]
+        if args.camera not in pix:
+            raise KeyError(
+                f"--camera {args.camera!r} not in obs['pixels']. "
+                f"Available: {sorted(pix)}")
+        f = np.asarray(pix[args.camera])
         if f.dtype != np.uint8:
             f = (f.clip(0, 1) * 255).astype(np.uint8) if f.max() <= 1.0 else f.astype(np.uint8)
         return Image.fromarray(f).convert("RGB")
