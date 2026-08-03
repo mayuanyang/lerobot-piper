@@ -101,6 +101,13 @@ def main() -> None:
     ap.add_argument("--distractor_body", default=None)
     ap.add_argument("--list_bodies", action="store_true",
                     help="print the sim body names for this task and exit")
+    ap.add_argument("--annotate", action="store_true",
+                    help="save the frame with every object's sim position projected "
+                         "onto it and labelled, then exit. Settles which blob in the "
+                         "picture is which sim object instead of guessing.")
+    ap.add_argument("--camera_name", default="agentview",
+                    help="robosuite camera name for --annotate projection "
+                         "(agentview / robot0_eye_in_hand)")
     ap.add_argument("--instruction", default=None,
                     help="text placed BEFORE the image, as text_first=True does. "
                          "Defaults to the task's own language.")
@@ -183,6 +190,52 @@ def main() -> None:
     for b in (args.target_body, args.distractor_body):
         if b not in known:
             ap.error(f"object {b!r} not in this task. Known: {sorted(known)}")
+
+    if args.annotate:
+        # Project each object's sim xyz into the frame and label it. Every
+        # confusion in this investigation so far has come from reading object
+        # identity off a screenshot by eye; this replaces that with the sim's
+        # own answer.
+        from PIL import ImageDraw
+        from robosuite.utils.camera_utils import (
+            get_camera_transform_matrix, project_points_from_world_to_camera)
+
+        obs, _ = env.reset(seed=0)
+        se = get_sim_env(env)
+        pos = obj_positions(env)
+        f = np.asarray(obs["pixels"][args.camera])
+        if f.dtype != np.uint8:
+            f = (f.clip(0, 1) * 255).astype(np.uint8) if f.max() <= 1.0 else f.astype(np.uint8)
+        H, W = f.shape[:2]
+        T = get_camera_transform_matrix(sim=se.sim, camera_name=args.camera_name,
+                                        camera_height=H, camera_width=W)
+        names = list(pos)
+        pix = project_points_from_world_to_camera(
+            np.stack([pos[n] for n in names]), T, H, W)  # (N, 2) as [row, col]
+
+        for flip in (False, True):
+            im = Image.fromarray(f).convert("RGB")
+            dr = ImageDraw.Draw(im)
+            for n, (r, c) in zip(names, pix):
+                r = (H - 1 - r) if flip else r
+                r, c = int(round(r)), int(round(c))
+                hit = 0 <= r < H and 0 <= c < W
+                col = (255, 40, 40) if "bowl_1" in n else (
+                    (40, 120, 255) if "bowl_2" in n else (40, 200, 40))
+                dr.ellipse([c - 5, r - 5, c + 5, r + 5], outline=col, width=2)
+                dr.text((c + 8, r - 6), n.replace("_1", "_1 ").replace("akita_black_", ""),
+                        fill=col)
+                print(f"  {n:<34} -> row={r:4d} col={c:4d}{'' if hit else '   OFF-FRAME'}"
+                      f"{'   [flipped]' if flip else ''}")
+            path = f"annotated_t{args.task_id}{'_flipped' if flip else ''}.png"
+            im.save(path)
+            print("saved", path)
+        print("\nBoth vertical conventions are saved because robosuite renders "
+              "bottom-up and LIBERO may or may not flip before handing the frame "
+              "over. Open both; exactly one will put the labels on the objects.")
+        print("RED = akita_black_bowl_1 (the BDDL target).  BLUE = bowl_2 (distractor).")
+        env.close()
+        return
 
     # 1. Collect frames + ground-truth object positions -----------------------
     frames, pos_t, pos_d = [], [], []
