@@ -50,9 +50,18 @@ class WiltechsMoEConfig(PreTrainedConfig):
     #
     # With 256x256 source frames, 512 is NOT empty upsampling: the detail is
     # already in the source, the 32px-per-token quantisation is what discards
-    # it. libero_spatial needs to separate the distractor bowl from the ramekin,
-    # ~17 native px apart -- 0.54 of a token at 8x8 (same token, unresolvable),
-    # 1.09 tokens at 16x16.
+    # it. libero_spatial has to separate the distractor bowl from the ramekin,
+    # 0.127 m apart in the sim (measured, --list_bodies task 0). Earlier notes
+    # here and in task_rewrites.py converted that to "~17 native px" / "~19
+    # native px" -- both were eyeballed, neither was ever measured, and they
+    # disagree. To get the real figure, read the row/col that
+    # `kv_grounding_probe.py --annotate` prints per object and divide by 32
+    # (8x8 grid) or 16 (16x16 grid) to see whether the two land in one token.
+    #
+    # The claim that 8x8 is too coarse does NOT rest on that number: at 64
+    # tokens the qwen_color_probe failed its own consistency control, naming
+    # one bowl as both nearest to and farthest from the plate. That is direct
+    # evidence, and it is why the between rewrite requires 512.
     #
     # COST: L_vlm is also the K/V length of every expert's cross-attention, so
     # it multiplies through num_experts x expert_num_layers, not just the VLM.

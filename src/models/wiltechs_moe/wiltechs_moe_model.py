@@ -151,7 +151,11 @@ class WiltechsMoETransformer(nn.Module):
         if config.use_robot_cnn: self.robot_visual_encoder = RobotVisualEncoder(input_size=config.robot_encoder_input_size, out_tokens=config.robot_encoder_tokens, out_dim=self.dit_hidden)
         else: self.robot_visual_encoder = None
         self.num_latent_tokens = config.num_latent_tokens
-        # MoE: Q-Former disabled -- each expert cross-attends to VLM KV directly.
+        # The LATENT Q-Former is off (num_latent_tokens defaults to 0) -- each
+        # expert cross-attends to VLM KV directly. Not to be confused with the
+        # THOUGHT Q-Former built below, which is a separate module and is on.
+        # The latents plumbing is kept live throughout for the config that
+        # re-enables it; "legacy latents" in the sequence comment is this.
         self.latent_qformer = None
 
         # ------------------------------------------------------------------
@@ -203,11 +207,11 @@ class WiltechsMoETransformer(nn.Module):
             self.thought_vlm_layer = -1
 
         # 128, not 48: the CoT rewrites from task_rewrites.py (enabled by
-        # --use_descriptive_objects) run ~110 tokens.  At 48 they were cut
-        # mid-Location, silently dropping the anti-grounding cue ("not the
-        # midpoint between the plate and the ramekin") and the entire Action
-        # clause -- i.e. the model was trained on a prompt that ENDED with
-        # "in the gap between the plate and the ramekin".
+        # --use_descriptive_objects) run up to ~105 tokens. At 48 they were cut
+        # mid-Location, dropping the selector and the entire Action clause, so
+        # the model trained on a prompt that ended partway through the
+        # description of where the target is. _report_lang_budget prints the
+        # real count every run and says TRUNCATED if this is ever too small.
         self._lang_max_len = 128
         self.text_first = bool(getattr(config, "text_first", True))
         self._template_ids_cpu = None; self._template_format_printed = False
