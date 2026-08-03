@@ -119,6 +119,13 @@ def main() -> None:
     ap.add_argument("--camera_name", default="agentview",
                     help="robosuite camera name for --annotate projection "
                          "(agentview / robot0_eye_in_hand)")
+    ap.add_argument("--annotate_detect", action="store_true",
+                    help="annotate by asking Qwen3-VL for 2D boxes instead of "
+                         "projecting sim coordinates. Uses the convention from "
+                         "precompute_video_bounding_boxes_standalone.py: bbox_2d = "
+                         "[x1,y1,x2,y2], x=col, y=row, origin top-left, normalised to "
+                         "[0,1000]. No camera matrices, so no axis ambiguity -- and it "
+                         "shows whether Qwen can localise the bowls at all.")
     ap.add_argument("--init_state_id", type=int, default=0,
                     help="which LIBERO init state to use for --list_bodies/--annotate. "
                          "LIBERO ships ~50 per task and eval sweeps them, so layouts "
@@ -219,6 +226,81 @@ def main() -> None:
         return
     # --annotate labels every object, so it needs no target/distractor: keep it
     # ahead of the required-args check.
+    if args.annotate_detect:
+        # Sim-projection-free annotation. Qwen reports boxes directly in image
+        # coordinates, so there is no camera matrix and no axis convention to
+        # get wrong -- which is the entire reason --annotate kept mislabelling.
+        # Convention lifted from precompute_video_bounding_boxes_standalone.py.
+        import json as _json
+        from PIL import ImageDraw
+        from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+
+        n_init = n_init_states(env)
+        if n_init:
+            env._init_state_id = args.init_state_id % n_init
+        obs, _ = env.reset()
+        f = np.asarray(obs["pixels"][args.camera])
+        if f.dtype != np.uint8:
+            f = (f.clip(0, 1) * 255).astype(np.uint8) if f.max() <= 1.0 else f.astype(np.uint8)
+        env.close()
+        im = Image.fromarray(f).convert("RGB")
+        H, W = f.shape[:2]
+        if args.vision_input_size:
+            im = im.resize((args.vision_input_size,) * 2, Image.BICUBIC)
+            W = H = args.vision_input_size
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        mid = "Qwen/Qwen3-VL-4B-Instruct"
+        print(f"loading {mid} ...")
+        mdl = Qwen3VLForConditionalGeneration.from_pretrained(
+            mid, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True).to(device).eval()
+        proc = AutoProcessor.from_pretrained(mid)
+        sysmsg = ("You are a precise 2D object detector. For each object, provide its "
+                  "2D bounding box in JSON format with 'bbox_2d' field containing "
+                  "[x1, y1, x2, y2] where (x1, y1) is the top-left corner and (x2, y2) "
+                  "is the bottom-right corner. All coordinates should be normalized to "
+                  "[0, 1000]. Also provide a 'label' field indicating the object category.")
+        usermsg = ('locate every instance that belongs to the following categories: '
+                   '"bowl, plate, small shallow cup, box, cabinet, stove". '
+                   'Report bbox coordinates in JSON format.')
+        msgs = [{"role": "system", "content": [{"type": "text", "text": sysmsg}]},
+                {"role": "user", "content": [{"type": "image", "image": im},
+                                             {"type": "text", "text": usermsg}]}]
+        with torch.no_grad():
+            inp = proc.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True,
+                                           return_dict=True, return_tensors="pt").to(device)
+            gen = mdl.generate(**inp, max_new_tokens=512)
+            txt = proc.batch_decode(gen[:, inp.input_ids.shape[1]:],
+                                    skip_special_tokens=True)[0]
+        print("\nraw:", txt[:1200])
+        s = txt.find("[")
+        e = txt.rfind("]")
+        boxes = []
+        if s != -1 and e != -1:
+            try:
+                boxes = _json.loads(txt[s:e + 1])
+            except _json.JSONDecodeError as ex:
+                print("could not parse JSON:", ex)
+        dr = ImageDraw.Draw(im)
+        print(f"\n{len(boxes)} box(es), converted to pixels on a {W}x{H} frame:")
+        for b in boxes:
+            bb, lab = b.get("bbox_2d"), str(b.get("label", "?"))
+            if not bb or len(bb) != 4:
+                continue
+            x1, y1, x2, y2 = (bb[0] / 1000 * W, bb[1] / 1000 * H,
+                              bb[2] / 1000 * W, bb[3] / 1000 * H)
+            dr.rectangle([x1, y1, x2, y2], outline=(255, 60, 60), width=2)
+            dr.text((x1 + 2, y1 + 2), lab, fill=(255, 60, 60))
+            print(f"  {lab:<24} x=[{x1:6.1f},{x2:6.1f}]  y=[{y1:6.1f},{y2:6.1f}]")
+        path = f"detected_t{args.task_id}_s{args.init_state_id}.png"
+        im.save(path)
+        print(f"\nsaved {path}")
+        print("Qwen's own image coordinates -- if the boxes land on the objects, the "
+              "convention is confirmed and this is also the readout box_encoder.py "
+              "would consume. If it finds only one bowl, or none, that is the "
+              "grounding answer without needing the probe.")
+        return
+
     if args.annotate:
         # Project each object's sim xyz into the frame and label it. Every
         # confusion in this investigation so far has come from reading object
