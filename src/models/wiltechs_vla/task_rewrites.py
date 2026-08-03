@@ -292,8 +292,44 @@ REPHRASINGS: dict[str, str] = {
             not_the="not the plate itself",
         ),
 
-    # ---- libero_object (20-29) — TODO: confirm canonical strings + which need rewrite ----
-    # ---- libero_goal   (10-19) — TODO: confirm canonical strings + which need rewrite ----
+    # ---- libero_object (20-29) — the confusable pairs only ----
+    # Every libero_object scene holds ALL of these props at once and the task
+    # names one to pick, so identity grounding matters more here than in
+    # libero_10, where the same objects appear in pairs.
+    #
+    # Only the four objects whose appearance this file already asserts are
+    # rewritten, reusing that wording verbatim: the two round cans (T5's rewrite
+    # exists precisely because they are confusable) and the two boxes. Leaving
+    # them bare here while libero_10 calls them "blue can" / "red can" would feed
+    # the model two descriptions of one object.
+    #
+    # The other six (orange juice, ketchup, bbq sauce, milk, salad dressing,
+    # chocolate pudding) are NOT rewritten: their colours are not attested
+    # anywhere in this repo and guessing one wrong is worse than leaving the
+    # canonical noun, which at least matches the demo language.
+    "pick up the alphabet soup and place it in the basket":
+        "pick up the blue can of alphabet soup and place it in the basket",
+    "pick up the tomato sauce and place it in the basket":
+        "pick up the red can of tomato sauce and place it in the basket",
+    "pick up the cream cheese and place it in the basket":
+        "pick up the silver purple cream cheese box and place it in the basket",
+    "pick up the butter and place it in the basket":
+        "pick up the red butter box and place it in the basket",
+
+    # ---- libero_goal (10-19) — no rewrite ----
+    # Every goal task names a single unambiguous target ("the bowl", "the plate",
+    # "the wine bottle", "the cream cheese") with no same-kind distractor to
+    # separate it from, so there is no referring expression to repair.
+    #
+    # ---- libero_10 T0 — NOT YET REWRITTEN, and the highest structural risk ----
+    # "put the white mug on the left plate and put the yellow and white mug on
+    # the right plate" has TWO plates told apart only by left/right -- the same
+    # shape as the libero_spatial "between" failure: identical candidates
+    # selected by a spatial word, where the word pins a region rather than an
+    # object. Do not guess a rewrite; get ground truth first with
+    #   python src/kv_grounding_probe.py --suite libero_10 --task_id 0 --list_bodies
+    # and check whether left/right is stable across the 50 init states, since a
+    # relation that flips between layouts cannot be encoded in the text at all.
 }
 
 
