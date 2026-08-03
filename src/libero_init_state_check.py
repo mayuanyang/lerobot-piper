@@ -102,6 +102,36 @@ def main():
             raw, _, _, _ = env._env.step(get_libero_dummy_action())
         return raw
 
+    # Ground truth, no sim resets involved --------------------------------
+    # _init_states[i] is a flattened MuJoCo state: [time] + qpos + qvel. Each
+    # prop is a free body, so its xyz sits at its first joint's qpos address.
+    # Reading it answers "how different ARE the 50 canonical layouts?" without
+    # touching reset ordering at all -- which is the question the achieved
+    # spreads cannot separate from sampler noise.
+    def requested_positions(state):
+        m = sim_env.sim.model
+        out = {}
+        for name, bid in (getattr(sim_env, "obj_body_id", None) or {}).items():
+            if m.body_jntnum[bid] < 1:
+                continue
+            adr = m.jnt_qposadr[m.body_jntadr[bid]]
+            out[name] = np.asarray(state[1 + adr: 1 + adr + 3], dtype=float)
+        return out
+
+    req = [requested_positions(states[i]) for i in range(n_init)]
+    req_names = sorted(req[0]) if req and req[0] else []
+    if req_names:
+        print(f"\nrequested positions read straight out of the {n_init} init "
+              f"states (no reset involved):")
+        for name in req_names:
+            arr = np.stack([r[name] for r in req])
+            rng = arr.max(0) - arr.min(0)
+            print(f"  {name:<34} std={np.round(arr.std(0), 4)}  "
+                  f"range={np.round(rng, 4)}")
+    else:
+        print("\n!! could not map bodies to qpos addresses; skipping the "
+              "requested-position readout.")
+
     results = {}   # mode -> (list[dict xyz], list[Image])
 
     # vary: today's path -----------------------------------------------------
@@ -132,23 +162,39 @@ def main():
         imgs.append(frame(env._format_raw_obs(raw)) if raw is not None else None)
     results["after"] = (pos, imgs)
 
+    # after_fixed: canonical order, same state every time. Control for "after"
+    # -- if this is ~0 the canonical order is deterministic and honours the
+    # state, so a small spread in "after" means the 50 states really are close.
+    # If it is as large as "after", the canonical order is not honouring it
+    # either and nothing here selects a layout.
+    pos, imgs = [], []
+    for _ in range(n):
+        env._env.reset()
+        env._env.set_init_state(states[0])
+        raw = settle()
+        pos.append(positions())
+        imgs.append(frame(env._format_raw_obs(raw)) if raw is not None else None)
+    results["after_fixed"] = (pos, imgs)
+
     # report -----------------------------------------------------------------
     names = sorted(results["vary"][0][0])
+    modes = ("vary", "fixed", "after", "after_fixed")
     print(f"\nper-object xyz spread over {n} layouts (metres, max over x/y/z)")
-    print(f"  {'object':<34} {'vary':>10} {'fixed':>10} {'after':>10}")
+    print("  " + f"{'object':<34}" + "".join(f"{m:>12}" for m in ("requested",) + modes))
+    have_req = bool(req) and bool(req[0])
     for name in names:
-        row = []
-        for mode in ("vary", "fixed", "after"):
-            arr = np.stack([p[name] for p in results[mode][0]])
-            row.append(arr.std(0).max())
-        print(f"  {name:<34} {row[0]:>10.4f} {row[1]:>10.4f} {row[2]:>10.4f}")
+        req_s = (np.stack([r[name] for r in req]).std(0).max()
+                 if have_req and name in req[0] else float("nan"))
+        row = [np.stack([p[name] for p in results[m][0]]).std(0).max() for m in modes]
+        print(f"  {name:<34}{req_s:>12.4f}" + "".join(f"{x:>12.4f}" for x in row))
 
     def agg(mode):
         return max(np.stack([p[name] for p in results[mode][0]]).std(0).max()
                    for name in names)
 
-    v, f_, a = agg("vary"), agg("fixed"), agg("after")
-    print(f"\n  overall  vary={v:.4f}  fixed={f_:.4f}  after={a:.4f}")
+    v, f_, a, af = (agg("vary"), agg("fixed"), agg("after"), agg("after_fixed"))
+    print(f"\n  overall  vary={v:.4f}  fixed={f_:.4f}  after={a:.4f}  "
+          f"after_fixed={af:.4f}")
 
     # Pixel-level spread. "the image changes when I change the id" is true under
     # BOTH hypotheses -- a resampled layout looks just as different as a
@@ -161,32 +207,53 @@ def main():
         arr = np.stack([np.asarray(im, dtype=np.float32) for im in ims])
         return float(np.abs(arr - arr.mean(0)).mean())
 
-    print(f"  mean |pixel - mode mean|  vary={pix_spread('vary'):.2f}  "
-          f"fixed={pix_spread('fixed'):.2f}  after={pix_spread('after'):.2f}  (0-255)")
+    print("  mean |pixel - mode mean|  " + "  ".join(
+        f"{m}={pix_spread(m):.2f}" for m in modes) + "  (0-255)")
 
-    # per-state agreement: does today's path land where the state says?
-    d = [max(np.linalg.norm(results["vary"][0][i][k] - results["after"][0][i][k])
-             for k in names) for i in range(n)]
-    print(f"  vary[i] vs after[i] displacement: mean={np.mean(d):.4f} "
-          f"max={np.max(d):.4f} m")
+    # Tracking error: how far each mode lands from what state i actually asked
+    # for. This is the direct measurement -- spread comparisons can be confounded
+    # by two random draws happening to have similar variance.
+    if have_req:
+        def track_err(mode, use_state_i=True):
+            errs = []
+            for i in range(n):
+                r = req[i if use_state_i else 0]
+                errs.append(max(np.linalg.norm(results[mode][0][i][k] - r[k])
+                                for k in names if k in r))
+            return float(np.mean(errs)), float(np.max(errs))
+        print("\n  distance from the position state i actually asks for (m):")
+        for mode, same in (("vary", True), ("after", True), ("after_fixed", False)):
+            mu, mx = track_err(mode, same)
+            print(f"    {mode:<12} mean={mu:.4f}  max={mx:.4f}")
 
     print("\nverdict:")
     if pix_spread("fixed") > 1.0 and pix_spread("vary") <= pix_spread("fixed") * 1.5:
         print("  NOTE: holding the id fixed changes the image about as much as")
         print("  varying it. Visible frame-to-frame variation is therefore NOT")
         print("  evidence that the id is selecting anything.")
+    if have_req:
+        req_spread = max(np.stack([r[k] for r in req]).std(0).max()
+                         for k in req[0])
+        print(f"  the 50 canonical states themselves span {req_spread:.4f} m "
+              f"(max per-object std).")
+        if req_spread < 0.02:
+            print("  That is small -- the canonical layouts are near-identical, so no")
+            print("  ordering fix would give you visibly different scenes. An eval")
+            print("  scene that looks different is NOT coming from these states:")
+            print("  check the suite/task_id, or whether eval passes init_states=False")
+            print("  (which drops to the placement sampler entirely).")
+        else:
+            print("  That is real variation, so the layouts DO differ and the only")
+            print("  question is whether reset ordering delivers them.")
     if v <= f_ * 1.5:
         print("  _init_state_id does NOT select the layout -- spread with varying ids")
-        print("  is no larger than with a fixed id. Layouts come from the placement")
-        print("  sampler, so every reset is a fresh draw and no probe run can")
-        print("  reproduce a specific eval scene.")
-        if a > f_ * 1.5:
-            print("  Reversing the order (reset -> set_init_state) DOES select it;")
-            print("  that is the fix.")
+        print("  is no larger than with a fixed id.")
+        if af < a * 0.5:
+            print("  Reversing the order (reset -> set_init_state) IS deterministic")
+            print("  (after_fixed collapses), so that ordering is the fix.")
         else:
-            print("  Reversing the order does not help either -- the 50 states may")
-            print("  genuinely be near-identical for this task. Check 'after' spread")
-            print("  against the object sizes before concluding.")
+            print("  Reversing the order is not deterministic either (after_fixed is")
+            print("  as large as after), so set_init_state is not sticking at all.")
     else:
         print("  _init_state_id works: varying it moves objects well beyond the")
         print("  per-reset noise floor. Then the eval scene IS among the 50 and the")
