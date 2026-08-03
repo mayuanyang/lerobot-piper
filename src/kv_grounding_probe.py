@@ -108,6 +108,10 @@ def main() -> None:
     ap.add_argument("--camera_name", default="agentview",
                     help="robosuite camera name for --annotate projection "
                          "(agentview / robot0_eye_in_hand)")
+    ap.add_argument("--init_state_id", type=int, default=0,
+                    help="which LIBERO init state to use for --list_bodies/--annotate. "
+                         "LIBERO ships ~50 per task and eval sweeps them, so layouts "
+                         "differ between them -- pass the one you are looking at.")
     ap.add_argument("--instruction", default=None,
                     help="text placed BEFORE the image, as text_first=True does. "
                          "Defaults to the task's own language.")
@@ -151,6 +155,12 @@ def main() -> None:
         return {k: np.array(se.sim.data.body_xpos[v]) for k, v in bid.items()}
 
     if args.list_bodies:
+        n_init = len(getattr(env, "_init_states", []) or [])
+        if n_init:
+            env._init_state_id = args.init_state_id % n_init
+            env.reset()
+        print(f"\ninit state {args.init_state_id} of {n_init or '?'} "
+              f"(layouts differ between them -- these coordinates are for THIS one)")
         pos0 = obj_positions(env)
         print("\nobjects:")
         for k, v in pos0.items():
@@ -195,7 +205,11 @@ def main() -> None:
         from robosuite.utils.camera_utils import (
             get_camera_transform_matrix, project_points_from_world_to_camera)
 
-        obs, _ = env.reset(seed=0)
+        n_init = len(getattr(env, "_init_states", []) or [])
+        if n_init:
+            env._init_state_id = args.init_state_id % n_init
+        print(f"init state {args.init_state_id} of {n_init or '?'}")
+        obs, _ = env.reset()
         se = get_sim_env(env)
         pos = obj_positions(env)
         f = np.asarray(obs["pixels"][args.camera])
@@ -241,12 +255,24 @@ def main() -> None:
 
     # 1. Collect frames + ground-truth object positions -----------------------
     frames, pos_t, pos_d = [], [], []
+    n_init = len(getattr(env, "_init_states", []) or [])
+    if n_init:
+        print(f"LIBERO init states available for this task: {n_init}")
+        if args.n_states > n_init:
+            print(f"  capping --n_states {args.n_states} -> {n_init}")
+            args.n_states = n_init
+    else:
+        print("!! could not read env._init_states -- every sample may be the SAME "
+              "layout, which makes the probe meaningless. Check the wrapper.")
+
     for i in range(args.n_states):
-        try:
-            env.set_init_state_index(i)  # some wrappers expose this
-        except AttributeError:
-            pass
-        obs, _ = env.reset(seed=i)
+        # LiberoEnv.reset() reads _init_state_id and calls
+        # set_init_state(_init_states[id]). reset(seed=...) does NOT select the
+        # layout -- getting this wrong pins every sample to one init state.
+        # (Mechanism per train_rft.py's init-state sweep.)
+        if n_init:
+            env._init_state_id = i % n_init
+        obs, _ = env.reset()
         p = obj_positions(env)
         f = np.asarray(obs["pixels"][args.camera])
         if f.dtype != np.uint8:
