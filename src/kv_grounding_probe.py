@@ -34,10 +34,21 @@ floor, because with ~50 initial states an unregularised high-dimensional probe
 will happily fit pure noise.
 
 Usage:
-    python src/kv_grounding_probe.py --suite libero_spatial --list_bodies
+    # 1. object names + the BDDL goal state, which names the real target
+    python src/kv_grounding_probe.py --suite libero_spatial --task_id 3 --list_bodies
+
+    # 2. label the objects on the frame, so identity is not guessed by eye
     python src/kv_grounding_probe.py --suite libero_spatial --task_id 3 \
-        --target_body akita_black_bowl_1_main --distractor_body akita_black_bowl_2_main \
-        --n_states 50 --vision_input_size 512
+        --annotate --init_state_id 0
+
+    # 3. the probe, once at the policy's current grid and once at 512
+    python src/kv_grounding_probe.py --suite libero_spatial --task_id 3 \
+        --target_body akita_black_bowl_1 --distractor_body akita_black_bowl_2 \
+        --n_states 50 [--vision_input_size 512]
+
+Layouts differ between LIBERO's ~50 initial states and eval sweeps all of them,
+so --init_state_id decides which one --list_bodies/--annotate describe, and the
+probe cycles through them for its sample.
 """
 from __future__ import annotations
 
@@ -146,6 +157,18 @@ def main() -> None:
             "get_sim_env() could not find the robosuite problem env. Run "
             "`python src/libero_reward_probe.py` to dump the wrapper chain.")
 
+    def n_init_states(e):
+        """Count of LIBERO initial states. Deliberately no truthiness test:
+        _init_states is a numpy array, so `x or []` raises "truth value of an
+        array is ambiguous"."""
+        s = getattr(e, "_init_states", None)
+        if s is None:
+            return 0
+        try:
+            return len(s)
+        except TypeError:
+            return 0
+
     def obj_positions(e):
         """{object_name: xyz}. obj_body_id is the env's own object registry, so
         it lists exactly the task objects -- far better than dumping every
@@ -155,7 +178,7 @@ def main() -> None:
         return {k: np.array(se.sim.data.body_xpos[v]) for k, v in bid.items()}
 
     if args.list_bodies:
-        n_init = len(getattr(env, "_init_states", []) or [])
+        n_init = n_init_states(env)
         if n_init:
             env._init_state_id = args.init_state_id % n_init
             env.reset()
@@ -205,7 +228,7 @@ def main() -> None:
         from robosuite.utils.camera_utils import (
             get_camera_transform_matrix, project_points_from_world_to_camera)
 
-        n_init = len(getattr(env, "_init_states", []) or [])
+        n_init = n_init_states(env)
         if n_init:
             env._init_state_id = args.init_state_id % n_init
         print(f"init state {args.init_state_id} of {n_init or '?'}")
@@ -255,7 +278,7 @@ def main() -> None:
 
     # 1. Collect frames + ground-truth object positions -----------------------
     frames, pos_t, pos_d = [], [], []
-    n_init = len(getattr(env, "_init_states", []) or [])
+    n_init = n_init_states(env)
     if n_init:
         print(f"LIBERO init states available for this task: {n_init}")
         if args.n_states > n_init:
