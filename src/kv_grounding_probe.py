@@ -117,32 +117,46 @@ def main() -> None:
     task_text = args.instruction or getattr(env, "task_description", "")
     print(f"task: {task_text!r}")
 
-    def sim_of(e):
-        for path in ("sim", "env.sim", "env.env.sim", "unwrapped.env.sim"):
-            o = e
-            try:
-                for part in path.split("."):
-                    o = getattr(o, part)
-                if hasattr(o, "data") and hasattr(o, "model"):
-                    return o
-            except AttributeError:
-                continue
-        raise RuntimeError("could not reach the robosuite sim through the LiberoEnv wrapper")
+    # Reuse the walker from rl_staged_reward rather than guessing attribute
+    # paths: it descends LiberoEnv -> OffScreenRenderEnv -> the robosuite
+    # problem env, 12 levels with cycle detection, and is already load-bearing
+    # for the staged-reward RL runs.
+    try:
+        from rl_staged_reward import get_sim_env
+    except ImportError:
+        import os
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from rl_staged_reward import get_sim_env
 
-    sim = sim_of(env)
-    names = [sim.model.body_id2name(i) for i in range(sim.model.nbody)]
+    sim_env = get_sim_env(env)
+    if sim_env is None:
+        raise RuntimeError(
+            "get_sim_env() could not find the robosuite problem env. Run "
+            "`python src/libero_reward_probe.py` to dump the wrapper chain.")
+
+    def obj_positions(e):
+        """{object_name: xyz}. obj_body_id is the env's own object registry, so
+        it lists exactly the task objects -- far better than dumping every
+        MuJoCo body and guessing which are props."""
+        se = get_sim_env(e)
+        bid = getattr(se, "obj_body_id", None) or {}
+        return {k: np.array(se.sim.data.body_xpos[v]) for k, v in bid.items()}
+
     if args.list_bodies:
-        print("\nbody names (pick --target_body / --distractor_body from these):")
-        for n in names:
-            if n and not n.startswith(("robot", "gripper", "world", "table")):
-                print("   ", n)
+        pos0 = obj_positions(env)
+        print("\nobjects (pick --target_body / --distractor_body from these):")
+        for k, v in pos0.items():
+            print(f"    {k:<34} xyz={np.round(v, 3)}")
+        print("\ntask language:", repr(getattr(env, 'task_description', '')))
         env.close()
         return
     if not args.target_body or not args.distractor_body:
         ap.error("--target_body and --distractor_body are required (see --list_bodies)")
+    known = set(obj_positions(env))
     for b in (args.target_body, args.distractor_body):
-        if b not in names:
-            ap.error(f"body {b!r} not in this task's sim. Run --list_bodies.")
+        if b not in known:
+            ap.error(f"object {b!r} not in this task. Known: {sorted(known)}")
 
     # 1. Collect frames + ground-truth object positions -----------------------
     frames, pos_t, pos_d = [], [], []
@@ -152,13 +166,13 @@ def main() -> None:
         except AttributeError:
             pass
         obs, _ = env.reset(seed=i)
-        s = sim_of(env)
+        p = obj_positions(env)
         f = np.asarray(obs["pixels"][args.camera])
         if f.dtype != np.uint8:
             f = (f.clip(0, 1) * 255).astype(np.uint8) if f.max() <= 1.0 else f.astype(np.uint8)
         frames.append(Image.fromarray(f).convert("RGB"))
-        pos_t.append(np.array(s.data.body_xpos[s.model.body_name2id(args.target_body)]))
-        pos_d.append(np.array(s.data.body_xpos[s.model.body_name2id(args.distractor_body)]))
+        pos_t.append(p[args.target_body])
+        pos_d.append(p[args.distractor_body])
     env.close()
     pos_t, pos_d = np.stack(pos_t), np.stack(pos_d)
 
