@@ -170,16 +170,27 @@ REPHRASINGS: dict[str, str] = {
             not_the="not the container itself",
         ),
     # "between" is a SELECTOR, not a position. The scene holds TWO identical
-    # black bowls; one sits directly beside the ramekin (the target of the
-    # "next to the ramekin" task) and the other sits out in the open. The
-    # relation exists only to pick which one -- the three objects are not
-    # collinear, so nothing about the target's coordinates follows from it.
+    # black bowls: akita_black_bowl_1 is the target, akita_black_bowl_2 the
+    # distractor (also the target of the "next to the ramekin" task).
     #
-    # The old wording described a 1-D parametric point on the plate->ramekin
-    # axis ("in the gap between ..., closer to the plate side") and the policy
-    # executed it literally: after the text-first fix it stopped aiming at the
-    # midpoint and started aiming somewhere ON the line joining the anchors,
-    # landing on bare table ~16% of the image width from the real bowl.
+    # Ground truth from the sim, one initial state (xy metres, --list_bodies):
+    #   ramekin (-0.211, 0.201)   plate (0.053, 0.209)
+    #   bowl_1  (-0.058, 0.210)   t=0.58 along ramekin->plate,   4mm off the line
+    #   bowl_2  (-0.175, 0.323)   t=0.15,                      121mm off the line
+    #
+    # So the target really is ON the plate->ramekin segment -- an earlier note
+    # here claimed the three objects were not collinear, which came from
+    # eyeballing a screenshot and was wrong. That makes the relation
+    # geometrically true but still useless as a coordinate: the target sits at
+    # t=0.58 in this layout and elsewhere in others, so "between" pins the LINE
+    # and nothing along it.
+    #
+    # Which is exactly what the policy learned. The old wording described a 1-D
+    # parametric point on that axis ("in the gap between ..., closer to the
+    # plate side") and it was executed literally: after the text-first fix the
+    # arm stopped aiming at the midpoint and started landing on bare table on
+    # the line -- right line, wrong point along it, because picking the point
+    # requires seeing the bowl.
     #
     # The wording below is not guesswork -- qwen_color_probe.py was run on the
     # real env frame at 64 / 256 / 1024 vision tokens with three question sets,
@@ -207,8 +218,12 @@ REPHRASINGS: dict[str, str] = {
     #    cannot separate from one of the things being measured. The plate is
     #    large, uniquely coloured and far from both bowls, and every
     #    plate-anchored judgement in the probe was correct from 256 tokens up.
-    #    The swap is safe: the target is ~30% of the frame from the plate against
-    #    the distractor's ~40%, so "nearest the plate" still selects the target.
+    #    The swap is safe, and the sim numbers say it is the better anchor by a
+    #    wide margin. Both selectors pick the target, but not equally well:
+    #      "nearest the plate"    bowl_1 0.111 m vs bowl_2 0.255 m -> 2.30x
+    #      "farthest from ramekin" bowl_1 0.153 m vs bowl_2 0.127 m -> 1.20x
+    #    A 1.20x margin flips on a 20% distance-estimation error, which is what
+    #    the probe did when anchored on the ramekin. 2.30x has room to be wrong.
     #
     # Still no coordinate the policy can interpolate -- "whichever of those two"
     # is a binary choice over discrete candidates, not a position. "Aim at the
