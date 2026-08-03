@@ -142,6 +142,20 @@ def main():
     v, f_, a = agg("vary"), agg("fixed"), agg("after")
     print(f"\n  overall  vary={v:.4f}  fixed={f_:.4f}  after={a:.4f}")
 
+    # Pixel-level spread. "the image changes when I change the id" is true under
+    # BOTH hypotheses -- a resampled layout looks just as different as a
+    # selected one. What separates them is whether holding the id fixed changes
+    # the image by the same amount, so print all three on the same scale.
+    def pix_spread(mode):
+        ims = [im for im in results[mode][1] if im is not None]
+        if len(ims) < 2:
+            return float("nan")
+        arr = np.stack([np.asarray(im, dtype=np.float32) for im in ims])
+        return float(np.abs(arr - arr.mean(0)).mean())
+
+    print(f"  mean |pixel - mode mean|  vary={pix_spread('vary'):.2f}  "
+          f"fixed={pix_spread('fixed'):.2f}  after={pix_spread('after'):.2f}  (0-255)")
+
     # per-state agreement: does today's path land where the state says?
     d = [max(np.linalg.norm(results["vary"][0][i][k] - results["after"][0][i][k])
              for k in names) for i in range(n)]
@@ -149,6 +163,10 @@ def main():
           f"max={np.max(d):.4f} m")
 
     print("\nverdict:")
+    if pix_spread("fixed") > 1.0 and pix_spread("vary") <= pix_spread("fixed") * 1.5:
+        print("  NOTE: holding the id fixed changes the image about as much as")
+        print("  varying it. Visible frame-to-frame variation is therefore NOT")
+        print("  evidence that the id is selecting anything.")
     if v <= f_ * 1.5:
         print("  _init_state_id does NOT select the layout -- spread with varying ids")
         print("  is no larger than with a fixed id. Layouts come from the placement")
