@@ -605,8 +605,19 @@ class WiltechsMoETransformer(nn.Module):
                     # LM layers only (no_grad, no activations retained).
                     perm_cpu = perm.detach().cpu().tolist()
                     descs_perm = [descs[i] for i in perm_cpu]
-                    shuffled_cache, shuffled_pad_mask, _, _, _, _ = self._run_vlm_and_cache_kv(
-                        batch, descs_override=descs_perm, vis_pack=vis_pack)
+                    # Keep the re-run's OWN hidden state. Two reasons, and the
+                    # first one crashes:
+                    #  * _hard_negative_perm is explicitly not a bijection, so
+                    #    descs_perm is a different multiset from descs and can
+                    #    pad to a different length -- L_vlm 406 vs 416, and
+                    #    _pool_vlm_semantic multiplies hidden by the mask.
+                    #  * Even when the lengths coincide, feeding the CORRECT
+                    #    language's hidden into the wrong-language branch gives
+                    #    v_t and v_wrong identical router weights, so the
+                    #    contrastive gradient never reaches the router at all.
+                    shuffled_cache, shuffled_pad_mask, _, _, vlm_hidden_wrong, _ = \
+                        self._run_vlm_and_cache_kv(
+                            batch, descs_override=descs_perm, vis_pack=vis_pack)
                     if vkv_drop is not None:
                         v_idx, v_keep = vkv_drop
                         shuffled_pad_mask = shuffled_pad_mask.clone(); shuffled_pad_mask[:, v_idx] &= v_keep
@@ -617,11 +628,14 @@ class WiltechsMoETransformer(nn.Module):
                         K_shuf[:, :, lang_start:, :] = K[perm, :, lang_start:, :]; V_shuf[:, :, lang_start:, :] = V[perm, :, lang_start:, :]
                         shuffled_cache[layer_idx] = (K_shuf, V_shuf)
                     shuffled_pad_mask = vlm_kv_pad_mask.clone(); shuffled_pad_mask[:, lang_start:] = vlm_kv_pad_mask[perm][:, lang_start:]
+                    # Same permutation the K/V got, so the router sees the wrong
+                    # language here too. Lengths always match on this path.
+                    vlm_hidden_wrong = vlm_hidden.clone(); vlm_hidden_wrong[:, lang_start:] = vlm_hidden[perm][:, lang_start:]
                 latents_wrong = self._generate_latents(shuffled_cache, shuffled_pad_mask)
                 # Also recompute thoughts from wrong-language cache so the thought
                 # path is language-forced too.
                 thoughts_wrong = self._generate_thoughts(shuffled_cache, shuffled_pad_mask, record=False)
-                v_wrong = self._run_moe_dit(batch, x_t_bf16, t, shuffled_cache, shuffled_pad_mask, robot_tokens, latents_wrong, vlm_hidden, thoughts_wrong)
+                v_wrong = self._run_moe_dit(batch, x_t_bf16, t, shuffled_cache, shuffled_pad_mask, robot_tokens, latents_wrong, vlm_hidden_wrong, thoughts_wrong)
                 diff_sq = (v_t - v_wrong).pow(2).mean(dim=[1, 2]); margin = float(getattr(self.config, "contrastive_margin", 0.05))
                 hinge = F.relu(margin - diff_sq) * pair_diff.float(); loss_contrastive = hinge.sum() / pair_diff.float().sum().clamp(min=1.0)
                 contrastive_v = float(loss_contrastive.detach()); main_loss = main_loss + contrastive_w * loss_contrastive
