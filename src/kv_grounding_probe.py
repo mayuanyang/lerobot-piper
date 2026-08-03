@@ -119,6 +119,11 @@ def main() -> None:
     ap.add_argument("--camera_name", default="agentview",
                     help="robosuite camera name for --annotate projection "
                          "(agentview / robot0_eye_in_hand)")
+    ap.add_argument("--annotate_flip", default="flipC",
+                    choices=["raw", "flipR", "flipC", "flipRC", "all"],
+                    help="axis convention for --annotate. flipC (columns mirrored, "
+                         "rows as-is) is verified correct for libero_spatial/agentview. "
+                         "'all' saves every variant if another camera differs.")
     ap.add_argument("--annotate_detect", action="store_true",
                     help="annotate by asking Qwen3-VL for 2D boxes instead of "
                          "projecting sim coordinates. Uses the convention from "
@@ -334,13 +339,17 @@ def main() -> None:
         except Exception:
             pass
 
-        # Save every row/col mirror combination rather than reasoning about the
-        # convention. robosuite renders bottom-up, LIBERO may flip before handing
-        # the frame over, and the projection helper's own axis order is one more
-        # place to be wrong -- four small PNGs settle it by eye in one look,
-        # which guessing demonstrably did not.
-        for fr in (False, True):
-            for fc in (False, True):
+        # CONFIRMED against the rendered frame: columns mirrored, rows as-is.
+        # robosuite renders bottom-up, LIBERO flips before handing the frame
+        # over, and the projection helper has its own axis order; the net effect
+        # is a horizontal mirror only. Verified by eye on libero_spatial, so
+        # --annotate_flip all remains for any camera or suite that differs.
+        variants = {"raw": (False, False), "flipR": (True, False),
+                    "flipC": (False, True), "flipRC": (True, True)}
+        chosen = (list(variants.items()) if args.annotate_flip == "all"
+                  else [(args.annotate_flip, variants[args.annotate_flip])])
+        for _tag, (fr, fc) in chosen:
+            if True:
                 im = Image.fromarray(f).convert("RGB")
                 dr = ImageDraw.Draw(im)
                 rows = []
@@ -353,17 +362,16 @@ def main() -> None:
                     dr.ellipse([c - 5, r - 5, c + 5, r + 5], outline=colr, width=2)
                     dr.text((c + 8, r - 6), n.replace("akita_black_", ""), fill=colr)
                     rows.append((n, r, c))
-                tag = ("_flipR" if fr else "") + ("_flipC" if fc else "")
-                path = f"annotated_t{args.task_id}_s{args.init_state_id}{tag or '_raw'}.png"
+                path = f"annotated_t{args.task_id}_s{args.init_state_id}_{_tag}.png"
                 im.save(path)
-                print(f"saved {path}   " + "  ".join(f"{n.split('_')[-2][:4]}=({r},{c})"
-                                                     for n, r, c in rows[:3]))
-        print("\nFour variants saved: raw, flipR (rows mirrored), flipC (columns "
-              "mirrored), flipR_flipC (both). Open them and keep the one whose "
-              "circles land on the objects; tell me which and I will pin it.")
-        print("RED = akita_black_bowl_1 (the BDDL target).  BLUE = bowl_2 (distractor).")
-        print("If NONE line up, --camera_name is probably wrong -- try another "
-              "entry from the camera list above.")
+                print(f"saved {path}")
+                for n, r, c in rows:
+                    print(f"    {n:<34} row={r:4d} col={c:4d}")
+        print("\nRED = akita_black_bowl_1 (the BDDL target).  "
+              "BLUE = akita_black_bowl_2 (distractor).")
+        if args.annotate_flip != "all":
+            print(f"Using the '{args.annotate_flip}' convention. Pass "
+                  "--annotate_flip all if a different camera or suite mislabels.")
         env.close()
         return
 
