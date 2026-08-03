@@ -145,14 +145,47 @@ REPHRASINGS: dict[str, str] = {
     "put both the cream cheese box and the butter in the basket":
          "put both the silver purple cream cheese box and the red butter box in the basket",
 
-    # ---- libero_spatial — "ramekin" is an ungroundable noun for the VLM ----
-    # These tasks fail because the model grounds the SPATIAL RELATION
-    # (between/next-to/on) to the GEOMETRIC MIDPOINT of the anchors rather
-    # than to the actual target object that happens to satisfy the relation.
-    # A flat rephrase ("between the plate and the ramekin, closer to the
-    # plate") still leaves the midpoint as a strong attractor. The CoT form
-    # below explicitly names the target first, so the DiT learns to attend to
-    # the object identity, then the relation.
+    # ---- libero_spatial ----
+    # The failing task grounds the SPATIAL RELATION (between/next-to/on) to the
+    # GEOMETRIC MIDPOINT of the anchors rather than to the object that satisfies
+    # the relation. A flat rephrase ("between the plate and the ramekin, closer
+    # to the plate") still leaves the midpoint as a strong attractor. The CoT
+    # form names the target first, so the DiT attends to object identity, then
+    # relation.
+    #
+    # ONLY REWRITE WHAT FAILS. In every one of the 10 tasks the BDDL target is
+    # akita_black_bowl_1 and the distractor akita_black_bowl_2, so the referring
+    # expression's whole job is to separate two bowls. Measured on init state 0
+    # (src/kv_grounding_probe.py --list_bodies), distance ratio between the two
+    # bowls under each task's OWN named anchor:
+    #
+    #   t0 between the plate and the ramekin  ramekin  1.20x   <-- the outlier
+    #   t1 next to the ramekin                ramekin  3.61x
+    #   t2 from table center                  centre   4.02x
+    #   t3 on the cookie box                  cookies    inf   (stacked)
+    #   t4 in the top drawer                  cabinet 13.28x   (in drawer vs on top)
+    #   t5 on the ramekin                     ramekin 20.82x   (stacked)
+    #   t6 next to the cookie box             cookies  3.33x
+    #   t7 on the stove                       stove    2.91x   (support surface)
+    #   t8 next to the plate                  plate    2.19x
+    #   t9 on the wooden cabinet              cabinet 17.83x   (stacked)
+    #
+    # Nine of ten relations are >=2x, most of them stacking or support-surface
+    # relations that are visually unambiguous. Only "between" is weak, because it
+    # names a LINE rather than an anchor, and the target's position along that
+    # line changes every episode. That -- not vocabulary -- is why this one task
+    # fails while libero_spatial as a whole sits at ~87%.
+    #
+    # Two corollaries, both learned by getting them wrong first:
+    #
+    #  * Do NOT unify the tasks onto the plate anchor. It is the right anchor for
+    #    t0 (2.30x vs the ramekin's 1.20x) and for t8, and useless elsewhere --
+    #    for t1 the plate separates the bowls 1.01x, a coin flip.
+    #  * Do NOT rewrite the nine working tasks to purge "black"/"ramekin". The
+    #    qwen_color_probe evidence that Qwen cannot see a "black bowl" comes from
+    #    its GENERATIVE path; the policy only ever reads cross-attention KV, and
+    #    ~87% success is direct evidence that path grounds these nouns fine.
+    #    Rewriting working tasks risks the minimal-pair collateral for no gain.
     "pick up the black bowl on the ramekin and place it on the plate":
         cot(
             target="the black bowl",
