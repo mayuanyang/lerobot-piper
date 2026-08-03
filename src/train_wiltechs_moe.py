@@ -99,11 +99,33 @@ def make_optimizer(params, lr, weight_decay, use_8bit: bool):
 # ---------------------------------------------------------------------------
 # Augmentation
 # ---------------------------------------------------------------------------
-def get_augmentations():
-    spatial = v2.RandomAffine(degrees=0, translate=(0.03, 0.03), scale=(0.95, 1.05), fill=0)
-    color = v2.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.08)
-    blur = v2.RandomApply([v2.GaussianBlur(kernel_size=5, sigma=(0.1, 1.0))], p=0.3)
-    return v2.Compose([spatial, color, blur])
+def get_augmentations(translate: float = 0.0, scale_jitter: float = 0.0):
+    """Photometric augmentation always; geometric augmentation opt-in.
+
+    Geometric augmentation moves the objects in the frame but NOT the action
+    label, so it teaches "position does not change the action" -- the exact
+    invariance a spatial-referring task must not have. On a 256px LIBERO frame
+    the old translate=0.03 was +-7.7px against a ~19px ramekin-to-bowl
+    separation: 40% of the distance the policy is being asked to resolve. The
+    LIBERO camera is fixed and eval uses the same viewpoint as training, so
+    there is no viewpoint robustness to buy in exchange.
+
+    Colour/blur do not move anything and stay on.
+
+    Not measured against a controlled A/B -- the mechanism is clear but the
+    magnitude of the effect is not. Pass --image_aug_translate 0.03 to restore
+    the previous behaviour.
+    """
+    tfs = []
+    if translate > 0 or scale_jitter > 0:
+        tfs.append(v2.RandomAffine(
+            degrees=0,
+            translate=(translate, translate) if translate > 0 else (0.0, 0.0),
+            scale=(1 - scale_jitter, 1 + scale_jitter) if scale_jitter > 0 else None,
+            fill=0))
+    tfs.append(v2.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.08))
+    tfs.append(v2.RandomApply([v2.GaussianBlur(kernel_size=5, sigma=(0.1, 1.0))], p=0.3))
+    return v2.Compose(tfs)
 
 
 def apply_image_augmentations(batch: dict, camera_keys: list[str], transform) -> dict:
@@ -313,6 +335,8 @@ def train(
     thought_qformer_layers: int = 2,
     thought_vlm_layer_idx: int = -1,
     thought_consistency_weight: float = 0.0,
+    image_aug_translate: float = 0.0,
+    image_aug_scale: float = 0.0,
 ):
     """Train WiltechsMoE on one or more HOMOGENEOUS LeRobot datasets.
 
@@ -330,7 +354,14 @@ def train(
 
     progress_update_freq = 200
     checkpoint_freq = 1000
-    image_transforms = get_augmentations()
+    image_transforms = get_augmentations(image_aug_translate, image_aug_scale)
+    if image_aug_translate or image_aug_scale:
+        print(f"Image aug: GEOMETRIC ON (translate={image_aug_translate}, "
+              f"scale=+-{image_aug_scale}) + colour/blur. Note the action label is "
+              f"NOT transformed with the image.")
+    else:
+        print("Image aug: colour/blur only (no geometric). "
+              "Pass --image_aug_translate/--image_aug_scale to re-enable.")
 
     # ── Load metadata for all datasets; first is the schema reference ────
     metas = {did: LeRobotDatasetMetadata(did, force_cache_sync=True, revision="main")
@@ -929,6 +960,15 @@ if __name__ == "__main__":
                         help="VLM layer to read KV from for thought generation. -1 = deepest captured layer.")
     parser.add_argument("--thought_consistency_weight", type=float, default=0.0,
                         help="Weight for thought consistency loss across denoising timesteps. 0 disables.")
+    parser.add_argument("--image_aug_translate", type=float, default=0.0,
+                        help="Random image translation as a fraction of frame size. Default 0: "
+                             "the action label is not transformed with the image, so this teaches "
+                             "position-invariance -- on a 256px LIBERO frame 0.03 is +-7.7px "
+                             "against a ~19px ramekin-to-bowl separation. 0.03 restores the "
+                             "pre-2026-08 behaviour.")
+    parser.add_argument("--image_aug_scale", type=float, default=0.0,
+                        help="Random image scale jitter (+-this). Default 0, same reasoning as "
+                             "--image_aug_translate. 0.05 restores the previous behaviour.")
     args = parser.parse_args()
 
     _v = args.robot_encoder_tokens
