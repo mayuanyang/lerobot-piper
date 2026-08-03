@@ -214,17 +214,31 @@ def main():
     # for. This is the direct measurement -- spread comparisons can be confounded
     # by two random draws happening to have similar variance.
     if have_req:
+        # A free joint's qpos[0:3] is the joint anchor, body_xpos is the body
+        # origin; they differ by a constant per-object translation. Raw
+        # |achieved - requested| therefore measures that offset, not tracking
+        # error. after_fixed is exactly deterministic and is the canonical
+        # order applied to state 0, so it calibrates the offset directly.
+        tracked = [k for k in names if k in req[0]]
+        off = {k: results["after_fixed"][0][0][k] - req[0][k] for k in tracked}
+        print("\n  frame offset (qpos anchor -> body origin), calibrated on "
+              "after_fixed:")
+        for k in tracked:
+            print(f"    {k:<34} {np.round(off[k], 4)}")
+
         def track_err(mode, use_state_i=True):
             errs = []
             for i in range(n):
                 r = req[i if use_state_i else 0]
-                errs.append(max(np.linalg.norm(results[mode][0][i][k] - r[k])
-                                for k in names if k in r))
+                errs.append(max(np.linalg.norm(results[mode][0][i][k] - r[k] - off[k])
+                                for k in tracked))
             return float(np.mean(errs)), float(np.max(errs))
-        print("\n  distance from the position state i actually asks for (m):")
+
+        print("\n  offset-corrected distance from the layout state i asks for (m):")
         for mode, same in (("vary", True), ("after", True), ("after_fixed", False)):
             mu, mx = track_err(mode, same)
             print(f"    {mode:<12} mean={mu:.4f}  max={mx:.4f}")
+        print("    (after_fixed is 0 by construction -- it defined the offset)")
 
     print("\nverdict:")
     if pix_spread("fixed") > 1.0 and pix_spread("vary") <= pix_spread("fixed") * 1.5:
@@ -232,32 +246,28 @@ def main():
         print("  varying it. Visible frame-to-frame variation is therefore NOT")
         print("  evidence that the id is selecting anything.")
     if have_req:
-        req_spread = max(np.stack([r[k] for r in req]).std(0).max()
-                         for k in req[0])
-        print(f"  the 50 canonical states themselves span {req_spread:.4f} m "
-              f"(max per-object std).")
-        if req_spread < 0.02:
-            print("  That is small -- the canonical layouts are near-identical, so no")
-            print("  ordering fix would give you visibly different scenes. An eval")
-            print("  scene that looks different is NOT coming from these states:")
-            print("  check the suite/task_id, or whether eval passes init_states=False")
-            print("  (which drops to the placement sampler entirely).")
-        else:
-            print("  That is real variation, so the layouts DO differ and the only")
-            print("  question is whether reset ordering delivers them.")
-    if v <= f_ * 1.5:
-        print("  _init_state_id does NOT select the layout -- spread with varying ids")
-        print("  is no larger than with a fixed id.")
-        if af < a * 0.5:
-            print("  Reversing the order (reset -> set_init_state) IS deterministic")
-            print("  (after_fixed collapses), so that ordering is the fix.")
-        else:
-            print("  Reversing the order is not deterministic either (after_fixed is")
-            print("  as large as after), so set_init_state is not sticking at all.")
-    else:
-        print("  _init_state_id works: varying it moves objects well beyond the")
-        print("  per-reset noise floor. Then the eval scene IS among the 50 and the")
-        print("  mismatch is elsewhere (task_id? suite? camera?).")
+        req_spread = max(np.stack([r[k] for r in req]).std(0).max() for k in req[0])
+        print(f"  the {n_init} canonical states span {req_spread:.4f} m "
+              f"(max per-object std) -- objects jitter, they never swap places.")
+        v_err = track_err("vary")[0]
+        a_err = track_err("after")[0]
+        print(f"  offset-corrected tracking error: vary={v_err:.4f} m, "
+              f"after={a_err:.4f} m")
+        if a_err < req_spread and v_err > 3 * max(a_err, 1e-6):
+            print("  => reset() then set_init_state() reproduces the requested layout;")
+            print("     set_init_state() then reset() does not. lerobot's LiberoEnv")
+            print("     uses the latter, so the layouts it serves are placement-sampler")
+            print("     draws, NOT the canonical states the demos were recorded on.")
+            print("     Everything running through LiberoEnv is affected: eval, RL")
+            print("     rollouts, and this repo's probes.")
+        elif v_err <= a_err:
+            print("  => today's ordering tracks the requested layout as well as the")
+            print("     canonical one. The ordering is not your problem.")
+        if v > req_spread * 2:
+            print(f"  Note the served spread ({v:.4f} m) is much LARGER than the")
+            print("  canonical one. Eval is drawing layouts the training demos never")
+            print("  contained -- a train/eval shift on exactly the geometry this")
+            print("  task depends on.")
 
     if args.sheet:
         import math
