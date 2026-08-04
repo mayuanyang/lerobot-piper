@@ -50,11 +50,20 @@ class MoERouter(nn.Module):
         action_pool = action_emb.mean(dim=1)
         state_flat = state_emb.squeeze(1) if state_emb.dim() == 3 else state_emb
         logits = self.router(torch.cat([state_flat, vlm_proj, time_emb, action_pool], dim=-1)) / max(self.temperature, 1e-6)
-        # Inject noise during training to prevent router collapse.  The noise
+        # Diagnostics read the PRE-noise weights: those are what inference
+        # actually uses, and the exploration noise below inflates peakedness by
+        # a lot at these logit scales (a router with zero input dependence still
+        # reports max_w 0.39 / entropy 1.30 once N(0, 0.5) is added, not the
+        # 0.25 / 1.386 that "uniform" suggests). Comparing the noisy statistic
+        # against the uniform reference therefore reads "differentiating" for a
+        # fully collapsed router.
+        self._last_clean_weights = F.softmax(logits, dim=-1).detach()
+        # Inject noise during training to prevent router collapse. The noise
         # keeps "dead" experts receiving exploration signal early in training,
-        # breaking the winner-take-all positive feedback loop.  Scaled to the
-        # logit magnitude so it matters at init (small logits) but washes out
-        # as the router learns confident routing.
+        # breaking the winner-take-all positive feedback loop. It is a FIXED
+        # 0.5, not scaled to the logit magnitude, so it does not wash out as the
+        # router grows confident -- it stops mattering only once the learned
+        # logit spread is large relative to 0.5.
         if self.training:
             logits = logits + torch.randn_like(logits) * 0.5
         if self.top_k > 0 and self.top_k < self.num_experts:
@@ -517,7 +526,7 @@ class WiltechsMoETransformer(nn.Module):
         pooled = (vlm_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)  # (B, hidden_size)
         return pooled
 
-    def _run_moe_dit(self, batch, noisy_actions, timesteps, kv_cache, vlm_kv_pad_mask, robot_tokens, latents, vlm_hidden, thoughts=None):
+    def _run_moe_dit(self, batch, noisy_actions, timesteps, kv_cache, vlm_kv_pad_mask, robot_tokens, latents, vlm_hidden, thoughts=None, record=True):
         device, dtype = noisy_actions.device, noisy_actions.dtype
         t_emb = self.time_embedder(create_sinusoidal_pos_embedding(timesteps, self.dit_hidden).to(dtype).float()).to(dtype)
         dit_seq, action_start_idx, state_tok, action_emb = self._build_expert_input(batch, noisy_actions, robot_tokens, latents, thoughts)
@@ -535,19 +544,29 @@ class WiltechsMoETransformer(nn.Module):
             expert_outputs.append(self.action_out_proj(self.final_norm(x[:, action_start_idx:])))
         stacked = torch.stack(expert_outputs, dim=1)
         v_t = (weights.unsqueeze(-1).unsqueeze(-1) * stacked).sum(dim=1)
-        self._last_router_usage = usage
-        # usage is the BATCH MEAN, so a perfectly uniform CV^2 is ambiguous: it
-        # is produced both by healthy per-sample specialisation that averages
-        # out, and by a router that has learned to emit uniform weights for
-        # every input -- which zeroes the CV^2 balance penalty for free and
-        # turns the MoE into a fixed 4-way average, killing the one module that
-        # conditions expert choice on the instruction. These two per-sample
-        # statistics separate them: with num_experts=4, uniform-per-sample means
-        # max_w -> 0.25 and entropy -> ln(4)=1.386.
-        with torch.no_grad():
-            w = weights.detach().float()
-            self._last_router_max_w = float(w.max(dim=-1).values.mean())
-            self._last_router_entropy = float(-(w.clamp_min(1e-9).log() * w).sum(-1).mean())
+        # record=False for the contrastive negative's forward: it runs AFTER
+        # this one and would otherwise overwrite every router statistic, so the
+        # training log would report routing under PERMUTED instructions while
+        # claiming to describe the real forward. (The balance loss is unaffected
+        # -- it reads _last_router_usage before the negative branch runs.)
+        if record:
+            self._last_router_usage = usage
+            # usage is the BATCH MEAN, so a perfectly uniform CV^2 is ambiguous:
+            # it is produced both by healthy per-sample specialisation that
+            # averages out, and by a router that has learned to emit uniform
+            # weights for every input -- which zeroes the CV^2 balance penalty
+            # for free and turns the MoE into a fixed 4-way average, killing the
+            # one module that conditions expert choice on the instruction. These
+            # two per-sample statistics separate them: with num_experts=4,
+            # uniform-per-sample means max_w -> 0.25 and entropy -> ln(4)=1.386.
+            #
+            # Taken from the router's PRE-noise weights (see MoERouter.forward),
+            # so the reference values above are the right ones to compare with
+            # and the numbers describe inference-time routing directly.
+            with torch.no_grad():
+                w = getattr(self.router, "_last_clean_weights", weights).detach().float()
+                self._last_router_max_w = float(w.max(dim=-1).values.mean())
+                self._last_router_entropy = float(-(w.clamp_min(1e-9).log() * w).sum(-1).mean())
         return v_t.float()
 
     def sample_noise(self, shape, device):
@@ -652,7 +671,7 @@ class WiltechsMoETransformer(nn.Module):
                 # Also recompute thoughts from wrong-language cache so the thought
                 # path is language-forced too.
                 thoughts_wrong = self._generate_thoughts(shuffled_cache, shuffled_pad_mask, record=False)
-                v_wrong = self._run_moe_dit(batch, x_t_bf16, t, shuffled_cache, shuffled_pad_mask, robot_tokens, latents_wrong, vlm_hidden_wrong, thoughts_wrong)
+                v_wrong = self._run_moe_dit(batch, x_t_bf16, t, shuffled_cache, shuffled_pad_mask, robot_tokens, latents_wrong, vlm_hidden_wrong, thoughts_wrong, record=False)
                 diff_sq = (v_t - v_wrong).pow(2).mean(dim=[1, 2]); margin = float(getattr(self.config, "contrastive_margin", 0.05))
                 hinge = F.relu(margin - diff_sq) * pair_diff.float(); loss_contrastive = hinge.sum() / pair_diff.float().sum().clamp(min=1.0)
                 contrastive_v = float(loss_contrastive.detach()); main_loss = main_loss + contrastive_w * loss_contrastive

@@ -165,11 +165,34 @@ failure state, and that is what the pre-text-first runs showed.
 **`Router usage` / `Router per-samp`** — batch-mean usage CV² near zero is
 ambiguous: healthy per-sample specialisation averages out the same way an
 input-independent uniform router does, and the latter zeroes the CV² balance
-penalty for free. The per-sample line separates them. At step 18000:
-`max_w=0.440 (uniform=0.250) entropy=1.237 (uniform=1.386)` — differentiating,
-not collapsed. **[measured]** Note this is measured in training mode, where the
-router adds `N(0, 0.5)` to its logits, so it is a *lower bound* on how peaked
-eval-time routing is.
+penalty for free. The per-sample line separates them, because CV² is taken over
+the batch mean while `max_w` / `entropy` are taken per sample and then averaged.
+
+`max_w` is the weight of the winning expert; `entropy` is how spread the mix is.
+With `num_experts=4`, an input-independent router gives `max_w=0.250`,
+`entropy=ln 4=1.386`; a hard one-expert-per-sample router gives `1.000` / `0.000`.
+Both statistics track the same underlying quantity — the spread of the router's
+logits — so read them together as one number, not two.
+
+**The step-18000 reading `max_w=0.440 entropy=1.237` overstated this.** Until
+2026-08-04 the statistics were computed from the *noisy* logits: training adds a
+fixed `N(0, 0.5)` for exploration, and at these logit scales that alone drives a
+router with **zero** input dependence to `max_w=0.388 / entropy=1.301`. So the
+noise floor is 0.388, not 0.250, and 0.440 sits just above it — consistent with a
+learned logit spread of only ≈0.5, i.e. an eval-time mix near 0.39/0.25/0.20/0.16.
+That is real differentiation but far weaker than the reading suggested, and the
+old note claiming the training-mode value was a *lower* bound on eval peakedness
+had the sign backwards: noise only ever adds logit variance, so it was an upper
+bound. **[measured]** Fixed by reading the pre-noise weights, so the 0.250/1.386
+reference is now the correct comparison. Rough decode of the corrected line:
+`≤0.30` collapsed, `0.35–0.55` differentiating, `>0.8` near-hard routing.
+
+The same reading was also taken from the wrong forward pass: with contrastive on,
+the negative branch ran second and overwrote every router statistic, so the log
+described routing under *permuted* instructions. Also fixed. Neither bug touched
+training — both are diagnostic-only, and the balance loss always read the correct
+branch — but no router number recorded before 2026-08-04 is comparable with one
+taken after.
 
 **`Loss components`** — `contrastive` is a hinge, `relu(margin − diff_sq)`. It
 falls to 0 as the constraint is satisfied; that is the design, not a fault.

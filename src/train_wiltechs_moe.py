@@ -260,6 +260,12 @@ def _log_gradient_analysis(policy, step: int) -> None:
         # router specialises per sample or has collapsed to uniform-for-everything
         # (which satisfies the balance penalty for free and makes the MoE a fixed
         # average). max_w at 1/E and entropy at ln(E) is that collapse.
+        #
+        # Both come from the router's pre-noise weights and from the main
+        # forward only (not the contrastive negative), so they describe
+        # inference-time routing and the uniform references below are the right
+        # comparison. See FINDINGS.md -- reading them off the noisy logits, as
+        # this did before 2026-08-04, put the collapse floor at 0.388/1.301.
         mw = getattr(policy.model, "_last_router_max_w", None)
         ent = getattr(policy.model, "_last_router_entropy", None)
         if mw is not None and ent is not None:
