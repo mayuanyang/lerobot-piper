@@ -108,64 +108,81 @@ def main():
         seg_len = float(np.linalg.norm(seg))
         t = float(np.dot(tgt - a0, seg) / max(seg_len ** 2, 1e-9))
         perp = float(np.linalg.norm((tgt - a0) - t * seg))
+        # The distractor's distance from the same segment. "Of the two bowls,
+        # the one ON the line" is a candidate SELECTOR (not a coordinate), and
+        # its margin is perp_d/perp_t -- worth comparing against the
+        # plate-distance selector's ratio, since they fail in different places.
+        t_d = float(np.dot(dis - a0, seg) / max(seg_len ** 2, 1e-9))
+        perp_d = float(np.linalg.norm((dis - a0) - t_d * seg))
         sel = p[args.selector_anchor][:2]
         d_t = float(np.linalg.norm(tgt - sel))
         d_d = float(np.linalg.norm(dis - sel))
-        rows.append({"i": i, "t": t, "perp": perp, "d_t": d_t, "d_d": d_d,
+        rows.append({"i": i, "t": t, "perp": perp, "perp_d": perp_d,
+                     "perp_ratio": perp_d / max(perp, 1e-9),
+                     "d_t": d_t, "d_d": d_d,
                      "ratio": d_d / max(d_t, 1e-9), "fail": i in failed})
     env.close()
 
-    print(f"\n{'state':>5} {'t':>7} {'perp(m)':>9} {'d_tgt':>7} {'d_dis':>7} "
-          f"{'ratio':>7}  {'result':>7}")
+    print(f"\n{'state':>5} {'t':>7} {'perp(m)':>9} {'perpR':>7} {'d_tgt':>7} "
+          f"{'d_dis':>7} {'ratio':>7}  {'result':>7}")
     for r in rows:
-        print(f"{r['i']:>5} {r['t']:>7.3f} {r['perp']:>9.4f} {r['d_t']:>7.3f} "
+        print(f"{r['i']:>5} {r['t']:>7.3f} {r['perp']:>9.4f} "
+              f"{r['perp_ratio']:>7.1f} {r['d_t']:>7.3f} "
               f"{r['d_d']:>7.3f} {r['ratio']:>7.2f}  "
               f"{'FAIL' if r['fail'] else 'ok':>7}")
 
-    def summarise(sel, label):
-        if not sel:
-            return None
-        f = lambda k: np.array([r[k] for r in sel])
-        print(f"  {label:<10} n={len(sel):<3} "
-              f"t={f('t').mean():.3f}+-{f('t').std():.3f}  "
-              f"perp={f('perp').mean():.4f}+-{f('perp').std():.4f}  "
-              f"ratio={f('ratio').mean():.2f}+-{f('ratio').std():.2f}")
-        return f
+    METRICS = [("t", "position along the segment", "{:.3f}"),
+               ("perp", "distance off the segment", "{:.4f}"),
+               ("perp_ratio", "on-the-line selector margin", "{:.1f}"),
+               ("ratio", "plate-distance selector margin", "{:.2f}")]
+
+    def col(sel, k):
+        return np.array([r[k] for r in sel])
 
     if failed:
-        print("\ngroup means:")
-        bad = summarise([r for r in rows if r["fail"]], "FAILED")
-        good = summarise([r for r in rows if not r["fail"]], "succeeded")
-        if bad is not None and good is not None:
-            print("\nreading:")
-            dp = bad("perp").mean() - good("perp").mean()
-            dr = bad("ratio").mean() - good("ratio").mean()
-            if abs(dp) > 2 * good("perp").std():
-                print(f"  perp differs by {dp:+.4f} m, beyond the successes' own"
-                      f" spread -- the failures ARE the off-the-line layouts.")
-            else:
-                print(f"  perp differs by only {dp:+.4f} m, inside the successes'"
-                      f" spread ({good('perp').std():.4f}) -- distance from the"
-                      f" line does NOT separate the failures.")
-            if bad("ratio").min() < 1.0:
-                print(f"  at least one failure has ratio < 1.0 (min "
-                      f"{bad('ratio').min():.2f}): the selector points at the"
-                      f" WRONG bowl there, so the instruction is incorrect for"
-                      f" that layout, not just hard.")
-            elif abs(dr) > 2 * good("ratio").std():
-                print(f"  selector margin differs by {dr:+.2f} -- the failures"
-                      f" are the layouts where the selector is weakest.")
-            else:
-                print(f"  selector margin differs by only {dr:+.2f}; geometry"
-                      f" does not explain these four. Look at the videos for a"
-                      f" control-side cause (grasp slip, timeout).")
+        bad_rows = [r for r in rows if r["fail"]]
+        good_rows = [r for r in rows if not r["fail"]]
+        print(f"\ngroup comparison (FAILED n={len(bad_rows)}, "
+              f"succeeded n={len(good_rows)}):")
+        print(f"  {'metric':<32}{'FAILED':>18}{'succeeded':>18}{'t-stat':>9}")
+        for k, label, fmt in METRICS:
+            b, g = col(bad_rows, k), col(good_rows, k)
+            # Welch: compare the difference of MEANS against the standard error
+            # of that difference. Comparing it against an individual sample's
+            # std instead -- which an earlier version of this script did -- is
+            # far too strict and hides real separations at n=4.
+            se = float(np.sqrt(b.var(ddof=1) / len(b) + g.var(ddof=1) / len(g)))
+            tstat = (b.mean() - g.mean()) / max(se, 1e-12)
+            print(f"  {label:<32}"
+                  f"{(fmt + '+-' + fmt).format(b.mean(), b.std()):>18}"
+                  f"{(fmt + '+-' + fmt).format(g.mean(), g.std()):>18}"
+                  f"{tstat:>9.1f}")
+        print("\n  |t-stat| >~ 2.5 is a real separation at these group sizes; "
+              "below ~1.5 is noise.")
+
+        r_bad = col(bad_rows, "ratio")
+        if r_bad.min() < 1.0:
+            print(f"\n  A failure has plate-selector ratio {r_bad.min():.2f} < 1: "
+                  f"the rewrite names the DISTRACTOR in that layout. The "
+                  f"instruction is wrong there, not merely hard.")
+        pr = col(rows, "perp_ratio")
+        print(f"\n  selector strength over all {n} states:")
+        print(f"    plate distance : min {col(rows, 'ratio').min():.2f}  "
+              f"mean {col(rows, 'ratio').mean():.2f}")
+        print(f"    on-the-line    : min {pr.min():.1f}  mean {pr.mean():.1f}")
+        if pr.min() > col(rows, "ratio").min() * 2:
+            print("    -> 'of the two bowls, the one lying on the segment' "
+                  "separates them far more strongly than plate distance, and it "
+                  "is a SELECTOR, not the coordinate that caused the original "
+                  "failure. Candidate second cue for the weak-t layouts.")
     else:
-        t = np.array([r["t"] for r in rows]); perp = np.array([r["perp"] for r in rows])
-        ratio = np.array([r["ratio"] for r in rows])
-        print(f"\nover {n} states: t={t.mean():.3f}+-{t.std():.3f}  "
-              f"perp={perp.mean():.4f}+-{perp.std():.4f}  "
-              f"ratio={ratio.mean():.2f}+-{ratio.std():.2f}  "
-              f"(ratio<1 in {int((ratio < 1).sum())} states)")
+        print(f"\nover {n} states:")
+        for k, label, fmt in METRICS:
+            v = col(rows, k)
+            print(f"  {label:<32}{(fmt + '+-' + fmt).format(v.mean(), v.std()):>18}"
+                  f"   min {fmt.format(v.min())}")
+        print(f"  plate-selector ratio < 1 in "
+              f"{int((col(rows, 'ratio') < 1).sum())} states")
 
 
 if __name__ == "__main__":
