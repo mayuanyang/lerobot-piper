@@ -51,6 +51,14 @@ def main():
     ap.add_argument("--selector_anchor", default="plate_1",
                     help="the object the rewrite's selector measures from")
     ap.add_argument("--n_states", type=int, default=50)
+    ap.add_argument("--source", choices=["canonical", "sampler"], default="canonical",
+                    help="canonical = the 50 init states the demos were recorded "
+                         "on and the benchmark evaluates. sampler = what stock "
+                         "lerobot actually serves, because its reset() discards "
+                         "the init state and re-runs the BDDL placement "
+                         "initializer (see libero_env_fixed.py). The sampler "
+                         "spread is ~10x wider, and it is the distribution an "
+                         "unpatched eval has been measuring all along.")
     ap.add_argument("--failed_episodes", type=int, nargs="*", default=[],
                     help="episode indices from the eval metrics dict")
     ap.add_argument("--failed_states", type=int, nargs="*", default=[],
@@ -67,7 +75,8 @@ def main():
     from libero_env_fixed import patch_lerobot_libero
     from rl_staged_reward import get_sim_env
 
-    patch_lerobot_libero(enable=True, init_from_seed=False)
+    canonical = args.source == "canonical"
+    patch_lerobot_libero(enable=canonical, init_from_seed=False)
 
     env = LiberoEnv(task_suite=_get_suite(args.suite), task_id=args.task_id,
                     task_suite_name=args.suite, obs_type="pixels_agent_pos",
@@ -79,8 +88,8 @@ def main():
 
     states = getattr(env, "_init_states", None)
     n_init = 0 if states is None else len(states)
-    n = min(args.n_states, n_init)
-    print(f"init states: {n_init}, reading {n}")
+    n = min(args.n_states, n_init) if canonical else args.n_states
+    print(f"source={args.source}, init states on file: {n_init}, reading {n}")
 
     def positions():
         bid = getattr(sim_env, "obj_body_id", None) or {}
@@ -99,8 +108,13 @@ def main():
 
     rows = []
     for i in range(n):
-        env._init_state_id = i
-        env.reset()
+        if canonical:
+            env._init_state_id = i
+            env.reset()
+        else:
+            # Stock ordering: reset() re-samples the placement initializer, so
+            # the seed -- not _init_state_id -- is what varies the layout.
+            env.reset(seed=args.start_seed + i)
         p = positions()
         a0, a1 = p[args.anchors[0]][:2], p[args.anchors[1]][:2]
         tgt, dis = p[args.target][:2], p[args.distractor][:2]
@@ -181,8 +195,16 @@ def main():
             v = col(rows, k)
             print(f"  {label:<32}{(fmt + '+-' + fmt).format(v.mean(), v.std()):>18}"
                   f"   min {fmt.format(v.min())}")
-        print(f"  plate-selector ratio < 1 in "
-              f"{int((col(rows, 'ratio') < 1).sum())} states")
+        bad_sel = int((col(rows, "ratio") < 1).sum())
+        print(f"\n  plate-selector ratio < 1 in {bad_sel}/{n} layouts")
+        if bad_sel:
+            print(f"  -> in {bad_sel} of these the rewrite's 'whichever is nearer"
+                  f" to the plate' names the DISTRACTOR. No amount of training"
+                  f" fixes those: the instruction is wrong there. States: "
+                  f"{[r['i'] for r in rows if r['ratio'] < 1][:15]}")
+        pr_bad = int((col(rows, "perp_ratio") < 1).sum())
+        print(f"  on-the-line selector wrong in {pr_bad}/{n} layouts "
+              f"(min margin {col(rows, 'perp_ratio').min():.1f})")
 
 
 if __name__ == "__main__":
