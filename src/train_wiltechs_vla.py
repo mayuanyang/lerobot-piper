@@ -288,7 +288,17 @@ def _log_gradient_analysis(policy, step: int) -> None:
     x_stats = getattr(policy.model, "_last_cross_attention_stats", None)
     if x_stats:
         print("  Action→ x-attn    : " + format_xattn(x_stats)
-              + "    (cross-attn to VLM KV)")
+              + "    (mean over sampled depths)")
+        per_d = x_stats.get("_per_expert") or []
+        labels = x_stats.get("_labels") or [f"d{i}" for i in range(len(per_d))]
+        if len(per_d) > 1:
+            # The depth spread is the signal, not the mean: WiltechsMoE at its
+            # 92% checkpoint read 55.8% VISION at VLM layer 8 but only 8.6% at
+            # layer 35. A shallow band that has gone language-dominated is the
+            # thing to catch — that is where spatial grounding lives.
+            cells = "  ".join(f"{lab}={lang * 100:4.1f}%"
+                              for lab, (_v, lang) in zip(labels, per_d))
+            print(f"  x-attn lang/depth : {cells}    (language %, shallow→deep)")
 
     _cfg = policy.model.config
     _rcnn_on = getattr(_cfg, "use_robot_cnn", True)

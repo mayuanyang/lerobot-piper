@@ -206,9 +206,28 @@ uninterpretable because language is a small minority of positions. `x1.0` is
 proportional attention; the WiltechsVLA run at step 1200 read
 `language=81.1% (x3.79)` against `[87 lang + 320 vis tok]`.
 
-`x-attn lang/exp` breaks it out per expert, shallow band → deep. A spread there
-means the depth bands are being read differently, which the weighted average
-hides. **[not yet measured]**
+`x-attn lang/exp` breaks it out per expert, shallow band → deep. Measured on the
+92% checkpoint (resumed for 200 steps), and the spread is the whole story:
+
+| expert | VLM layers | language | **vision** |
+|--------|-----------|----------|--------|
+| E0 | 0–8 | 44.2% | **55.8%** |
+| E1 | 9–17 | 90.6% | 9.4% |
+| E2 | 18–26 | 81.1% | 18.9% |
+| E3 | 27–35 | 91.4% | 8.6% |
+| router-weighted | | 76.7% (x3.53) | 23.3% (x0.30) |
+
+**Visual grounding lives almost entirely in the SHALLOW band.** E0 is the only
+expert reading vision more than language; by layer 35 vision is down to 8.6%.
+That fits what the layers hold — geometry early, task semantics late — and it
+means a deep-layer-only reading says nothing about whether the model is
+grounding. **[measured]**
+
+Consequence for any single-stack model (WiltechsVLA): measuring the last layer
+alone is misleading. 91% language at the deepest layer is *normal*, not a
+failure. The VLA now samples four depths matching these band boundaries
+(DiT/VLM layers 8, 17, 26, 35 at `num_dit_layers=36`) so the two line up depth
+for depth; its mean over those four is what compares with 76.7% here.
 
 **`Loss components`** — `contrastive` is a hinge, `relu(margin − diff_sq)`. It
 falls to 0 as the constraint is satisfied; that is the design, not a fault.

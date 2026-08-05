@@ -320,6 +320,29 @@ def cross_attention_mass(
     return stats
 
 
+def _merge_depths(per_depth: list[dict], vlm_layers: list[int]) -> dict:
+    """Average cross-attn shares sampled at several DiT depths into one figure.
+
+    A plain mean, which is what makes it comparable with WiltechsMoE's
+    router-weighted mean over experts: that router sits near uniform
+    (25.4/26.0/24.0/24.6 at ckpt 18000), so its weighted mean is a plain mean
+    too. `_per_depth` keeps the breakdown, because the spread is the point —
+    the MoE reads 55.8% vision at VLM layer 8 and 8.6% at layer 35, and the
+    average of those two says nothing useful on its own.
+    """
+    valid = [d for d in per_depth if d]
+    if not valid:
+        return {}
+    out = {k: sum(d.get(k, 0.0) for d in valid) / len(valid)
+           for k in ("vision", "language")}
+    out["_n_vis"] = valid[0].get("_n_vis", 0.0)
+    out["_n_lang"] = valid[0].get("_n_lang", 0.0)
+    out["_per_expert"] = [(d.get("vision", 0.0), d.get("language", 0.0))
+                          for d in valid]
+    out["_labels"] = [f"L{v}" for v in vlm_layers[:len(valid)]]
+    return out
+
+
 def format_xattn(s: dict) -> str:
     """Render cross_attention_mass() output as one log line.
 
@@ -1634,29 +1657,41 @@ class WiltechsVLATransformer(nn.Module):
         # are already detached, so checkpointing only re-runs DiT compute.
         x = dit_seq
         use_ckpt = self.gradient_checkpointing and self.training
+        capture = self._capture_attention_stats
+        # Sample cross-attn mass at FOUR depths, not just the last layer.
+        # WiltechsMoE's per-expert breakdown showed the shares swing enormously
+        # with depth on the same model — 44% language at VLM layer 8 against 91%
+        # at layer 35 — so a last-layer-only reading says nothing about whether
+        # the shallow, geometric part of the stack is grounding on vision. These
+        # indices are the last layer of each quarter, matching the MoE's four
+        # expert-band boundaries when num_dit_layers=36, so the two models'
+        # numbers line up depth for depth.
+        n_l = len(self.dit_layers)
+        depth_idx = sorted({max(0, (n_l * q) // 4 - 1) for q in (1, 2, 3, 4)})
+        per_depth: list[dict] = []
+
         for i, layer in enumerate(self.dit_layers):
-            # Capture attention mass at the LAST DiT layer's input. This is
-            # the "final say" before the action readout — what action queries
-            # decide to attend to here is what shapes the velocity output.
-            if (
-                i == len(self.dit_layers) - 1
-                and self._capture_attention_stats
-            ):
+            if capture and i in depth_idx:
+                per_depth.append(cross_attention_mass(
+                    layer, x, t_emb, kv_cache[i], vlm_kv_pad_mask,
+                    action_start_idx, H_horizon, vis_mask,
+                ))
+            # Self-attn mass is only meaningful at the LAST layer — the "final
+            # say" before the action readout.
+            if capture and i == n_l - 1:
                 self._last_attention_stats = self._compute_attention_mass(
                     x, t_emb, causal_mask, regions,
-                )
-                self._last_cross_attention_stats = self._compute_cross_attention_mass(
-                    x, t_emb, kv_cache[i], vlm_kv_pad_mask,
-                    action_start_idx, H_horizon, vis_mask,
                 )
                 # one-shot: don't capture again if _run_dit is called twice
                 # (e.g. for the contrastive-language v_wrong forward).
                 self._capture_attention_stats = False
-                # The no_grad capture above populated the autocast weight
-                # cache with GRAD-LESS bf16 casts of this layer's sa_q/sa_k/
-                # ca_q/adaLN weights. Clear it so the real forward below
-                # re-casts them WITH grad tracking — otherwise those weights
-                # silently receive no gradient on every capture step.
+                self._last_cross_attention_stats = _merge_depths(
+                    per_depth, [self.capture_layers[j] for j in depth_idx])
+                # The no_grad captures above populated the autocast weight cache
+                # with GRAD-LESS bf16 casts of these layers' sa_q/sa_k/ca_q/adaLN
+                # weights. Clear it so the real forward re-casts them WITH grad
+                # tracking — otherwise those weights silently receive no
+                # gradient on every capture step.
                 torch.clear_autocast_cache()
 
             vlm_k, vlm_v = kv_cache[i]

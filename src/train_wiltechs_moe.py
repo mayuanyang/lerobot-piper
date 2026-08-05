@@ -319,8 +319,10 @@ def _log_gradient_analysis(policy, step: int) -> None:
             # Each expert reads a different VLM depth band, so a spread here
             # means the bands are being used differently — invisible in the
             # weighted average above.
-            cells = "  ".join(f"E{i}={lang*100:4.1f}%" for i, (_v, lang) in enumerate(per_e))
-            print(f"  x-attn lang/exp : {cells}    (by depth band, shallow→deep)")
+            labels = x_stats.get("_labels") or [f"E{i}" for i in range(len(per_e))]
+            cells = "  ".join(f"{lab}={lang * 100:4.1f}%"
+                              for lab, (_v, lang) in zip(labels, per_e))
+            print(f"  x-attn lang/exp : {cells}    (language %, shallow→deep)")
 
     print("--- End Gradient Analysis ---\n")
 
