@@ -319,8 +319,17 @@ FFN        3·h·intermediate  (SwiGLU)            adaLN       9·h²
 
 > The current default reads **every** VLM layer yet is roughly **half** the old
 > 16-layer stack, because the width and FFN shrink outweigh the extra depth.
-> 36L @ 640 also matches WiltechsMoE's expert budget (4 × 9 layers, all of which
-> run every forward), which is what makes the two directly comparable.
+
+> **To compare against WiltechsMoE, match the WIDTH, not just the layer count.**
+> The MoE's 92% checkpoint runs `dit_hidden=1280` — 4 experts × 9 layers at
+> 34.1M/layer = **1,227,386,880** expert params (confirmed three ways from its
+> training log: expert total, `Sink Token` = 1280, `Time Embedder` = 3,279,360).
+> The layer counts match at 36, but `36L @ 640` is **1/3 the parameters**, not
+> parity. An earlier note here claimed otherwise; it had been derived from the
+> MoE config's *default* 640 rather than from what the run actually used, and a
+> VLA run at 640 scored 25% against the MoE's 92% with three variables
+> confounded (width, gradient-update count, topology). Use
+> `--dit_hidden_size 1280` for a controlled comparison.
 
 Non-DiT components (at `dit_hidden=640`): state encoder ~7K, action in/out ~5K
 each, action pos emb ~41K, Robot CNN ~5M, latent Q-Former ~17M, time embedder

@@ -266,6 +266,21 @@ Vision input size 512px -> 256 tokens/frame for ['observation.images.image']
 
 ---
 
+## 5b. The 92% run's actual size — read this before any comparison
+
+`dit_hidden=1280`, giving **1,227,386,880** expert params (4 × 9 layers at
+34.1M). Confirmed three independent ways from its training log: the expert
+total, `Sink Token` = 1280 params, `Time Embedder` = 3,279,360 = 2·(1280²+1280).
+**[measured]**
+
+The config file's *default* is 640. Reading the default instead of the log is
+how a WiltechsVLA run got built at 1/3 the parameters and scored 25% against
+this 92% — with width, gradient-update count (10k at batch 65 vs 18k at batch
+40) and topology all differing at once, so it attributed nothing. Take sizes
+from the log, not the defaults.
+
+---
+
 ## 6. Open
 
 - **Is the router doing anything?** The corrected per-sample statistic (§4) puts

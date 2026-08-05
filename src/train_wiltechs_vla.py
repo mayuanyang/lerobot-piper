@@ -987,8 +987,10 @@ if __name__ == "__main__":
     parser.add_argument("--num_dit_layers", type=int, default=36,
                         help="DiT decoder depth = number of VLM layers whose KV the DiT "
                              "cross-attends to, one per DiT layer. 36 (default) = every layer, "
-                             "the same total layer budget as WiltechsMoE (4 experts x 9 layers, "
-                             "all of which run every forward) but as one sequential stack. Below "
+                             "the same LAYER COUNT as WiltechsMoE (4 experts x 9 layers, all of "
+                             "which run every forward) but as one sequential stack -- to match its "
+                             "PARAMETERS too you also need --dit_hidden_size 1280 (its 92% run's "
+                             "width; 36L at 640 is only 1/3 the params). Below "
                              "36 the captured layers are spread evenly over the full depth, not "
                              "taken from the tail. Biggest memory lever; pair with "
                              "--dit_hidden_size to control per-layer width. Must be <= 36.")

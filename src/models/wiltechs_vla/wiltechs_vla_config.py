@@ -90,9 +90,13 @@ class WiltechsVLAConfig(PreTrainedConfig):
     # (Field name kept for backwards-compat with saved configs.)
     #
     # 36 = one DiT layer per VLM layer, i.e. every layer's KV is used. This is
-    # the same total layer budget as WiltechsMoE (4 experts x 9 layers, all of
-    # which run every forward), but composed sequentially instead of averaged
-    # in action space -- a fixed 4-way average is a special case of it.
+    # the same LAYER COUNT as WiltechsMoE (4 experts x 9 layers, all of which
+    # run every forward), but composed sequentially instead of averaged in
+    # action space -- a fixed 4-way average is a special case of it.
+    #
+    # Layer count alone does NOT make the two comparable: parameters scale with
+    # dit_hidden_size, and the MoE's 92% checkpoint runs 1280, i.e. 1.23B expert
+    # params against 401M for 36L at 640. Match the width too.
     #
     # Below 36 the captured layers are spread evenly over the full depth
     # (np.linspace), NOT taken from the tail: the old behaviour read only layers
