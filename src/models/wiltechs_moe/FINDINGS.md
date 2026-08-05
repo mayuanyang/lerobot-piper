@@ -194,6 +194,22 @@ training — both are diagnostic-only, and the balance loss always read the corr
 branch — but no router number recorded before 2026-08-04 is comparable with one
 taken after.
 
+**`Action→ x-attn`** — added 2026-08-05, so **no run that produced a published
+number here has it**, including the 92% checkpoint. To get a reference, load
+ckpt 18000 and take one training step; the line prints on the first
+gradient-analysis tick.
+
+It reports the share of the action queries' cross-attention landing on vision
+vs language positions of the VLM KV, router-weighted across experts, with the
+`(xN)` factor normalising by each region's share of `L_vlm` — the share alone is
+uninterpretable because language is a small minority of positions. `x1.0` is
+proportional attention; the WiltechsVLA run at step 1200 read
+`language=81.1% (x3.79)` against `[87 lang + 320 vis tok]`.
+
+`x-attn lang/exp` breaks it out per expert, shallow band → deep. A spread there
+means the depth bands are being read differently, which the weighted average
+hides. **[not yet measured]**
+
 **`Loss components`** — `contrastive` is a hinge, `relu(margin − diff_sq)`. It
 falls to 0 as the constraint is satisfied; that is the design, not a fault.
 Observed: 0.0204 (s400) → 0.0058 (s1800) → 0.0032 (s3000) → 0.0000 (s15400). The
@@ -233,6 +249,29 @@ Vision input size 512px -> 256 tokens/frame for ['observation.images.image']
 
 ## 6. Open
 
+- **Is the router doing anything?** The corrected per-sample statistic (§4) puts
+  the learned routing barely above the collapse floor, so this is now the
+  cheapest high-value question: no retraining, existing checkpoint, one env var.
+
+  ```bash
+  WILTECHS_MOE_ROUTER=uniform python <eval>   # router removed: fixed 1/E average
+  WILTECHS_MOE_ROUTER=0       python <eval>   # expert 0 alone (VLM layers 0-8)
+  ```
+
+  `uniform` vs learned isolates the **router** — same parameters, same compute,
+  only the mixing weights change. If it matches, the router and its balance loss
+  are dead weight and the right move is the opposite of adding experts: one
+  deeper decoder over all 36 layers, ~4× fewer parameters, strictly more
+  expressive (a fixed average is a special case of it).
+
+  Single-expert vs uniform isolates the **ensemble**, and is confounded — one
+  expert is 1/E of the parameters *and* sees only its own 9-layer block, so a
+  drop there is not evidence that routing matters. Do not read it as one.
+
+  Power: at n=50 and ~92%, the 2σ band on an unpaired rate *difference* is about
+  11 points, so only a collapse is visible that way. The runs share initial
+  states, so compare the per-episode success **sets** — the discordant episodes
+  are the signal.
 - **Suite-level number.** 92% is one task. Published LIBERO figures are 10 tasks
   × 50 episodes. The vocabulary unification touched nine previously-working
   tasks, and that is this round's biggest risk — it has not been measured.

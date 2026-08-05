@@ -72,6 +72,42 @@ def vlm_grid_key(cam_key: str) -> str:
     return f"{_VLM_PIX_PREFIX}thw::{cam_key}"
 
 
+def _as_instruction_list(value, key_name: str):
+    """Return `value` as a list of instruction strings, or None if absent.
+
+    ABSENT (None / empty) returns None — a dataset with no language is a valid
+    configuration and the caller falls through to the next key.
+
+    PRESENT BUT NOT STRINGS raises. The common case is a `task` column holding
+    the integer task INDEX rather than the text: default_collate turns it into a
+    (B,) tensor, and every downstream truth test on it either raises deep inside
+    the encoder ("Boolean value of Tensor with more than one value is
+    ambiguous") or, worse, would quietly train a vision-only policy. Failing
+    here names the key and shows what it actually held.
+
+    The fix is upstream, in the train script's task-description block: make
+    tasks.parquet load so `task_index` maps to text, or set
+    batch["task_description"] yourself.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            return None
+        if all(isinstance(d, str) for d in value):
+            return list(value)
+    raise TypeError(
+        f"batch[{key_name!r}] must be a list of instruction strings, got "
+        f"{type(value).__name__}"
+        + (f" of shape {tuple(value.shape)}" if hasattr(value, "shape") else "")
+        + f" (first entries: {list(value[:2]) if hasattr(value, '__getitem__') else value!r}). "
+        f"A (B,) tensor here means the column holds the task INDEX, not the "
+        f"text — tasks.parquet did not load, so no instruction is reaching the "
+        f"VLM. Fix the task-description block in the train script; do not "
+        f"silence this."
+    )
+
+
 def preprocess_camera_to_pixels(image_processor, img: torch.Tensor, target_size: int = 0):
     """img: (B, 3, H, W) or (3, H, W) float in [0, 1]. Returns
     (pixel_values, image_grid_thw) on CPU from the Qwen image_processor.
@@ -213,6 +249,104 @@ def _build_mrope_position_ids(
 def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """x: (B, L, D) — shift/scale: (B, D). Broadcasts over L."""
     return x * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+@torch.no_grad()
+def cross_attention_mass(
+    layer,
+    x: torch.Tensor,
+    t_emb: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    vlm_kv_pad_mask: Optional[torch.Tensor],
+    action_start: int,
+    action_len: int,
+    vis_mask: Optional[torch.Tensor],
+) -> dict[str, float]:
+    """Fraction of a DiT layer's cross-attention that ACTION queries place on
+    the vision vs language positions of the VLM KV cache.
+
+    SDPA does not expose softmax weights, so this re-projects Q and re-runs the
+    Q·K^T softmax by hand; cost is one extra layer's cross-attn projection.
+
+    `layer` is any DiTLayer, `x` its input and `kv` the (K, V) it reads. Shared
+    by both models: WiltechsVLA measures its single last layer, WiltechsMoE
+    measures each expert's last layer (it has no single 'last layer', and the
+    experts read different VLM depth bands, so they can differ).
+
+    Read it against the POSITION split, not on its own: language is typically a
+    small minority of L_vlm, so equal informativeness would show up as a small
+    language share. Divide each share by that region's fraction of L_vlm to get
+    the over-attention factor.
+
+    Caveat: x is the layer input, pre-self-attn. The true cross-attn input is
+    x + sa_gate·sa_out; the gate path is a residual refinement and x dominates,
+    which is accurate enough for a diagnostic but not for anything load-bearing.
+    """
+    if action_len <= 0 or vis_mask is None:
+        return {}
+    mod = layer.adaLN_modulation(t_emb)
+    chunks = mod.chunk(9, dim=-1)
+    s_ca, sc_ca = chunks[3], chunks[4]
+    h = _modulate(layer.ca_norm(x), s_ca, sc_ca)
+
+    B = h.shape[0]
+    H, Hk, D = layer.ca_num_heads, layer.ca_num_kv_heads, layer.ca_head_dim
+    Q_full = layer.ca_q(h).view(B, -1, H, D).transpose(1, 2).float()
+    Q = Q_full[:, :, action_start:action_start + action_len, :]   # action rows only
+
+    K = kv[0].float()                                             # (B, Hk, L_vlm, D)
+    if Hk != H:
+        K = K.repeat_interleave(H // Hk, dim=1)
+
+    scores = (Q @ K.transpose(-1, -2)) * (1.0 / math.sqrt(D))     # (B,H,a_len,L_vlm)
+    if vlm_kv_pad_mask is not None:
+        ca_mask = torch.zeros(B, 1, 1, vlm_kv_pad_mask.shape[-1],
+                              device=scores.device, dtype=scores.dtype)
+        ca_mask.masked_fill_((~vlm_kv_pad_mask).unsqueeze(1).unsqueeze(1), float("-inf"))
+        scores = scores + ca_mask
+    weights = torch.softmax(scores, dim=-1)
+
+    stats: dict[str, float] = {}
+    if bool(vis_mask.any()):
+        stats["vision"] = weights[:, :, :, vis_mask].sum(dim=-1).mean().item()
+    txt_mask = ~vis_mask
+    if bool(txt_mask.any()):
+        # "language" = every non-vision KV position: the instruction, plus the
+        # ChatML prefix/markers/assistant header when the template is on.
+        stats["language"] = weights[:, :, :, txt_mask].sum(dim=-1).mean().item()
+    # Position split, so the caller never has to reconstruct it to normalise.
+    stats["_n_vis"] = float(vis_mask.sum().item())
+    stats["_n_lang"] = float(txt_mask.sum().item())
+    return stats
+
+
+def format_xattn(s: dict) -> str:
+    """Render cross_attention_mass() output as one log line.
+
+    The raw share is not interpretable alone: language is usually a small
+    minority of L_vlm (87 of 407 in a 2-camera LIBERO run at
+    --vision_input_size 512), so "language=81%" has to be read against "language
+    is 21% of the positions". The x= factor is share / position-share, so 1.0
+    means the region is attended exactly in proportion to its size and 3.8 means
+    each language token draws 3.8x its share.
+
+    Lives here rather than in either train script so both print the identical
+    format and the two models' numbers stay comparable.
+    """
+    n_v, n_l = s.get("_n_vis", 0.0), s.get("_n_lang", 0.0)
+    total = n_v + n_l
+    out = []
+    for key, n in (("vision", n_v), ("language", n_l)):
+        if key not in s:
+            continue
+        share = s[key]
+        cell = f"{key}={share * 100:5.1f}%"
+        if total > 0 and n > 0:
+            cell += f" (x{share / (n / total):.2f})"
+        out.append(cell)
+    if total > 0:
+        out.append(f"[{int(n_l)} lang + {int(n_v)} vis tok]")
+    return "  ".join(out)
 
 
 def _hard_negative_perm(
@@ -560,16 +694,43 @@ class WiltechsVLATransformer(nn.Module):
         # ─────────────────────────────────────────────────────────────
         # 2. DiT (trainable) — N layers cross-attending to last N VLM KV pairs
         # ─────────────────────────────────────────────────────────────
-        # `num_vlm_layers` field in config is reused as DiT depth (= number
-        # of last VLM layers whose KV cache the DiT cross-attends to).
+        # `num_vlm_layers` field in config is reused as DiT depth (= number of
+        # VLM KV caches the DiT cross-attends to, one per DiT layer).
         self.num_dit_layers = int(config.num_vlm_layers)
         if self.num_dit_layers > self.num_vlm_layers:
             raise ValueError(
                 f"num_dit_layers ({self.num_dit_layers}) > VLM layers "
                 f"({self.num_vlm_layers}); not enough KV caches to source from."
             )
+        # Which VLM layers to read. The VLM runs all 36 either way, so a layer
+        # left out is one whose KV was computed and thrown away -- the old
+        # trailing-window behaviour discarded layers 0..19 for free. Spread the
+        # captures over the FULL depth instead, so a shallower DiT still spans
+        # early (geometric) through late (semantic) representations.
+        explicit = list(getattr(config, "vlm_capture_layers", None) or [])
+        if explicit:
+            if len(explicit) != self.num_dit_layers:
+                raise ValueError(
+                    f"vlm_capture_layers has {len(explicit)} entries but "
+                    f"num_dit_layers is {self.num_dit_layers}; they must match."
+                )
+            if max(explicit) >= self.num_vlm_layers or min(explicit) < 0:
+                raise ValueError(
+                    f"vlm_capture_layers {explicit} out of range for a "
+                    f"{self.num_vlm_layers}-layer VLM."
+                )
+            self.capture_layers = sorted(explicit)
+        elif self.num_dit_layers == self.num_vlm_layers:
+            self.capture_layers = list(range(self.num_vlm_layers))
+        else:
+            self.capture_layers = np.linspace(
+                0, self.num_vlm_layers - 1, self.num_dit_layers, dtype=int
+            ).tolist()
+        # kv_cache stays a LIST ordered by increasing VLM layer index, so DiT
+        # layer i reads capture_layers[i] and kv_cache[-1] is still the deepest
+        # captured layer (what the latent Q-Former distils).
         print(f"DiT: {self.num_dit_layers} layers, sourcing KV from VLM layers "
-              f"{self.num_vlm_layers - self.num_dit_layers}..{self.num_vlm_layers - 1}")
+              f"{self.capture_layers}")
 
         # ── DiT width (may be < VLM width to save params) ───────────────
         # 0 → match the VLM hidden size (original behavior). Otherwise the DiT
@@ -596,7 +757,11 @@ class WiltechsVLATransformer(nn.Module):
             sa_nkv = max(1, sa_nh // gqa_ratio)
             while sa_nh % sa_nkv != 0:
                 sa_nkv -= 1
-            dit_intermediate = int(round(self.intermediate_size * self.dit_hidden / self.hidden_size))
+            # FFN inner width = the DiT width itself, matching WiltechsMoE.
+            # Scaling the VLM's own intermediate_size by dit_hidden/hidden_size
+            # (the pre-2026-08-04 formula) gives roughly 4x this, which at 36
+            # layers dominates the parameter count for no measured benefit.
+            dit_intermediate = self.dit_hidden
             print(f"DiT width decoupled: dit_hidden={self.dit_hidden} (VLM hidden={self.hidden_size}); "
                   f"self-attn {sa_nh}x{sa_hd} (kv {sa_nkv}), cross-attn {ca_nh}x{ca_hd} (kv {ca_nkv}), "
                   f"ffn_intermediate={dit_intermediate}")
@@ -673,12 +838,19 @@ class WiltechsVLATransformer(nn.Module):
                 rms_norm_eps=self.rms_norm_eps,
             )
 
-        self._lang_max_len = 48
+        # 128, not 48: the CoT rewrites in task_rewrites.py (shared with
+        # WiltechsMoE) render up to ~105 tokens, and truncation is silent and
+        # lands exactly on the disambiguating tail. _report_lang_budget makes
+        # the headroom visible at startup.
+        self._lang_max_len = 128
+        self.text_first = bool(getattr(config, "text_first", True))
 
         # Chat-template static token ids (lazy; only built when
         # config.use_chat_template is on) + one-shot format print.
         self._template_ids_cpu: Optional[tuple] = None
         self._template_format_printed = False
+        self._lang_len_printed = False
+        self._vision_grid_printed: set = set()
 
         # Activation checkpointing toggle for the DiT layers. The VLM runs in
         # @torch.no_grad and would not benefit from checkpointing; only the
@@ -734,6 +906,30 @@ class WiltechsVLATransformer(nn.Module):
     # =========================================================================
     # Vision / language encoding (no gradient, frozen VLM components)
     # =========================================================================
+    def cam_target_size(self, cam_key: str) -> int:
+        """Square input side length for this camera's Qwen preprocessing, or 0
+        for the processor default. Shared with the DataLoader-worker path so
+        both produce identical grids."""
+        vs = int(getattr(self.config, "vision_input_size", 0) or 0)
+        if vs <= 0:
+            return 0
+        hires = list(getattr(self.config, "vision_hires_cameras", None) or [])
+        return vs if (not hires or cam_key in hires) else 0
+
+    def _report_vision_grid(self, cam_key: str, image_grid_thw: torch.Tensor) -> None:
+        """One line per camera at startup. The pixel-bound plumbing inside
+        preprocess_camera_to_pixels varies by transformers version, so this is
+        the ONLY trustworthy confirmation that a resolution change took."""
+        if cam_key in self._vision_grid_printed:
+            return
+        self._vision_grid_printed.add(cam_key)
+        g = image_grid_thw[0].tolist() if image_grid_thw.dim() > 1 else image_grid_thw.tolist()
+        m = self.spatial_merge_size
+        gh, gw = int(g[1]) // m, int(g[2]) // m
+        print(f"[wiltechs_vla] vision grid {cam_key}: patch_thw={g} -> {gh}x{gw} merged "
+              f"= {gh * gw} tokens/frame "
+              f"(target_size={self.cam_target_size(cam_key) or 'processor default'})")
+
     def _encode_images(
         self, batch: dict, B: int
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
@@ -763,11 +959,13 @@ class WiltechsVLATransformer(nn.Module):
                     img = imgs[:, -1] if imgs.dim() == 5 else imgs
                     pixel_values, image_grid_thw = preprocess_camera_to_pixels(
                         self.processor.image_processor, img,
+                        target_size=self.cam_target_size(cam_key),
                     )
                     pixel_values = pixel_values.to(device=device)
                     image_grid_thw = image_grid_thw.to(device=device)
                 else:
                     continue
+                self._report_vision_grid(cam_key, image_grid_thw)
                 # Call the vision tower directly. `Qwen3VLVisionTransformer`
                 # already includes the spatial merger that projects vision
                 # features (vision_hidden, e.g. 1024) → text_hidden (2560),
@@ -840,18 +1038,49 @@ class WiltechsVLATransformer(nn.Module):
             return empty, []
         return torch.cat(all_vis, dim=1), grid_thw_list
 
-    def _resolve_descs(self, batch: dict):
+    def _resolve_descs(self, batch: dict, descs_override=None):
         """Single entry point for the instruction strings the model consumes.
 
         Pulls the task string from the batch and, when use_descriptive_objects
         is on, rewrites ambiguous object/region names via the task_rewrites
         single source of truth. Used by every language read site so the same
         phrasing reaches training, RL rollout, and eval.
+
+        descs_override feeds the contrastive branch's permuted instructions
+        through the same path. rewrite_instruction is idempotent (a rewritten
+        string is not itself a key in the map), so re-resolving an already
+        rewritten override is safe.
         """
-        descs = batch.get("task_description") or batch.get("task")
+        if descs_override is not None:
+            descs = descs_override
+        else:
+            descs = _as_instruction_list(batch.get("task_description"), "task_description")
+            if descs is None:
+                descs = _as_instruction_list(batch.get("task"), "task")
         if descs and getattr(self.config, "use_descriptive_objects", False):
             descs = [rewrite_instruction(d) for d in descs]
         return descs
+
+    def _report_lang_budget(self, texts, lang_ids, lang_mask) -> None:
+        """One-time print of the token budget vs. the longest instruction.
+
+        Truncation is silent and destroys exactly the disambiguating tail of the
+        CoT rewrites, so make it visible at startup instead of leaving it to be
+        inferred from rollout behaviour."""
+        if self._lang_len_printed:
+            return
+        self._lang_len_printed = True
+        tok = self.processor.tokenizer
+        lens = [len(tok(t, add_special_tokens=False)["input_ids"]) for t in texts]
+        i = int(np.argmax(lens))
+        full = tok(texts[i], add_special_tokens=False)["input_ids"]
+        print(f"[wiltechs_vla] lang budget: max_len={self._lang_max_len}, longest "
+              f"instruction in batch={lens[i]} tokens, "
+              f"kept={int(lang_mask[i].sum().item())}")
+        print(f"[wiltechs_vla]   kept: {tok.decode(lang_ids[i][lang_mask[i]])!r}")
+        if lens[i] > self._lang_max_len:
+            print(f"[wiltechs_vla]   *** TRUNCATED *** dropped tail: "
+                  f"{tok.decode(full[self._lang_max_len:])!r}")
 
     def _encode_language(self, batch: dict, device: torch.device) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         descs = self._resolve_descs(batch)
@@ -866,16 +1095,23 @@ class WiltechsVLATransformer(nn.Module):
         lang_tokens = self.language_model.get_input_embeddings()(input_ids)
         return lang_tokens, lang_mask
 
-    def _get_template_ids(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _get_template_ids(self, device: torch.device) -> tuple:
         """Token ids for the static ChatML pieces (cached after first call).
 
-        Returns (prefix_ids, vision_start_id, vision_end_id) — prefix is
-        "<|im_start|>user\\n"; the marker ids bracket each camera's vision block.
+        Returns (prefix_ids, vision_start_id, vision_end_id, assistant_ids).
+        prefix is "<|im_start|>user\\n"; the marker ids bracket each camera's
+        vision block; assistant_ids is the "<|im_end|>\\n<|im_start|>assistant\\n"
+        tail, which text-first has to append separately because the images —
+        not the instruction — now sit last inside the user turn.
         """
         if self._template_ids_cpu is None:
             tok = self.processor.tokenizer
             prefix_ids = tok(
                 "<|im_start|>user\n", add_special_tokens=False, return_tensors="pt",
+            )["input_ids"][0].long()
+            asst_ids = tok(
+                "<|im_end|>\n<|im_start|>assistant\n", add_special_tokens=False,
+                return_tensors="pt",
             )["input_ids"][0].long()
             vs = tok.convert_tokens_to_ids("<|vision_start|>")
             ve = tok.convert_tokens_to_ids("<|vision_end|>")
@@ -889,44 +1125,138 @@ class WiltechsVLATransformer(nn.Module):
                 prefix_ids,
                 torch.tensor([vs], dtype=torch.long),
                 torch.tensor([ve], dtype=torch.long),
+                asst_ids,
             )
         return tuple(t.to(device) for t in self._template_ids_cpu)
 
     # =========================================================================
-    # VLM encoder: run all 36 layers, cache K/V from the last num_dit_layers
+    # VLM encoder: run all 36 layers, cache K/V from self.capture_layers
     # =========================================================================
     @torch.no_grad()
     def _run_vlm_and_cache_kv(
-        self, batch: dict
-    ) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor, torch.Tensor, int]:
+        self, batch: dict, descs_override=None, vis_pack=None
+    ) -> tuple:
         """
         Returns:
           kv_cache:        list of length num_dit_layers, each entry is
-                           (K, V) of shape (B, num_kv_heads, L_vlm, head_dim).
-                           K is post-M-RoPE rotation.
+                           (K, V) of shape (B, num_kv_heads, L_vlm, head_dim),
+                           ordered by increasing VLM layer index so DiT layer i
+                           reads self.capture_layers[i]. K is post-M-RoPE.
           vlm_kv_pad_mask: (B, L_vlm) bool — True at non-padded positions.
                            Used by DiT cross-attn to ignore padded language slots.
           vis_mask:        (L_vlm,) bool — True at actual VISION token positions
                            (excludes the ChatML prefix/markers when
                            use_chat_template is on). Sample-independent.
-          text_start:      int — index where the PER-SAMPLE text begins. With the
-                           chat template that is the {directive task <|im_end|>
-                           assistant-header} suffix; legacy it equals L_vis.
-                           Everything before it is identical across the batch, so
-                           contrastive perturbation shuffles [text_start:].
+          lang_span:       (start, end) index range of the PER-SAMPLE instruction
+                           tokens inside the VLM sequence. Everything outside it
+                           is identical across the batch. Under text-last this is
+                           a trailing slice, which is what the legacy contrastive
+                           branch shuffles; under text_first it sits mid-sequence
+                           and shuffling the slice is NOT valid (see compute_loss).
+          vis_pack:        the (vis_tokens, grid_thw_list) ViT output, so a second
+                           call with a different instruction can skip re-encoding
+                           the images.
+
+        descs_override replaces the batch's instructions (contrastive negatives).
         """
         B = batch["observation.state"].shape[0]
         device = batch["observation.state"].device
 
-        vis_tokens, grid_thw_list = self._encode_images(batch, B)
+        if vis_pack is not None:
+            vis_tokens, grid_thw_list = vis_pack
+        else:
+            vis_tokens, grid_thw_list = self._encode_images(batch, B)
+        vis_pack_out = (vis_tokens, grid_thw_list)
         L_vis = vis_tokens.shape[1]
 
-        descs = self._resolve_descs(batch)
+        descs = self._resolve_descs(batch, descs_override)
         have_lang = bool(descs) and any(descs)
         use_template = bool(getattr(self.config, "use_chat_template", False)) and have_lang
+        text_first = self.text_first and have_lang
         embed_tokens = self.language_model.get_input_embeddings()
 
-        if use_template:
+        if text_first:
+            # ---- instruction BEFORE images ------------------------------
+            # Under the VLM's causal mask this makes every vision patch's K/V
+            # at every layer conditioned on the instruction, so the DiT's
+            # cross-attention reads a language-grounded feature map rather than
+            # a language-blind one.
+            m = self.spatial_merge_size
+            cam_sizes = [
+                int(g[0].item()) * (int(g[1].item()) // m) * (int(g[2].item()) // m)
+                for g in grid_thw_list
+            ]
+            cam_tokens = list(vis_tokens.split(cam_sizes, dim=1)) if cam_sizes else []
+
+            directive = str(getattr(self.config, "chat_directive", "") or "").strip()
+            texts = [(f"{directive} {d}" if directive else str(d)) for d in descs]
+            lang = self.processor.tokenizer(
+                texts, return_tensors="pt", padding=True, truncation=True,
+                max_length=self._lang_max_len, add_special_tokens=not use_template,
+            )
+            lang_ids = lang["input_ids"].to(device)
+            lang_mask = lang["attention_mask"].bool().to(device)
+            L_lang = lang_ids.shape[1]
+            self._report_lang_budget(texts, lang_ids, lang_mask)
+            lang_emb = embed_tokens(lang_ids)
+            lang_emb = torch.where(
+                lang_mask.unsqueeze(-1), lang_emb, torch.zeros_like(lang_emb),
+            )
+
+            parts: list = []
+            segments: list[tuple[str, object]] = []
+            vis_flags: list[bool] = []
+            head_len = 0
+            asst_ids = None
+            if use_template:
+                prefix_ids, vs_id, ve_id, asst_ids = self._get_template_ids(device)
+                head_len = prefix_ids.shape[0]
+                parts.append(embed_tokens(prefix_ids).unsqueeze(0).expand(B, -1, -1))
+                segments.append(("text", head_len))
+                vis_flags += [False] * head_len
+
+            parts.append(lang_emb)
+            segments.append(("text", L_lang))
+            vis_flags += [False] * L_lang
+
+            for ct, g in zip(cam_tokens, grid_thw_list):
+                if use_template:
+                    vs_emb = embed_tokens(vs_id).unsqueeze(0).expand(B, -1, -1)
+                    ve_emb = embed_tokens(ve_id).unsqueeze(0).expand(B, -1, -1)
+                    parts += [vs_emb, ct, ve_emb]
+                    segments += [("text", 1), ("image", g), ("text", 1)]
+                    vis_flags += [False] + [True] * ct.shape[1] + [False]
+                else:
+                    parts.append(ct)
+                    segments.append(("image", g))
+                    vis_flags += [True] * ct.shape[1]
+
+            if use_template:
+                parts.append(embed_tokens(asst_ids).unsqueeze(0).expand(B, -1, -1))
+                segments.append(("text", asst_ids.shape[0]))
+                vis_flags += [False] * asst_ids.shape[0]
+
+            vlm_seq = torch.cat(parts, dim=1).to(torch.bfloat16)
+            L_vlm = vlm_seq.shape[1]
+            lang_span = (head_len, head_len + L_lang)
+            vis_mask = torch.tensor(vis_flags, device=device, dtype=torch.bool)
+            # Padded instruction positions now sit MID-sequence; they are masked
+            # out as attention KEYS, so the images never read them. M-RoPE
+            # positions are built from the padded length uniformly across the
+            # batch, which is a constant offset for the image block — harmless
+            # under RoPE.
+            vlm_kv_pad_mask = torch.cat([
+                torch.ones(B, head_len, device=device, dtype=torch.bool),
+                lang_mask,
+                torch.ones(B, L_vlm - head_len - L_lang, device=device, dtype=torch.bool),
+            ], dim=1)
+
+            if not self._template_format_printed:
+                self._template_format_printed = True
+                print(f"[wiltechs_vla] TEXT-FIRST layout ON "
+                      f"(chat_template={use_template}) — L_vlm={L_vlm}, "
+                      f"lang span={lang_span}, L_vis={L_vis}")
+        elif use_template:
             # ChatML wrapping (in-distribution for the instruct-tuned VLM):
             #   <|im_start|>user\n
             #   (<|vision_start|> [cam tokens] <|vision_end|>) × num_cameras
@@ -959,7 +1289,7 @@ class WiltechsVLATransformer(nn.Module):
                 suffix_mask.unsqueeze(-1), suffix_emb, torch.zeros_like(suffix_emb),
             )
 
-            prefix_ids, vs_id, ve_id = self._get_template_ids(device)
+            prefix_ids, vs_id, ve_id, _ = self._get_template_ids(device)
             prefix_emb = embed_tokens(prefix_ids).unsqueeze(0).expand(B, -1, -1)
             vs_emb = embed_tokens(vs_id).unsqueeze(0).expand(B, -1, -1)
             ve_emb = embed_tokens(ve_id).unsqueeze(0).expand(B, -1, -1)
@@ -989,10 +1319,11 @@ class WiltechsVLATransformer(nn.Module):
                 decoded = self.processor.tokenizer.decode(
                     suffix_ids[0][suffix_mask[0]], skip_special_tokens=False,
                 )
-                print(f"[wiltechs_vla] chat template ON — L_vlm={L_vlm} "
+                print(f"[wiltechs_vla] chat template ON (text-last) — L_vlm={L_vlm} "
                       f"(prefix {prefix_ids.shape[0]} | {len(cam_tokens)} cams ×(1+vis+1) "
                       f"| suffix {suffix_ids.shape[1]})")
                 print(f"[wiltechs_vla]   suffix[0]: {decoded!r}")
+            lang_span = (text_start, L_vlm)
         else:
             # Legacy raw concatenation [vision | task].
             lang_result = self._encode_language(batch, device)
@@ -1028,6 +1359,7 @@ class WiltechsVLATransformer(nn.Module):
                 vlm_kv_pad_mask = torch.cat([vis_ones, lang_mask], dim=1)
             else:
                 vlm_kv_pad_mask = torch.ones(B, L_vlm, device=device, dtype=torch.bool)
+            lang_span = (text_start, L_vlm)
 
         # M-RoPE position_ids — image segments get (t, h, w), text monotonic
         position_ids = _build_mrope_position_ids(
@@ -1046,8 +1378,10 @@ class WiltechsVLATransformer(nn.Module):
         key_pad = ~vlm_kv_pad_mask                            # True = pad
         full_mask.masked_fill_(key_pad.unsqueeze(1).unsqueeze(1), float("-inf"))
 
-        # Layer-by-layer forward, capturing K/V from the trailing layers.
-        capture_start = self.num_vlm_layers - self.num_dit_layers
+        # Layer-by-layer forward, capturing K/V from self.capture_layers.
+        # Appended in loop order, so kv_cache is sorted by VLM layer index and
+        # kv_cache[-1] is the deepest captured layer.
+        capture_set = set(self.capture_layers)
         hidden = vlm_seq
         kv_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
 
@@ -1067,7 +1401,7 @@ class WiltechsVLATransformer(nn.Module):
             Q, K = _apply_rope(Q, K, cos, sin)
 
             # Capture K (post-RoPE) and V — these are the cross-attn memory.
-            if i >= capture_start:
+            if i in capture_set:
                 kv_cache.append((K.detach(), V.detach()))
 
             if self.num_kv_heads != self.num_heads:
@@ -1086,7 +1420,7 @@ class WiltechsVLATransformer(nn.Module):
             h_in = layer.post_attention_layernorm(hidden)
             hidden = residual + layer.mlp(h_in)
 
-        return kv_cache, vlm_kv_pad_mask, vis_mask, text_start
+        return kv_cache, vlm_kv_pad_mask, vis_mask, lang_span, vis_pack_out
 
     # =========================================================================
     # DiT-side helpers: robot CNN, latents, time, input assembly
@@ -1244,55 +1578,13 @@ class WiltechsVLATransformer(nn.Module):
         action_len: int,
         vis_mask: Optional[torch.Tensor],
     ) -> dict[str, float]:
-        """Re-run the LAST DiT layer's cross-attn Q·K^T softmax manually and
-        report mass that action queries place on vision vs language portions
-        of the VLM KV cache.
-
-        x is the input to the last DiT layer (pre-self-attn). The "real"
-        cross-attn input is x + sa_gate · sa_out, but the gate path is a
-        residual refinement and x dominates — close enough for a diagnostic.
-        """
-        if action_len <= 0:
-            return {}
-        layer = self.dit_layers[-1]
-        mod = layer.adaLN_modulation(t_emb)
-        chunks = mod.chunk(9, dim=-1)
-        s_ca, sc_ca = chunks[3], chunks[4]
-        h = _modulate(layer.ca_norm(x), s_ca, sc_ca)
-
-        B, _, _ = h.shape
-        H, Hk, D = layer.ca_num_heads, layer.ca_num_kv_heads, layer.ca_head_dim
-        Q_full = layer.ca_q(h).view(B, -1, H, D).transpose(1, 2).float()
-        Q = Q_full[:, :, action_start:action_start + action_len, :]   # only action rows
-
-        K = kv_last[0].float()                                          # (B, Hk, L_vlm, D)
-        if Hk != H:
-            K = K.repeat_interleave(H // Hk, dim=1)
-
-        scale = 1.0 / math.sqrt(D)
-        scores = (Q @ K.transpose(-1, -2)) * scale                      # (B, H, a_len, L_vlm)
-
-        if vlm_kv_pad_mask is not None:
-            kpad = ~vlm_kv_pad_mask
-            ca_mask = torch.zeros(
-                B, 1, 1, vlm_kv_pad_mask.shape[-1],
-                device=scores.device, dtype=scores.dtype,
-            )
-            ca_mask.masked_fill_(kpad.unsqueeze(1).unsqueeze(1), float("-inf"))
-            scores = scores + ca_mask
-
-        weights = torch.softmax(scores, dim=-1)
-
-        stats: dict[str, float] = {}
-        if vis_mask is not None:
-            if bool(vis_mask.any()):
-                stats["vision"] = weights[:, :, :, vis_mask].sum(dim=-1).mean().item()
-            txt_mask = ~vis_mask
-            if bool(txt_mask.any()):
-                # "language" = every non-vision KV position (task text; plus the
-                # ChatML prefix/markers/assistant header when the template is on).
-                stats["language"] = weights[:, :, :, txt_mask].sum(dim=-1).mean().item()
-        return stats
+        """Cross-attn mass at this model's last DiT layer. See
+        cross_attention_mass() — WiltechsMoE calls that directly, once per
+        expert, since it has no single 'last layer'."""
+        return cross_attention_mass(
+            self.dit_layers[-1], x, t_emb, kv_last, vlm_kv_pad_mask,
+            action_start, action_len, vis_mask,
+        )
 
     # =========================================================================
     # DiT decoder pass — one denoising step given pre-computed VLM KV cache
@@ -1407,7 +1699,8 @@ class WiltechsVLATransformer(nn.Module):
         device = actions.device
 
         # ── Encoder: run VLM once, cache KV ─────────────────────────
-        kv_cache, vlm_kv_pad_mask, vis_mask, text_start = self._run_vlm_and_cache_kv(batch)
+        kv_cache, vlm_kv_pad_mask, vis_mask, lang_span, vis_pack = \
+            self._run_vlm_and_cache_kv(batch)
 
         # ── Vision-KV dropout (training only) ───────────────────────
         # Mask a random fraction of VISION positions in the cross-attn pad
@@ -1420,6 +1713,7 @@ class WiltechsVLATransformer(nn.Module):
         # so all consumers see one consistent mask.
         vkv_p = float(getattr(self.config, "vision_kv_dropout_prob", 0.0))
         n_vis = int(vis_mask.sum().item())
+        vkv_drop = None
         if self.training and vkv_p > 0.0 and n_vis > 0:
             vis_idx = vis_mask.nonzero(as_tuple=True)[0]
             keep = torch.rand(B, n_vis, device=device) > vkv_p
@@ -1430,6 +1724,12 @@ class WiltechsVLATransformer(nn.Module):
                 keep[dead, 0] = True
             vlm_kv_pad_mask = vlm_kv_pad_mask.clone()
             vlm_kv_pad_mask[:, vis_idx] &= keep
+            # Remembered so the contrastive negative gets the SAME vision KV
+            # dropout — otherwise v_t and v_wrong differ because of dropout,
+            # not because of the language, and the hinge measures the wrong
+            # thing. (Only matters on the text_first re-run path, which builds
+            # a fresh mask instead of cloning this one.)
+            vkv_drop = (vis_idx, keep)
 
         # ── DiT-side conditioning that does NOT depend on noise ─────
         robot_tokens = self._compute_robot_tokens(batch)
@@ -1482,29 +1782,38 @@ class WiltechsVLATransformer(nn.Module):
         denom = (pos_w[None, :, None] * valid_cells).sum().clamp(min=1e-6)
         main_loss = loss.sum() / denom
 
-        # ── Contrastive language loss (cheap variant) ───────────────
-        # Permute the per-sample TEXT slice [text_start:] of each VLM KV pair
-        # across batch and re-run the DiT. (Legacy that slice is the raw task;
-        # with the chat template it is the task + <|im_end|> + assistant-header
-        # registers — all task-conditioned summaries.) The "wrong-language"
-        # prediction should differ from the right-language one by at least
-        # `contrastive_margin`. Avoids a second full VLM forward (which would
-        # be expensive on Qwen3-VL 4B).
+        # ── Contrastive language loss ───────────────────────────────
+        # Build a "wrong-language" prediction and require it to differ from the
+        # right-language one by at least `contrastive_margin`.
+        #
+        # HOW the negative is built depends on the layout:
+        #  * text-last — permute the per-sample language slice of each VLM KV
+        #    pair across the batch. Cheap: no second VLM forward.
+        #  * text_first — the instruction is baked into every vision K/V, so
+        #    swapping only the language slice is self-inconsistent. The frozen
+        #    LM is re-run with permuted instructions instead; the ViT output is
+        #    reused via vis_pack, so the extra cost is the 36 LM layers under
+        #    no_grad, with no activations retained.
         contrastive_w = float(getattr(self.config, "contrastive_loss_weight", 0.0))
         contrastive_v = 0.0
-        L_lang_total = vlm_kv_pad_mask.shape[-1] - text_start
+        lang_start, lang_end = lang_span
+        L_lang_total = lang_end - lang_start
+        descs = self._resolve_descs(batch)
+        have_descs = descs is not None and len(descs) == B
+        # The re-run path needs the actual strings; there is no valid KV slice
+        # to swap without them.
+        can_contrast = have_descs if self.text_first else True
         if (
             self.training and contrastive_w > 0.0
-            and L_lang_total > 0 and B >= 2
+            and L_lang_total > 0 and B >= 2 and can_contrast
         ):
             # Pick the wrong-language partner for each sample. Hard negatives
             # (most-similar DIFFERENT instruction) focus the hinge on confusable
             # minimal pairs that fail at eval; random pairs (legacy) are almost
             # always grossly different and trivially satisfied.
-            descs = self._resolve_descs(batch)
             if (
                 getattr(self.config, "contrastive_hard_negatives", False)
-                and descs is not None and len(descs) == B
+                and have_descs
             ):
                 perm, pair_diff = _hard_negative_perm(descs, device)
             else:
@@ -1515,7 +1824,7 @@ class WiltechsVLATransformer(nn.Module):
                 # Skip pairs whose language string actually matches (cross-dataset
                 # collisions, e.g. "Grasp a lego block ..." appearing 4× across
                 # community).
-                if descs is not None and len(descs) == B:
+                if have_descs:
                     perm_cpu = perm.detach().cpu().tolist()
                     pair_diff = torch.tensor(
                         [descs[i] != descs[perm_cpu[i]] for i in range(B)],
@@ -1525,15 +1834,39 @@ class WiltechsVLATransformer(nn.Module):
                     pair_diff = torch.ones(B, device=device, dtype=torch.bool)
 
             if pair_diff.any():
-                shuffled_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
-                for K, V in kv_cache:
-                    K_shuf = K.clone()
-                    V_shuf = V.clone()
-                    K_shuf[:, :, text_start:, :] = K[perm, :, text_start:, :]
-                    V_shuf[:, :, text_start:, :] = V[perm, :, text_start:, :]
-                    shuffled_cache.append((K_shuf, V_shuf))
-                shuffled_pad_mask = vlm_kv_pad_mask.clone()
-                shuffled_pad_mask[:, text_start:] = vlm_kv_pad_mask[perm][:, text_start:]
+                if self.text_first:
+                    # _hard_negative_perm is deliberately NOT a bijection, so
+                    # descs_perm is a different multiset from descs and can pad
+                    # to a different length than the positive forward. Nothing
+                    # downstream mixes the two — shuffled_cache and
+                    # shuffled_pad_mask are used together — so that is fine, but
+                    # it is why the mask must come from this call rather than
+                    # being derived from vlm_kv_pad_mask.
+                    perm_cpu = perm.detach().cpu().tolist()
+                    descs_perm = [descs[i] for i in perm_cpu]
+                    shuffled_cache, shuffled_pad_mask, shuf_vis_mask, _, _ = \
+                        self._run_vlm_and_cache_kv(
+                            batch, descs_override=descs_perm, vis_pack=vis_pack)
+                    if vkv_drop is not None:
+                        # Re-apply the SAME vision dropout. The vision block is
+                        # a fixed-size suffix in both forwards, so index it from
+                        # this call's own vis_mask rather than reusing positions
+                        # computed against a possibly different L_vlm.
+                        _, v_keep = vkv_drop
+                        shuf_vis_idx = shuf_vis_mask.nonzero(as_tuple=True)[0]
+                        if shuf_vis_idx.numel() == v_keep.shape[1]:
+                            shuffled_pad_mask = shuffled_pad_mask.clone()
+                            shuffled_pad_mask[:, shuf_vis_idx] &= v_keep
+                else:
+                    shuffled_cache = []
+                    for K, V in kv_cache:
+                        K_shuf = K.clone()
+                        V_shuf = V.clone()
+                        K_shuf[:, :, lang_start:, :] = K[perm, :, lang_start:, :]
+                        V_shuf[:, :, lang_start:, :] = V[perm, :, lang_start:, :]
+                        shuffled_cache.append((K_shuf, V_shuf))
+                    shuffled_pad_mask = vlm_kv_pad_mask.clone()
+                    shuffled_pad_mask[:, lang_start:] = vlm_kv_pad_mask[perm][:, lang_start:]
 
                 # Recompute the latents from the wrong-language cache so the
                 # QFormer path is ALSO language-forced. Passing the correct-
@@ -1581,7 +1914,7 @@ class WiltechsVLATransformer(nn.Module):
         B = x_init.shape[0]
         device = x_init.device
 
-        kv_cache, vlm_kv_pad_mask, _vis_mask, _text_start = self._run_vlm_and_cache_kv(batch)
+        kv_cache, vlm_kv_pad_mask, *_ = self._run_vlm_and_cache_kv(batch)
         robot_tokens = self._compute_robot_tokens(batch)
         latents = self._generate_latents(kv_cache, vlm_kv_pad_mask)
 
@@ -1610,7 +1943,7 @@ class WiltechsVLATransformer(nn.Module):
 
         with autocast_ctx:
             # Encoder pass: run VLM once, get KV cache
-            kv_cache, vlm_kv_pad_mask, _vis_mask, _text_start = self._run_vlm_and_cache_kv(batch)
+            kv_cache, vlm_kv_pad_mask, *_ = self._run_vlm_and_cache_kv(batch)
 
             # DiT-side static conditioning (same across denoising steps)
             robot_tokens = self._compute_robot_tokens(batch)

@@ -58,6 +58,7 @@ from models.wiltechs_moe.wiltechs_moe_policy import WiltechsMoEPolicy
 from models.wiltechs_moe.processor_wiltechs_moe import make_pre_post_processors
 from models.wiltechs_vla.wiltechs_vla_model import (
     preprocess_camera_to_pixels, vlm_pixels_key, vlm_grid_key, _VLM_PIX_PREFIX,
+    format_xattn,
 )
 
 from torchvision.transforms import v2
@@ -306,6 +307,20 @@ def _log_gradient_analysis(policy, step: int) -> None:
         if bw > 0.0:
             parts.append(f"balance: {bal_v:.4f} (w={bw})")
         print(f"  Loss components : {'  '.join(parts)}")
+
+    x_stats = getattr(policy.model, "_last_cross_attention_stats", None)
+    if x_stats:
+        # Router-weighted across experts — the figure comparable with
+        # WiltechsVLA's single-stack reading.
+        print("  Action→ x-attn  : " + format_xattn(x_stats)
+              + "    (router-weighted over experts)")
+        per_e = x_stats.get("_per_expert") or []
+        if len(per_e) > 1:
+            # Each expert reads a different VLM depth band, so a spread here
+            # means the bands are being used differently — invisible in the
+            # weighted average above.
+            cells = "  ".join(f"E{i}={lang*100:4.1f}%" for i, (_v, lang) in enumerate(per_e))
+            print(f"  x-attn lang/exp : {cells}    (by depth band, shallow→deep)")
 
     print("--- End Gradient Analysis ---\n")
 
@@ -681,27 +696,47 @@ def train(
         print("Image preprocessing moved into DataLoader workers "
               "(augment + Qwen image_processor per-sample, parallel + overlapped).")
 
+    # task_index → description. Primary source is ref_meta.tasks, which
+    # LeRobotDatasetMetadata already loaded from meta/tasks.parquet during
+    # construction; it is a DataFrame INDEXED BY THE TASK STRING with a
+    # `task_index` column. Re-reading the parquet by hand (the old path) failed
+    # silently in train_wiltechs_vla.py: the map stayed empty, no batch got a
+    # `task_description`, and the model fell through to batch["task"] — which
+    # holds the task INDEX, not the text. Vision-only training, nothing in the
+    # logs. Same code was here, so it is fixed the same way.
     task_idx_to_description: dict[int, str] = {}
     try:
-        tasks_parquet_path = first_root / "meta" / "tasks.parquet"
-        if tasks_parquet_path.exists():
-            tasks_df = pd.read_parquet(tasks_parquet_path)
-            if "task_index" in tasks_df.columns:
-                if "task" in tasks_df.columns:
-                    task_idx_to_description = {
-                        int(row["task_index"]): str(row["task"])
-                        for _, row in tasks_df.iterrows()
-                    }
-                else:
-                    task_idx_to_description = {
-                        int(row["task_index"]): str(idx)
-                        for idx, row in tasks_df.iterrows()
-                    }
-            print(f"Loaded {len(task_idx_to_description)} task descriptions from tasks.parquet")
+        tasks_df = getattr(ref_meta, "tasks", None)
+        if tasks_df is not None and "task_index" in getattr(tasks_df, "columns", []):
+            if "task" in tasks_df.columns:
+                task_idx_to_description = {
+                    int(r["task_index"]): str(r["task"]) for _, r in tasks_df.iterrows()}
+            else:
+                task_idx_to_description = {
+                    int(r["task_index"]): str(k) for k, r in tasks_df.iterrows()}
         else:
-            print("tasks.parquet not found; task_description will not be added to batches.")
+            p = first_root / "meta" / "tasks.parquet"
+            if p.exists():
+                df = pd.read_parquet(p)
+                if "task_index" in df.columns:
+                    task_idx_to_description = {
+                        int(r["task_index"]): str(r["task"] if "task" in df.columns else k)
+                        for k, r in df.iterrows()}
     except Exception as e:
-        print(f"Warning: could not load tasks.parquet: {e}")
+        print(f"Warning: could not build the task_index → description map: {e}")
+
+    if task_idx_to_description:
+        print(f"Loaded {len(task_idx_to_description)} task descriptions "
+              f"(e.g. 0 -> {task_idx_to_description.get(0, '?')!r})")
+    else:
+        raise RuntimeError(
+            f"Could not build a task_index → description map for "
+            f"'{dataset_ids[0]}'. ref_meta.tasks="
+            f"{type(getattr(ref_meta, 'tasks', None)).__name__}, columns="
+            f"{list(getattr(getattr(ref_meta, 'tasks', None), 'columns', []))}. "
+            f"Without it no instruction reaches the VLM and the run is "
+            f"vision-only. Inspect ref_meta.tasks before rerunning."
+        )
 
     sampler = EpisodeAwareSampler(
         dataset_from_indices=ep_from,
@@ -736,15 +771,31 @@ def train(
                 if isinstance(batch[key], torch.Tensor) and not key.startswith(_VLM_PIX_PREFIX):
                     batch[key] = batch[key].to(device, non_blocking=True)
 
-            if "task" in batch and isinstance(batch["task"], (list, tuple)):
+            # Preferred: the batch already carries the instruction TEXT.
+            if ("task" in batch and isinstance(batch["task"], (list, tuple))
+                    and all(isinstance(t, str) for t in batch["task"])):
                 batch["task_description"] = batch["task"]
-            elif task_idx_to_description and "task_index" in batch:
-                task_indices = batch["task_index"]
-                if isinstance(task_indices, torch.Tensor) and task_indices.dim() > 1:
-                    task_indices = task_indices[:, 0]
-                batch["task_description"] = [
-                    task_idx_to_description.get(int(ti), "") for ti in task_indices
-                ]
+            else:
+                # Otherwise resolve an INDEX through the map. The index can
+                # arrive under either key: some datasets expose "task_index",
+                # others put the integer in "task" itself (which then collates
+                # to a (B,) tensor and is NOT the text, however it is named).
+                idx_src = None
+                for k in ("task_index", "task"):
+                    v = batch.get(k)
+                    if isinstance(v, torch.Tensor):
+                        idx_src = v[:, 0] if v.dim() > 1 else v
+                        break
+                if idx_src is not None:
+                    batch["task_description"] = [
+                        task_idx_to_description.get(int(ti), "") for ti in idx_src
+                    ]
+                    n_unmapped = sum(1 for d in batch["task_description"] if not d)
+                    if n_unmapped and not lang_check_done:
+                        print(f"WARNING: {n_unmapped}/{len(idx_src)} task indices are "
+                              f"not in the description map (known: "
+                              f"{sorted(task_idx_to_description)[:10]}). Those "
+                              f"samples train with an EMPTY instruction.")
 
             if not preprocess_in_workers:
                 present_cams = [c for c in camera_keys if c in batch]

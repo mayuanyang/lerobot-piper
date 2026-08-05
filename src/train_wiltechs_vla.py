@@ -58,6 +58,7 @@ from models.wiltechs_vla.wiltechs_vla_policy import WiltechsVLAPolicy
 from models.wiltechs_vla.processor_wiltechs_vla import make_pre_post_processors
 from models.wiltechs_vla.wiltechs_vla_model import (
     preprocess_camera_to_pixels, vlm_pixels_key, vlm_grid_key, _VLM_PIX_PREFIX,
+    format_xattn,
 )
 
 from torchvision.transforms import v2
@@ -149,11 +150,17 @@ class VLMImagePreprocDataset(torch.utils.data.Dataset):
     CNN still consumes them. Assumes a uniform camera resolution (true for a
     single homogeneous dataset) so pixel_values collate cleanly to (B, P, dim)."""
 
-    def __init__(self, dataset, image_processor, camera_keys, augment=None):
+    def __init__(self, dataset, image_processor, camera_keys, augment=None,
+                 cam_target_sizes=None):
         self.dataset = dataset
         self.image_processor = image_processor
         self.camera_keys = list(camera_keys)
         self.augment = augment  # torchvision transform, or None (e.g. eval)
+        # Per-camera square input size for the Qwen processor, 0 = its default.
+        # Must match the model's cam_target_size() or this path and the
+        # in-model fallback would build different vision grids for the same
+        # frame -- silently, since both are valid inputs downstream.
+        self.cam_target_sizes = dict(cam_target_sizes or {})
 
     def __len__(self):
         return len(self.dataset)
@@ -183,7 +190,9 @@ class VLMImagePreprocDataset(torch.utils.data.Dataset):
 
         # Run the (CPU) Qwen image_processor here, in the worker.
         for i, k in enumerate(present):
-            pv, thw = preprocess_camera_to_pixels(self.image_processor, imgs3[i])
+            pv, thw = preprocess_camera_to_pixels(
+                self.image_processor, imgs3[i],
+                target_size=self.cam_target_sizes.get(k, 0))
             sample[vlm_pixels_key(k)] = pv         # (P, dim)
             sample[vlm_grid_key(k)] = thw[0]       # (3,)
         return sample
@@ -278,10 +287,8 @@ def _log_gradient_analysis(policy, step: int) -> None:
 
     x_stats = getattr(policy.model, "_last_cross_attention_stats", None)
     if x_stats:
-        order = ["vision", "language"]
-        ordered = [(k, x_stats[k]) for k in order if k in x_stats]
-        cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in ordered)
-        print(f"  Action→ x-attn    : {cells}    (cross-attn to VLM KV)")
+        print("  Action→ x-attn    : " + format_xattn(x_stats)
+              + "    (cross-attn to VLM KV)")
 
     _cfg = policy.model.config
     _rcnn_on = getattr(_cfg, "use_robot_cnn", True)
@@ -320,7 +327,12 @@ def train(
     training_steps: int = 300000,
     reset_lang_params: bool = False,
     gradient_checkpointing: bool = False,
-    num_dit_layers: int = 16,
+    num_dit_layers: int = 36,
+    vlm_capture_layers: Optional[list] = None,
+    num_latent_tokens: int = 8,
+    vision_input_size: int = 0,
+    vision_hires_cameras: Optional[list] = None,
+    text_last: bool = False,
     dit_hidden_size: int = 0,
     use_8bit_adam: bool = False,
     max_episode_index: Optional[int] = None,
@@ -454,13 +466,17 @@ def train(
         state_dim=state_dim,
         action_dim=action_dim,
         num_vlm_layers=num_dit_layers,
+        vlm_capture_layers=list(vlm_capture_layers or []),
         dit_hidden_size=dit_hidden_size,
         num_cameras=len(camera_keys),
         cameras_for_vision_state_concat=camera_keys,
         robot_cnn_cameras=robot_cnn_camera_keys,
+        vision_input_size=vision_input_size,
+        vision_hires_cameras=list(vision_hires_cameras or []),
+        text_first=not text_last,
         action_dim_weights=action_dim_weights,
         pos_decay_lambda=0.0,
-        num_latent_tokens=8,
+        num_latent_tokens=num_latent_tokens,
         vlm_attends_to_expert=True,
         contrastive_loss_weight=contrastive_loss_weight,
         contrastive_margin=contrastive_margin,
@@ -669,34 +685,64 @@ def train(
         dataset = VLMImagePreprocDataset(
             dataset, policy.model.processor.image_processor, camera_keys,
             augment=image_transforms,
+            cam_target_sizes={k: policy.model.cam_target_size(k) for k in camera_keys},
         )
         print("Image preprocessing moved into DataLoader workers "
               "(augment + Qwen image_processor per-sample, parallel + overlapped).")
 
-    # task_index → description (from the first dataset's tasks.parquet). Batches
-    # carry the per-frame "task" string directly (preferred); for multi-dataset
-    # task_index is dataset-local, so we rely on batch["task"].
+    # task_index → description. Primary source is ref_meta.tasks, which
+    # LeRobotDatasetMetadata ALREADY loaded from meta/tasks.parquet during
+    # construction — if that file were missing we would never have got this far.
+    # It is a DataFrame INDEXED BY THE TASK STRING with a `task_index` column.
+    #
+    # This used to re-read the parquet by hand off `first_root`. When that read
+    # produced nothing the failure was silent: the map stayed empty, no batch
+    # ever got a `task_description`, and the model fell through to batch["task"]
+    # — which holds the task INDEX, not the text. The result was a policy
+    # training with NO instruction at all, with nothing in the logs saying so.
     task_idx_to_description: dict[int, str] = {}
     try:
-        tasks_parquet_path = first_root / "meta" / "tasks.parquet"
-        if tasks_parquet_path.exists():
-            tasks_df = pd.read_parquet(tasks_parquet_path)
-            if "task_index" in tasks_df.columns:
-                if "task" in tasks_df.columns:
-                    task_idx_to_description = {
-                        int(row["task_index"]): str(row["task"])
-                        for _, row in tasks_df.iterrows()
-                    }
-                else:
-                    task_idx_to_description = {
-                        int(row["task_index"]): str(idx)
-                        for idx, row in tasks_df.iterrows()
-                    }
-            print(f"Loaded {len(task_idx_to_description)} task descriptions from tasks.parquet")
+        tasks_df = getattr(ref_meta, "tasks", None)
+        if tasks_df is not None and "task_index" in getattr(tasks_df, "columns", []):
+            # index = task text, column = index. (A "task" column, if a future
+            # schema adds one, wins over the DataFrame index.)
+            if "task" in tasks_df.columns:
+                task_idx_to_description = {
+                    int(r["task_index"]): str(r["task"]) for _, r in tasks_df.iterrows()}
+            else:
+                task_idx_to_description = {
+                    int(r["task_index"]): str(k) for k, r in tasks_df.iterrows()}
         else:
-            print("tasks.parquet not found; task_description will not be added to batches.")
+            # Fall back to the on-disk parquet only if the metadata object did
+            # not expose what we expect (schema drift across lerobot versions).
+            p = first_root / "meta" / "tasks.parquet"
+            if p.exists():
+                df = pd.read_parquet(p)
+                if "task_index" in df.columns:
+                    task_idx_to_description = {
+                        int(r["task_index"]): str(r["task"] if "task" in df.columns else k)
+                        for k, r in df.iterrows()}
     except Exception as e:
-        print(f"Warning: could not load tasks.parquet: {e}")
+        print(f"Warning: could not build the task_index → description map: {e}")
+
+    if task_idx_to_description:
+        print(f"Loaded {len(task_idx_to_description)} task descriptions "
+              f"(e.g. 0 -> {task_idx_to_description.get(0, '?')!r})")
+    else:
+        # Hard stop. Continuing trains a vision-only policy that looks healthy
+        # in every metric until eval, and no contrastive weight or prompt
+        # rewrite can compensate for language never reaching the VLM.
+        raise RuntimeError(
+            f"Could not build a task_index → description map for "
+            f"'{dataset_ids[0]}'. ref_meta.tasks="
+            f"{type(getattr(ref_meta, 'tasks', None)).__name__}, columns="
+            f"{list(getattr(getattr(ref_meta, 'tasks', None), 'columns', []))}. "
+            f"Without it no instruction reaches the VLM and the run is "
+            f"vision-only. Inspect ref_meta.tasks before rerunning."
+        )
+    if len(dataset_ids) > 1:
+        print("  NOTE: task_index is dataset-LOCAL; with multiple datasets it "
+              "only disambiguates if each batch also carries the task string.")
 
     sampler = EpisodeAwareSampler(
         dataset_from_indices=ep_from,
@@ -732,16 +778,34 @@ def train(
                 if isinstance(batch[key], torch.Tensor) and not key.startswith(_VLM_PIX_PREFIX):
                     batch[key] = batch[key].to(device, non_blocking=True)
 
-            # Task description handling
-            if "task" in batch and isinstance(batch["task"], (list, tuple)):
+            # ── Task description handling ────────────────────────────
+            # Preferred: the batch already carries the instruction TEXT.
+            if ("task" in batch and isinstance(batch["task"], (list, tuple))
+                    and all(isinstance(t, str) for t in batch["task"])):
                 batch["task_description"] = batch["task"]
-            elif task_idx_to_description and "task_index" in batch:
-                task_indices = batch["task_index"]
-                if isinstance(task_indices, torch.Tensor) and task_indices.dim() > 1:
-                    task_indices = task_indices[:, 0]
-                batch["task_description"] = [
-                    task_idx_to_description.get(int(ti), "") for ti in task_indices
-                ]
+            else:
+                # Otherwise resolve an INDEX through the map. The index can
+                # arrive under either key: some datasets expose "task_index",
+                # others put the integer in "task" itself (which then collates
+                # to a (B,) tensor and is NOT the text, however it is named).
+                idx_src = None
+                for k in ("task_index", "task"):
+                    v = batch.get(k)
+                    if isinstance(v, torch.Tensor):
+                        idx_src = v[:, 0] if v.dim() > 1 else v
+                        break
+                if idx_src is not None:
+                    batch["task_description"] = [
+                        task_idx_to_description.get(int(ti), "") for ti in idx_src
+                    ]
+                    # An index outside the map yields "" — silently vision-only
+                    # for that sample, so surface it rather than let it ride.
+                    n_unmapped = sum(1 for d in batch["task_description"] if not d)
+                    if n_unmapped and not lang_check_done:
+                        print(f"⚠️  {n_unmapped}/{len(idx_src)} task indices are not "
+                              f"in the description map (known: "
+                              f"{sorted(task_idx_to_description)[:10]}). Those "
+                              f"samples train with an EMPTY instruction.")
 
             # Image augmentation: in-loop only when the workers aren't doing it.
             if not preprocess_in_workers:
@@ -771,6 +835,21 @@ def train(
                 if descs is None:
                     print("⚠️  LANG CHECK: neither 'task_description' nor 'task' in "
                           "batch after preprocessor — model will train VISION-ONLY.")
+                elif not (isinstance(descs, (list, tuple))
+                          and all(isinstance(d, str) for d in descs)):
+                    # A (B,) tensor of task INDICES lands here. It used to slip
+                    # through: iterating a 1-D tensor yields 0-dim tensors whose
+                    # truth test is legal, so `sum(1 for d in descs if d)` counted
+                    # happily and the check reported success on integers.
+                    print(f"\n--- LANG CHECK (step 0) ---")
+                    print(f"⚠️  'task'/'task_description' is {type(descs).__name__}"
+                          + (f" of shape {tuple(descs.shape)}" if hasattr(descs, 'shape') else "")
+                          + f", NOT strings: {list(descs[:2])}")
+                    print("    This is the task INDEX, not the text — tasks.parquet "
+                          "did not load, so NO instruction reaches the VLM.")
+                    print("    Check the 'Loaded N task descriptions' line above; if "
+                          "it is missing, meta/tasks.parquet was not found.")
+                    print("--- end LANG CHECK ---\n")
                 else:
                     n_nonempty = sum(1 for d in descs if d)
                     print(f"\n--- LANG CHECK (step 0) ---")
@@ -895,11 +974,37 @@ if __name__ == "__main__":
                         help="Recompute DiT layer activations in backward to save GPU memory "
                              "(trades ~extra forward compute; frozen VLM is unaffected). "
                              "Recommended when using the contrastive loss, which runs a 2nd DiT forward.")
-    parser.add_argument("--num_dit_layers", type=int, default=16,
-                        help="DiT decoder depth = number of trailing VLM layers whose KV the DiT "
-                             "cross-attends to. Each layer is ~180M params, so this is the BIGGEST "
-                             "memory lever: 16 (default) ~2.9B trainable params; drop to 6-8 to fit "
-                             "a 22-24GB GPU. Lower = less capacity. Must be <= the VLM's layer count (36).")
+    parser.add_argument("--num_dit_layers", type=int, default=36,
+                        help="DiT decoder depth = number of VLM layers whose KV the DiT "
+                             "cross-attends to, one per DiT layer. 36 (default) = every layer, "
+                             "the same total layer budget as WiltechsMoE (4 experts x 9 layers, "
+                             "all of which run every forward) but as one sequential stack. Below "
+                             "36 the captured layers are spread evenly over the full depth, not "
+                             "taken from the tail. Biggest memory lever; pair with "
+                             "--dit_hidden_size to control per-layer width. Must be <= 36.")
+    parser.add_argument("--vlm_capture_layers", type=int, nargs="+", default=[],
+                        help="Explicit VLM layer indices for the DiT to read, overriding the even "
+                             "spread. Must have exactly --num_dit_layers entries.")
+    parser.add_argument("--num_latent_tokens", type=int, default=8,
+                        help="Learned-query Q-Former 'thought' tokens prepended to the DiT "
+                             "sequence, distilled from the DEEPEST captured VLM layer. 0 disables.")
+    parser.add_argument("--vision_input_size", type=int, default=0,
+                        help="Square side length (px) fed to the Qwen image processor. 0 = the "
+                             "processor's smart-resize default. Qwen3-VL merges 32x32 native px "
+                             "into one token, so 256->8x8=64 tok/cam and 512->16x16=256 tok/cam. "
+                             "L_vlm is also every DiT layer's cross-attn K/V length, so the cost "
+                             "multiplies by --num_dit_layers. Check the '[wiltechs_vla] vision "
+                             "grid' startup line to confirm it took effect.")
+    parser.add_argument("--vision_hires_cameras", type=str, nargs="+", default=[],
+                        help="Cameras that get --vision_input_size; empty = all of them. Naming "
+                             "just the third-person view roughly halves the added cost, since the "
+                             "relations that need the resolution are not resolvable at the wrist "
+                             "camera's scale anyway.")
+    parser.add_argument("--text_last", action="store_true",
+                        help="Legacy [images, instruction] VLM layout. The VLM is causal, so this "
+                             "leaves every vision K/V the DiT reads LANGUAGE-BLIND and the model "
+                             "tends to use the instruction as a coarse location prior rather than "
+                             "an object selector. Default is text-first.")
     parser.add_argument("--dit_hidden_size", type=int, default=0,
                         help="DiT decoder width. 0 (default) = match the VLM hidden size (2560). "
                              "Set a smaller multiple of the VLM head_dim (e.g. 1280) to shrink the "

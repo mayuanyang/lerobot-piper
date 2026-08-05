@@ -95,28 +95,28 @@ graph TB
 │  ┌─────────────────────┐     ┌─────────────────────┐                   │
 │  │  Vision Tower       │     │  Language Embedding │                   │
 │  │  Qwen3-VL Visual    │     │  Tokenizer + Embed  │                   │
-│  │  → spatial merger   │     │  (max 48 tokens)    │                   │
+│  │  → spatial merger   │     │  (max 128 tokens)   │                   │
 │  └──────────┬──────────┘     └──────────┬──────────┘                   │
 │             │                           │                               │
 │             └───────────┬───────────────┘                               │
 │                         ▼                                               │
 │              ┌─────────────────────┐                                    │
 │              │  VLM Sequence       │                                    │
-│              │  [vision | language]│                                    │
+│              │  [language | vision]│  ← text_first (default)            │
 │              │  (B, L_vlm, 2560)   │                                    │
 │              └──────────┬──────────┘                                    │
 │                         │                                               │
 │  ┌──────────────────────────────────────────────────────────┐          │
 │  │  Qwen3-VL Text Layers (ALL 36 layers, frozen)            │          │
 │  │                                                           │          │
-│  │  Layer 0 → Layer 1 → ... → Layer 19 → Layer 20 → ... → 35│          │
-│  │                                        │                  │          │
-│  │                    ┌───────────────────┘                  │          │
-│  │                    ▼                                       │          │
-│  │     Capture KV from last N layers                         │          │
-│  │     (num_dit_layers, default 16)                          │          │
+│  │  Layer 0 → Layer 1 → Layer 2 → ... → Layer 34 → Layer 35 │          │
+│  │     │         │         │                │          │     │          │
+│  │     ▼         ▼         ▼                ▼          ▼     │          │
+│  │     Capture KV from self.capture_layers                   │          │
+│  │     (num_dit_layers=36 → every layer; fewer → an even     │          │
+│  │      spread over the full depth, NOT the tail)            │          │
 │  │                                                           │          │
-│  │     KV Cache: [(K_20,V_20), (K_21,V_21), ..., (K_35,V_35)]│         │
+│  │     KV Cache: [(K_0,V_0), (K_1,V_1), ..., (K_35,V_35)]    │          │
 │  │     Each: (B, num_kv_heads, L_vlm, head_dim)              │          │
 │  │     K is post-M-RoPE rotation                              │         │
 │  └───────────────────────────────────────────────────────────┘          │
@@ -223,18 +223,19 @@ graph TB
 | **Intermediate FFN** | 9728 |
 | **Vision** | Dynamic resolution, spatial_merge_size=2 |
 | **Position Encoding** | M-RoPE (3D: t, h, w for vision; monotonic for language) |
-| **KV Capture** | Last `num_dit_layers` layers (default: layers 20-35, 16 layers) |
+| **Sequence Order** | `[language, vision]` by default (`text_first`). The VLM is causal, so this is what makes the captured vision K/V language-conditioned; `--text_last` restores the legacy language-blind layout |
+| **KV Capture** | `self.capture_layers` — all 36 when `num_dit_layers=36`, otherwise an even spread (`np.linspace`) over the full depth. Before 2026-08-04 this was the trailing window only, discarding layers 0-19 |
 | **KV Geometry** | Each KV: (B, 8, L_vlm, 128) — 8 KV heads, head_dim 128 |
 
 ### 2. DiT Decoder (Trainable)
 
 | Component | Details |
 |-----------|---------|
-| **Layers** | `num_dit_layers` (default: 16) |
-| **Hidden Size** | `dit_hidden_size` — **1280** (decoupled from VLM's 2560 for param savings) |
-| **Self-Attention** | 10 heads × 128 dim, **2 KV heads** (GQA 5:1), causal mask over full DiT sequence |
+| **Layers** | `num_dit_layers` (default: **36**, one per VLM layer) |
+| **Hidden Size** | `dit_hidden_size` — decoupled from VLM's 2560 for param savings (640 matches WiltechsMoE) |
+| **Self-Attention** | `dit_hidden/128` heads × 128 dim, GQA at the VLM's 4:1 ratio, causal mask over full DiT sequence |
 | **Cross-Attention** | **32 heads × 128 dim**, 8 KV heads (matches VLM KV geometry); Q from DiT, K/V from VLM cache (no RoPE on Q) |
-| **FFN** | SwiGLU, intermediate=4864 (scaled proportionally to dit_hidden) |
+| **FFN** | SwiGLU, intermediate = `dit_hidden` (matches WiltechsMoE). Before 2026-08-04 this scaled the VLM's 9728 by `dit_hidden/2560`, ~4× wider |
 | **Modulation** | adaLN-Zero with 9 vectors per layer (3 sublayers × {shift, scale, gate}) |
 | **Time Embedding** | Sinusoidal(dit_hidden) → MLP(SiLU, hidden→hidden→hidden) → per-layer adaLN |
 | **Gradient Checkpointing** | Optional — recomputes DiT layer activations in backward (saves ~5-10× activation memory) |
@@ -301,23 +302,35 @@ Each DiT position can attend to ALL valid VLM positions:
 
 ## Parameter Count Summary
 
-With `dit_hidden_size=1280` (decoupled from VLM's 2560):
+The DiT stack dominates, and its size is set by three knobs: `num_dit_layers`,
+`dit_hidden_size`, and the FFN width (now `= dit_hidden`). Per-layer cost is
 
-| Component | Trainable | Frozen | Details |
-|-----------|-----------|--------|---------|
-| **VLM (Qwen3-VL-4B)** | 0 | ~4B | Frozen Qwen3-VL-4B-Instruct (vision + 36 text layers) |
-| **DiT Layers** | **~803M** | 0 | 16 layers @ dit_hidden=1280: self-attn (10×128, kv=2) + cross-attn (32×128, kv=8) + SwiGLU(4864) + adaLN |
-| **State Encoder** | ~13K | 0 | Linear(state_dim→1280) + RMSNorm |
-| **Action In Proj** | ~10K | 0 | Linear(action_dim→1280) |
-| **Action Out Proj** | ~10K | 0 | Linear(1280→action_dim), zero-init |
-| **Action Pos Emb** | ~82K | 0 | (1, horizon=64, 1280) |
-| **Robot CNN** | ~5M | 0 | RobotVisualEncoder (optional, per camera) |
-| **Latent QFormer** | ~17M | 0 | 8 queries, 2 layers, cross-attn to VLM KV |
-| **Time Embedder** | ~3.3M | 0 | MLP(1280→1280→1280) with SiLU |
-| **SINK Token** | ~1.3K | 0 | (1, 1, 1280) |
-| **Total Trainable** | **~803M** | | ≈ 20% of the old 2560-width DiT (~4B trainable) |
+```
+self-attn  h·(sa_nh + 2·sa_nkv + sa_nh)·128     cross-attn  2·h·32·128
+FFN        3·h·intermediate  (SwiGLU)            adaLN       9·h²
+```
 
-> **Note**: The actual `trainable params` reported at runtime is **803,033,675** (confirmed from RL training log). This is dominated by the 16 DiT layers. The decoupled width (1280 vs 2560) saves ~75% of DiT parameters with minimal performance impact.
+| Config | Per layer | DiT total |
+|--------|-----------|-----------|
+| 16L @ 1280, FFN 4864 (pre-2026-08-04 default) | 47.9M | **766M** |
+| **36L @ 640, FFN 640 (current default)** | 11.1M | **401M** |
+| 36L @ 1280, FFN 1280 | 34.1M | 1227M |
+| 18L @ 640, FFN 640 | 11.1M | 201M |
+
+> The current default reads **every** VLM layer yet is roughly **half** the old
+> 16-layer stack, because the width and FFN shrink outweigh the extra depth.
+> 36L @ 640 also matches WiltechsMoE's expert budget (4 × 9 layers, all of which
+> run every forward), which is what makes the two directly comparable.
+
+Non-DiT components (at `dit_hidden=640`): state encoder ~7K, action in/out ~5K
+each, action pos emb ~41K, Robot CNN ~5M, latent Q-Former ~17M, time embedder
+~820K, SINK ~640.
+
+> **Calibration**: the formula above reproduces the one measured figure on
+> record — 16L @ 1280 predicts 766M against a reported 803,033,675 total
+> trainable, the ~37M difference being the non-DiT components. The other rows
+> are computed, not measured; the runtime `trainable params` print is
+> authoritative.
 
 ---
 

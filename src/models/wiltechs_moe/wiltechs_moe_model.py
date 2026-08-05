@@ -1,5 +1,6 @@
 """WiltechsMoE - Mixture-of-Experts encoder-decoder flow matching policy."""
 import math
+import os
 from contextlib import nullcontext
 from typing import Optional
 import numpy as np
@@ -16,7 +17,30 @@ from ..wiltechs_vla.wiltechs_vla_model import (
     DiTLayer, LatentQFormer, create_sinusoidal_pos_embedding,
     preprocess_camera_to_pixels, vlm_pixels_key, vlm_grid_key,
     _apply_rope, _build_mrope_position_ids, _modulate, _hard_negative_perm,
+    _as_instruction_list, cross_attention_mass,
 )
+
+
+def _merge_xattn(per_expert: list[dict], usage: list[float]) -> dict:
+    """Combine per-expert cross-attn shares into one router-weighted figure.
+
+    The experts are mixed by the router, so the router-weighted mean is the
+    number comparable with WiltechsVLA's single-stack reading. Per-expert values
+    are kept alongside it: the experts read different VLM depth bands, so a
+    spread across them says the bands are being used differently, which a single
+    averaged number would hide.
+    """
+    valid = [(d, w) for d, w in zip(per_expert, usage) if d]
+    if not valid:
+        return {}
+    tot_w = sum(w for _, w in valid) or 1.0
+    out = {k: sum(d.get(k, 0.0) * w for d, w in valid) / tot_w
+           for k in ("vision", "language")}
+    out["_n_vis"] = valid[0][0].get("_n_vis", 0.0)
+    out["_n_lang"] = valid[0][0].get("_n_lang", 0.0)
+    out["_per_expert"] = [(d.get("vision", 0.0), d.get("language", 0.0))
+                          for d, _ in valid]
+    return out
 
 class MoERouter(nn.Module):
     def __init__(self, hidden_size, num_experts, vlm_hidden_size, temperature=1.0, top_k=0):
@@ -86,9 +110,19 @@ class ExpertDecoder(nn.Module):
                      ca_head_dim=ca_head_dim, intermediate_size=intermediate_size,
                      rms_norm_eps=rms_norm_eps, dropout=dropout)
             for _ in range(num_layers)])
+        # Diagnostic hook, set as an ATTRIBUTE rather than a forward kwarg so
+        # the torch.utils.checkpoint call site needs no signature change. Called
+        # once with (x, layer, kv) at the input to the FINAL layer -- the same
+        # measurement point WiltechsVLA uses. Under use_reentrant=False the
+        # forward runs normally before any backward recompute, and the caller
+        # disarms after one capture, so the recompute never re-fires it.
+        self._capture = None
     def forward(self, x, t_emb, expert_kv_cache, vlm_kv_pad_mask, self_attn_mask):
+        last = len(self.layers) - 1
         for i, layer in enumerate(self.layers):
             vlm_k, vlm_v = expert_kv_cache[i % len(expert_kv_cache)]
+            if i == last and self._capture is not None:
+                self._capture(x, layer, (vlm_k, vlm_v))
             x = layer(x, t_emb=t_emb, vlm_k=vlm_k, vlm_v=vlm_v,
                       vlm_kv_pad_mask=vlm_kv_pad_mask, self_attn_mask=self_attn_mask)
         return x
@@ -225,6 +259,27 @@ class WiltechsMoETransformer(nn.Module):
         self.text_first = bool(getattr(config, "text_first", True))
         self._template_ids_cpu = None; self._template_format_printed = False
         self._lang_len_printed = False; self._vision_grid_printed = set()
+        # Router ablation (see _apply_router_override). Parsed and VALIDATED
+        # here, at load time, so a typo raises instead of silently leaving the
+        # learned router in place and reporting the ablation as a null result.
+        self.router_override = None
+        _ro = str(os.environ.get("WILTECHS_MOE_ROUTER", "") or "").strip().lower()
+        if _ro and _ro != "off":
+            if _ro != "uniform":
+                if not _ro.isdigit() or int(_ro) >= num_experts:
+                    raise ValueError(
+                        f"WILTECHS_MOE_ROUTER={_ro!r} is not 'uniform', 'off', or an "
+                        f"expert index in 0..{num_experts - 1}.")
+            self.router_override = _ro
+            print(f"[wiltechs_moe] *** ROUTER OVERRIDE: {_ro} *** learned routing is "
+                  f"DISABLED — this run is an ablation, not a normal eval")
+        # Cross-attn mass diagnostic, mirroring WiltechsVLA so the two models'
+        # numbers are directly comparable. Armed by the train script on the
+        # gradient-analysis cadence; self-disarms after one capture so the
+        # contrastive v_wrong forward cannot overwrite the main-forward reading.
+        self._capture_attention_stats = False
+        self._last_cross_attention_stats: Optional[dict] = None
+        self._last_vis_mask: Optional[torch.Tensor] = None
         self.gradient_checkpointing = False
     def train(self, mode=True):
         super().train(mode); self.visual.eval(); self.language_model.eval(); return self
@@ -290,7 +345,14 @@ class WiltechsMoETransformer(nn.Module):
         if not all_vis: return torch.zeros(B, 0, self.hidden_size, device=device, dtype=torch.bfloat16), []
         return torch.cat(all_vis, dim=1), grid_thw_list
     def _resolve_descs(self, batch, descs_override=None):
-        descs = descs_override if descs_override is not None else (batch.get("task_description") or batch.get("task"))
+        # _as_instruction_list raises if the key is present but holds something
+        # other than strings (e.g. a (B,) tensor of task INDICES, which means
+        # tasks.parquet never loaded and no language is reaching the VLM).
+        if descs_override is not None:
+            descs = descs_override
+        else:
+            descs = _as_instruction_list(batch.get("task_description"), "task_description")
+            if descs is None: descs = _as_instruction_list(batch.get("task"), "task")
         # rewrite_instruction is idempotent (a rewritten string is not a key in
         # REPHRASINGS), so re-resolving an already-rewritten override is safe.
         if descs and getattr(self.config, "use_descriptive_objects", False): descs = [rewrite_instruction(d) for d in descs]
@@ -526,6 +588,45 @@ class WiltechsMoETransformer(nn.Module):
         pooled = (vlm_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)  # (B, hidden_size)
         return pooled
 
+    def _apply_router_override(self, weights, usage):
+        """Replace the learned routing weights, for ablation. No-op by default.
+
+        Set `WILTECHS_MOE_ROUTER` (or assign model.router_override directly):
+
+          unset / "off"  learned routing -- normal behaviour
+          "uniform"      every expert weighted 1/E, input-independent. This is
+                         the router-removal control: the MoE becomes a fixed
+                         E-way average of the expert velocity fields.
+          "0".."E-1"     that expert alone (one-hot).
+
+        Why this is the first thing to run: the corrected per-sample statistic
+        (see FINDINGS.md) put max_w just above the collapse floor, i.e. the
+        learned routing is close to a fixed average already. If "uniform"
+        matches the learned run, the router and its balance loss are dead weight
+        and the architecture is an ensemble, not a mixture of experts.
+
+        Interpretation -- these are two DIFFERENT questions, do not conflate:
+          uniform vs learned  isolates the ROUTER (same params, same compute)
+          single vs uniform   isolates the ENSEMBLE, and is confounded: one
+                              expert is 1/E of the parameters AND sees only its
+                              own block of VLM layers, so a drop there is not
+                              evidence that routing matters.
+
+        Compare per-episode success sets, not just the rates: at n=50 and ~92%
+        the 2-sigma band on a rate DIFFERENCE is about 11 points, so anything
+        smaller is invisible unpaired. Paired on the same initial states it is
+        the discordant episodes that carry the signal.
+        """
+        mode = self.router_override
+        if mode is None:
+            return weights, usage
+        if mode == "uniform":
+            w = torch.full_like(weights, 1.0 / weights.shape[-1])
+        else:
+            w = torch.zeros_like(weights)
+            w[:, int(mode)] = 1.0
+        return w, w.mean(dim=0)
+
     def _run_moe_dit(self, batch, noisy_actions, timesteps, kv_cache, vlm_kv_pad_mask, robot_tokens, latents, vlm_hidden, thoughts=None, record=True):
         device, dtype = noisy_actions.device, noisy_actions.dtype
         t_emb = self.time_embedder(create_sinusoidal_pos_embedding(timesteps, self.dit_hidden).to(dtype).float()).to(dtype)
@@ -534,15 +635,40 @@ class WiltechsMoETransformer(nn.Module):
         causal_mask = torch.triu(torch.full((L_dit, L_dit), float("-inf"), device=device, dtype=dtype), diagonal=1)
         vlm_semantic = self._pool_vlm_semantic(vlm_hidden, vlm_kv_pad_mask).to(dtype)
         weights, usage = self.router(state_tok, vlm_semantic, t_emb, action_emb)
+        weights, usage = self._apply_router_override(weights, usage)
+        # Cross-attn mass diagnostic: armed by the train script, one capture per
+        # expert's LAST layer, then self-disarmed. Each expert reads a different
+        # VLM depth band, so the shares can legitimately differ between them --
+        # that difference is itself the interesting part.
+        capture = record and self._capture_attention_stats
+        per_expert_xattn: list[dict] = []
+        vis_mask = self._last_vis_mask if capture else None
+
         expert_outputs = []
         for e, expert in enumerate(self.experts):
             expert_kv = [kv_cache[idx] for idx in self.expert_kv_blocks[e]]; x = dit_seq
+            if capture:
+                def _cap(xin, layer, kv):
+                    per_expert_xattn.append(cross_attention_mass(
+                        layer, xin, t_emb, kv, vlm_kv_pad_mask, action_start_idx,
+                        noisy_actions.shape[1], vis_mask))
+                expert._capture = _cap
             if self.gradient_checkpointing and self.training:
                 x = torch.utils.checkpoint.checkpoint(expert, x, t_emb, expert_kv, vlm_kv_pad_mask, causal_mask, use_reentrant=False)
             else:
                 x = expert(x, t_emb=t_emb, expert_kv_cache=expert_kv, vlm_kv_pad_mask=vlm_kv_pad_mask, self_attn_mask=causal_mask)
+            expert._capture = None
             expert_outputs.append(self.action_out_proj(self.final_norm(x[:, action_start_idx:])))
         stacked = torch.stack(expert_outputs, dim=1)
+        if capture:
+            self._capture_attention_stats = False
+            self._last_cross_attention_stats = _merge_xattn(
+                per_expert_xattn, usage.detach().float().tolist())
+            # The no_grad capture above populated the autocast weight cache with
+            # GRAD-LESS bf16 casts of each expert's final ca_q / adaLN weights.
+            # Clear it so the real forward re-casts them WITH grad tracking --
+            # otherwise those weights silently get no gradient on capture steps.
+            torch.clear_autocast_cache()
         v_t = (weights.unsqueeze(-1).unsqueeze(-1) * stacked).sum(dim=1)
         # record=False for the contrastive negative's forward: it runs AFTER
         # this one and would otherwise overwrite every router statistic, so the
@@ -580,6 +706,9 @@ class WiltechsMoETransformer(nn.Module):
     def compute_loss(self, batch):
         actions = batch["action"].float().nan_to_num(0.0).clamp(-10.0, 10.0); B = actions.shape[0]; device = actions.device
         kv_cache, vlm_kv_pad_mask, vis_mask, lang_span, vlm_hidden, vis_pack = self._run_vlm_and_cache_kv(batch)
+        # _run_moe_dit needs it for the cross-attn diagnostic but is not handed
+        # it (the experts do not otherwise care which positions are vision).
+        self._last_vis_mask = vis_mask
         vkv_p = float(getattr(self.config, "vision_kv_dropout_prob", 0.0)); n_vis = int(vis_mask.sum().item())
         vkv_drop = None
         if self.training and vkv_p > 0.0 and n_vis > 0:

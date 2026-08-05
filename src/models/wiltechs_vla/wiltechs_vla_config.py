@@ -5,9 +5,9 @@ Backbone: Qwen/Qwen3-VL-4B-Instruct (bf16; non-FP8 to avoid the finegrained-fp8 
 Architecture: Mixture-of-Transformers (MoT) — encoder-decoder with KV cache.
 
   - **Encoder (frozen VLM)**: all 36 Qwen3-VL text layers run ONCE per
-    inference on [vision tokens, language tokens]. K, V tensors from the
-    last `num_vlm_layers` (re-purposed below as DiT depth) layers are
-    cached and exposed to the DiT.
+    inference on [language tokens, vision tokens] (see `text_first`). The
+    K, V tensors of `num_vlm_layers` of them are cached and exposed to the
+    DiT — by default all 36.
 
   - **Decoder (trainable DiT)**: `num_vlm_layers` independent DiT layers,
     each with self-attention (causal) + cross-attention to one matched
@@ -19,12 +19,13 @@ Architecture: Mixture-of-Transformers (MoT) — encoder-decoder with KV cache.
     action_tokens]. The VLM never sees state/action tokens, preserving
     its pretrained vision-language capabilities exactly.
 
-Compared to the previous interleaved version:
-  - VLM runs 1× instead of `num_inference_steps`× → ~5-10× faster inference.
-  - All 36 VLM layers are used; the DiT just reads from the trailing N.
-  - VLM activations are not perturbed by an untrained expert.
+Relationship to WiltechsMoE: same frozen backbone and the same total DiT
+layer budget (MoE's 4 experts x 9 layers all run on every forward), but one
+sequential stack instead of four parallel ones convex-combined in action
+space, and no router. See wiltechs_moe/FINDINGS.md.
 
-Checkpoints from the previous (interleaved) WiltechsVLA are NOT compatible.
+Checkpoints from before 2026-08-04 are NOT compatible: the DiT depth default
+moved 16 -> 36 and the FFN width formula changed to match MoE.
 """
 
 from dataclasses import dataclass, field
@@ -54,16 +55,52 @@ class WiltechsVLAConfig(PreTrainedConfig):
     )
 
     # -------- Image processing --------
-    # Qwen3-VL uses dynamic resolution; this is a nominal target.
-    vision_input_size: int = 448
+    # Side length (px) fed to the Qwen image processor. 0 = leave the processor
+    # on its own smart-resize defaults.
+    #
+    # This used to read 448 and was NEVER passed anywhere -- _encode_images
+    # called preprocess_camera_to_pixels without target_size -- so every run
+    # before 2026-08-04 was on the processor default regardless of this value.
+    # It is now plumbed through; 0 reproduces the old behaviour exactly.
+    #
+    # Qwen3-VL uses patch=16 with spatial_merge=2, so one merged vision token
+    # covers a 32x32 block of whatever the processor emits:
+    #
+    #   input 256 -> 8x8 grid  =  64 tok/cam
+    #   input 512 -> 16x16 grid = 256 tok/cam
+    #
+    # With 256x256 source frames, 512 is not empty upsampling: the detail is in
+    # the source and the 32px-per-token quantisation is what discards it. See
+    # wiltechs_moe/FINDINGS.md -- at 64 tokens the colour probe failed its own
+    # consistency control on libero_spatial.
+    #
+    # COST: L_vlm is also the K/V length of every DiT layer's cross-attention,
+    # so it multiplies through num_dit_layers, not just the VLM.
+    vision_input_size: int = 0
+    # Cameras that get vision_input_size. Empty = all of them. Restricting this
+    # to the third-person view is usually the right trade: the spatial relations
+    # that need the resolution are not resolvable at the wrist camera's scale
+    # anyway, and it roughly halves the added cost.
+    vision_hires_cameras: list[str] = field(default_factory=list)
 
     # -------- VLM backbone --------
     num_cameras: int = 3
-    # DiT depth = number of trailing VLM layers whose KV cache the DiT
-    # cross-attends to. The VLM itself always runs ALL 36 layers — this
-    # field controls only how many of its KV pairs are consumed.
+    # DiT depth. The VLM always runs ALL 36 layers; this controls how many of
+    # its KV pairs the DiT consumes and therefore how deep the DiT is.
     # (Field name kept for backwards-compat with saved configs.)
-    num_vlm_layers: int = 16
+    #
+    # 36 = one DiT layer per VLM layer, i.e. every layer's KV is used. This is
+    # the same total layer budget as WiltechsMoE (4 experts x 9 layers, all of
+    # which run every forward), but composed sequentially instead of averaged
+    # in action space -- a fixed 4-way average is a special case of it.
+    #
+    # Below 36 the captured layers are spread evenly over the full depth
+    # (np.linspace), NOT taken from the tail: the old behaviour read only layers
+    # 20..35 and discarded the KV of the first 20, which cost nothing to keep.
+    num_vlm_layers: int = 36
+    # Explicit VLM layer indices to capture, overriding the even spread. Must
+    # have exactly num_vlm_layers entries. Empty = automatic.
+    vlm_capture_layers: list[int] = field(default_factory=list)
 
     # Selective camera list for vision token construction.
     cameras_for_vision_state_concat: list[str] = field(default_factory=lambda: [
@@ -125,9 +162,30 @@ class WiltechsVLAConfig(PreTrainedConfig):
     # demonstrably lives (libero wrist key: 'observation.images.image2').
     robot_cnn_cameras: list[str] = field(default_factory=list)
 
+    # -------- Language placement in the VLM sequence --------
+    # The VLM is CAUSAL. With the legacy layout ([images..., instruction]) a
+    # vision token's K/V never attends to the instruction, so every vision KV
+    # the DiT cross-attends to is language-BLIND: referring-expression
+    # disambiguation ("the black bowl BETWEEN the plate and the ramekin")
+    # survives only in the trailing text positions, which then compete in a
+    # softmax against several hundred vision positions. The model degenerates to
+    # using language as a coarse location prior (reaching for the midpoint)
+    # instead of as an object selector.
+    #
+    # text_first=True moves the instruction BEFORE the images, so every patch's
+    # K/V at every layer is conditioned on the instruction.
+    #
+    # NOTE: this changes the contrastive branch's cost. With text_first the
+    # language is baked into the vision KV, so swapping only the language KV
+    # slice is self-inconsistent; the frozen VLM's language model is re-run with
+    # permuted instructions instead (ViT output is reused, so the extra cost is
+    # the 36 LM layers only, under no_grad).
+    text_first: bool = True
+
     # -------- Latent "thought" tokens --------
-    # Prepended to the expert sequence. 0 disables.
-    num_latent_tokens: int = 4
+    # Prepended to the DiT sequence, produced by a learned-query Q-Former
+    # cross-attending to the DEEPEST captured VLM layer. 0 disables.
+    num_latent_tokens: int = 8
     # Number of Q-Former cross-attention blocks that distill the VLM KV cache
     # into the latent tokens (learned queries → cross-attn to VLM vision+lang).
     num_latent_qformer_layers: int = 2
