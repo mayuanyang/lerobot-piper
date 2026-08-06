@@ -92,7 +92,14 @@ class WiltechsVLAConfig(PreTrainedConfig):
     # 36 = one DiT layer per VLM layer, i.e. every layer's KV is used. This is
     # the same LAYER COUNT as WiltechsMoE (4 experts x 9 layers, all of which
     # run every forward), but composed sequentially instead of averaged in
-    # action space -- a fixed 4-way average is a special case of it.
+    # action space.
+    #
+    # These are NOT the same function class. An earlier note here claimed a
+    # fixed 4-way average is a special case of a 36-layer stack; it is not --
+    # f4.f3.f2.f1 != (f1+f2+f3+f4)/4, and embedding four independent branches
+    # in one stack needs ~4x the residual width or they interfere. Measured:
+    # matched width/batch/data/schedule, the sequential stack scored 33% (4/12)
+    # at 12k against the MoE's 92% (46/50) at 18k.
     #
     # Layer count alone does NOT make the two comparable: parameters scale with
     # dit_hidden_size, and the MoE's 92% checkpoint runs 1280, i.e. 1.23B expert

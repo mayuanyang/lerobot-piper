@@ -330,10 +330,16 @@ from the log, not the defaults.
   ```
 
   `uniform` vs learned isolates the **router** — same parameters, same compute,
-  only the mixing weights change. If it matches, the router and its balance loss
-  are dead weight and the right move is the opposite of adding experts: one
-  deeper decoder over all 36 layers, ~4× fewer parameters, strictly more
-  expressive (a fixed average is a special case of it).
+  only the mixing weights change. This is now the most informative experiment
+  available, because §8 showed the parallel topology is what wins and the router
+  is the only part of it not yet tested: if `uniform` also scores ~92%, the win
+  is the 4-way *average*, not the routing, and the router plus its balance loss
+  can go while the topology stays.
+
+  (An earlier version of this note said a matching `uniform` would justify
+  replacing the experts with one deeper 36-layer decoder, "strictly more
+  expressive, a fixed average being a special case of it". That is wrong on both
+  counts — see §8.)
 
   Single-expert vs uniform isolates the **ensemble**, and is confounded — one
   expert is 1/E of the parameters *and* sees only its own 9-layer block, so a
@@ -386,3 +392,59 @@ from the log, not the defaults.
 - **"Increase `num_thought_tokens`, the gradient is low."** The gradient is low
   because RMSNorm rescales magnitude away. The gates moved from 0.100 to 0.171,
   so the tokens are used and capacity is not the constraint.
+
+---
+
+## 8. The parallel topology is doing the work — WiltechsVLA head-to-head
+
+A single 36-layer sequential DiT was built to test whether the MoE's four
+parallel 9-layer experts are needed. Everything else was matched: same frozen
+backbone, `dit_hidden=1280`, `batch=40`, same `--dataset_id`, same 50k cosine
+schedule (both read `lr=7.4e-05` at step 18k), same 36 VLM layers read 1:1, same
+CoT rewrites, `--vision_input_size 512` on the third-person camera only,
+`--robot_cnn_wrist_only`, `--contrastive_loss_weight 0.1`.
+
+| run | libero_spatial t0 | 95% CI |
+|-----|-------------------|--------|
+| VLA 10k, `dit_hidden=640`, batch 65 | 3/12 = 25.0% | [9%, 53%] |
+| VLA 12k, matched config | 4/12 = 33.3% | [14%, 61%] |
+| **MoE 18k** | **46/50 = 92.0%** | [81%, 97%] |
+
+**[measured]** `P(≤4 | p=0.92, n=12) = 6.2e-07`, so the gap is decisive even at
+n=12. The width fix bought nothing measurable: 3/12 vs 4/12 is Fisher p=1.00, so
+the 3× parameter deficit that looked like the obvious cause was not it.
+
+The VLA run was stopped at 12k rather than 18k — 10k→12k showed no movement
+toward 92%, so the remaining 6k had low expected information. **The comparison
+is therefore 12k vs 18k, not step-matched**; state that whenever the number is
+quoted.
+
+**The claim that motivated the experiment was wrong.** A 36-layer sequential
+stack was said to be "strictly more expressive" than four parallel 9-layer
+experts because "a fixed average is a special case of it". It is not:
+`f4∘f3∘f2∘f1 ≠ (f1+f2+f3+f4)/4`. Sequential composition and parallel averaging
+are different function classes at equal width, neither containing the other;
+embedding four independent branches in one residual stream needs roughly 4× the
+width or they interfere. The claim was asserted from intuition and never
+checked, and it was the entire justification for "delete the router, use one
+deep decoder".
+
+Unverified hypotheses for *why* parallel wins, in the order worth testing:
+1. **Ensemble variance reduction** — flow matching is regression; averaging four
+   predictors helps for reasons that have nothing to do with routing. The
+   `WILTECHS_MOE_ROUTER=uniform` ablation (§6) tests exactly this.
+2. **Gradient path length** — 9 layers to the loss instead of 36.
+3. **Depth-band commitment** — each expert owns one band of VLM layers; the
+   sequential stack must push all 36 bands through one residual stream.
+
+Two diagnostics diverged before the eval did, and now correlate with it. Neither
+is established as causal, but they are the leading candidates:
+
+| | VLA @12k | MoE @18k |
+|---|---|---|
+| `L8` language (null 6.3%) | 69.6% = **11.0×** | 44.2% = 7.0× |
+| Q-Former gate mean (init 0.100) | 0.087, **falling** | 0.110, rising |
+
+The Q-Former collapse is not weight decay — at `wd=1e-6` the cumulative shrink
+over 12k steps is 0.9999988, while the observed weight norm went 106.15 → 43.57
+(0.41×). The task loss is switching the module off. **[measured]**
