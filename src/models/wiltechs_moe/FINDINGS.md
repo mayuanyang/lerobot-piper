@@ -162,6 +162,43 @@ expert's first RMSNorm renormalises per token, so magnitude is rescaled away.
 The gates are the honest signal. Pinned at 0.100 after thousands of steps is the
 failure state, and that is what the pre-text-first runs showed.
 
+**The x-attn null is NOT x1.0 — always compare against step 0.** At random
+init the shares should be proportional to the position counts, i.e. `x1.00`
+each. Measured on an untrained WiltechsVLA (step 0, `[96 lang + 320 vis]`):
+
+```
+vision= 89.5% (x1.16)   language= 10.5% (x0.45)
+L8= 6.3%  L17= 6.3%  L26= 7.0%  L35=22.3%      (language %, shallow→deep)
+```
+
+The frozen VLM's text-position K vectors have smaller norm than its vision-token
+K, so random queries score them lower — and the gap widens with depth. The null
+is a property of the backbone, not of the policy. **[measured]**
+
+Read every x-attn number against it, not against x1.0:
+
+| | language | vs positions | **vs null** |
+|---|----------|--------------|---------|
+| step 0 (null) | 10.5% | x0.45 | — |
+| MoE @18k (92%) | 76.7% | x3.32 | **7.4×** |
+| VLA @8.6k, `dit_hidden=640` | 95.6% | x4.14 | **9.2×** |
+
+The same applies per depth: the MoE's `L8=44.2%` is a **7×** move off a 6.3%
+null, while its `L35=91.4%` is only **4×** off a 22.3% null. So "E0 is the
+vision expert" is mostly the null showing through — in *relative* terms E0
+shifts toward language harder than E3 does, not less.
+
+The self-attn regions have a null too: `robot=30.7% latent=16.0% action=49.3%`
+at step 0. A later `robot=36.4%` is therefore a small move, not the RobotCNN
+taking over; what actually moves is `latent`, which halves.
+
+**Trajectory** (VLA at `dit_hidden=1280`, matched config): language attention is
+learned **deep-first and propagates shallow-ward** — L35 reaches 69.5% by step
+400, L26 by 800, L17 by 1000, L8 last. By step 1200 the whole profile sits on
+top of the MoE's 18k profile (mean 71.1% vs 76.7%, every depth slightly *less*
+language-dominated). A single deep-layer reading taken early therefore looks
+alarming for reasons that resolve on their own. **[measured]**
+
 **`Router usage` / `Router per-samp`** — batch-mean usage CV² near zero is
 ambiguous: healthy per-sample specialisation averages out the same way an
 input-independent uniform router does, and the latter zeroes the CV² balance
