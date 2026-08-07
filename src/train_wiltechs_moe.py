@@ -351,6 +351,8 @@ def train(
     output_dir: str,
     dataset_id="ISdept/piper_arm",
     resume_from_checkpoint: Optional[str] = None,
+    reset_training_state: bool = False,
+    reset_params: Optional[list] = None,
     batch_size: int = 16,
     training_steps: int = 300000,
     gradient_checkpointing: bool = False,
@@ -571,17 +573,36 @@ def train(
             if cfg_file.exists():
                 with open(cfg_file) as f:
                     saved_cfg_json = json.load(f)
+                break
+        if reset_training_state:
+            # FINETUNE, not continuation. Without this the counters below come
+            # back from the checkpoint, and a checkpoint from a COMPLETED run
+            # carries step == training_steps_total -- the training loop's
+            # `if step >= training_steps` then fires on the very first batch and
+            # the "finetune" silently trains for zero steps.
+            print(f"--reset_training_state: starting a NEW schedule at step 0 for "
+                  f"{training_steps} steps (checkpoint reported step="
+                  f"{saved_cfg_json.get('training_step', 0)}). Optimizer state and "
+                  f"the saved LR schedule are discarded; weights are kept.")
+        else:
+            if saved_cfg_json:
                 step = saved_cfg_json.get("training_step", 0)
                 epoch = saved_cfg_json.get("training_epoch", 0)
                 saved_total = saved_cfg_json.get("training_steps_total", 0)
                 if saved_total > 0:
                     training_steps = saved_total
-                print(f"Read config from {cfg_name}: step={step}, epoch={epoch}, "
+                print(f"Read config from checkpoint: step={step}, epoch={epoch}, "
                       f"training_steps_total={training_steps}")
-                break
-        if step == 0 and local_ckpt.name.startswith("checkpoint-"):
-            step = int(local_ckpt.name.split("-")[1])
-        print(f"Resuming from step {step}, epoch {epoch}")
+            if step == 0 and local_ckpt.name.startswith("checkpoint-"):
+                step = int(local_ckpt.name.split("-")[1])
+            if step >= training_steps:
+                raise RuntimeError(
+                    f"Checkpoint is at step {step} of {training_steps}: the training loop "
+                    f"would exit before the first optimizer step. This is what a FINISHED "
+                    f"pretraining run looks like -- pass --reset_training_state to start a "
+                    f"fresh schedule from these weights, or raise --training_steps to "
+                    f"genuinely continue the same run.")
+            print(f"Resuming from step {step}, epoch {epoch}")
 
         ckpt_state = load_safetensors(model_file, device="cpu")
         policy.train()
@@ -590,6 +611,23 @@ def train(
             k: v for k, v in ckpt_state.items()
             if k in cur_state and cur_state[k].shape == v.shape
         }
+        # Deliberately drop transferable-by-shape weights whose MEANING changed.
+        # The shape filter above cannot see this: after cross-embodiment
+        # pretraining, action_pos_emb has the same (1, horizon, dit_hidden) shape
+        # but encodes a different physical duration per step whenever the two fps
+        # differ (64 frames is 2.1 s at 30 fps and 6.4 s at 10 fps), and
+        # action_in_proj / action_out_proj are calibrated to the pretraining
+        # dataset's normalisation statistics.
+        if reset_params:
+            dropped = [k for k in filtered if any(p in k for p in reset_params)]
+            for k in dropped:
+                del filtered[k]
+            print(f"--reset_params {list(reset_params)}: dropped {len(dropped)} tensors, "
+                  f"they will re-initialise: {dropped[:6]}")
+            if not dropped:
+                print(f"[WARN] --reset_params matched NOTHING. Prefixes are matched as "
+                      f"substrings of parameter names, e.g. 'action_pos_emb', "
+                      f"'action_in_proj', 'state_encoder'.")
         skipped = [k for k in ckpt_state if k not in filtered]
         missing = [k for k in cur_state if k not in ckpt_state]
         if skipped:
@@ -607,14 +645,24 @@ def train(
         )
 
         base_lr = cfg.optimizer_lr
-        resume_warmup = saved_cfg_json.get("scheduler_warmup_steps", cfg.scheduler_warmup_steps)
-        print(f"Scheduler base (peak) LR: {base_lr:.2e}  (decay rebuilt by "
-              f"fast-forwarding to step {step})")
+        resume_warmup = (cfg.scheduler_warmup_steps if reset_training_state
+                         else saved_cfg_json.get("scheduler_warmup_steps",
+                                                 cfg.scheduler_warmup_steps))
+        print(f"Scheduler base (peak) LR: {base_lr:.2e}  (warmup {resume_warmup}, "
+              + ("fresh schedule from step 0)" if reset_training_state
+                 else f"decay rebuilt by fast-forwarding to step {step})"))
 
         trainable_params = [p for p in policy.model.parameters() if p.requires_grad]
         optimizer = make_optimizer(trainable_params, base_lr, cfg.optimizer_weight_decay, use_8bit_adam)
         opt_state_path = local_ckpt / "optimizer_state.pth"
-        if opt_state_path.exists():
+        # Adam's moment estimates describe the PRETRAINING data distribution. On
+        # a finetune they point the first few hundred steps in the wrong
+        # direction, and the second-moment scaling is calibrated to gradients
+        # that no longer occur.
+        if reset_training_state and opt_state_path.exists():
+            print("--reset_training_state: skipping optimizer_state.pth (Adam moments "
+                  "belong to the previous data distribution).")
+        elif opt_state_path.exists():
             try:
                 opt_sd = torch.load(opt_state_path, map_location="cpu")
                 optimizer.load_state_dict(opt_sd)
@@ -944,6 +992,19 @@ if __name__ == "__main__":
                              "must share a homogeneous schema (same robot/cameras/dims/fps); "
                              "their normalization stats are aggregated.")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Resume from a checkpoint")
+    parser.add_argument("--reset_training_state", action="store_true",
+                        help="Load the checkpoint's WEIGHTS but start a new run: step 0, a "
+                             "fresh warmup+cosine over --training_steps, and no optimizer "
+                             "state. Required to finetune from a FINISHED run -- such a "
+                             "checkpoint reports step == training_steps_total, which without "
+                             "this flag makes the loop exit before the first optimizer step.")
+    parser.add_argument("--reset_params", type=str, nargs="+", default=None,
+                        help="Parameter-name substrings to DROP from the checkpoint so they "
+                             "re-initialise, e.g. 'action_pos_emb action_in_proj "
+                             "action_out_proj'. Use when a tensor transfers by shape but not "
+                             "by meaning: action_pos_emb indexes frames, so the same horizon "
+                             "spans 2.1s at 30fps and 6.4s at 10fps, and the action "
+                             "projections are calibrated to the pretraining normalisation.")
     parser.add_argument("--batch_size", type=int, default=16,
                         help="Batch size (Qwen3-VL-4B backbone is memory-heavy; 8-24).")
     parser.add_argument("--training_steps", type=int, default=300000, help="Total training steps")

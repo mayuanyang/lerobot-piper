@@ -5,6 +5,7 @@ Supported model types:
   - `interleaved`  : SmolVLA-style interleaved flow matching (SmolVLM2-500M, d_model=960)
   - `wilro`        : VLM KV-cache → DiT cross-attention (SmolVLM2-500M, d_model=960)
   - `wiltechs_vla` : Encoder-decoder MoT (Qwen3-VL-4B, d_model=2560)
+  - `wiltechs_moe` : N parallel expert decoders over VLM depth bands (Qwen3-VL-4B)
 
 Each model type has its own config/policy/processor classes but shares the same
 training loop, dataset adapter, and canonical schema projection.
@@ -31,6 +32,25 @@ Usage:
         --output_dir outputs/train/community_wiltechs \
         --batch_size 16 \
         --training_steps 300000
+
+    # Pretrain wiltechs_moe, then finetune it on LIBERO. The architecture flags
+    # must be IDENTICAL across the two commands: --resume_from_checkpoint keeps
+    # only tensors whose shapes agree, silently, so a mismatch turns a 300k-step
+    # pretrain into a no-op that still trains and still looks healthy.
+    python src/train_community.py \
+        --model_type wiltechs_moe \
+        --output_dir outputs/train/community_moe \
+        --num_experts 4 --expert_num_layers 9 --dit_hidden_size 1280 \
+        --batch_size 16 --training_steps 300000
+
+    python src/train_wiltechs_moe.py \
+        --output_dir outputs/train/moe_libero \
+        --dataset_id <libero-dataset> \
+        --num_experts 4 --expert_num_layers 9 --dit_hidden_size 1280 \
+        --resume_from_checkpoint outputs/train/community_moe \
+        --reset_training_state \
+        --reset_params action_pos_emb action_in_proj action_out_proj \
+        --training_steps 50000
 """
 
 from __future__ import annotations
@@ -89,6 +109,10 @@ def _lazy_imports():
     from models.wiltechs_vla.wiltechs_vla_policy import WiltechsVLAPolicy
     from models.wiltechs_vla.processor_wiltechs_vla import make_pre_post_processors as proc_wiltechs
 
+    from models.wiltechs_moe.wiltechs_moe_config import WiltechsMoEConfig
+    from models.wiltechs_moe.wiltechs_moe_policy import WiltechsMoEPolicy
+    from models.wiltechs_moe.processor_wiltechs_moe import make_pre_post_processors as proc_wiltechs_moe
+
     _register_model("interleaved", InterleavedFlowMatchingConfig, InterleavedFlowMatchingPolicy, proc_interleaved, {
         "d_model": 960,
         "vision_input_size": 384,
@@ -98,6 +122,10 @@ def _lazy_imports():
         "vision_input_size": 384,
     })
     _register_model("wiltechs_vla", WiltechsVLAConfig, WiltechsVLAPolicy, proc_wiltechs, {
+        "d_model": 2560,
+        "vision_input_size": 448,
+    })
+    _register_model("wiltechs_moe", WiltechsMoEConfig, WiltechsMoEPolicy, proc_wiltechs_moe, {
         "d_model": 2560,
         "vision_input_size": 448,
     })
@@ -792,6 +820,11 @@ def train(
     gripper_encoder_tokens: int = 100,
     kv_capture_strategy: str = "last",
     kv_capture_layers: Optional[list[int]] = None,
+    num_experts: int = 4,
+    expert_num_layers: int = 9,
+    dit_hidden_size: int = 1280,
+    num_thought_tokens: int = 8,
+    thought_qformer_layers: int = 1,
 ):
     # Resolve model components
     ConfigCls, PolicyCls, processor_fn, model_defaults = get_model_components(model_type)
@@ -1052,6 +1085,32 @@ def train(
         cfg_kwargs["vision_lora_num_layers"] = 0
     elif model_type == "wiltechs_vla":
         cfg_kwargs["use_robot_cnn"] = True
+    elif model_type == "wiltechs_moe":
+        # Everything here has to MATCH the LIBERO finetune config, or the 1.24B
+        # of expert / router / Q-Former weights this run produces will be
+        # shape-filtered out at --resume_from_checkpoint and the pretraining is
+        # wasted. Only ~0.01% of the trainable parameters (state_encoder,
+        # action_in_proj, action_out_proj) are embodiment-specific; the rest are
+        # dim-agnostic because the VLM is frozen and the experts only ever see
+        # its KV cache.
+        cfg_kwargs["use_robot_cnn"] = True
+        # Two of the common kwargs above are wrong for this model and must be
+        # overridden rather than inherited:
+        #   num_vlm_layers   36, not 16 -- expert e is bound to a contiguous band
+        #                    of Qwen3-VL-4B's layers and num_experts x
+        #                    expert_num_layers must tile them.
+        #   num_latent_tokens 0, not 8 -- the LEGACY latent Q-Former. The MoE
+        #                    runs with it off (thought tokens replaced it), so
+        #                    leaving it at 8 builds a module the finetune has no
+        #                    weights for and trains it for nothing.
+        cfg_kwargs["num_vlm_layers"] = 36
+        cfg_kwargs["num_latent_tokens"] = 0
+        cfg_kwargs["num_experts"] = num_experts
+        cfg_kwargs["expert_num_layers"] = expert_num_layers
+        cfg_kwargs["dit_hidden_size"] = dit_hidden_size
+        cfg_kwargs["num_thought_tokens"] = num_thought_tokens
+        cfg_kwargs["thought_qformer_layers"] = thought_qformer_layers
+        cfg_kwargs["text_first"] = True
 
     # The community canonical close-range view is "observation.images.wrist"
     # (canonical set is front/wrist/top), NOT the config default
@@ -1328,6 +1387,25 @@ if __name__ == "__main__":
     parser.add_argument("--kv_capture_layers", type=int, nargs="*", default=None,
                         help="[wilro only] Explicit VLM layer indices for kv_capture_strategy=custom "
                              "(0-based). Example: --kv_capture_layers 3 7 11 15 19 23 27 31")
+    # wiltechs_moe-specific. These must match the LIBERO finetune exactly --
+    # they set the shapes of the 1.24B parameters that pretraining exists to
+    # produce, and --resume_from_checkpoint silently shape-filters anything that
+    # disagrees.
+    parser.add_argument("--num_experts", type=int, default=4,
+                        help="[wiltechs_moe only] Expert decoders. Each binds to a contiguous "
+                             "band of Qwen3-VL-4B's 36 layers.")
+    parser.add_argument("--expert_num_layers", type=int, default=9,
+                        help="[wiltechs_moe only] DiT layers per expert, which is ALSO the width "
+                             "of its VLM capture band. num_experts x expert_num_layers must be "
+                             "<= 36; 4x9 tiles all 36 exactly.")
+    parser.add_argument("--dit_hidden_size", type=int, default=1280,
+                        help="[wiltechs_moe only] Expert width. Must match the finetune.")
+    parser.add_argument("--num_thought_tokens", type=int, default=8,
+                        help="[wiltechs_moe only] Thought Q-Former query tokens. 0 disables.")
+    parser.add_argument("--thought_qformer_layers", type=int, default=1,
+                        help="[wiltechs_moe only] Thought Q-Former depth. Default 1: at 2 layers "
+                             "the second layer's gates sat at their init while both FFN gates "
+                             "decayed to 0.000 over 37k LIBERO steps.")
     args = parser.parse_args()
 
     if args.list_versions:
@@ -1338,6 +1416,18 @@ if __name__ == "__main__":
         _v = getattr(args, _name)
         if int(_v ** 0.5) ** 2 != _v:
             parser.error(f"--{_name} must be a perfect square, got {_v}")
+
+    if args.model_type == "wiltechs_moe":
+        _total = args.num_experts * args.expert_num_layers
+        if _total > 36:
+            parser.error(f"--num_experts ({args.num_experts}) x --expert_num_layers "
+                         f"({args.expert_num_layers}) = {_total} > 36 (Qwen3-VL-4B layer "
+                         f"count). Reduce one or both.")
+        if _total < 36:
+            print(f"[warn] num_experts x expert_num_layers = {_total} < 36: capture layers "
+                  f"will be strided across 0..35 rather than tiling them, so the expert->VLM "
+                  f"band mapping will NOT match a 4x9 finetune. Keep the product identical "
+                  f"across pretrain and finetune.")
 
     kwargs = vars(args)
     kwargs.pop("list_versions", None)
