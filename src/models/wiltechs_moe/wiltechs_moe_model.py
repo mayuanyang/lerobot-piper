@@ -759,7 +759,14 @@ class WiltechsMoETransformer(nn.Module):
         loss = F.mse_loss(v_t, u_t, reduction="none")
         if self.config.action_dim_weights:
             dim_w = torch.tensor(self.config.action_dim_weights, device=loss.device, dtype=loss.dtype); loss = loss * dim_w[None, None, :]
-        H = loss.shape[1]; n_exec = self.config.n_action_steps; pos_w = torch.ones(H, device=loss.device, dtype=loss.dtype)
+        H = loss.shape[1]
+        # loss_exec_steps decouples the loss boundary from n_action_steps, which
+        # also controls how many actions inference executes per replan. See the
+        # config field: with both at 64 = horizon this slice was empty and
+        # future_steps_weight applied to nothing.
+        n_exec = int(getattr(self.config, "loss_exec_steps", 0) or self.config.n_action_steps)
+        n_exec = max(1, min(n_exec, H))
+        pos_w = torch.ones(H, device=loss.device, dtype=loss.dtype)
         pos_w[n_exec:] = self.config.future_steps_weight
         if self.config.pos_decay_lambda > 0.0:
             pos = torch.arange(H, device=loss.device, dtype=loss.dtype); pos_w = pos_w * torch.exp(-self.config.pos_decay_lambda * pos)

@@ -391,6 +391,8 @@ def train(
     thought_consistency_weight: float = 0.0,
     image_aug_translate: float = 0.0,
     image_aug_scale: float = 0.0,
+    loss_exec_steps: int = 0,
+    future_steps_weight: float = 0.3,
 ):
     """Train WiltechsMoE on one or more HOMOGENEOUS LeRobot datasets.
 
@@ -516,6 +518,25 @@ def train(
     horizon = 64
     n_action_steps = 64
 
+    # Report the temporal loss weighting explicitly. This block existed and was
+    # silently doing nothing: the loss read n_action_steps directly, and with
+    # n_action_steps == horizon the `pos_w[n_exec:]` slice was empty, so
+    # future_steps_weight applied to no timestep at all. Printing the resulting
+    # share of the first few steps makes that visible instead of inferable.
+    _n_exec = min(max(1, loss_exec_steps or n_action_steps), horizon)
+    _total_w = _n_exec + (horizon - _n_exec) * future_steps_weight
+    print(f"Loss horizon weighting: steps 0..{_n_exec - 1} at 1.0, "
+          f"{_n_exec}..{horizon - 1} at {future_steps_weight} "
+          f"(total weight {_total_w:.1f})")
+    for _k in (4, 8):
+        _share = min(_k, _n_exec) + max(0, _k - _n_exec) * future_steps_weight
+        print(f"  first {_k:>2} steps carry {_share / _total_w * 100:5.1f}% of the "
+              f"horizon weight")
+    if _n_exec >= horizon:
+        print("  NOTE: loss_exec_steps >= horizon, so future_steps_weight is inert "
+              "and every step is weighted equally. Pass --loss_exec_steps to "
+              "concentrate the gradient on the part an eval actually executes.")
+
     action_dim_weights = [1.0] * action_dim
     if lock_joint_index is not None and 0 <= lock_joint_index < action_dim:
         action_dim_weights[lock_joint_index] = 0.0
@@ -543,6 +564,8 @@ def train(
         robot_cnn_cameras=robot_cnn_camera_keys,
         action_dim_weights=action_dim_weights,
         pos_decay_lambda=0.0,
+        loss_exec_steps=loss_exec_steps,
+        future_steps_weight=future_steps_weight,
         contrastive_loss_weight=contrastive_loss_weight,
         contrastive_margin=contrastive_margin,
         contrastive_hard_negatives=contrastive_hard_negatives,
@@ -1137,6 +1160,19 @@ if __name__ == "__main__":
                              "position-invariance -- on a 256px LIBERO frame 0.03 is +-7.7px "
                              "against a ~19px ramekin-to-bowl separation. 0.03 restores the "
                              "pre-2026-08 behaviour.")
+    parser.add_argument("--loss_exec_steps", type=int, default=0,
+                        help="Horizon index where --future_steps_weight kicks in. 0 (default) "
+                             "= use n_action_steps, which the training script pins to the full "
+                             "horizon of 64 -- so the down-weighting has never actually applied "
+                             "and all 64 steps are equal. At 10Hz that is 6.4s predicted from "
+                             "one frame, most of it aleatoric, taking most of the gradient, "
+                             "while the ~4 steps an eval executes take 6.25%%. Set 8 to give "
+                             "those 4 steps ~16%%. UNTESTED: the far horizon is not executed "
+                             "but predicting it is a useful auxiliary task, so move this "
+                             "gradually rather than to an extreme.")
+    parser.add_argument("--future_steps_weight", type=float, default=0.3,
+                        help="Loss weight on horizon steps at or beyond --loss_exec_steps. "
+                             "Only has any effect once loss_exec_steps < horizon.")
     parser.add_argument("--image_aug_scale", type=float, default=0.0,
                         help="Random image scale jitter (+-this). Default 0, same reasoning as "
                              "--image_aug_translate. 0.05 restores the previous behaviour.")

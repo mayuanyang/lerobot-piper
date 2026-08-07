@@ -101,6 +101,23 @@ class WiltechsMoEConfig(PreTrainedConfig):
     action_dim_weights: list = field(default_factory=list)
     pos_decay_lambda: float = 0.1
     future_steps_weight: float = 0.3
+    # Horizon index where future_steps_weight starts. 0 = fall back to
+    # n_action_steps, which is what the loss used to read directly.
+    #
+    # That coupling made a knob silently inert: n_action_steps serves two
+    # unrelated purposes -- the loss boundary here, and how many actions the
+    # policy executes per replan at inference -- and train_wiltechs_moe.py set
+    # it to 64 to match `horizon`, so `pos_w[n_exec:]` was an EMPTY slice and
+    # future_steps_weight never applied to anything. With pos_decay_lambda at
+    # 0.0 that left the whole 64-step horizon exactly uniform.
+    #
+    # Why it matters: the LIBERO datasets are 10 Hz, so 64 steps is 6.4 s
+    # predicted from a single observation, against episodes capped at 150 steps.
+    # The far end of that chunk is dominated by aleatoric uncertainty -- no
+    # amount of visual grounding predicts where the gripper is three seconds out
+    # -- yet at uniform weighting it takes most of the gradient, while the ~4
+    # steps an eval actually executes take 6.25% of it.
+    loss_exec_steps: int = 0
 
     # -------- Training presets --------
     optimizer_lr: float = 1e-4
