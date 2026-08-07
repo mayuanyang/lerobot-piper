@@ -34,6 +34,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import math
 import argparse
 from pathlib import Path
 from typing import Optional
@@ -271,7 +272,6 @@ def _log_gradient_analysis(policy, step: int) -> None:
         ent = getattr(policy.model, "_last_router_entropy", None)
         if mw is not None and ent is not None:
             E = int(usage_cpu.numel())
-            import math
             print(f"  Router per-samp : max_w={mw:.3f} (uniform={1/E:.3f})   "
                   f"entropy={ent:.3f} (uniform={math.log(E):.3f})")
 
@@ -293,6 +293,23 @@ def _log_gradient_analysis(policy, step: int) -> None:
         ratio = f"   ratio: {t_rms / a_rms:.3f}" if a_rms else ""
         print(f"  Thought tok RMS : {t_rms:.4f}   action_emb RMS: {a_rms:.4f}{ratio}"
               if a_rms else f"  Thought tok RMS : {t_rms:.4f}")
+        # Does that magnitude carry information, or is it a learned constant?
+        # The Q-Former output is `queries` (a constant) plus gated corrections,
+        # so as the gates decay it collapses toward a big input-independent bias
+        # prepended to every expert sequence -- which the RMS line above cannot
+        # distinguish from a working thought pathway.
+        c_rms = getattr(policy.model, "_last_thought_const_rms", None)
+        v_rms = getattr(policy.model, "_last_thought_vary_rms", None)
+        q_rms = getattr(policy.model, "_last_thought_query_rms", None)
+        B_th = getattr(policy.model, "_last_thought_batch", None)
+        if c_rms is not None and v_rms is not None and t_rms:
+            # Ceiling is sqrt(1 - 1/B), not 1.0: the batch mean of B independent
+            # samples absorbs a 1/sqrt(B) share even when nothing is constant.
+            ceil = math.sqrt(max(0.0, 1.0 - 1.0 / B_th)) if B_th else 1.0
+            q_txt = f"   queries={q_rms:.4f}" if q_rms is not None else ""
+            print(f"  Thought input-dep: vary/total={v_rms / t_rms:.3f} "
+                  f"(0.0=learned constant, {ceil:.3f}=fully input-dependent at B={B_th})"
+                  f"   const={c_rms:.4f} vary={v_rms:.4f}{q_txt}")
 
     comps = getattr(policy.model, "_last_loss_components", None)
     if comps is not None:

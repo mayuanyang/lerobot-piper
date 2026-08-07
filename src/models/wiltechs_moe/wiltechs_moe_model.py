@@ -554,7 +554,36 @@ class WiltechsMoETransformer(nn.Module):
         # against _last_action_emb_rms: the expert's first RMSNorm renormalises
         # per token, so a tiny ratio does not mean "inert", but a ratio that
         # never moves off its init does.
-        if record: self._last_thought_rms = float(thoughts.detach().float().pow(2).mean().sqrt())
+        if record:
+            th = thoughts.detach().float()  # (B, K, dit_hidden)
+            self._last_thought_rms = float(th.pow(2).mean().sqrt())
+            # How much of that magnitude actually depends on the input.
+            #
+            # LatentQFormer computes x = queries + sum_l g_l0 * ca_o(attn) +
+            # g_l1 * ffn(...), where `queries` is a learned CONSTANT. Once the
+            # gates decay the output collapses toward that constant -- and a
+            # large constant prepended to every expert sequence looks exactly
+            # like a working thought pathway on the RMS line while carrying no
+            # scene information at all. RMS alone cannot tell the two apart.
+            #
+            # Split the batch into its input-independent and input-dependent
+            # parts. These are exactly orthogonal, so total^2 = const^2 + vary^2.
+            #
+            # Reference values for vary/total: 0.0 is a pure learned constant.
+            # A fully input-dependent signal does NOT reach 1.0 -- the batch mean
+            # of B independent samples still absorbs a 1/sqrt(B) share -- so the
+            # ceiling is sqrt(1 - 1/B), which the train script prints alongside.
+            B_th = th.shape[0]
+            if B_th > 1:
+                const = th.mean(dim=0, keepdim=True)
+                self._last_thought_const_rms = float(const.pow(2).mean().sqrt())
+                self._last_thought_vary_rms = float((th - const).pow(2).mean().sqrt())
+                self._last_thought_batch = B_th
+            # The learned queries on their own, for a direct read with no
+            # sampling bias: queries RMS close to the output RMS means the
+            # Q-Former blocks are barely moving their own inputs.
+            self._last_thought_query_rms = float(
+                self.thought_qformer.queries.detach().float().pow(2).mean().sqrt())
         return thoughts
 
     def _build_expert_input(self, batch, noisy_actions, robot_tokens, latents, thoughts=None):
