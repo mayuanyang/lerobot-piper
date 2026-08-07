@@ -379,6 +379,7 @@ def train(
     vision_dropout_anneal_steps: int = 0,
     robot_cnn_cameras: Optional[list] = None,
     robot_cnn_wrist_only: bool = False,
+    use_robot_cnn: bool = True,
     preprocess_in_workers: bool = False,
     router_temperature: float = 1.0,
     router_balance_weight: float = 0.1,
@@ -452,7 +453,18 @@ def train(
 
     # ── Resolve the RobotCNN camera list ────────────────────────────────
     robot_cnn_camera_keys: list[str] = []
-    if robot_cnn_cameras:
+    if not use_robot_cnn:
+        # No parameter SHAPE changes when this is off -- robot_visual_encoder
+        # becomes None, its keys are simply absent, and action_start_idx is
+        # derived from the built sequence rather than assumed. So a checkpoint
+        # trained WITH the CNN resumes cleanly without it, which makes this a
+        # cheap controlled test rather than a from-scratch run.
+        print("RobotCNN: DISABLED (--no_robot_cnn). The raw-pixel pathway that "
+              "bypasses the VLM is gone; scene information can now only reach the "
+              "experts through the VLM KV or the thought tokens. Watch the "
+              "'Action-> x-attn' vision share: if it climbs, the CNN was the "
+              "shortcut that made VLM vision redundant.")
+    elif robot_cnn_cameras:
         missing = [c for c in robot_cnn_cameras if c not in camera_keys]
         if missing:
             raise ValueError(
@@ -467,7 +479,9 @@ def train(
             raise ValueError(
                 f"--robot_cnn_wrist_only: no wrist-like camera among {camera_keys}. "
                 f"Pass --robot_cnn_cameras <key> explicitly.")
-    if robot_cnn_camera_keys:
+    if not use_robot_cnn:
+        pass  # already reported above
+    elif robot_cnn_camera_keys:
         print(f"RobotCNN cameras (wrist-specialized): {robot_cnn_camera_keys}  "
               f"(VLM still sees all {len(camera_keys)})")
     else:
@@ -525,6 +539,7 @@ def train(
         dit_hidden_size=dit_hidden_size,
         num_cameras=len(camera_keys),
         cameras_for_vision_state_concat=camera_keys,
+        use_robot_cnn=use_robot_cnn,
         robot_cnn_cameras=robot_cnn_camera_keys,
         action_dim_weights=action_dim_weights,
         pos_decay_lambda=0.0,
@@ -1079,6 +1094,14 @@ if __name__ == "__main__":
                         help="Explicit camera key(s) the trainable RobotCNN ingests.")
     parser.add_argument("--robot_cnn_wrist_only", action="store_true",
                         help="Restrict the RobotCNN to the auto-detected WRIST/gripper camera.")
+    parser.add_argument("--no_robot_cnn", dest="use_robot_cnn", action="store_false", default=True,
+                        help="Remove the RobotCNN entirely. It is a raw-pixel pathway that "
+                             "BYPASSES the VLM, so it can supply close-range visual servoing "
+                             "for any task -- which makes the VLM's own vision redundant no "
+                             "matter how many tasks are in the training set. Disabling it "
+                             "changes no parameter shape (the encoder's keys are simply "
+                             "absent), so an existing checkpoint resumes cleanly and this is a "
+                             "controlled ablation rather than a from-scratch run.")
     parser.add_argument("--noise_temporal_correlation", type=float, default=0.0,
                         help="AR(1) coefficient correlating the flow-matching source noise "
                              "along the action horizon (0=white; ~0.9=temporally smooth).")
@@ -1122,6 +1145,11 @@ if __name__ == "__main__":
     _v = args.robot_encoder_tokens
     if int(_v ** 0.5) ** 2 != _v:
         parser.error(f"--robot_encoder_tokens must be a perfect square, got {_v}")
+    if not args.use_robot_cnn and (args.robot_cnn_cameras or args.robot_cnn_wrist_only):
+        # Silently-inert flags are exactly how the vision_dropout_prob confusion
+        # happened: a setting that reads as active while doing nothing.
+        parser.error("--no_robot_cnn removes the RobotCNN, so --robot_cnn_cameras / "
+                     "--robot_cnn_wrist_only have nothing to configure. Drop one side.")
     if args.lock_joint_index is not None and args.lock_joint_index < 0:
         args.lock_joint_index = None
 
