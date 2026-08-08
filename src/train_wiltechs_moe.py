@@ -457,6 +457,21 @@ def train(
               f"other cameras keep the processor default. "
               f"Confirm with the '[wiltechs_moe] vision grid ...' lines below.")
 
+    # ── Sequence-shape constants ─────────────────────────────────────────
+    # Defined here rather than with the other training parameters below: the
+    # RobotCNN report needs `horizon` to print the DiT sequence length, and a
+    # name assigned anywhere in a function is local to the WHOLE function, so
+    # reading it before the assignment is an UnboundLocalError, not a fallback.
+    obs = 2
+    horizon = 64
+    # Inference-only: how many steps the action queue pops before replanning.
+    # It no longer touches the loss (see compute_loss), so it is safe to set to
+    # whatever the eval actually uses. Stored in the checkpoint config, and an
+    # eval that forgets to override it inherits THIS value -- at 10Hz, 64 means
+    # 6.4s of open-loop execution from a single observation, which is fatal for
+    # grasp precision. Default to the value evals really run at.
+    n_action_steps = int(n_action_steps)
+
     # ── Resolve the RobotCNN camera list ────────────────────────────────
     robot_cnn_camera_keys: list[str] = []
     if not use_robot_cnn:
@@ -562,15 +577,7 @@ def train(
         print(f"Aggregated normalization stats across {len(dataset_ids)} datasets.")
 
     # ── Training parameters ──────────────────────────────────────────────
-    obs = 2
-    horizon = 64
-    # Inference-only: how many steps the action queue pops before replanning.
-    # It no longer touches the loss (see compute_loss), so it is safe to set to
-    # whatever the eval actually uses. Stored in the checkpoint config, and an
-    # eval that forgets to override it inherits THIS value -- at 10Hz, 64 means
-    # 6.4s of open-loop execution from a single observation, which is fatal for
-    # grasp precision. Default to the value evals really run at.
-    n_action_steps = int(n_action_steps)
+    # obs / horizon / n_action_steps are set above, before the RobotCNN report.
 
     # Report the temporal loss weighting explicitly. This block existed and was
     # silently doing nothing: the loss read n_action_steps directly, and with
