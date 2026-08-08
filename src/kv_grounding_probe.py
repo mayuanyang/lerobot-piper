@@ -55,12 +55,27 @@ from __future__ import annotations
 import argparse
 
 
-def ridge_cv(X, Y, alphas, folds=5, seed=0):
-    """Leave-fold-out ridge. Returns (best_alpha, cv_r2, per-dim cv_r2).
+def ridge_cv(X, Y, alphas, folds=5, seed=0, pca_dim=0):
+    """Leave-fold-out ridge. Returns (best_alpha, cv_r2, per-dim cv_r2, all_r2).
 
     Closed form, numpy only -- no sklearn dependency. R^2 is computed against a
     predict-the-training-mean baseline, so 0 means "no better than guessing the
     average layout" and negative means actively worse.
+
+    pca_dim > 0 projects each TRAINING fold onto its own top-k principal
+    components and maps the held-out fold through the same basis. Without it the
+    fit runs at d=12800 against n=50 -- 256 features per sample -- and the dual
+    solve is so underdetermined that bf16 nondeterminism in the VLM forward
+    alone moved a measured TARGET R^2 from 0.164 to 0.392 between two otherwise
+    identical runs (the layouts and the fold assignment are both deterministic,
+    so the features were the only thing that could differ). Fitting the basis
+    inside the fold matters: PCA on all n first would let the held-out samples
+    inform the projection and inflate every score.
+
+    all_r2 is the score at EVERY alpha, because `best` is chosen by maximising
+    over the same folds it is scored on -- that is a nested-CV violation and
+    biases the reported number upward. A flat curve across alphas means the
+    selection was arbitrary and the headline number should not be trusted.
     """
     import numpy as np
 
@@ -69,6 +84,7 @@ def ridge_cv(X, Y, alphas, folds=5, seed=0):
     order = rng.permutation(n)
     cuts = np.array_split(order, folds)
     best = (None, -1e9, None)
+    all_r2 = {}
     for a in alphas:
         preds = np.zeros_like(Y)
         for f in range(folds):
@@ -77,20 +93,28 @@ def ridge_cv(X, Y, alphas, folds=5, seed=0):
             Xtr, Ytr = X[tr], Y[tr]
             mu, my = Xtr.mean(0, keepdims=True), Ytr.mean(0, keepdims=True)
             Xc, Yc = Xtr - mu, Ytr - my
+            Xte = X[te] - mu
+            if pca_dim > 0:
+                k = min(pca_dim, Xc.shape[0] - 1, Xc.shape[1])
+                # Right singular vectors of the centred training fold only.
+                _, _, Vt = np.linalg.svd(Xc, full_matrices=False)
+                P = Vt[:k].T
+                Xc, Xte = Xc @ P, Xte @ P
             d = Xc.shape[1]
             if d <= Xc.shape[0]:
                 W = np.linalg.solve(Xc.T @ Xc + a * np.eye(d), Xc.T @ Yc)
             else:  # dual form: cheaper and identical when features outnumber samples
                 K = Xc @ Xc.T
                 W = Xc.T @ np.linalg.solve(K + a * np.eye(K.shape[0]), Yc)
-            preds[te] = (X[te] - mu) @ W + my
+            preds[te] = Xte @ W + my
         ss_res = ((Y - preds) ** 2).sum(0)
         ss_tot = ((Y - Y.mean(0, keepdims=True)) ** 2).sum(0)
         r2_dim = 1.0 - ss_res / np.maximum(ss_tot, 1e-12)
         r2 = float(r2_dim.mean())
+        all_r2[a] = r2
         if r2 > best[1]:
             best = (a, r2, r2_dim)
-    return best
+    return best[0], best[1], best[2], all_r2
 
 
 def main() -> None:
@@ -108,6 +132,16 @@ def main() -> None:
     ap.add_argument("--layer", type=int, default=-1,
                     help="LM layer to read hidden states from. -1 = last. Use one of "
                          "the policy's vlm_capture_layers to match what an expert sees.")
+    ap.add_argument("--pca_dim", type=int, default=0,
+                    help="Project onto this many principal components, fitted INSIDE each "
+                         "training fold (0 = off, the default). Checked on synthetic data at "
+                         "the same d=12800 / n=50 and in the same weak-signal regime: it is "
+                         "very nearly a no-op (0.246 -> 0.243) and does NOT reduce run-to-run "
+                         "spread, so it is kept only as a robustness cross-check, not as a "
+                         "fix. The 0.164-vs-0.392 swing was the layouts changing between runs.")
+    ap.add_argument("--repeats", type=int, default=10,
+                    help="Refit under this many different CV fold assignments and report "
+                         "mean +- std. A single number here is not interpretable.")
     ap.add_argument("--target_body", default=None)
     ap.add_argument("--distractor_body", default=None)
     ap.add_argument("--list_bodies", action="store_true",
@@ -144,6 +178,22 @@ def main() -> None:
     import torch
     from PIL import Image
     from lerobot.envs.libero import LiberoEnv, _get_suite
+
+    # Stock LiberoEnv.reset() writes the init state and THEN calls the
+    # underlying reset(), which re-runs the placement initialiser and discards
+    # it -- and the probe calls reset() with no seed, so the layouts are fresh
+    # random sampler draws on every run, not the canonical 50. That is what made
+    # two identical invocations report TARGET R^2 0.164 and 0.392: different
+    # data, not a noisy estimator. init_from_seed stays off because the probe
+    # sets _init_state_id itself.
+    try:
+        from libero_env_fixed import patch_lerobot_libero
+        fixed = patch_lerobot_libero(enable=True, init_from_seed=False)
+        print(f"[probe] LIBERO init-state ordering: {'FIXED' if fixed else 'STOCK'}")
+    except ImportError:
+        print("!! libero_env_fixed not importable -- layouts will come from the "
+              "placement sampler and DIFFER BETWEEN RUNS. Every number below is "
+              "then a sample from a different dataset. Fix the import first.")
 
     suite = _get_suite(args.suite)
     env = LiberoEnv(task_suite=suite, task_id=args.task_id, task_suite_name=args.suite,
@@ -416,6 +466,12 @@ def main() -> None:
     print(f"\ncollected {len(frames)} layouts, frame {frames[0].size}")
     print(f"  target     xyz std: {np.round(spread_t, 4)}")
     print(f"  distractor xyz std: {np.round(pos_d.std(0), 4)}")
+    # Fingerprint of the ground-truth layouts. Two runs of the same command MUST
+    # print the same value; if they do not, the init-state ordering is not
+    # actually fixed and the runs are fitting different datasets, which is not
+    # visible anywhere else in this output.
+    print(f"  layout fingerprint: {float(np.abs(pos_t).sum() + np.abs(pos_d).sum()):.6f}"
+          f"   (identical across runs = same layouts)")
     if spread_t.max() < 1e-3:
         print("  !! the target never moves across initial states. A position probe has "
               "nothing to fit -- regression R^2 will be meaningless. Check that "
@@ -492,16 +548,48 @@ def main() -> None:
     # 3. Fit ------------------------------------------------------------------
     alphas = [1e1, 1e2, 1e3, 1e4, 1e5, 1e6]
     rng = np.random.default_rng(0)
+    reps = max(1, int(args.repeats))
+    print(f"\nfit: d={X.shape[1]} n={X.shape[0]}"
+          + (f", PCA to {args.pca_dim} inside each training fold" if args.pca_dim
+             else " (NO PCA -- d/n is "
+                  f"{X.shape[1] / X.shape[0]:.0f}:1, expect large run-to-run swings)")
+          + f", {reps} CV seed(s)")
+
+    def score(Y, label):
+        """Same probe under `reps` different fold assignments -> mean +- std."""
+        r2s, alist, curves = [], [], []
+        for s in range(reps):
+            a, r2, _, curve = ridge_cv(X, Y, alphas, seed=s, pca_dim=args.pca_dim)
+            r2s.append(r2); alist.append(a); curves.append(curve)
+        r2s = np.array(r2s)
+        mean_curve = {a: float(np.mean([c[a] for c in curves])) for a in alphas}
+        return label, float(r2s.mean()), float(r2s.std()), alist, mean_curve
+
+    rows = [
+        score(pos_t, "TARGET bowl xyz"),
+        score(pos_d, "DISTRACTOR bowl xyz"),
+        score(pos_t[rng.permutation(len(pos_t))], "TARGET, labels shuffled"),
+    ]
     print("\n" + "=" * 68)
-    print(f"{'probe':<28}{'best alpha':>12}{'CV R^2':>10}")
+    print(f"{'probe':<28}{'CV R^2':>16}{'best alpha':>14}")
     print("=" * 68)
-    a1, r1, _ = ridge_cv(X, pos_t, alphas)
-    print(f"{'TARGET bowl xyz':<28}{a1:>12.0e}{r1:>10.3f}")
-    a2, r2, _ = ridge_cv(X, pos_d, alphas)
-    print(f"{'DISTRACTOR bowl xyz':<28}{a2:>12.0e}{r2:>10.3f}")
-    a3, r3, _ = ridge_cv(X, pos_t[rng.permutation(len(pos_t))], alphas)
-    print(f"{'TARGET, labels shuffled':<28}{a3:>12.0e}{r3:>10.3f}   <- noise floor")
+    for i, (label, m, sd, alist, _) in enumerate(rows):
+        amode = max(set(alist), key=alist.count)
+        tail = "   <- noise floor" if i == 2 else ""
+        print(f"{label:<28}{m:>9.3f} +-{sd:5.3f}{amode:>14.0e}{tail}")
     print("=" * 68)
+    # The alpha above is picked by maximising over the SAME folds it is scored
+    # on, so the headline is biased upward. A flat curve here means that choice
+    # was arbitrary and the number should not carry an argument on its own.
+    print(f"\nR^2 vs alpha (mean over {reps} seeds) -- flat means the selection was arbitrary")
+    print(f"  {'alpha':<10}" + "".join(f"{a:>10.0e}" for a in alphas))
+    for label, _, _, _, curve in rows:
+        print(f"  {label.split(',')[0].split(' ')[0][:9]:<10}"
+              + "".join(f"{curve[a]:>10.3f}" for a in alphas))
+    if reps > 1 and rows[0][2] > abs(rows[0][1] - rows[2][1]) / 2:
+        print(f"\n  !! TARGET spread (+-{rows[0][2]:.3f}) is large next to its margin over "
+              f"the noise floor ({rows[0][1] - rows[2][1]:+.3f}). Raise --repeats, lower "
+              f"--pca_dim, or treat this layer as undecided.")
 
     print("\nHOW TO READ THIS")
     print("  target >> shuffled  AND  target >> distractor")
