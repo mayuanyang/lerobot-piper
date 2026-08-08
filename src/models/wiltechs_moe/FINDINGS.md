@@ -448,3 +448,100 @@ is established as causal, but they are the leading candidates:
 The Q-Former collapse is not weight decay — at `wd=1e-6` the cumulative shrink
 over 12k steps is 0.9999988, while the observed weight norm went 106.15 → 43.57
 (0.41×). The task loss is switching the module off. **[measured]**
+
+## 9. The grounding probe — and three artifacts that each reversed its sign
+
+`kv_grounding_probe.py` fits a ridge from the frozen VLM's vision-position
+hidden states to a bowl's xyz across LIBERO's 50 canonical layouts, and fits the
+same probe against the distractor bowl as a control. It answers the question a
+10-hour run cannot: is the target's position *in* the representation the DiT
+reads, or is the policy being asked to infer something that is not there?
+
+**[measured, task 0, layer 8, after all three fixes below]**
+
+| probe | CV R² | R² x | R² y | err x | err y |
+|---|---|---|---|---|---|
+| TARGET bowl | 0.366 | 0.52 | 0.22 | 8.4 mm | 8.4 mm |
+| DISTRACTOR bowl | 0.419 | 0.35 | 0.49 | 6.4 mm | 6.5 mm |
+| shuffled labels | −0.051 | −0.04 | −0.06 | 12.4 mm | 9.8 mm |
+
+Normalised by each object's own travel (target moves 12.1/9.5 mm, distractor
+8.0/9.0 mm), the errors are **0.79 vs 0.76** — the same to 0.026, where 1.00 is
+the predict-the-mean baseline.
+
+**Conclusion: the representation encodes where the bowls ARE, to ~8 mm against a
+~150 mm bowl separation, but it does NOT encode which one the instruction
+selects.** Three runs at layer 8 put the target at 0.434 / 0.463 / 0.366 and the
+distractor at 0.379 / 0.366 / 0.419 — the *ordering flips between runs*, which
+is what no real effect looks like.
+
+Two consequences follow. Under `text_first=True` the language positions precede
+the images under the causal mask, so they carry zero scene content; if the
+vision positions also do not privilege the target, then nothing in the VLM
+output identifies it and the DiT must derive the relation itself from the
+encoded positions of all objects. And the run-to-run spread (0.097 on the
+aggregate) is 2–3× the ± the script prints, because that ± covers only fold
+reassignment, not the bf16 forward. **Do not read any R² gap below ~0.1.**
+
+### The artifacts
+
+Each was found only because a result looked wrong, and each on its own was
+enough to reverse the conclusion. All three are now guarded in the script.
+
+**1. A zero-variance label dimension scored +1.0.** `R² = 1 − ss_res/max(ss_tot,
+1e-12)`. Both bowls rest on the table, so z barely varies — but *unequally*:
+the distractor's z std is exactly 0.000 and the target's is 1e-4. For the
+distractor the ridge predicts the constant exactly, giving `1 − 0/1e-12 = +1.0`
+folded into the 3-dim mean; for the target z scored −0.37. On synthetic data
+with **identical** x,y signal (0.257 each) that alone produced 0.505 vs 0.149 —
+against the 0.590 vs 0.166 then being measured. Every target-vs-distractor
+number the script printed before the dim mask was reading this.
+
+**2. The layouts were resampled on every run.** The probe built the stock
+`lerobot.envs.libero.LiberoEnv`, whose `reset()` writes the init state and then
+calls the underlying `reset()`, which re-runs the placement initialiser and
+discards it — and the probe passes no seed. Two identical invocations reported
+0.164 and 0.392 because they fitted **different datasets**. The script now
+applies `libero_env_fixed.patch_lerobot_libero` and prints a fingerprint of the
+ground-truth positions; two runs of one command must print the same value.
+
+Before finding this I had diagnosed the swing as estimator noise at d/n = 256:1
+and proposed fold-internal PCA as the fix. Synthetic data at the same d, n and
+signal strength said otherwise: PCA moved R² 0.246 → 0.243 and left the spread
+unchanged under both feature perturbation (0.000 either way) and fold
+reassignment (±0.017 vs ±0.016). **The proposed fix addressed nothing.** It is
+kept as `--pca_dim`, defaulting to off.
+
+**3. R² rewards the object that moves further.** `R² = 1 − MSE/Var`, so against
+a *fixed* feature precision — an 8×8 grid quantises position to one token per
+32×32 source px regardless of travel — the object with more travel scores higher
+for the same absolute error. The target's x std is 1.52× the distractor's and
+its x R² was 0.56 vs 0.29; on y, where the two move within 5% of each other, it
+was 0.37 vs 0.44 and the *distractor* won. Modelling a fixed 4 mm precision
+reproduces this axis by axis: 0.84 vs 0.66 for objects travelling 12.1 vs 8.0
+mm, at RMSE 4.47 vs 4.27 mm.
+
+A first synthetic check missed it by scaling the signal proportionally, which
+makes R² exactly scale-invariant (0.579 both) — the confound needs an
+*absolute* error floor to appear. The script now reports per-dimension RMSE and
+normalises each object's error by its own travel.
+
+### Method note
+
+Three independent artifacts, each individually sign-reversing, in one ~50-line
+diagnostic. Two were caught by a result that did not match any anticipated case
+and one by a synthetic check of a proposed fix. **Before a probe result changes
+a training decision, build the null on synthetic data with the same n, d and
+effect size** — that is what separated the real confound from the invented one
+here, and it costs minutes.
+
+### Open
+
+- `--instruction ""` at layer 8. If the numbers do not move, the vision
+  positions are not language-conditioned at all and `text_first`'s premise is
+  not being realised. Note `--instruction ""` was inert until 2026-08-07: the
+  argument was read with `or`, so the empty string fell back to the task's own
+  language.
+- If confirmed, the fork is `box_encoder.py` (resolve the relation offline, hand
+  the DiT coordinates) versus `--text_last` (put language after the images so
+  the language positions can see the scene and the selection can happen there).

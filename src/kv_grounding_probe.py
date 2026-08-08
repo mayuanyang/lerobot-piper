@@ -219,8 +219,17 @@ def main() -> None:
     suite = _get_suite(args.suite)
     env = LiberoEnv(task_suite=suite, task_id=args.task_id, task_suite_name=args.suite,
                     obs_type="pixels_agent_pos", init_states=True, episode_index=0)
-    task_text = args.instruction or getattr(env, "task_description", "")
-    print(f"task: {task_text!r}")
+    # `or` would treat --instruction "" as "not given" and silently fall back to
+    # the task's own language, which is exactly the ablation that matters: an
+    # empty instruction is the control for whether the vision positions are
+    # language-conditioned at all. Test for None.
+    task_text = (args.instruction if args.instruction is not None
+                 else getattr(env, "task_description", ""))
+    if args.instruction is not None:
+        print(f"task language OVERRIDDEN: {task_text!r} "
+              f"(the env's own is {getattr(env, 'task_description', '')!r})")
+    else:
+        print(f"task: {task_text!r}")
 
     # Reuse the walker from rl_staged_reward rather than guessing attribute
     # paths: it descends LiberoEnv -> OffScreenRenderEnv -> the robosuite
