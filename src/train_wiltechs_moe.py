@@ -251,6 +251,22 @@ def _log_gradient_analysis(policy, step: int) -> None:
         else:
             print(f"  {label:14s} - no grad")
 
+    # Robot CNN grid positional encoding. The gate is a single scalar starting
+    # at exactly 0, so "pos share" is 0.0% at init by construction and any
+    # nonzero value is the model actively choosing to use grid position. If it
+    # stays flat near zero while --robot_cnn_fine_tokens is raised, the extra
+    # tokens are resolution the DiT cannot localise and the sequence cost is
+    # being paid for nothing.
+    _gate = getattr(policy.model, "robot_pos_gate", None)
+    if _gate is not None:
+        _g = float(_gate.detach())
+        _gg = float(_gate.grad.abs().mean()) if _gate.grad is not None else float("nan")
+        _prms = getattr(policy.model, "_last_robot_pos_rms", 0.0)
+        _trms = getattr(policy.model, "_last_robot_tok_rms", 0.0)
+        _share = (_prms / _trms * 100.0) if _trms else 0.0
+        print(f"  Robot pos gate  : gate={_g:+.5f}  grad={_gg:.2e}   "
+              f"pos RMS {_prms:.4f} / token RMS {_trms:.4f} = {_share:.1f}% of magnitude")
+
     # MoE router usage — show expert load balancing
     usage = getattr(policy.model, "_last_router_usage", None)
     if usage is not None:

@@ -567,6 +567,7 @@ class WiltechsMoETransformer(nn.Module):
         toks_list = []; cnn_cams = getattr(self.config, "robot_cnn_cameras", None) or self.config.cameras_for_vision_state_concat
         fine_cams = set(getattr(self.config, "robot_cnn_fine_cameras", None) or [])
         fine_tok = int(getattr(self.config, "robot_cnn_fine_tokens", 0) or 0)
+        pos_sq = 0.0; pos_n = 0
         for cam_key in cnn_cams:
             if cam_key not in batch: continue
             img = batch[cam_key]
@@ -577,10 +578,20 @@ class WiltechsMoETransformer(nn.Module):
             n_tok = fine_tok if (fine_tok > 0 and cam_key in fine_cams) else None
             tk = self.robot_visual_encoder(img.float(), out_tokens=n_tok)
             pe = self._robot_grid_pos_emb(tk.shape[1], tk.shape[-1], tk.device, tk.dtype)
-            if pe is not None: tk = tk + self.robot_pos_gate.to(tk.dtype) * pe
+            if pe is not None:
+                contrib = self.robot_pos_gate.to(tk.dtype) * pe
+                tk = tk + contrib
+                pos_sq += float(contrib.detach().float().pow(2).sum()); pos_n += contrib.numel()
             toks_list.append(tk)
         if not toks_list: return None
         toks = torch.cat(toks_list, dim=1)
+        # How much of a robot token's magnitude is POSITION rather than content.
+        # Exactly 0 at init by construction (the gate starts at zero), so a value
+        # stuck near 0 says the DiT found no use for knowing where in the grid a
+        # token came from -- which would mean a denser grid is buying resolution
+        # the model cannot place, and --robot_cnn_fine_tokens is wasted sequence.
+        self._last_robot_tok_rms = float(toks.detach().float().pow(2).mean().sqrt())
+        self._last_robot_pos_rms = float((pos_sq / pos_n) ** 0.5) if pos_n else 0.0
         vp = float(getattr(self.config, "vision_dropout_prob", 0.0)) if self.training else 0.0
         if vp > 0:
             B, R, _ = toks.shape; keep = torch.rand(B, R, device=toks.device) > vp; toks = toks * keep.unsqueeze(-1).to(toks.dtype)
