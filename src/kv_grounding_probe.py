@@ -644,11 +644,33 @@ def main() -> None:
           f"distractor {np.round(rd * 1000, 1)}")
     print(f"object motion,  mm   target {np.round(sd_t * 1000, 1)}   "
           f"distractor {np.round(sd_d * 1000, 1)}")
-    gap = float(np.abs(rt - rd).max() * 1000)
-    if gap < 1.0:
-        print(f"  -> errors agree to {gap:.2f} mm. The representation localises BOTH "
-              f"bowls equally well; any R^2 margin between them is the variance "
-              f"denominator, NOT the instruction selecting a target.")
+    # Normalise each object's error by its OWN travel. That is the comparison an
+    # absolute millimetre threshold gets wrong: the two bowls do not move the
+    # same distance, so equal accuracy shows up as unequal millimetres. A ratio
+    # of 1.0 is the shuffled baseline (predict the mean, RMSE = the label's own
+    # std), and the shuffled row above should sit there as a self-check.
+    nt, nd = rt / np.maximum(sd_t, 1e-9), rd / np.maximum(sd_d, 1e-9)
+    print(f"error / motion       target {np.round(nt, 2)}   distractor "
+          f"{np.round(nd, 2)}   (1.00 = no better than the mean)")
+    rel = abs(float(nt.mean()) - float(nd.mean()))
+    if min(float(nt.mean()), float(nd.mean())) > 0.95:
+        # Both at the predict-the-mean baseline. "Equally well" would be a
+        # nonsense reading of equally-not-at-all.
+        print("  -> NEITHER object beats the predict-the-mean baseline. Nothing is "
+              "linearly readable here; check --layer and --vision_input_size before "
+              "drawing any target-vs-distractor conclusion.")
+    elif rel < 0.10:
+        print(f"  -> the two agree to {rel:.3f} once normalised. The representation "
+              f"localises BOTH bowls equally well, so it encodes where the bowls are "
+              f"but NOT which one the instruction selects. Any R^2 margin between "
+              f"them is the variance denominator.")
+    elif float(nt.mean()) < float(nd.mean()):
+        print(f"  -> the target is localised {rel:.3f} better than the distractor "
+              f"once normalised: evidence the instruction is selecting it.")
+    else:
+        print(f"  -> the DISTRACTOR is localised {rel:.3f} better once normalised. "
+              f"Whatever the representation is doing, it is not privileging the "
+              f"instruction's target.")
     # The alpha above is picked by maximising over the SAME folds it is scored
     # on, so the headline is biased upward. A flat curve here means that choice
     # was arbitrary and the number should not carry an argument on its own.
