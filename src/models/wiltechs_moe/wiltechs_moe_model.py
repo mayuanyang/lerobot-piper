@@ -113,9 +113,15 @@ class ExpertDecoder(nn.Module):
         # Diagnostic hook, set as an ATTRIBUTE rather than a forward kwarg so
         # the torch.utils.checkpoint call site needs no signature change. Called
         # once with (x, layer, kv) at the input to the FINAL layer -- the same
-        # measurement point WiltechsVLA uses. Under use_reentrant=False the
-        # forward runs normally before any backward recompute, and the caller
-        # disarms after one capture, so the recompute never re-fires it.
+        # measurement point WiltechsVLA uses.
+        #
+        # MUST be None during any forward that builds an autograd graph under
+        # gradient checkpointing. Arming it for the real forward and disarming
+        # right after makes the backward RECOMPUTE take the other branch of the
+        # `i == last` test below, so it saves a different number of tensors and
+        # torch raises CheckpointError with every saved tensor shifted by one.
+        # The caller therefore probes in a separate no_grad pass and leaves this
+        # None for the graph-building call -- see _run_moe_dit.
         self._capture = None
     def forward(self, x, t_emb, expert_kv_cache, vlm_kv_pad_mask, self_attn_mask):
         last = len(self.layers) - 1
@@ -725,27 +731,42 @@ class WiltechsMoETransformer(nn.Module):
         for e, expert in enumerate(self.experts):
             expert_kv = [kv_cache[idx] for idx in self.expert_kv_blocks[e]]; x = dit_seq
             if capture:
+                # Probe in a SEPARATE no_grad pass, never during the forward that
+                # builds the graph. Arming _capture for the real forward and
+                # clearing it afterwards made the checkpoint recompute take the
+                # other branch in MoEExpert.forward, so it saved one fewer tensor
+                # and torch aborted the backward with every saved tensor shifted
+                # by one. The extra pass costs one grad-free expert forward on
+                # the ~1-in-progress_update_freq steps that capture.
                 def _cap(xin, layer, kv):
                     per_expert_xattn.append(cross_attention_mass(
                         layer, xin, t_emb, kv, vlm_kv_pad_mask, action_start_idx,
                         noisy_actions.shape[1], vis_mask))
                 expert._capture = _cap
+                with torch.no_grad():
+                    expert(x, t_emb=t_emb, expert_kv_cache=expert_kv,
+                           vlm_kv_pad_mask=vlm_kv_pad_mask, self_attn_mask=causal_mask)
+                expert._capture = None
+                # The probe just populated the autocast weight cache with
+                # GRAD-LESS bf16 casts of this expert's weights. Clear it BEFORE
+                # the real forward so those weights re-cast with grad tracking --
+                # the old code cleared only after every expert had run, by which
+                # point they had already consumed the grad-less casts.
+                torch.clear_autocast_cache()
             if self.gradient_checkpointing and self.training:
                 x = torch.utils.checkpoint.checkpoint(expert, x, t_emb, expert_kv, vlm_kv_pad_mask, causal_mask, use_reentrant=False)
             else:
                 x = expert(x, t_emb=t_emb, expert_kv_cache=expert_kv, vlm_kv_pad_mask=vlm_kv_pad_mask, self_attn_mask=causal_mask)
-            expert._capture = None
             expert_outputs.append(self.action_out_proj(self.final_norm(x[:, action_start_idx:])))
         stacked = torch.stack(expert_outputs, dim=1)
         if capture:
             self._capture_attention_stats = False
             self._last_cross_attention_stats = _merge_xattn(
                 per_expert_xattn, usage.detach().float().tolist())
-            # The no_grad capture above populated the autocast weight cache with
-            # GRAD-LESS bf16 casts of each expert's final ca_q / adaLN weights.
-            # Clear it so the real forward re-casts them WITH grad tracking --
-            # otherwise those weights silently get no gradient on capture steps.
-            torch.clear_autocast_cache()
+            # NOTE: the autocast cache is now cleared per-expert, immediately
+            # after each probe and BEFORE that expert's real forward. Clearing
+            # here as well would be too late to matter -- by this point every
+            # expert has already run.
         v_t = (weights.unsqueeze(-1).unsqueeze(-1) * stacked).sum(dim=1)
         # record=False for the contrastive negative's forward: it runs AFTER
         # this one and would otherwise overwrite every router statistic, so the
