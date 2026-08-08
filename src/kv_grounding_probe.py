@@ -575,12 +575,23 @@ def main() -> None:
     DIM_MIN_STD = 1e-3
     keep = (pos_t.std(0) > DIM_MIN_STD) & (pos_d.std(0) > DIM_MIN_STD)
     names = np.array(["x", "y", "z"])
-    print(f"\nscoring dims {list(names[keep])} "
-          f"(std > {DIM_MIN_STD}); dropped {list(names[~keep])} "
+    print(f"\nscoring dims {[str(s) for s in names[keep]]} "
+          f"(std > {DIM_MIN_STD}); dropped {[str(s) for s in names[~keep]]} "
           f"-- target std {np.round(pos_t.std(0), 5)}, "
           f"distractor std {np.round(pos_d.std(0), 5)}")
     if not keep.any():
         raise SystemExit("no label dimension varies enough to probe")
+    # A target that MOVES more is easier to regress against a fixed feature
+    # noise floor -- at an 8x8 grid one token covers 32x32 source pixels, so
+    # displacement below that quantisation is unreadable regardless of what the
+    # representation encodes. Flag it, because it is a live alternative
+    # explanation for any target-over-distractor margin.
+    ratio = (pos_t.std(0)[keep] / np.maximum(pos_d.std(0)[keep], 1e-9))
+    if ratio.max() > 1.25 or ratio.min() < 0.8:
+        print(f"  note: the two objects do not move equally "
+              f"(target/distractor std ratio {np.round(ratio, 2)}). The one that "
+              f"moves more is easier to fit, so read a small margin between them "
+              f"as inconclusive.")
 
     def score(Y, label):
         """Same probe under `reps` different fold assignments -> mean +- std."""
@@ -615,7 +626,8 @@ def main() -> None:
     # was arbitrary and the number should not carry an argument on its own.
     print(f"\nR^2 vs alpha (mean over {reps} seeds) -- flat means the selection was arbitrary")
     print(f"  {'alpha':<10}" + "".join(f"{a:>10.0e}" for a in alphas))
-    for label, _, _, _, curve in rows:
+    for row in rows:
+        label, curve = row[0], row[4]
         print(f"  {label.split(',')[0].split(' ')[0][:9]:<10}"
               + "".join(f"{curve[a]:>10.3f}" for a in alphas))
     if reps > 1 and rows[0][2] > abs(rows[0][1] - rows[2][1]) / 2:
