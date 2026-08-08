@@ -55,12 +55,22 @@ from __future__ import annotations
 import argparse
 
 
-def ridge_cv(X, Y, alphas, folds=5, seed=0, pca_dim=0):
+def ridge_cv(X, Y, alphas, folds=5, seed=0, pca_dim=0, dim_mask=None):
     """Leave-fold-out ridge. Returns (best_alpha, cv_r2, per-dim cv_r2, all_r2).
 
     Closed form, numpy only -- no sklearn dependency. R^2 is computed against a
     predict-the-training-mean baseline, so 0 means "no better than guessing the
     average layout" and negative means actively worse.
+
+    dim_mask selects which label dimensions enter the reported aggregate, and it
+    is not optional in practice. A dimension with ZERO variance gets ss_tot = 0,
+    which the epsilon clamp turns into R^2 = 1 - 0/1e-12 = +1.0 -- a free point
+    for predicting a constant. In libero_spatial the distractor bowl's z is
+    exactly constant across the 50 layouts while the target's has std 1e-4, and
+    that alone produced aggregates of 0.505 vs 0.149 from IDENTICAL x,y signal
+    (0.257 each) on synthetic data -- almost exactly the 0.590 vs 0.166 measured
+    at layer 8. Every target-vs-distractor comparison this script printed before
+    the mask existed was reading that artifact.
 
     pca_dim > 0 projects each TRAINING fold onto its own top-k principal
     components and maps the held-out fold through the same basis. Without it the
@@ -110,7 +120,8 @@ def ridge_cv(X, Y, alphas, folds=5, seed=0, pca_dim=0):
         ss_res = ((Y - preds) ** 2).sum(0)
         ss_tot = ((Y - Y.mean(0, keepdims=True)) ** 2).sum(0)
         r2_dim = 1.0 - ss_res / np.maximum(ss_tot, 1e-12)
-        r2 = float(r2_dim.mean())
+        m = np.ones(Y.shape[1], bool) if dim_mask is None else np.asarray(dim_mask, bool)
+        r2 = float(r2_dim[m].mean()) if m.any() else float("nan")
         all_r2[a] = r2
         if r2 > best[1]:
             best = (a, r2, r2_dim)
@@ -555,29 +566,50 @@ def main() -> None:
                   f"{X.shape[1] / X.shape[0]:.0f}:1, expect large run-to-run swings)")
           + f", {reps} CV seed(s)")
 
+    # Which label dimensions carry enough variance to score at all. A zero- or
+    # near-zero-variance dimension is not "perfectly predicted", it is
+    # undefined, and the epsilon clamp in ridge_cv scores it +1.0 -- see that
+    # docstring. Both bowls sit on the table, so z is the degenerate one here,
+    # and the two are degenerate to DIFFERENT degrees (0.0 vs 1e-4), which is
+    # what made the comparison unfair rather than merely inflated.
+    DIM_MIN_STD = 1e-3
+    keep = (pos_t.std(0) > DIM_MIN_STD) & (pos_d.std(0) > DIM_MIN_STD)
+    names = np.array(["x", "y", "z"])
+    print(f"\nscoring dims {list(names[keep])} "
+          f"(std > {DIM_MIN_STD}); dropped {list(names[~keep])} "
+          f"-- target std {np.round(pos_t.std(0), 5)}, "
+          f"distractor std {np.round(pos_d.std(0), 5)}")
+    if not keep.any():
+        raise SystemExit("no label dimension varies enough to probe")
+
     def score(Y, label):
         """Same probe under `reps` different fold assignments -> mean +- std."""
-        r2s, alist, curves = [], [], []
+        r2s, alist, curves, dims = [], [], [], []
         for s in range(reps):
-            a, r2, _, curve = ridge_cv(X, Y, alphas, seed=s, pca_dim=args.pca_dim)
-            r2s.append(r2); alist.append(a); curves.append(curve)
+            a, r2, r2d, curve = ridge_cv(X, Y, alphas, seed=s,
+                                         pca_dim=args.pca_dim, dim_mask=keep)
+            r2s.append(r2); alist.append(a); curves.append(curve); dims.append(r2d)
         r2s = np.array(r2s)
         mean_curve = {a: float(np.mean([c[a] for c in curves])) for a in alphas}
-        return label, float(r2s.mean()), float(r2s.std()), alist, mean_curve
+        return (label, float(r2s.mean()), float(r2s.std()), alist, mean_curve,
+                np.stack(dims).mean(0))
 
     rows = [
         score(pos_t, "TARGET bowl xyz"),
         score(pos_d, "DISTRACTOR bowl xyz"),
         score(pos_t[rng.permutation(len(pos_t))], "TARGET, labels shuffled"),
     ]
-    print("\n" + "=" * 68)
-    print(f"{'probe':<28}{'CV R^2':>16}{'best alpha':>14}")
-    print("=" * 68)
-    for i, (label, m, sd, alist, _) in enumerate(rows):
+    print("\n" + "=" * 78)
+    print(f"{'probe':<28}{'CV R^2':>16}{'best alpha':>12}"
+          + "".join(f"{'R2 ' + n:>7}" for n in names))
+    print("=" * 78)
+    for i, (label, m, sd, alist, _, r2d) in enumerate(rows):
         amode = max(set(alist), key=alist.count)
         tail = "   <- noise floor" if i == 2 else ""
-        print(f"{label:<28}{m:>9.3f} +-{sd:5.3f}{amode:>14.0e}{tail}")
-    print("=" * 68)
+        per = "".join(f"{v:>7.2f}" if keep[j] else f"{'--':>7}"
+                      for j, v in enumerate(r2d))
+        print(f"{label:<28}{m:>9.3f} +-{sd:5.3f}{amode:>12.0e}{per}{tail}")
+    print("=" * 78)
     # The alpha above is picked by maximising over the SAME folds it is scored
     # on, so the headline is biased upward. A flat curve here means that choice
     # was arbitrary and the number should not carry an argument on its own.
