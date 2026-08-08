@@ -192,7 +192,26 @@ def main() -> None:
                          "differ between them -- pass the one you are looking at.")
     ap.add_argument("--instruction", default=None,
                     help="text placed BEFORE the image, as text_first=True does. "
-                         "Defaults to the task's own language.")
+                         "Defaults to the task's own language. Pass \"\" for the "
+                         "no-language control -- measured at layer 8 it changes "
+                         "nothing (target 0.437 against 0.434/0.463/0.366 with the "
+                         "real instruction), i.e. the vision positions are not "
+                         "language-conditioned in any way a linear readout sees.")
+    ap.add_argument("--text_last", action="store_true",
+                    help="Put the instruction AFTER the image, the pre-text_first "
+                         "layout. Under the causal mask this is the ONLY ordering in "
+                         "which the language positions can see the scene, so it is "
+                         "the ordering where the VLM itself could resolve 'the bowl "
+                         "between the plate and the ramekin'. Combine with "
+                         "--read_positions language to test whether it does.")
+    ap.add_argument("--read_positions", default="vision",
+                    choices=["vision", "language", "all"],
+                    help="Which sequence positions the probe pools. 'vision' (default) "
+                         "asks what the image tokens hold. 'language' asks what the "
+                         "instruction tokens hold, which is only interesting with "
+                         "--text_last: under text-first they precede the image and "
+                         "carry no scene content at all, so a positive result there "
+                         "would mean the probe is broken.")
     args = ap.parse_args()
 
     import numpy as np
@@ -525,11 +544,12 @@ def main() -> None:
             img = img.resize((ts, ts), Image.BICUBIC)
         # Instruction BEFORE the image: under a causal mask this is what makes
         # the vision positions language-conditioned, which is the whole premise
-        # of the layout the policy now uses.
-        messages = [{"role": "user", "content": [
-            {"type": "text", "text": task_text},
-            {"type": "image", "image": img},
-        ]}]
+        # of the layout the policy now uses. --text_last reverses it, which is
+        # the only ordering where the LANGUAGE positions can see the scene.
+        content = ([{"type": "image", "image": img}, {"type": "text", "text": task_text}]
+                   if args.text_last else
+                   [{"type": "text", "text": task_text}, {"type": "image", "image": img}])
+        messages = [{"role": "user", "content": content}]
         text = processor.apply_chat_template(messages, tokenize=False,
                                              add_generation_prompt=True)
         px = img.size[0] * img.size[1]
@@ -543,18 +563,42 @@ def main() -> None:
         ids = inputs["input_ids"][0]
         out = model(**inputs.to(device), output_hidden_states=True)
         h = out.hidden_states[args.layer][0].float().cpu().numpy()  # (L, d)
-        # Keep ONLY the image positions. Slicing the whole sequence would mix in
-        # the instruction tokens, which are identical across layouts and would
-        # dilute the very signal being measured.
+        # By default keep ONLY the image positions: slicing the whole sequence
+        # would mix in the instruction tokens, which are identical across
+        # layouts and would dilute the very signal being measured.
+        #
+        # --read_positions language does the opposite, and is the point of
+        # --text_last. Under text-first the instruction precedes the image, so
+        # its positions cannot attend to it and hold no scene content; under
+        # text-last they can, which is the only route by which the VLM's own
+        # layers could resolve a referring expression before the DiT sees
+        # anything.
         img_tok = getattr(model.config, "image_token_id", None)
         if img_tok is not None:
-            vis_idx = (ids == img_tok).nonzero().flatten().cpu().numpy()
+            is_vis = (ids == img_tok).cpu().numpy()
         else:
-            vis_idx = np.arange(h.shape[0])
-        if len(vis_idx) != n_vis:
-            print(f"  note: {len(vis_idx)} image-token positions vs {n_vis} expected "
+            is_vis = np.ones(h.shape[0], bool)
+        if args.read_positions == "vision":
+            idx = np.flatnonzero(is_vis)
+        elif args.read_positions == "language":
+            # Includes the chat-template tokens. The ones before the image are
+            # identical across every layout, so they become constant features
+            # and the per-feature standardisation below maps them to exactly
+            # zero -- inert, not a dilutant. The trailing assistant-turn tokens
+            # sit after both the image and the instruction and are the most
+            # informative positions in the text-last layout.
+            idx = np.flatnonzero(~is_vis)
+        else:
+            idx = np.arange(h.shape[0])
+        if args.read_positions == "vision" and len(idx) != n_vis:
+            print(f"  note: {len(idx)} image-token positions vs {n_vis} expected "
                   f"from grid_thw; using the token mask.")
-        return h[vis_idx], n_vis
+        if len(idx) < 4:
+            raise SystemExit(
+                f"only {len(idx)} {args.read_positions} positions -- the 4-band "
+                f"pooling needs at least 4. With --read_positions language and an "
+                f"empty --instruction there is nothing to read.")
+        return h[idx], n_vis
 
     feats, n_vis = [], None
     for i, im in enumerate(frames):
@@ -570,8 +614,15 @@ def main() -> None:
         bands = np.stack([h[j * L // 4:(j + 1) * L // 4].mean(0) for j in range(4)])
         feats.append(np.concatenate([h.mean(0), bands.reshape(-1)]))
         if i == 0:
-            print(f"  vision tokens/frame: {n_vis}   pooled positions: {L}   "
+            print(f"  vision tokens/frame: {n_vis}   reading {args.read_positions} "
+                  f"positions ({L} of them)   layout: "
+                  f"{'image then text' if args.text_last else 'text then image'}   "
                   f"feature dim: {feats[0].shape[0]}")
+            if args.read_positions == "language" and not args.text_last:
+                print("  !! reading language positions under TEXT-FIRST: they precede "
+                      "the image under the causal mask and cannot contain scene "
+                      "content. Anything above the noise floor here is a bug, not a "
+                      "finding.")
     X = np.stack(feats)
     X = (X - X.mean(0)) / (X.std(0) + 1e-6)
 
