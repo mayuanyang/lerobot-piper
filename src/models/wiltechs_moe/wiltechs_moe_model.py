@@ -193,6 +193,19 @@ class WiltechsMoETransformer(nn.Module):
         self.time_embedder = nn.Sequential(nn.Linear(self.dit_hidden, self.dit_hidden), nn.SiLU(), nn.Linear(self.dit_hidden, self.dit_hidden))
         if config.use_robot_cnn: self.robot_visual_encoder = RobotVisualEncoder(input_size=config.robot_encoder_input_size, out_tokens=config.robot_encoder_tokens, out_dim=self.dit_hidden)
         else: self.robot_visual_encoder = None
+        # Robot CNN tokens carry NO positional information: they are concatenated
+        # raw into the DiT sequence, and the only position parameter in the model
+        # is action_pos_emb (action slice only). Their location is therefore
+        # implicit in the causal self-attention ORDER alone. At a 4x4 grid the
+        # DiT can memorise "index 5 = centre-left"; at 12x12 it cannot, and
+        # *where* the fine detail sits is the entire reason for raising the grid.
+        #
+        # Fixed 2D sinusoidal, so no parameter depends on the token count and any
+        # grid size resumes cleanly. The gate is a single scalar at ZERO init:
+        # on resume this is an exact no-op at step 0 and the model opens it only
+        # if position helps, so it cannot by itself explain a regression.
+        self._robot_pos_cache: dict = {}
+        self.robot_pos_gate = nn.Parameter(torch.zeros(1)) if config.use_robot_cnn else None
         self.num_latent_tokens = config.num_latent_tokens
         # The LATENT Q-Former is off (num_latent_tokens defaults to 0) -- each
         # expert cross-attends to VLM KV directly. Not to be confused with the
@@ -517,14 +530,49 @@ class WiltechsMoETransformer(nn.Module):
             attn = layer.self_attn.o_proj(attn); hidden = residual + attn
             residual = hidden; h_in = layer.post_attention_layernorm(hidden); hidden = residual + layer.mlp(h_in)
         return kv_cache, vlm_kv_pad_mask, vis_mask, lang_span, hidden, vis_pack_out
+    def _robot_grid_pos_emb(self, n_tok, dim, device, dtype):
+        """Fixed 2D sinusoidal encoding for a sqrt(n_tok) x sqrt(n_tok) grid.
+
+        Half the channels encode the row, half the column, matching the
+        row-major flatten in RobotVisualEncoder.forward. Cached per
+        (n_tok, dim, device, dtype) -- these are a handful of small constants."""
+        key = (int(n_tok), int(dim), str(device), str(dtype))
+        hit = self._robot_pos_cache.get(key)
+        if hit is not None: return hit
+        side = int(n_tok ** 0.5)
+        if side * side != int(n_tok):  # not a square grid -> no spatial layout to encode
+            self._robot_pos_cache[key] = None; return None
+        half = dim // 2; nfreq = max(1, half // 2)
+        pos = torch.arange(side, device=device, dtype=torch.float32)
+        omega = torch.exp(torch.arange(nfreq, device=device, dtype=torch.float32)
+                          * -(math.log(10000.0) / nfreq))
+        ang = pos[:, None] * omega[None, :]
+        emb1d = torch.cat([ang.sin(), ang.cos()], dim=1)          # (side, 2*nfreq)
+        r = emb1d[:, None, :].expand(side, side, emb1d.shape[1])
+        c = emb1d[None, :, :].expand(side, side, emb1d.shape[1])
+        out = torch.cat([r, c], dim=-1).reshape(side * side, -1)  # row-major
+        if out.shape[-1] < dim: out = F.pad(out, (0, dim - out.shape[-1]))
+        out = out[:, :dim].to(dtype).unsqueeze(0)                 # (1, n_tok, dim)
+        self._robot_pos_cache[key] = out
+        return out
+
     def _compute_robot_tokens(self, batch):
         if self.robot_visual_encoder is None: return None
         toks_list = []; cnn_cams = getattr(self.config, "robot_cnn_cameras", None) or self.config.cameras_for_vision_state_concat
+        fine_cams = set(getattr(self.config, "robot_cnn_fine_cameras", None) or [])
+        fine_tok = int(getattr(self.config, "robot_cnn_fine_tokens", 0) or 0)
         for cam_key in cnn_cams:
             if cam_key not in batch: continue
             img = batch[cam_key]
             if img.dim() == 5: img = img[:, -1]
-            toks_list.append(self.robot_visual_encoder(img.float()))
+            # Per-camera grid: the wrist view carries contact geometry and wants
+            # a denser grid than the third-person view, which only has to supply
+            # coarse approach context. Same backbone, different pooling.
+            n_tok = fine_tok if (fine_tok > 0 and cam_key in fine_cams) else None
+            tk = self.robot_visual_encoder(img.float(), out_tokens=n_tok)
+            pe = self._robot_grid_pos_emb(tk.shape[1], tk.shape[-1], tk.device, tk.dtype)
+            if pe is not None: tk = tk + self.robot_pos_gate.to(tk.dtype) * pe
+            toks_list.append(tk)
         if not toks_list: return None
         toks = torch.cat(toks_list, dim=1)
         vp = float(getattr(self.config, "vision_dropout_prob", 0.0)) if self.training else 0.0
@@ -760,11 +808,17 @@ class WiltechsMoETransformer(nn.Module):
         if self.config.action_dim_weights:
             dim_w = torch.tensor(self.config.action_dim_weights, device=loss.device, dtype=loss.dtype); loss = loss * dim_w[None, None, :]
         H = loss.shape[1]
-        # loss_exec_steps decouples the loss boundary from n_action_steps, which
-        # also controls how many actions inference executes per replan. See the
-        # config field: with both at 64 = horizon this slice was empty and
-        # future_steps_weight applied to nothing.
-        n_exec = int(getattr(self.config, "loss_exec_steps", 0) or self.config.n_action_steps)
+        # loss_exec_steps owns the loss boundary outright; n_action_steps is now
+        # inference-only (how many actions the queue pops per replan).
+        # 0 = no down-weighting at all (every horizon step equal). This used to
+        # fall back to n_action_steps, which coupled the LOSS boundary to an
+        # INFERENCE setting: dropping n_action_steps to match how evals actually
+        # replan (4) would have silently switched the loss to pos_w[4:]=0.3 as a
+        # side effect, putting two variables in one run. The fallback bought
+        # nothing either -- every checkpoint this trainer produced pinned
+        # n_action_steps to the full horizon, so `or n_action_steps` and `or H`
+        # are the same number for all of them.
+        n_exec = int(getattr(self.config, "loss_exec_steps", 0) or 0) or H
         n_exec = max(1, min(n_exec, H))
         pos_w = torch.ones(H, device=loss.device, dtype=loss.dtype)
         pos_w[n_exec:] = self.config.future_steps_weight

@@ -127,10 +127,45 @@ class WiltechsMoEConfig(PreTrainedConfig):
     scheduler_warmup_steps: int = 1500
 
     # -------- Robot visual encoder --------
+    # The CNN is a ResNet-18 truncated after layer3: total stride 16, so the
+    # feature map is input_size/16 on a side. `robot_encoder_tokens` then
+    # adaptive-avg-pools that map down to sqrt(tokens) per side.
+    #
+    # The historical defaults threw away almost all of it. At input_size=224 the
+    # feature map is 14x14 = 196 cells, pooled to 4x4 = 16 tokens: 92% of the
+    # spatial positions are averaged away, and each surviving token covers
+    # 56x56 of the 224 input = 64x64 native px of a 256px LIBERO frame.
+    #
+    # The frozen VLM's merged vision tokens cover 32x32 native px. So the CNN --
+    # whose entire stated purpose is "spatial, pixel-level precision" that the
+    # ViT's patch size is too coarse to reach -- was running at HALF the frozen
+    # backbone's spatial granularity. Removing it still cost 34 points of
+    # success (92% -> 58% on libero_spatial task 0, same checkpoint lineage,
+    # same n_action_steps=4), so what it contributes is real; it just was never
+    # contributing resolution.
+    #
+    # input_size 256 matches the native LIBERO frame exactly (no resample) and
+    # gives a 16x16 feature map:
+    #   8x8  =  64 tok -> 32 px/token  (parity with the VLM)
+    #   10x10 = 100 tok -> 25.6 px/token
+    #   12x12 = 144 tok -> 21.3 px/token
+    #   16x16 = 256 tok -> 16 px/token (ceiling: every feature cell kept)
     robot_encoder_tokens: int = 16
     robot_encoder_input_size: int = 224
     use_robot_cnn: bool = True
     robot_cnn_cameras: list[str] = field(default_factory=list)
+    # Per-camera token override. Cameras listed in `robot_cnn_fine_cameras` emit
+    # `robot_cnn_fine_tokens` instead of `robot_encoder_tokens`. 0 disables.
+    #
+    # This exists so "give the wrist more resolution" does not have to be
+    # bundled with "drop the front camera's CNN pathway". Those are two changes,
+    # and the 34-point ablation says the pathway as a whole is load-bearing --
+    # running both at once would leave a regression unattributable. The encoder
+    # already supports it: RobotVisualEncoder.forward takes an `out_tokens`
+    # override and only the pooling grid depends on it (proj/norm are
+    # per-token), so one shared backbone serves both grids at no parameter cost.
+    robot_cnn_fine_cameras: list[str] = field(default_factory=list)
+    robot_cnn_fine_tokens: int = 0
 
     # -------- Thought tokens (spatial reasoning bottleneck) --------
     # Learned-query Q-Former cross-attends to the DEEPEST captured VLM layer's

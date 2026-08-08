@@ -372,7 +372,11 @@ def train(
     text_first: bool = True,
     vision_input_size: int = 0,
     vision_hires_cameras: Optional[list] = None,
+    n_action_steps: int = 4,
     robot_encoder_tokens: int = 16,
+    robot_encoder_input_size: int = 224,
+    robot_cnn_fine_cameras: Optional[list] = None,
+    robot_cnn_fine_tokens: int = 0,
     noise_temporal_correlation: float = 0.0,
     vision_dropout_prob: float = 0.3,
     vision_dropout_start: float = -1.0,
@@ -481,13 +485,57 @@ def train(
             raise ValueError(
                 f"--robot_cnn_wrist_only: no wrist-like camera among {camera_keys}. "
                 f"Pass --robot_cnn_cameras <key> explicitly.")
+    # Cameras that get the DENSE token grid. Explicit list wins; otherwise
+    # --robot_cnn_fine_tokens auto-targets the wrist view, which is where
+    # contact geometry lives.
+    fine_cam_keys: list = []
+    if use_robot_cnn and robot_cnn_fine_tokens > 0:
+        _pool = robot_cnn_camera_keys or camera_keys
+        if robot_cnn_fine_cameras:
+            missing = [c for c in robot_cnn_fine_cameras if c not in _pool]
+            if missing:
+                raise ValueError(
+                    f"--robot_cnn_fine_cameras {missing} not among the RobotCNN's "
+                    f"cameras {_pool}")
+            fine_cam_keys = list(robot_cnn_fine_cameras)
+        else:
+            _WRIST_HINTS = ("image2", "wrist", "gripper", "eye_in_hand", "hand")
+            fine_cam_keys = [
+                c for c in _pool
+                if any(h in c.rsplit(".", 1)[-1].lower() for h in _WRIST_HINTS)]
+            if not fine_cam_keys:
+                raise ValueError(
+                    f"--robot_cnn_fine_tokens: no wrist-like camera among {_pool}. "
+                    f"Pass --robot_cnn_fine_cameras <key> explicitly.")
+
     if not use_robot_cnn:
         pass  # already reported above
-    elif robot_cnn_camera_keys:
-        print(f"RobotCNN cameras (wrist-specialized): {robot_cnn_camera_keys}  "
-              f"(VLM still sees all {len(camera_keys)})")
     else:
-        print(f"RobotCNN cameras: ALL {camera_keys} (legacy: CNN re-encodes VLM views)")
+        if robot_cnn_camera_keys:
+            print(f"RobotCNN cameras (wrist-specialized): {robot_cnn_camera_keys}  "
+                  f"(VLM still sees all {len(camera_keys)})")
+        else:
+            print(f"RobotCNN cameras: ALL {camera_keys} (legacy: CNN re-encodes VLM views)")
+        # Report the actual spatial granularity, in native px of the source
+        # frame. This is the number that was silently 64 while the frozen VLM
+        # ran at 32 -- print it so a coarse setting cannot hide again.
+        _fmap = robot_encoder_input_size // 16  # ResNet-18 through layer3: stride 16
+        _cams = robot_cnn_camera_keys or camera_keys
+        _total = 0
+        for _c in _cams:
+            _n = robot_cnn_fine_tokens if _c in fine_cam_keys else robot_encoder_tokens
+            _side = int(_n ** 0.5)
+            _total += _n
+            print(f"  {_c}: {_side}x{_side}={_n} tok  "
+                  f"({256 / _side:.1f} native px/token, feature map {_fmap}x{_fmap})"
+                  + ("  <- FINE" if _c in fine_cam_keys else ""))
+            if _side > _fmap:
+                print(f"    WARNING: {_side}x{_side} exceeds the {_fmap}x{_fmap} feature "
+                      f"map -- adaptive pooling will UPSAMPLE and add no information. "
+                      f"Raise --robot_encoder_input_size to {_side * 16} or lower the tokens.")
+        print(f"  RobotCNN total: {_total} tokens  "
+              f"(DiT sequence = 2 + {_total} + {num_thought_tokens} + {horizon} "
+              f"= {2 + _total + num_thought_tokens + horizon})")
 
     # ── Validate the other datasets share the same schema ────────────────
     for did in dataset_ids[1:]:
@@ -516,14 +564,20 @@ def train(
     # ── Training parameters ──────────────────────────────────────────────
     obs = 2
     horizon = 64
-    n_action_steps = 64
+    # Inference-only: how many steps the action queue pops before replanning.
+    # It no longer touches the loss (see compute_loss), so it is safe to set to
+    # whatever the eval actually uses. Stored in the checkpoint config, and an
+    # eval that forgets to override it inherits THIS value -- at 10Hz, 64 means
+    # 6.4s of open-loop execution from a single observation, which is fatal for
+    # grasp precision. Default to the value evals really run at.
+    n_action_steps = int(n_action_steps)
 
     # Report the temporal loss weighting explicitly. This block existed and was
     # silently doing nothing: the loss read n_action_steps directly, and with
     # n_action_steps == horizon the `pos_w[n_exec:]` slice was empty, so
     # future_steps_weight applied to no timestep at all. Printing the resulting
     # share of the first few steps makes that visible instead of inferable.
-    _n_exec = min(max(1, loss_exec_steps or n_action_steps), horizon)
+    _n_exec = min(max(1, loss_exec_steps or horizon), horizon)
     _total_w = _n_exec + (horizon - _n_exec) * future_steps_weight
     print(f"Loss horizon weighting: steps 0..{_n_exec - 1} at 1.0, "
           f"{_n_exec}..{horizon - 1} at {future_steps_weight} "
@@ -578,6 +632,9 @@ def train(
         vision_input_size=vision_input_size,
         vision_hires_cameras=list(vision_hires_cameras or []),
         robot_encoder_tokens=robot_encoder_tokens,
+        robot_encoder_input_size=robot_encoder_input_size,
+        robot_cnn_fine_cameras=fine_cam_keys,
+        robot_cnn_fine_tokens=robot_cnn_fine_tokens,
         noise_temporal_correlation=noise_temporal_correlation,
         router_temperature=router_temperature,
         router_balance_weight=router_balance_weight,
@@ -1113,6 +1170,34 @@ if __name__ == "__main__":
                              "text-first (instruction before images).")
     parser.add_argument("--robot_encoder_tokens", type=int, default=16,
                         help="Robot CNN tokens per camera. Must be a perfect square. Default: 16 (4x4).")
+    parser.add_argument("--n_action_steps", type=int, default=4,
+                        help="Steps the action queue executes per replan at INFERENCE. Purely "
+                             "bookkeeping for training -- it no longer feeds the loss boundary "
+                             "(--loss_exec_steps owns that now), so changing it cannot alter "
+                             "what is optimised. It IS written into the checkpoint config, so "
+                             "an eval that does not override it inherits this value: the old "
+                             "hardcoded 64 meant 6.4s of open-loop execution at 10Hz. Default 4 "
+                             "matches how evals are actually run.")
+    parser.add_argument("--robot_encoder_input_size", type=int, default=224,
+                        help="Square resolution the RobotCNN resizes to. Was a config field "
+                             "that the training script NEVER passed, so it has been pinned at "
+                             "224 in every run to date -- a pointless 256->224 downsample of "
+                             "a native 256px LIBERO frame. ResNet-18 through layer3 has stride "
+                             "16, so this gives an input/16 feature map: 224->14x14, 256->16x16. "
+                             "256 is the natural setting (no resampling, 16x16 grid).")
+    parser.add_argument("--robot_cnn_fine_tokens", type=int, default=0,
+                        help="Dense token grid for the wrist camera only (perfect square). "
+                             "Other cameras keep --robot_encoder_tokens. 0 disables. The "
+                             "default 4x4=16 grid pools a 14x14 feature map down to 16 tokens "
+                             "covering 64 native px each -- COARSER than the frozen VLM's 32px "
+                             "merged tokens, which is the opposite of this encoder's purpose. "
+                             "At --robot_encoder_input_size 256: 64=32px, 100=25.6px, "
+                             "144=21.3px, 256=16px (ceiling). Costs DiT sequence length, which "
+                             "is quadratic in self-attn and multiplies through "
+                             "num_experts x expert_num_layers.")
+    parser.add_argument("--robot_cnn_fine_cameras", type=str, nargs="+", default=None,
+                        help="Explicit camera key(s) that get --robot_cnn_fine_tokens. "
+                             "Default: auto-detect the wrist/gripper view.")
     parser.add_argument("--robot_cnn_cameras", type=str, nargs="+", default=None,
                         help="Explicit camera key(s) the trainable RobotCNN ingests.")
     parser.add_argument("--robot_cnn_wrist_only", action="store_true",
@@ -1181,6 +1266,20 @@ if __name__ == "__main__":
     _v = args.robot_encoder_tokens
     if int(_v ** 0.5) ** 2 != _v:
         parser.error(f"--robot_encoder_tokens must be a perfect square, got {_v}")
+    if args.robot_cnn_fine_tokens:
+        _f = args.robot_cnn_fine_tokens
+        if int(_f ** 0.5) ** 2 != _f:
+            parser.error(f"--robot_cnn_fine_tokens must be a perfect square, got {_f}")
+        if int(_f ** 0.5) > args.robot_encoder_input_size // 16:
+            parser.error(
+                f"--robot_cnn_fine_tokens {_f} ({int(_f ** 0.5)}x{int(_f ** 0.5)}) exceeds the "
+                f"{args.robot_encoder_input_size // 16}x{args.robot_encoder_input_size // 16} "
+                f"feature map produced by --robot_encoder_input_size "
+                f"{args.robot_encoder_input_size}. Adaptive pooling would upsample and add no "
+                f"information. Use --robot_encoder_input_size {int(_f ** 0.5) * 16} or higher.")
+    if not args.use_robot_cnn and (args.robot_cnn_fine_tokens or args.robot_cnn_fine_cameras):
+        parser.error("--no_robot_cnn removes the RobotCNN, so --robot_cnn_fine_tokens / "
+                     "--robot_cnn_fine_cameras have nothing to configure. Drop one side.")
     if not args.use_robot_cnn and (args.robot_cnn_cameras or args.robot_cnn_wrist_only):
         # Silently-inert flags are exactly how the vision_dropout_prob confusion
         # happened: a setting that reads as active while doing nothing.
