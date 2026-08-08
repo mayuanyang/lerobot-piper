@@ -56,7 +56,17 @@ import argparse
 
 
 def ridge_cv(X, Y, alphas, folds=5, seed=0, pca_dim=0, dim_mask=None):
-    """Leave-fold-out ridge. Returns (best_alpha, cv_r2, per-dim cv_r2, all_r2).
+    """Leave-fold-out ridge. Returns (best_alpha, cv_r2, per-dim cv_r2, all_r2,
+    per-dim RMSE in label units).
+
+    READ THE RMSE, NOT ONLY THE R^2, whenever two objects are being compared.
+    R^2 = 1 - MSE/Var, so an object that MOVES more across the layouts scores
+    higher for the same absolute error. Measured on task 0: the target's x
+    std is 1.52x the distractor's and its x R^2 is 0.56 against 0.29, while on
+    y -- where the two move within 5% of each other -- the scores are 0.37 and
+    0.44, i.e. the distractor wins. Equal RMSE with unequal R^2 means the
+    representation localises both bowls equally well and the margin is the
+    variance denominator, not the instruction selecting a target.
 
     Closed form, numpy only -- no sklearn dependency. R^2 is computed against a
     predict-the-training-mean baseline, so 0 means "no better than guessing the
@@ -93,7 +103,7 @@ def ridge_cv(X, Y, alphas, folds=5, seed=0, pca_dim=0, dim_mask=None):
     rng = np.random.default_rng(seed)
     order = rng.permutation(n)
     cuts = np.array_split(order, folds)
-    best = (None, -1e9, None)
+    best = (None, -1e9, None, None)
     all_r2 = {}
     for a in alphas:
         preds = np.zeros_like(Y)
@@ -124,8 +134,8 @@ def ridge_cv(X, Y, alphas, folds=5, seed=0, pca_dim=0, dim_mask=None):
         r2 = float(r2_dim[m].mean()) if m.any() else float("nan")
         all_r2[a] = r2
         if r2 > best[1]:
-            best = (a, r2, r2_dim)
-    return best[0], best[1], best[2], all_r2
+            best = (a, r2, r2_dim, np.sqrt(ss_res / n))
+    return best[0], best[1], best[2], all_r2, best[3]
 
 
 def main() -> None:
@@ -595,32 +605,50 @@ def main() -> None:
 
     def score(Y, label):
         """Same probe under `reps` different fold assignments -> mean +- std."""
-        r2s, alist, curves, dims = [], [], [], []
+        r2s, alist, curves, dims, rmses = [], [], [], [], []
         for s in range(reps):
-            a, r2, r2d, curve = ridge_cv(X, Y, alphas, seed=s,
-                                         pca_dim=args.pca_dim, dim_mask=keep)
-            r2s.append(r2); alist.append(a); curves.append(curve); dims.append(r2d)
+            a, r2, r2d, curve, rmse = ridge_cv(X, Y, alphas, seed=s,
+                                               pca_dim=args.pca_dim, dim_mask=keep)
+            r2s.append(r2); alist.append(a); curves.append(curve)
+            dims.append(r2d); rmses.append(rmse)
         r2s = np.array(r2s)
         mean_curve = {a: float(np.mean([c[a] for c in curves])) for a in alphas}
         return (label, float(r2s.mean()), float(r2s.std()), alist, mean_curve,
-                np.stack(dims).mean(0))
+                np.stack(dims).mean(0), np.stack(rmses).mean(0))
 
     rows = [
         score(pos_t, "TARGET bowl xyz"),
         score(pos_d, "DISTRACTOR bowl xyz"),
         score(pos_t[rng.permutation(len(pos_t))], "TARGET, labels shuffled"),
     ]
-    print("\n" + "=" * 78)
+    print("\n" + "=" * 96)
     print(f"{'probe':<28}{'CV R^2':>16}{'best alpha':>12}"
-          + "".join(f"{'R2 ' + n:>7}" for n in names))
-    print("=" * 78)
-    for i, (label, m, sd, alist, _, r2d) in enumerate(rows):
+          + "".join(f"{'R2 ' + n:>7}" for n in names[keep])
+          + "".join(f"{'mm ' + n:>7}" for n in names[keep]))
+    print("=" * 96)
+    for i, row in enumerate(rows):
+        label, m, sd, alist, r2d, rmse = row[0], row[1], row[2], row[3], row[5], row[6]
         amode = max(set(alist), key=alist.count)
         tail = "   <- noise floor" if i == 2 else ""
-        per = "".join(f"{v:>7.2f}" if keep[j] else f"{'--':>7}"
-                      for j, v in enumerate(r2d))
-        print(f"{label:<28}{m:>9.3f} +-{sd:5.3f}{amode:>12.0e}{per}{tail}")
-    print("=" * 78)
+        per = "".join(f"{r2d[j]:>7.2f}" for j in range(3) if keep[j])
+        mm = "".join(f"{rmse[j] * 1000:>7.1f}" for j in range(3) if keep[j])
+        print(f"{label:<28}{m:>9.3f} +-{sd:5.3f}{amode:>12.0e}{per}{mm}{tail}")
+    print("=" * 96)
+    # The decisive comparison when the two objects do not move equally. R^2 is
+    # variance-normalised; RMSE is not. Equal error in millimetres with unequal
+    # R^2 means both bowls are localised equally well and the margin is the
+    # denominator, not the instruction picking one out.
+    rt, rd = rows[0][6][keep], rows[1][6][keep]
+    sd_t, sd_d = pos_t.std(0)[keep], pos_d.std(0)[keep]
+    print(f"\nabsolute error, mm   target {np.round(rt * 1000, 1)}   "
+          f"distractor {np.round(rd * 1000, 1)}")
+    print(f"object motion,  mm   target {np.round(sd_t * 1000, 1)}   "
+          f"distractor {np.round(sd_d * 1000, 1)}")
+    gap = float(np.abs(rt - rd).max() * 1000)
+    if gap < 1.0:
+        print(f"  -> errors agree to {gap:.2f} mm. The representation localises BOTH "
+              f"bowls equally well; any R^2 margin between them is the variance "
+              f"denominator, NOT the instruction selecting a target.")
     # The alpha above is picked by maximising over the SAME folds it is scored
     # on, so the headline is biased upward. A flat curve here means that choice
     # was arbitrary and the number should not carry an argument on its own.
