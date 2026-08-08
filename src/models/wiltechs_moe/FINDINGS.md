@@ -535,13 +535,57 @@ a training decision, build the null on synthetic data with the same n, d and
 effect size** — that is what separated the real confound from the invented one
 here, and it costs minutes.
 
+### The VLM never resolves the referring expression — anywhere
+
+Four configurations at layer 8, reported as error / the object's own travel,
+where 1.00 is predict-the-mean. **[measured]**
+
+| | read | target | distractor |
+|---|---|---|---|
+| A text-first | vision | 0.65 / 0.78 | 0.81 / 0.73 |
+| B **text-last** | **language** | **0.92 / 1.02** | **0.96 / 0.90** |
+| C text-last, WRONG instruction | language | 0.99 / 0.96 | 0.90 / 0.83 |
+| D text-last | vision | 0.70 / 0.78 | 0.82 / 0.71 |
+
+Plus the no-language control: `--instruction ""` on A's configuration gives
+target 0.437 against 0.434 / 0.463 / 0.366 / 0.429 with the real instruction.
+
+**B closes the `--text_last` branch.** Text-last is the only ordering in which
+the language positions can attend to the image, so it was the one route by which
+the VLM's own 36 layers could resolve "the bowl between the plate and the
+ramekin" before the DiT sees anything. They carry essentially nothing: both
+bowls sit at 0.92–1.02, i.e. no better than guessing the average layout.
+
+**D says the ordering changes nothing at all.** A and D agree to within the
+run-to-run spread on both objects, so text-first and text-last are equivalent
+for every readout tested. The `text_first` flag is neither delivering its
+premise nor costing anything measurable.
+
+Putting it together: the bowls' positions are in the vision tokens to ~8 mm
+against a ~150 mm separation, and **that is the only thing the VLM output
+contains.** The instruction is not fused into the vision positions, the
+selection is not written into the language positions, and neither ordering
+changes either fact. Nothing in the frozen backbone's output identifies which
+bowl is meant — the DiT would have to compute the relation itself from
+language × coordinates, across cross-attention, with no supervision that
+rewards doing so.
+
+That is consistent with every training measurement: 77/23 language-vs-vision
+cross-attention mass, `--no_robot_cnn` not moving the vision share over ~10k
+steps, 40 tasks of scene diversity not moving it, and 92% on the task being
+reachable without fine grounding — a prior over where "between" lands is enough.
+
 ### Open
 
-- `--instruction ""` at layer 8. If the numbers do not move, the vision
-  positions are not language-conditioned at all and `text_first`'s premise is
-  not being realised. Note `--instruction ""` was inert until 2026-08-07: the
-  argument was read with `or`, so the empty string fell back to the task's own
-  language.
-- If confirmed, the fork is `box_encoder.py` (resolve the relation offline, hand
-  the DiT coordinates) versus `--text_last` (put language after the images so
-  the language positions can see the scene and the selection can happen there).
+- **`box_encoder.py` is the remaining path.** Resolve the relation offline and
+  hand the DiT coordinates, rather than asking it to infer a selection the
+  backbone never encodes. `--annotate_detect` already shows whether Qwen can
+  produce the boxes that readout would consume.
+- Not yet tested: whether a *non-relational* instruction changes B. Every
+  instruction tried names the target by a spatial relation. An instruction that
+  names it by an intrinsic visual property is the one case where the VLM would
+  not need to compute anything — but two identical black bowls may not admit
+  one, which is itself the reason this task is hard.
+- `--instruction ""` was inert until 2026-08-07: the argument was read with
+  `or`, so the empty string fell back to the task's own language and the
+  ablation would have silently re-run the baseline.

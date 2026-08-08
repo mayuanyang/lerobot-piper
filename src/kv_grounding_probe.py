@@ -713,17 +713,22 @@ def main() -> None:
     print(f"error / motion       target {np.round(nt, 2)}   distractor "
           f"{np.round(nd, 2)}   (1.00 = no better than the mean)")
     rel = abs(float(nt.mean()) - float(nd.mean()))
-    if min(float(nt.mean()), float(nd.mean())) > 0.95:
-        # Both at the predict-the-mean baseline. "Equally well" would be a
-        # nonsense reading of equally-not-at-all.
-        print("  -> NEITHER object beats the predict-the-mean baseline. Nothing is "
-              "linearly readable here; check --layer and --vision_input_size before "
-              "drawing any target-vs-distractor conclusion.")
+    mt, md = float(nt.mean()), float(nd.mean())
+    # 0.90 rather than 0.95. Measured under --text_last --read_positions
+    # language: target 0.97, distractor 0.93, i.e. both barely beat
+    # predict-the-mean -- and at a 0.95 cut the distractor slipped through and
+    # the run reported "localises BOTH bowls equally well", which reads as "both
+    # are well localised" when it meant "neither is".
+    if min(mt, md) > 0.90:
+        print(f"  -> NEITHER object meaningfully beats the predict-the-mean baseline "
+              f"(best is {min(mt, md):.2f} against 1.00). Nothing useful is linearly "
+              f"readable at these positions; a target-vs-distractor comparison here "
+              f"is a comparison of two nulls.")
     elif rel < 0.10:
-        print(f"  -> the two agree to {rel:.3f} once normalised. The representation "
-              f"localises BOTH bowls equally well, so it encodes where the bowls are "
-              f"but NOT which one the instruction selects. Any R^2 margin between "
-              f"them is the variance denominator.")
+        print(f"  -> both at {mt:.2f} / {md:.2f} against a 1.00 baseline, agreeing to "
+              f"{rel:.3f}. The representation localises BOTH bowls, and equally well, "
+              f"so it encodes where the bowls are but NOT which one the instruction "
+              f"selects. Any R^2 margin between them is the variance denominator.")
     elif float(nt.mean()) < float(nd.mean()):
         print(f"  -> the target is localised {rel:.3f} better than the distractor "
               f"once normalised: evidence the instruction is selecting it.")
