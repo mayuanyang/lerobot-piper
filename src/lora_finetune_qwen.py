@@ -198,28 +198,51 @@ def make_collate(processor, max_len):
     return collate
 
 
+# The two towers do NOT share Linear naming, and matching only the text names
+# against the vision tower silently selects nothing:
+#   Qwen3VLTextAttention    q_proj, k_proj, v_proj, o_proj
+#   Qwen3VLVisionAttention  qkv, proj              <- fused QKV, different names
+#   Qwen3VLTextMLP          gate_proj, up_proj, down_proj
+#   Qwen3VLVisionMLP        linear_fc1, linear_fc2 (same for the patch merger)
+# Because the text names still match, the module list comes back non-empty and
+# the run proceeds with the vision tower untouched.
+TEXT_ATTN = ("q_proj", "k_proj", "v_proj", "o_proj")
+TEXT_MLP = ("gate_proj", "up_proj", "down_proj")
+VIS_ATTN = ("qkv", "proj")
+VIS_MLP = ("linear_fc1", "linear_fc2")
+
+
 def build_lora(model, args):
     from peft import LoraConfig, get_peft_model
 
-    targets = ["q_proj", "k_proj", "v_proj", "o_proj"]
-    if args.lora_mlp:
-        targets += ["gate_proj", "up_proj", "down_proj"]
+    text_names = set(TEXT_ATTN) | (set(TEXT_MLP) if args.lora_mlp else set())
+    vis_names = set(VIS_ATTN) | (set(VIS_MLP) if args.lora_mlp else set())
 
-    # By default LoRA touches the LANGUAGE tower only. The vision tower is what
-    # produces the patch features the experts ultimately read, so adapting it
-    # moves the KV caches hardest -- opt in deliberately with --lora_vision.
-    def in_scope(name: str) -> bool:
-        is_visual = ".visual." in name or name.startswith("visual.")
-        return args.lora_vision or not is_visual
+    def is_visual(name: str) -> bool:
+        return ".visual." in name or name.startswith("visual.")
 
-    modules = sorted({
-        name for name, mod in model.named_modules()
-        if isinstance(mod, torch.nn.Linear)
-        and any(name.endswith(t) for t in targets)
-        and in_scope(name)
-    })
+    text_mods, vis_mods = set(), set()
+    for name, mod in model.named_modules():
+        if not isinstance(mod, torch.nn.Linear):
+            continue
+        # Exact LEAF match, not endswith: "q_proj".endswith("proj") is True, so a
+        # suffix test would pull every text projection in under the vision rule.
+        leaf = name.rsplit(".", 1)[-1]
+        if is_visual(name):
+            if args.lora_vision and leaf in vis_names:
+                vis_mods.add(name)
+        elif leaf in text_names:
+            text_mods.add(name)
+
+    modules = sorted(text_mods | vis_mods)
     if not modules:
-        raise RuntimeError(f"No LoRA target modules matched {targets}")
+        raise RuntimeError("No LoRA target modules matched.")
+    if args.lora_vision and not vis_mods:
+        raise RuntimeError(
+            "--lora_vision matched ZERO modules in the vision tower. Its Linear "
+            f"names are expected to be {VIS_ATTN + VIS_MLP}; this build must differ. "
+            "Refusing to train, because the text tower still matched and the run "
+            "would look normal while adapting no vision at all.")
 
     cfg = LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
@@ -228,9 +251,16 @@ def build_lora(model, args):
     model = get_peft_model(model, cfg)
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_all = sum(p.numel() for p in model.parameters())
-    print(f"LoRA: r={args.lora_r} alpha={args.lora_alpha} on {len(modules)} modules "
-          f"(vision={'yes' if args.lora_vision else 'no'}, mlp={'yes' if args.lora_mlp else 'no'})")
-    print(f"Trainable: {n_train:,} / {n_all:,} ({100 * n_train / n_all:.3f}%)")
+    print(f"LoRA: r={args.lora_r} alpha={args.lora_alpha}  mlp={'yes' if args.lora_mlp else 'no'}")
+    print(f"  language tower: {len(text_mods)} modules")
+    print(f"  vision tower  : {len(vis_mods)} modules"
+          + ("" if args.lora_vision else "   (--lora_vision not set)"))
+    print(f"  trainable: {n_train:,} / {n_all:,} ({100 * n_train / n_all:.3f}%)")
+    # The MoE reads the LANGUAGE layers' KV caches, and vision tokens occupy
+    # positions inside those same caches (the x-attn diagnostic counts ~128 vis
+    # vs ~96 lang). So adapting the text tower alone already changes how vision
+    # is represented in exactly the tensors the experts consume; --lora_vision
+    # additionally changes the patch features before they enter that sequence.
     return model
 
 
