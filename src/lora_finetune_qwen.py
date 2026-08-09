@@ -265,30 +265,61 @@ def build_lora(model, args):
 
 
 @torch.no_grad()
-def report_kv_drift(base, tuned, processor, loader, device, n_batches=4):
+def report_kv_drift(model, loader, device, image_token_id,
+                    n_batches=4, n_bands=4, layers_per_band=9):
     """How far the LoRA moved the hidden states the MoE's experts read.
 
-    The experts' ca_q projections were fit against the ORIGINAL geometry, so
-    this number is the size of the shock a resumed MoE run has to absorb. A
-    relative drift near 1.0 means the caches are unrecognisable and the
-    cross-attention is effectively re-initialised.
+    Reported per EXPERT BAND and split by VISION vs LANGUAGE token positions,
+    because a single scalar cannot answer the question that matters. Each expert
+    cross-attends to its own contiguous block of VLM layers, so drift
+    concentrated in the deep layers hits E3 and leaves E0 nearly untouched. And
+    vision and language occupy positions in the SAME per-layer KV cache (the
+    MoE's x-attn diagnostic counts ~128 vis vs ~96 lang), so adapting both
+    towers can move one and not the other.
+
+    The baseline comes from peft's disable_adapter() rather than a second loaded
+    model: same weights, adapter off, so the comparison is exact and costs no
+    extra memory -- a second 4B copy would be ~8GB of bf16 for nothing.
     """
-    base.eval(); tuned.eval()
-    num, den, seen = 0.0, 0.0, 0
-    for batch in loader:
+    model.eval()
+    stats = {}  # layer -> [vis_num, vis_den, lang_num, lang_den]
+    for bi, batch in enumerate(loader):
+        if bi >= n_batches:
+            break
         batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
         batch.pop("labels", None)
-        hb = base(**batch, output_hidden_states=True).hidden_states
-        ht = tuned(**batch, output_hidden_states=True).hidden_states
-        for a, b in zip(hb, ht):
-            num += float((a.float() - b.float()).pow(2).sum())
-            den += float(a.float().pow(2).sum())
-        seen += 1
-        if seen >= n_batches:
-            break
-    if den == 0:
-        return float("nan")
-    return math.sqrt(num / den)
+        with model.disable_adapter():
+            hb = model(**batch, output_hidden_states=True).hidden_states
+        ht = model(**batch, output_hidden_states=True).hidden_states
+
+        vis = (batch["input_ids"] == image_token_id)
+        real = batch["attention_mask"].bool()
+        lang = real & ~vis
+        for li, (a, b) in enumerate(zip(hb, ht)):
+            a = a.float(); b = b.float()
+            d2 = (a - b).pow(2).sum(-1)
+            a2 = a.pow(2).sum(-1)
+            s = stats.setdefault(li, [0.0, 0.0, 0.0, 0.0])
+            s[0] += float(d2[vis].sum()); s[1] += float(a2[vis].sum())
+            s[2] += float(d2[lang].sum()); s[3] += float(a2[lang].sum())
+
+    def rel(num, den):
+        return math.sqrt(num / den) if den > 0 else float("nan")
+
+    # hidden_states[0] is the embedding output; layer i is at index i+1.
+    print(f"\n  {'expert band':<22} {'vision':>9} {'language':>9}")
+    worst = 0.0
+    for e in range(n_bands):
+        lo, hi = 1 + e * layers_per_band, (e + 1) * layers_per_band
+        agg = [0.0, 0.0, 0.0, 0.0]
+        for li in range(lo, hi + 1):
+            if li in stats:
+                for j in range(4):
+                    agg[j] += stats[li][j]
+        v, l = rel(agg[0], agg[1]), rel(agg[2], agg[3])
+        worst = max(worst, max(x for x in (v, l) if not math.isnan(x)) if (agg[1] or agg[3]) else 0.0)
+        print(f"  E{e} (VLM layers {lo - 1:>2}-{hi - 1:<2})    {v:>9.4f} {l:>9.4f}")
+    return worst
 
 
 def main():
@@ -325,6 +356,10 @@ def main():
                         "read the KV-drift note in the module docstring first.")
     p.add_argument("--lora_mlp", action="store_true",
                    help="Also adapt gate/up/down projections, not just attention.")
+    p.add_argument("--drift_bands", type=int, default=4,
+                   help="Expert bands to report drift over. Match --num_experts.")
+    p.add_argument("--drift_layers_per_band", type=int, default=9,
+                   help="VLM layers each expert reads. Match --expert_num_layers.")
     p.add_argument("--report_kv_drift", action="store_true",
                    help="After training, measure relative hidden-state drift vs the "
                         "base model -- the size of the shock a resumed MoE absorbs.")
@@ -449,14 +484,23 @@ def main():
     print(f"\nAdapter saved to {final}")
 
     if args.report_kv_drift:
-        print("\nMeasuring KV drift vs the base encoder ...")
-        base = Qwen3VLForConditionalGeneration.from_pretrained(
-            args.vlm_model_id, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True).to(device)
-        drift = report_kv_drift(base, model, processor, loader, device)
-        print(f"  relative hidden-state drift: {drift:.4f}")
-        print("  This is the shock a resumed MoE's cross-attention must absorb: its")
-        print("  ca_q projections were fit against the ORIGINAL geometry. Above ~0.3,")
-        print("  expect the experts to need substantial re-adaptation, not a warm start.")
+        print("\nMeasuring KV drift vs the base encoder (adapter disabled) ...")
+        img_tok = getattr(model.config, "image_token_id", None)
+        if img_tok is None:
+            img_tok = getattr(getattr(model, "base_model", model).config, "image_token_id", None)
+        if img_tok is None:
+            print("  skipped: could not resolve image_token_id, so vision and "
+                  "language positions cannot be told apart.")
+        else:
+            worst = report_kv_drift(model, loader, device, img_tok,
+                                    n_bands=args.drift_bands,
+                                    layers_per_band=args.drift_layers_per_band)
+            print(f"\n  worst band/tower drift: {worst:.4f}")
+            print("  This is the shock a resumed MoE's cross-attention must absorb: each")
+            print("  expert's ca_q was fit against the ORIGINAL geometry of ITS band.")
+            print("  Above ~0.3 in a band, expect that expert to need real re-adaptation")
+            print("  rather than a warm start. Drift concentrated in the deep bands hits")
+            print("  E3 hardest; drift on the vision positions is what --lora_vision buys.")
 
     print(f"\nNext:\n"
           f"  python src/lora_finetune_qwen.py --merge_and_save {final} \\\n"
