@@ -93,6 +93,48 @@ POSE_PROMPT = (
 )
 
 
+# Same convention the MoE trainer uses to auto-detect the wrist view
+# (--robot_cnn_wrist_only), kept identical so the two never disagree about which
+# camera is which.
+WRIST_HINTS = ("image2", "wrist", "gripper", "eye_in_hand", "hand")
+
+
+def is_wrist_cam(key: str) -> bool:
+    return any(h in key.rsplit(".", 1)[-1].lower() for h in WRIST_HINTS)
+
+
+def order_cameras(keys, max_cameras=0):
+    """Order cameras by ROLE -- scene views first, wrist views last.
+
+    Datasets do not agree on naming, and sorting alphabetically makes the
+    ordering incidental rather than meaningful: 'top' before 'wrist' puts the
+    scene first, but 'gripper' before 'top', 'hand' before 'side', and
+    'eye_in_hand' before 'front' all put the WRIST first. Half the common
+    conventions invert. Since the images enter the prompt in list order, that
+    hands the model a convention that flips per dataset for no reason.
+
+    max_cameras caps the count so a 4-camera dataset does not contribute 4x the
+    image tokens of a 1-camera one; when it bites, one scene and one wrist view
+    are kept first so neither role is dropped entirely.
+
+    Returns (ordered_keys, scene_keys, wrist_keys).
+    """
+    scene = sorted(k for k in keys if not is_wrist_cam(k))
+    wrist = sorted(k for k in keys if is_wrist_cam(k))
+    ordered = scene + wrist
+    if max_cameras > 0 and len(ordered) > max_cameras:
+        keep = []
+        for k in (scene[:1] + wrist[:1] + scene[1:] + wrist[1:]):
+            if len(keep) >= max_cameras:
+                break
+            if k not in keep:
+                keep.append(k)
+        ordered = [k for k in ordered if k in keep]
+        scene = [k for k in scene if k in ordered]
+        wrist = [k for k in wrist if k in ordered]
+    return ordered, scene, wrist
+
+
 def pick_device():
     if torch.cuda.is_available():
         return "cuda"
@@ -338,6 +380,10 @@ def main():
                         "rebalance the mix -- ConcatDataset samples proportionally to "
                         "size, so a 10x larger dataset otherwise supplies 10x the "
                         "gradient.")
+    p.add_argument("--max_cameras", type=int, default=0,
+                   help="Cap cameras per dataset (0 = all). Keeps a 4-camera dataset "
+                        "from contributing 4x the image tokens of a 1-camera one. When "
+                        "it bites, one scene and one wrist view are kept first.")
     p.add_argument("--cameras", type=str, nargs="+", default=None,
                    help="Camera keys to feed the VLM. Default: all detected, resolved "
                         "PER DATASET -- names need not match across datasets, since the "
@@ -417,15 +463,28 @@ def main():
         # the MoE, where a camera's identity fixes its slot in the DiT sequence,
         # here the key name carries no meaning. Requiring identical names was
         # the one thing blocking a LIBERO + community-dataset mix.
-        cks = args.cameras or sorted(
-            k for k in ds.meta.features if k.startswith("observation.images."))
-        if not cks:
+        avail = [k for k in ds.meta.features if k.startswith("observation.images.")]
+        if not avail:
             raise ValueError(f"{did}: no observation.images.* features found")
+        if args.cameras:
+            # An explicit list is global, so a key absent from THIS dataset used
+            # to be filtered out silently in __getitem__ -- and a sample whose
+            # every key missed produced an image-free prompt, training the VLM
+            # to answer from text alone while looking entirely normal.
+            missing = [c for c in args.cameras if c not in avail]
+            if missing:
+                raise ValueError(
+                    f"{did}: --cameras {missing} not present. Available: {sorted(avail)}. "
+                    f"Drop --cameras to auto-select per dataset (names need not match).")
+            sel = list(args.cameras)
+        else:
+            sel = avail
+        cks, scene, wrist = order_cameras(sel, args.max_cameras)
         sd = ds.meta.features.get(state_key, {}).get("shape", [None])[-1]
         state_dims[did] = sd
         sub = LeRobotVLMDataset(ds, cks, args.target, stride, state_key)
         subsets.append(sub)
-        rows.append((did, len(cks), cks, sd, stride, len(sub)))
+        rows.append((did, cks, scene, wrist, sd, stride, len(sub)))
 
     # pose templates observation.state positionally as LIBERO's
     # [xyz(3), axis-angle(3), fingers(2)]. On a dataset whose state is joint
@@ -447,16 +506,24 @@ def main():
               f"[xyz(3), axis-angle(3), fingers(2)]; only xyz + finger aperture "
               f"are templated.")
 
-    print(f"\n  {'dataset':<34} {'cams':>4} {'state':>5} {'stride':>6} {'frames':>9} {'mix':>6}")
-    total = sum(r[5] for r in rows)
-    for did, ncam, cks, sd, stride, n in rows:
-        print(f"  {did[:34]:<34} {ncam:>4} {str(sd):>5} {stride:>6} {n:>9,} "
+    print(f"\n  {'dataset':<30} {'cams':>4} {'state':>5} {'stride':>6} {'frames':>9} {'mix':>6}")
+    total = sum(r[6] for r in rows)
+    for did, cks, scene, wrist, sd, stride, n in rows:
+        print(f"  {did[:30]:<30} {len(cks):>4} {str(sd):>5} {stride:>6} {n:>9,} "
               f"{100 * n / max(1, total):>5.1f}%")
-        print(f"      {cks}")
+        # Print the ROLE beside each key. Camera names do not match across
+        # datasets and are never matched to each other -- they are ordered
+        # scene-first so the prompt has one convention regardless of naming.
+        order = "  ".join(f"{k.rsplit('.', 1)[-1]}[{'wrist' if k in wrist else 'scene'}]"
+                          for k in cks)
+        print(f"      {order}")
+        if not scene:
+            print("      WARNING: every camera classified as WRIST. A scene view is "
+                  "what a 'describe the scene' target needs.")
     # ConcatDataset + shuffle samples proportionally to size, so the mix column
     # IS the sampling distribution. A dataset 10x the size of another silently
     # supplies 10x the gradient; tune it with per-dataset --frame_stride.
-    print(f"  {'TOTAL':<34} {'':>4} {'':>5} {'':>6} {total:>9,}\n")
+    print(f"  {'TOTAL':<30} {'':>4} {'':>5} {'':>6} {total:>9,}\n")
     dataset = subsets[0] if len(subsets) == 1 else torch.utils.data.ConcatDataset(subsets)
 
     processor = AutoProcessor.from_pretrained(args.vlm_model_id)
