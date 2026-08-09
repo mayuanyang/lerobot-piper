@@ -87,9 +87,15 @@ PROMPT = (
     "Describe the scene and the manipulation task, naming the target object and "
     "how to tell it apart from the other objects present."
 )
-POSE_PROMPT = (
+# The question has to match the answer format, or the model is being asked one
+# thing and graded on another.
+POSE_PROMPT_BINARY = (
     "Report the robot gripper's current end-effector position and whether its "
     "fingers are open or closed."
+)
+POSE_PROMPT_NUMERIC = (
+    "Report the robot gripper's current end-effector position and how far apart "
+    "its fingers are."
 )
 
 
@@ -179,6 +185,31 @@ def gripper_threshold_from_stats(stats, state_key="observation.state"):
     return None
 
 
+def pose_target_numeric(state: torch.Tensor) -> str:
+    """Same pose, with the finger APERTURE as a number instead of open/closed.
+
+    How far the fingers are apart is set by the width of whatever is being
+    held, so it is not two states but a continuum, and the free-space modes
+    (~0.011 closed, ~0.040 open on LIBERO) are only its endpoints. A binary cut
+    at their midpoint therefore lands exactly where a grasped object puts the
+    aperture, and the label flips on millimetre changes during the grasp --
+    contradictory supervision on the one phase that is still failing.
+
+    Reporting the number removes the cut entirely and keeps the object-width
+    signal the binary form discards. Aperture is the finger GAP where both
+    finger dims exist, since they mirror each other.
+    """
+    s = state.flatten().tolist()
+    if len(s) > GRIPPER_DIM + 1:
+        gap = abs(s[GRIPPER_DIM] - s[GRIPPER_DIM + 1])
+    elif len(s) > GRIPPER_DIM:
+        gap = abs(s[GRIPPER_DIM])
+    else:
+        gap = 0.0
+    return (f"gripper at x={s[0]:+.3f} y={s[1]:+.3f} z={s[2]:+.3f}, "
+            f"fingers {gap:.3f} apart")
+
+
 def pose_target(state: torch.Tensor, grip_threshold: float) -> str:
     """Template an end-effector pose from observation.state.
 
@@ -204,8 +235,13 @@ class LeRobotVLMDataset(torch.utils.data.Dataset):
     """
 
     def __init__(self, ds, camera_keys, target, frame_stride, state_key,
-                 grip_threshold=0.02):
+                 grip_threshold=0.02, grip_format="numeric", ds_id="",
+                 decode_retries=8):
         self.ds = ds
+        self.ds_id = ds_id
+        self.grip_format = grip_format
+        self.decode_retries = decode_retries
+        self._decode_failures = 0
         self.camera_keys = camera_keys
         self.target = target
         self.state_key = state_key
@@ -216,14 +252,39 @@ class LeRobotVLMDataset(torch.utils.data.Dataset):
         return len(self.indices)
 
     def __getitem__(self, i):
-        item = self.ds[self.indices[i]]
+        # A single undecodable video packet used to kill the whole run from
+        # inside a DataLoader worker, hours in. One corrupt frame out of tens of
+        # thousands is not a reason to lose the training; substitute a
+        # neighbouring frame, which is an equally valid self-contained sample
+        # (its own images, own state, own task). Failures are counted and
+        # announced so a systematically broken dataset still cannot pass as
+        # healthy.
+        item = None
+        for attempt in range(self.decode_retries + 1):
+            j = self.indices[(i + attempt) % len(self.indices)]
+            try:
+                item = self.ds[j]
+                break
+            except Exception as exc:
+                self._decode_failures += 1
+                if self._decode_failures in (1, 10, 100, 1000, 10000):
+                    print(f"[decode] {self.ds_id}: frame {j} unreadable "
+                          f"({type(exc).__name__}: {str(exc)[:90]}); using a neighbour. "
+                          f"{self._decode_failures} failure(s) so far in this worker.",
+                          flush=True)
+        if item is None:
+            raise RuntimeError(
+                f"{self.ds_id}: {self.decode_retries + 1} consecutive frames from index "
+                f"{i} were undecodable. That is a broken dataset, not a stray bad packet.")
         images = [to_pil(item[k]) for k in self.camera_keys if k in item]
         task = item.get("task", "")
         if isinstance(task, (list, tuple)):
             task = task[0] if task else ""
         if self.target == "pose":
-            return images, POSE_PROMPT, pose_target(item[self.state_key].float(),
-                                                    self.grip_threshold)
+            st = item[self.state_key].float()
+            if self.grip_format == "numeric":
+                return images, POSE_PROMPT_NUMERIC, pose_target_numeric(st)
+            return images, POSE_PROMPT_BINARY, pose_target(st, self.grip_threshold)
         if self.target == "cot":
             return images, PROMPT, rewrite_instruction(str(task))
         return images, PROMPT, str(task)
@@ -412,6 +473,15 @@ def main():
                         "rebalance the mix -- ConcatDataset samples proportionally to "
                         "size, so a 10x larger dataset otherwise supplies 10x the "
                         "gradient.")
+    p.add_argument("--gripper_format", type=str, default="numeric",
+                   choices=["numeric", "binary"],
+                   help="How --target pose reports the fingers. numeric (default): "
+                        "'fingers 0.027 apart'. binary: 'fingers open/closed', which "
+                        "needs a cut that a grasped object sits right on top of, so "
+                        "the label flips during the grasp -- see pose_target_numeric.")
+    p.add_argument("--decode_retries", type=int, default=8,
+                   help="Neighbouring frames to try when a video packet fails to "
+                        "decode, before treating the dataset as broken.")
     p.add_argument("--gripper_threshold", type=float, default=None,
                    help="Open/closed cut on observation.state[6] for --target pose. "
                         "Default: auto, the midpoint of that dim's q10/q90 in the "
@@ -550,7 +620,8 @@ def main():
                       f"hardcoded gripper threshold of {grip_t}. Check the open/closed "
                       f"split below -- a misplaced cut mislabels the one categorical "
                       f"token in every target.")
-        sub = LeRobotVLMDataset(ds, cks, args.target, stride, state_key, grip_t)
+        sub = LeRobotVLMDataset(ds, cks, args.target, stride, state_key, grip_t,
+                                args.gripper_format, did, args.decode_retries)
         subsets.append(sub)
         eps = getattr(ds, "num_episodes", None)
         rows.append((did, cks, scene, wrist, sd, stride, len(sub), raw, eps, grip_t))
@@ -590,7 +661,7 @@ def main():
         order = "  ".join(f"{k.rsplit('.', 1)[-1]}[{'wrist' if k in wrist else 'scene'}]"
                           for k in cks)
         print(f"      {order}")
-        if args.target == "pose":
+        if args.target == "pose" and args.gripper_format == "binary":
             # Sample the labels this cut actually produces instead of trusting
             # it. The gripper column is bimodal and roughly balanced in these
             # demos, so a split far from 50/50 means the cut landed inside a
