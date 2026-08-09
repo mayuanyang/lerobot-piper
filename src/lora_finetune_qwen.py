@@ -624,7 +624,12 @@ def main():
         step += 1
 
         if step % args.log_every == 0:
-            print(f"step {step:6d}/{args.training_steps}  loss {run_loss / args.log_every:.4f}  "
+            # run_loss accumulates ONE entry per micro-batch, i.e. grad_accum
+            # entries per optimiser step -- so the divisor is the micro-batch
+            # count, not the step count. Dividing by log_every alone reported
+            # grad_accum x the true loss.
+            n_micro = args.log_every * args.grad_accum
+            print(f"step {step:6d}/{args.training_steps}  loss {run_loss / n_micro:.4f}  "
                   f"lr {sched.get_last_lr()[0]:.2e}  grad_norm {float(gn):.2f}")
             run_loss = 0.0
         if step % args.save_every == 0 or step == args.training_steps:
