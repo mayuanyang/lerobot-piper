@@ -331,12 +331,17 @@ def main():
     p.add_argument("--target", type=str, default="cot",
                    choices=["cot", "instruction", "pose"],
                    help="What the model is trained to produce. See module docstring.")
-    p.add_argument("--frame_stride", type=int, default=10,
+    p.add_argument("--frame_stride", type=int, nargs="+", default=[10],
                    help="Keep 1 frame in N. Neighbouring frames share an instruction "
                         "and nearly the same pixels, so a stride of 1 mostly buys "
-                        "duplicate gradients.")
+                        "duplicate gradients. Pass one value, or one per dataset to "
+                        "rebalance the mix -- ConcatDataset samples proportionally to "
+                        "size, so a 10x larger dataset otherwise supplies 10x the "
+                        "gradient.")
     p.add_argument("--cameras", type=str, nargs="+", default=None,
-                   help="Camera keys to feed the VLM. Default: all detected.")
+                   help="Camera keys to feed the VLM. Default: all detected, resolved "
+                        "PER DATASET -- names need not match across datasets, since the "
+                        "VLM only receives a list of images.")
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--training_steps", type=int, default=4000)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -394,21 +399,65 @@ def main():
 
     # ── data ─────────────────────────────────────────────────────────────
     print(f"Loading dataset(s): {args.dataset_id}")
-    subsets = []
-    camera_keys, state_key = None, "observation.state"
-    for did in args.dataset_id:
+    state_key = "observation.state"
+
+    strides = args.frame_stride
+    if len(strides) == 1:
+        strides = strides * len(args.dataset_id)
+    elif len(strides) != len(args.dataset_id):
+        raise ValueError(
+            f"--frame_stride takes 1 value or one per dataset, got {len(strides)} "
+            f"for {len(args.dataset_id)} datasets")
+
+    subsets, rows, state_dims = [], [], {}
+    for did, stride in zip(args.dataset_id, strides):
         ds = LeRobotDataset(did, force_cache_sync=True, revision="main")
+        # Camera keys are resolved PER DATASET and deliberately not required to
+        # match. The VLM is handed a list of images and nothing else -- unlike
+        # the MoE, where a camera's identity fixes its slot in the DiT sequence,
+        # here the key name carries no meaning. Requiring identical names was
+        # the one thing blocking a LIBERO + community-dataset mix.
         cks = args.cameras or sorted(
             k for k in ds.meta.features if k.startswith("observation.images."))
-        if camera_keys is None:
-            camera_keys = cks
-            print(f"Cameras: {camera_keys}")
-        elif cks != camera_keys:
-            raise ValueError(f"{did} cameras {cks} != {camera_keys}")
-        subsets.append(LeRobotVLMDataset(ds, camera_keys, args.target,
-                                         args.frame_stride, state_key))
+        if not cks:
+            raise ValueError(f"{did}: no observation.images.* features found")
+        sd = ds.meta.features.get(state_key, {}).get("shape", [None])[-1]
+        state_dims[did] = sd
+        sub = LeRobotVLMDataset(ds, cks, args.target, stride, state_key)
+        subsets.append(sub)
+        rows.append((did, len(cks), cks, sd, stride, len(sub)))
+
+    # pose templates observation.state positionally as LIBERO's
+    # [xyz(3), axis-angle(3), fingers(2)]. On a dataset whose state is joint
+    # angles, s[0:3] are joint positions and every target would be confidently
+    # wrong -- a silent label corruption, not a crash.
+    if args.target == "pose":
+        dims = set(state_dims.values())
+        if len(dims) > 1:
+            raise ValueError(
+                f"--target pose reads observation.state positionally as LIBERO's "
+                f"[xyz(3), axis-angle(3), fingers(2)], but the datasets disagree on "
+                f"state dim: {state_dims}. Mixing them would produce confidently "
+                f"wrong targets with no error. Train pose on one layout at a time.")
+        if dims and next(iter(dims)) not in (7, 8):
+            raise ValueError(
+                f"--target pose expects an 8-dim LIBERO-style state (or 7), got "
+                f"{next(iter(dims))}. Check the layout before trusting the targets.")
+        print(f"--target pose: reading state dim {next(iter(dims), '?')} as "
+              f"[xyz(3), axis-angle(3), fingers(2)]; only xyz + finger aperture "
+              f"are templated.")
+
+    print(f"\n  {'dataset':<34} {'cams':>4} {'state':>5} {'stride':>6} {'frames':>9} {'mix':>6}")
+    total = sum(r[5] for r in rows)
+    for did, ncam, cks, sd, stride, n in rows:
+        print(f"  {did[:34]:<34} {ncam:>4} {str(sd):>5} {stride:>6} {n:>9,} "
+              f"{100 * n / max(1, total):>5.1f}%")
+        print(f"      {cks}")
+    # ConcatDataset + shuffle samples proportionally to size, so the mix column
+    # IS the sampling distribution. A dataset 10x the size of another silently
+    # supplies 10x the gradient; tune it with per-dataset --frame_stride.
+    print(f"  {'TOTAL':<34} {'':>4} {'':>5} {'':>6} {total:>9,}\n")
     dataset = subsets[0] if len(subsets) == 1 else torch.utils.data.ConcatDataset(subsets)
-    print(f"Frames after stride {args.frame_stride}: {len(dataset):,}")
 
     processor = AutoProcessor.from_pretrained(args.vlm_model_id)
     if processor.tokenizer.pad_token is None:
