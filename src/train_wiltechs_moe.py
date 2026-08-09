@@ -389,6 +389,7 @@ def train(
     vision_input_size: int = 0,
     vision_hires_cameras: Optional[list] = None,
     n_action_steps: int = 4,
+    vlm_model_id: str = "",
     robot_encoder_tokens: int = 16,
     robot_encoder_input_size: int = 224,
     robot_cnn_fine_cameras: Optional[list] = None,
@@ -635,6 +636,7 @@ def train(
         num_experts=num_experts,
         expert_num_layers=expert_num_layers,
         dit_hidden_size=dit_hidden_size,
+        vlm_model_id=vlm_model_id,
         num_cameras=len(camera_keys),
         cameras_for_vision_state_concat=camera_keys,
         use_robot_cnn=use_robot_cnn,
@@ -1193,6 +1195,12 @@ if __name__ == "__main__":
                              "text-first (instruction before images).")
     parser.add_argument("--robot_encoder_tokens", type=int, default=16,
                         help="Robot CNN tokens per camera. Must be a perfect square. Default: 16 (4x4).")
+    parser.add_argument("--vlm_model_id", type=str, default="",
+                        help="Local dir holding a LoRA-merged Qwen3-VL from "
+                             "lora_finetune_qwen.py --merge_and_save. Empty = stock "
+                             "hub weights. This moves every KV cache the experts "
+                             "cross-attend to, so a checkpoint trained against the "
+                             "stock encoder does not warm-start cleanly.")
     parser.add_argument("--n_action_steps", type=int, default=4,
                         help="Steps the action queue executes per replan at INFERENCE. Purely "
                              "bookkeeping for training -- it no longer feeds the loss boundary "

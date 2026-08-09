@@ -138,9 +138,18 @@ class WiltechsMoETransformer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        print(f"Loading {self.VLM_MODEL_ID} ...")
-        vlm = Qwen3VLForConditionalGeneration.from_pretrained(self.VLM_MODEL_ID, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
-        self.processor = AutoProcessor.from_pretrained(self.VLM_MODEL_ID)
+        # A local path here loads a LoRA-merged encoder from lora_finetune_qwen.py
+        # instead of the stock hub weights. Note that this changes every KV cache
+        # the experts cross-attend to, so a checkpoint trained against the stock
+        # encoder does NOT warm-start cleanly -- its ca_q projections were fit to
+        # the old feature geometry.
+        model_id = str(getattr(config, "vlm_model_id", "") or self.VLM_MODEL_ID)
+        if model_id != self.VLM_MODEL_ID:
+            print(f"Loading FINETUNED VLM from {model_id} (stock is {self.VLM_MODEL_ID})")
+        else:
+            print(f"Loading {model_id} ...")
+        vlm = Qwen3VLForConditionalGeneration.from_pretrained(model_id, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
+        self.processor = AutoProcessor.from_pretrained(model_id)
         self.vlm_model = vlm.model
         self.visual = self.vlm_model.visual
         self.language_model = self.vlm_model.language_model

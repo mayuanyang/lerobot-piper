@@ -73,6 +73,11 @@ class WiltechsMoEConfig(PreTrainedConfig):
     vision_hires_cameras: list[str] = field(default_factory=list)
 
     # -------- VLM backbone --------
+    # Empty = the stock hub id. A local directory loads a LoRA-merged encoder
+    # produced by lora_finetune_qwen.py --merge_and_save. Stored in the
+    # checkpoint, so an eval reloads the same encoder the policy was trained
+    # against -- a mismatch here is silent and would move every KV cache.
+    vlm_model_id: str = ""
     num_cameras: int = 3
     num_vlm_layers: int = 36
     vlm_capture_layers: list[int] = field(default_factory=list)
