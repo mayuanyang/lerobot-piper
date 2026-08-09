@@ -157,6 +157,46 @@ def to_pil(img: torch.Tensor) -> Image.Image:
     return Image.fromarray(arr)
 
 
+def frame_episode_indices(ds):
+    """Per-frame episode index, or None if this build will not surface it.
+
+    A validation split MUST be made on episodes, never on frames. Neighbouring
+    frames of one episode differ by 0.1s and are all but identical, so a frame
+    split puts near-copies of training samples in the validation set: val loss
+    then tracks train loss down forever and reports no overfitting no matter how
+    long the run goes -- which is precisely the failure it exists to detect.
+    Returning None here is treated as fatal rather than silently degrading.
+    """
+    hf = getattr(getattr(ds, "reader", None), "hf_dataset", None)
+    if hf is None:
+        hf = getattr(ds, "hf_dataset", None)
+    if hf is None:
+        return None
+    try:
+        return np.asarray(hf.data.column("episode_index").to_numpy())
+    except Exception:
+        pass
+    try:
+        return np.asarray(hf["episode_index"])
+    except Exception:
+        return None
+
+
+def split_episodes(ep_ids, val_spec, seed):
+    """Choose validation episodes deterministically.
+
+    val_spec < 1 is a fraction of episodes, >= 1 an absolute count. Seeded so a
+    restart or a resume reuses the same split -- a reshuffled split would move
+    the validation set into what the model has already trained on and quietly
+    flatter every later number.
+    """
+    uniq = np.unique(ep_ids)
+    n_val = int(round(len(uniq) * val_spec)) if val_spec < 1 else int(val_spec)
+    n_val = max(1, min(n_val, len(uniq) - 1))
+    order = np.random.default_rng(seed).permutation(len(uniq))
+    return set(uniq[order[:n_val]].tolist())
+
+
 GRIPPER_DIM = 6
 
 
@@ -236,7 +276,7 @@ class LeRobotVLMDataset(torch.utils.data.Dataset):
 
     def __init__(self, ds, camera_keys, target, frame_stride, state_key,
                  grip_threshold=0.02, grip_format="numeric", ds_id="",
-                 decode_retries=8):
+                 decode_retries=8, ep_ids=None, keep_episodes=None):
         self.ds = ds
         self.ds_id = ds_id
         self.grip_format = grip_format
@@ -246,7 +286,11 @@ class LeRobotVLMDataset(torch.utils.data.Dataset):
         self.target = target
         self.state_key = state_key
         self.grip_threshold = grip_threshold
-        self.indices = list(range(0, len(ds), max(1, frame_stride)))
+        idx = range(0, len(ds), max(1, frame_stride))
+        if keep_episodes is not None and ep_ids is not None:
+            self.indices = [i for i in idx if int(ep_ids[i]) in keep_episodes]
+        else:
+            self.indices = list(idx)
 
     def __len__(self):
         return len(self.indices)
@@ -400,6 +444,34 @@ def build_lora(model, args):
 
 
 @torch.no_grad()
+def evaluate(model, loader, device, max_batches):
+    """Token-weighted mean loss on held-out EPISODES.
+
+    Weighted by supervised-token count, not batch count: HF returns a per-token
+    mean within each batch, so averaging those directly would over-weight short
+    batches. Without this number, training loss falls forever and there is no
+    way to tell learned geometry from memorised coordinates -- which matter very
+    differently for the KV caches the MoE will consume.
+    """
+    was_training = model.training
+    model.eval()
+    tot, ntok = 0.0, 0
+    for bi, batch in enumerate(loader):
+        if bi >= max_batches:
+            break
+        batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                 for k, v in batch.items()}
+        n = int((batch["labels"] != -100).sum())
+        if n == 0:
+            continue
+        tot += float(model(**batch).loss) * n
+        ntok += n
+    if was_training:
+        model.train()
+    return tot / ntok if ntok else float("nan")
+
+
+@torch.no_grad()
 def report_kv_drift(model, loader, device, image_token_id,
                     n_batches=4, n_bands=4, layers_per_band=9):
     """How far the LoRA moved the hidden states the MoE's experts read.
@@ -473,6 +545,19 @@ def main():
                         "rebalance the mix -- ConcatDataset samples proportionally to "
                         "size, so a 10x larger dataset otherwise supplies 10x the "
                         "gradient.")
+    p.add_argument("--val_episodes", type=float, default=0.05,
+                   help="Held-out EPISODES for validation: <1 a fraction, >=1 a count, "
+                        "0 disables. Split is on episodes, never frames -- neighbouring "
+                        "frames differ by 0.1s and are near copies, so a frame split "
+                        "makes val loss track train loss forever and detect nothing.")
+    p.add_argument("--val_every", type=int, default=200,
+                   help="Steps between validation passes.")
+    p.add_argument("--val_batches", type=int, default=20,
+                   help="Validation batches per pass.")
+    p.add_argument("--val_seed", type=int, default=0,
+                   help="Seeds the episode split. Fixed so a restart reuses the same "
+                        "held-out set; a reshuffle would move validation onto episodes "
+                        "the model already trained on.")
     p.add_argument("--gripper_format", type=str, default="numeric",
                    choices=["numeric", "binary"],
                    help="How --target pose reports the fingers. numeric (default): "
@@ -584,7 +669,7 @@ def main():
         print(f"--balance: equalising to the smallest dataset ({target:,} frames); "
               f"--frame_stride overridden -> {strides}")
 
-    subsets, rows, state_dims = [], [], {}
+    subsets, val_subsets, rows, state_dims = [], [], [], {}
     for (did, ds, raw), stride in zip(loaded, strides):
         # Camera keys are resolved PER DATASET and deliberately not required to
         # match. The VLM is handed a list of images and nothing else -- unlike
@@ -620,11 +705,31 @@ def main():
                       f"hardcoded gripper threshold of {grip_t}. Check the open/closed "
                       f"split below -- a misplaced cut mislabels the one categorical "
                       f"token in every target.")
-        sub = LeRobotVLMDataset(ds, cks, args.target, stride, state_key, grip_t,
-                                args.gripper_format, did, args.decode_retries)
+        keep_tr = keep_va = None
+        ep_ids = None
+        if args.val_episodes > 0:
+            ep_ids = frame_episode_indices(ds)
+            if ep_ids is None:
+                raise RuntimeError(
+                    f"{did}: cannot read per-frame episode_index, so a leak-free "
+                    f"validation split is impossible. Splitting on frames instead "
+                    f"would make val loss meaningless (neighbouring frames are near "
+                    f"copies). Pass --val_episodes 0 to train without validation.")
+            keep_va = split_episodes(ep_ids, args.val_episodes, args.val_seed)
+            keep_tr = set(np.unique(ep_ids).tolist()) - keep_va
+
+        def _mk(keep):
+            return LeRobotVLMDataset(ds, cks, args.target, stride, state_key, grip_t,
+                                     args.gripper_format, did, args.decode_retries,
+                                     ep_ids, keep)
+        sub = _mk(keep_tr)
         subsets.append(sub)
+        if keep_va is not None:
+            val_subsets.append(_mk(keep_va))
         eps = getattr(ds, "num_episodes", None)
-        rows.append((did, cks, scene, wrist, sd, stride, len(sub), raw, eps, grip_t))
+        rows.append((did, cks, scene, wrist, sd, stride, len(sub), raw, eps, grip_t,
+                     len(val_subsets[-1]) if keep_va is not None else 0,
+                     len(keep_va) if keep_va is not None else 0))
 
     # pose templates observation.state positionally as LIBERO's
     # [xyz(3), axis-angle(3), fingers(2)]. On a dataset whose state is joint
@@ -652,7 +757,8 @@ def main():
     print(f"\n  {'dataset':<30} {'cams':>4} {'state':>5} {'episodes':>8} {'raw':>9} "
           f"{'stride':>6} {'used':>9} {'mix':>6}")
     total = sum(r[6] for r in rows)
-    for ri, (did, cks, scene, wrist, sd, stride, n, raw, eps, grip_t) in enumerate(rows):
+    for ri, (did, cks, scene, wrist, sd, stride, n, raw, eps, grip_t,
+             n_val, n_val_eps) in enumerate(rows):
         print(f"  {did[:30]:<30} {len(cks):>4} {str(sd):>5} {str(eps or '?'):>8} {raw:>9,} "
               f"{stride:>6} {n:>9,} {100 * n / max(1, total):>5.1f}%")
         # Print the ROLE beside each key. Camera names do not match across
@@ -677,6 +783,9 @@ def main():
             flag = "   <-- far from 50/50, check the cut" if not 30 <= pct <= 70 else ""
             print(f"      gripper cut {grip_t:.4f} -> {pct:.1f}% open / "
                   f"{100 - pct:.1f}% closed  (n={len(idxs)}){flag}")
+        if n_val:
+            print(f"      val split: {n_val_eps} held-out episodes -> {n_val:,} frames "
+                  f"({100 * n_val / max(1, n + n_val):.1f}% of this dataset)")
         if not scene:
             print("      WARNING: every camera classified as WRIST. A scene view is "
                   "what a 'describe the scene' target needs.")
@@ -706,6 +815,19 @@ def main():
         num_workers=args.num_workers, drop_last=True, pin_memory=(device == "cuda"),
         collate_fn=make_collate(processor, args.max_len),
     )
+
+    val_loader = None
+    if val_subsets:
+        val_ds = (val_subsets[0] if len(val_subsets) == 1
+                  else torch.utils.data.ConcatDataset(val_subsets))
+        val_loader = DataLoader(
+            val_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=max(1, args.num_workers // 2), drop_last=False,
+            pin_memory=(device == "cuda"),
+            collate_fn=make_collate(processor, args.max_len))
+        print(f"Validation: {len(val_ds):,} frames from held-out episodes "
+              f"({100 * len(val_ds) / (len(dataset) + len(val_ds)):.1f}% of all frames), "
+              f"every {args.val_every} steps over {args.val_batches} batches\n")
 
     # Show one fully-assembled example. A silently-empty or mis-masked target is
     # the failure mode that looks exactly like normal training.
@@ -739,6 +861,7 @@ def main():
     print(f"Training {args.training_steps} steps on {device}, "
           f"batch {args.batch_size} x accum {args.grad_accum}\n")
     step, run_loss, it = 0, 0.0, iter(loader)
+    best_val, best_step = None, 0
     while step < args.training_steps:
         opt.zero_grad(set_to_none=True)
         for _ in range(args.grad_accum):
@@ -766,6 +889,15 @@ def main():
             print(f"step {step:6d}/{args.training_steps}  loss {run_loss / n_micro:.4f}  "
                   f"lr {sched.get_last_lr()[0]:.2e}  grad_norm {float(gn):.2f}")
             run_loss = 0.0
+        if val_loader is not None and (step % args.val_every == 0
+                                       or step == args.training_steps):
+            v = evaluate(model, val_loader, device, args.val_batches)
+            gap = ""
+            if best_val is None or v < best_val - 1e-4:
+                best_val, best_step = v, step
+            else:
+                gap = f"   (best {best_val:.4f} @ {best_step}; {step - best_step} steps ago)"
+            print(f"  val {v:.4f}{gap}")
         if step % args.save_every == 0 or step == args.training_steps:
             out = Path(args.output_dir) / f"checkpoint-{step}"
             model.save_pretrained(out)
