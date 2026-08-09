@@ -151,7 +151,35 @@ def to_pil(img: torch.Tensor) -> Image.Image:
     return Image.fromarray(arr)
 
 
-def pose_target(state: torch.Tensor) -> str:
+GRIPPER_DIM = 6
+
+
+def gripper_threshold_from_stats(stats, state_key="observation.state"):
+    """Midpoint of the gripper dim's two modes, read from the dataset's own stats.
+
+    The finger position is bimodal -- on LIBERO the modes sit at ~0.011 (closed)
+    and ~0.040 (open) -- so the open/closed cut belongs at their midpoint. A
+    hardcoded constant does not survive a change of robot or of units, and gets
+    it wrong even here: 0.02 labelled 31% of frames closed, while the ACTION
+    column (bimodal at -1.0/+0.9194, mean -0.0496) independently implies 50.5%.
+    That is ~19% of frames carrying the wrong word for the one categorical token
+    in the target.
+
+    q10/q90 rather than min/max: the tails are where stray frames live, and
+    q01-q10 on this column spans only 0.002 while q10-q50 spans 0.014.
+    Returns None if the stats cannot supply it, leaving the caller to decide.
+    """
+    st = (stats or {}).get(state_key) or {}
+    lo, hi = st.get("q10"), st.get("q90")
+    try:
+        if lo is not None and hi is not None and len(lo) > GRIPPER_DIM:
+            return (float(lo[GRIPPER_DIM]) + float(hi[GRIPPER_DIM])) / 2.0
+    except (TypeError, ValueError, IndexError):
+        pass
+    return None
+
+
+def pose_target(state: torch.Tensor, grip_threshold: float) -> str:
     """Template an end-effector pose from observation.state.
 
     LIBERO's state is [xyz(3), axis-angle(3), finger_qpos(2)]. Only xyz and the
@@ -161,7 +189,8 @@ def pose_target(state: torch.Tensor) -> str:
     and would teach the model a boundary that is an artefact of the encoding.
     """
     s = state.flatten().tolist()
-    grip = "open" if len(s) < 7 or abs(s[6]) > 0.02 else "closed"
+    grip = ("open" if len(s) <= GRIPPER_DIM or abs(s[GRIPPER_DIM]) > grip_threshold
+            else "closed")
     return (f"gripper at x={s[0]:+.3f} y={s[1]:+.3f} z={s[2]:+.3f}, "
             f"fingers {grip}")
 
@@ -174,11 +203,13 @@ class LeRobotVLMDataset(torch.utils.data.Dataset):
     buys duplicate gradients and a fast route to memorising the instruction set.
     """
 
-    def __init__(self, ds, camera_keys, target, frame_stride, state_key):
+    def __init__(self, ds, camera_keys, target, frame_stride, state_key,
+                 grip_threshold=0.02):
         self.ds = ds
         self.camera_keys = camera_keys
         self.target = target
         self.state_key = state_key
+        self.grip_threshold = grip_threshold
         self.indices = list(range(0, len(ds), max(1, frame_stride)))
 
     def __len__(self):
@@ -191,7 +222,8 @@ class LeRobotVLMDataset(torch.utils.data.Dataset):
         if isinstance(task, (list, tuple)):
             task = task[0] if task else ""
         if self.target == "pose":
-            return images, POSE_PROMPT, pose_target(item[self.state_key].float())
+            return images, POSE_PROMPT, pose_target(item[self.state_key].float(),
+                                                    self.grip_threshold)
         if self.target == "cot":
             return images, PROMPT, rewrite_instruction(str(task))
         return images, PROMPT, str(task)
@@ -380,6 +412,11 @@ def main():
                         "rebalance the mix -- ConcatDataset samples proportionally to "
                         "size, so a 10x larger dataset otherwise supplies 10x the "
                         "gradient.")
+    p.add_argument("--gripper_threshold", type=float, default=None,
+                   help="Open/closed cut on observation.state[6] for --target pose. "
+                        "Default: auto, the midpoint of that dim's q10/q90 in the "
+                        "dataset's own stats -- the column is bimodal and a hardcoded "
+                        "constant does not survive a change of robot or units.")
     p.add_argument("--balance", action="store_true",
                    help="Auto-pick per-dataset strides so every dataset contributes "
                         "roughly equally. ConcatDataset samples proportionally to "
@@ -503,10 +540,20 @@ def main():
         cks, scene, wrist = order_cameras(sel, args.max_cameras)
         sd = ds.meta.features.get(state_key, {}).get("shape", [None])[-1]
         state_dims[did] = sd
-        sub = LeRobotVLMDataset(ds, cks, args.target, stride, state_key)
+        grip_t = args.gripper_threshold
+        if grip_t is None:
+            grip_t = gripper_threshold_from_stats(getattr(ds.meta, "stats", None), state_key)
+        if grip_t is None:
+            grip_t = 0.02
+            if args.target == "pose":
+                print(f"  WARNING {did}: no q10/q90 for {state_key}; falling back to a "
+                      f"hardcoded gripper threshold of {grip_t}. Check the open/closed "
+                      f"split below -- a misplaced cut mislabels the one categorical "
+                      f"token in every target.")
+        sub = LeRobotVLMDataset(ds, cks, args.target, stride, state_key, grip_t)
         subsets.append(sub)
         eps = getattr(ds, "num_episodes", None)
-        rows.append((did, cks, scene, wrist, sd, stride, len(sub), raw, eps))
+        rows.append((did, cks, scene, wrist, sd, stride, len(sub), raw, eps, grip_t))
 
     # pose templates observation.state positionally as LIBERO's
     # [xyz(3), axis-angle(3), fingers(2)]. On a dataset whose state is joint
@@ -534,7 +581,7 @@ def main():
     print(f"\n  {'dataset':<30} {'cams':>4} {'state':>5} {'episodes':>8} {'raw':>9} "
           f"{'stride':>6} {'used':>9} {'mix':>6}")
     total = sum(r[6] for r in rows)
-    for did, cks, scene, wrist, sd, stride, n, raw, eps in rows:
+    for ri, (did, cks, scene, wrist, sd, stride, n, raw, eps, grip_t) in enumerate(rows):
         print(f"  {did[:30]:<30} {len(cks):>4} {str(sd):>5} {str(eps or '?'):>8} {raw:>9,} "
               f"{stride:>6} {n:>9,} {100 * n / max(1, total):>5.1f}%")
         # Print the ROLE beside each key. Camera names do not match across
@@ -543,6 +590,22 @@ def main():
         order = "  ".join(f"{k.rsplit('.', 1)[-1]}[{'wrist' if k in wrist else 'scene'}]"
                           for k in cks)
         print(f"      {order}")
+        if args.target == "pose":
+            # Sample the labels this cut actually produces instead of trusting
+            # it. The gripper column is bimodal and roughly balanced in these
+            # demos, so a split far from 50/50 means the cut landed inside a
+            # mode -- which is exactly how a hardcoded 0.02 read 31/69 here.
+            sub = subsets[ri]
+            step = max(1, len(sub) // 400)
+            idxs = range(0, len(sub), step)
+            opened = sum(
+                1 for i in idxs
+                if abs(sub.ds[sub.indices[i]][state_key].float().flatten().tolist()
+                       [GRIPPER_DIM]) > grip_t)
+            pct = 100 * opened / max(1, len(idxs))
+            flag = "   <-- far from 50/50, check the cut" if not 30 <= pct <= 70 else ""
+            print(f"      gripper cut {grip_t:.4f} -> {pct:.1f}% open / "
+                  f"{100 - pct:.1f}% closed  (n={len(idxs)}){flag}")
         if not scene:
             print("      WARNING: every camera classified as WRIST. A scene view is "
                   "what a 'describe the scene' target needs.")
