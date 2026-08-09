@@ -380,6 +380,12 @@ def main():
                         "rebalance the mix -- ConcatDataset samples proportionally to "
                         "size, so a 10x larger dataset otherwise supplies 10x the "
                         "gradient.")
+    p.add_argument("--balance", action="store_true",
+                   help="Auto-pick per-dataset strides so every dataset contributes "
+                        "roughly equally. ConcatDataset samples proportionally to "
+                        "length, so without this the largest dataset IS the run. "
+                        "Overrides --frame_stride; reference is the smallest dataset "
+                        "at stride 1, since upsampling is not possible here.")
     p.add_argument("--max_cameras", type=int, default=0,
                    help="Cap cameras per dataset (0 = all). Keeps a 4-camera dataset "
                         "from contributing 4x the image tokens of a 1-camera one. When "
@@ -455,9 +461,24 @@ def main():
             f"--frame_stride takes 1 value or one per dataset, got {len(strides)} "
             f"for {len(args.dataset_id)} datasets")
 
-    subsets, rows, state_dims = [], [], {}
-    for did, stride in zip(args.dataset_id, strides):
+    # Load first, decide strides second: --balance needs every raw frame count
+    # before it can pick any of them.
+    loaded = []
+    for did in args.dataset_id:
         ds = LeRobotDataset(did, force_cache_sync=True, revision="main")
+        loaded.append((did, ds, len(ds)))
+
+    if args.balance:
+        # ConcatDataset samples proportionally to length, so an equal mix means
+        # equal post-stride counts. Reference is the SMALLEST dataset at stride
+        # 1 -- anything larger would need to upsample, which this cannot do.
+        target = min(n for _, _, n in loaded)
+        strides = [max(1, round(n / target)) for _, _, n in loaded]
+        print(f"--balance: equalising to the smallest dataset ({target:,} frames); "
+              f"--frame_stride overridden -> {strides}")
+
+    subsets, rows, state_dims = [], [], {}
+    for (did, ds, raw), stride in zip(loaded, strides):
         # Camera keys are resolved PER DATASET and deliberately not required to
         # match. The VLM is handed a list of images and nothing else -- unlike
         # the MoE, where a camera's identity fixes its slot in the DiT sequence,
@@ -484,7 +505,8 @@ def main():
         state_dims[did] = sd
         sub = LeRobotVLMDataset(ds, cks, args.target, stride, state_key)
         subsets.append(sub)
-        rows.append((did, cks, scene, wrist, sd, stride, len(sub)))
+        eps = getattr(ds, "num_episodes", None)
+        rows.append((did, cks, scene, wrist, sd, stride, len(sub), raw, eps))
 
     # pose templates observation.state positionally as LIBERO's
     # [xyz(3), axis-angle(3), fingers(2)]. On a dataset whose state is joint
@@ -506,11 +528,15 @@ def main():
               f"[xyz(3), axis-angle(3), fingers(2)]; only xyz + finger aperture "
               f"are templated.")
 
-    print(f"\n  {'dataset':<30} {'cams':>4} {'state':>5} {'stride':>6} {'frames':>9} {'mix':>6}")
+    # `used` is ceil(raw / stride) -- the raw column is here so the number can be
+    # checked against what the dataset is known to contain, rather than only
+    # being back-computable by multiplying by the stride.
+    print(f"\n  {'dataset':<30} {'cams':>4} {'state':>5} {'episodes':>8} {'raw':>9} "
+          f"{'stride':>6} {'used':>9} {'mix':>6}")
     total = sum(r[6] for r in rows)
-    for did, cks, scene, wrist, sd, stride, n in rows:
-        print(f"  {did[:30]:<30} {len(cks):>4} {str(sd):>5} {stride:>6} {n:>9,} "
-              f"{100 * n / max(1, total):>5.1f}%")
+    for did, cks, scene, wrist, sd, stride, n, raw, eps in rows:
+        print(f"  {did[:30]:<30} {len(cks):>4} {str(sd):>5} {str(eps or '?'):>8} {raw:>9,} "
+              f"{stride:>6} {n:>9,} {100 * n / max(1, total):>5.1f}%")
         # Print the ROLE beside each key. Camera names do not match across
         # datasets and are never matched to each other -- they are ordered
         # scene-first so the prompt has one convention regardless of naming.
@@ -522,8 +548,19 @@ def main():
                   "what a 'describe the scene' target needs.")
     # ConcatDataset + shuffle samples proportionally to size, so the mix column
     # IS the sampling distribution. A dataset 10x the size of another silently
-    # supplies 10x the gradient; tune it with per-dataset --frame_stride.
-    print(f"  {'TOTAL':<30} {'':>4} {'':>5} {'':>6} {total:>9,}\n")
+    # supplies 10x the gradient; tune it with per-dataset --frame_stride or
+    # --balance.
+    print(f"  {'TOTAL':<30} {'':>4} {'':>5} {'':>8} {'':>9} {'':>6} {total:>9,}")
+    if len(rows) > 1:
+        top = max(rows, key=lambda r: r[6])
+        share = 100 * top[6] / max(1, total)
+        if share >= 80.0:
+            print(f"\n  WARNING: {top[0]} is {share:.1f}% of the sampling distribution. "
+                  f"The other {len(rows) - 1} dataset(s) contribute "
+                  f"{100 - share:.1f}% of the gradient between them, so this is close "
+                  f"to a single-dataset run. Use --balance, or raise that dataset's "
+                  f"--frame_stride.")
+    print()
     dataset = subsets[0] if len(subsets) == 1 else torch.utils.data.ConcatDataset(subsets)
 
     processor = AutoProcessor.from_pretrained(args.vlm_model_id)
