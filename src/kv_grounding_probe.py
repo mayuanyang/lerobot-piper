@@ -55,7 +55,7 @@ from __future__ import annotations
 import argparse
 
 
-def ridge_cv(X, Y, alphas, folds=5, seed=0, pca_dim=0, dim_mask=None):
+def ridge_cv(X, Y, alphas, folds=5, seed=0, pca_dim=0, dim_mask=None, groups=None):
     """Leave-fold-out ridge. Returns (best_alpha, cv_r2, per-dim cv_r2, all_r2,
     per-dim RMSE in label units).
 
@@ -101,8 +101,21 @@ def ridge_cv(X, Y, alphas, folds=5, seed=0, pca_dim=0, dim_mask=None):
 
     n = X.shape[0]
     rng = np.random.default_rng(seed)
-    order = rng.permutation(n)
-    cuts = np.array_split(order, folds)
+    if groups is None:
+        order = rng.permutation(n)
+        cuts = np.array_split(order, folds)
+    else:
+        # Fold by GROUP, not by row. The referent probe encodes one layout once
+        # per candidate name, so its rows come in near-identical sibling sets --
+        # same image, only the instruction differs. Splitting rows at random
+        # puts siblings on both sides and the fit stops being a fit: the scene
+        # control scored 0.999 (0.3mm on an object the position probe resolves
+        # to 6-8mm), which is a lookup, not skill. Same leak as splitting a
+        # video dataset on frames instead of episodes.
+        g = np.asarray(groups)
+        uniq = rng.permutation(np.unique(g))
+        cuts = [np.concatenate([np.where(g == u)[0] for u in part])
+                for part in np.array_split(uniq, folds)]
     best = (None, -1e9, None, None)
     all_r2 = {}
     for a in alphas:
@@ -699,32 +712,59 @@ def main() -> None:
             sl = slice(li * K, (li + 1) * K)
             rY_shuf[sl] = rY[sl][rng_s.permutation(K)]
 
+        # Folds are formed over LAYOUTS: the K rows of one layout share an image
+        # and must never straddle the split.
+        grp = np.repeat(np.arange(len(frames)), K)
+
+        # A one-hot of WHICH name was used is the ceiling for reading the name
+        # and nothing else: it predicts each object's mean position. R^2 here is
+        # dominated by the ~100mm spread BETWEEN objects, not the ~8mm jitter
+        # within one, so a small R^2 is not evidence of binding and the measured
+        # value has to be read against this reference rather than against zero.
+        onehot = np.zeros((len(rY), K))
+        onehot[np.arange(len(rY)), np.asarray(rWhich)] = 1.0
+
         alphas_r = [1e1, 1e2, 1e3, 1e4, 1e5, 1e6]
         rows_r = []
-        for label, Y in (("NAMED object position", rY),
-                         (f"FIXED ({bodies[0]}) -- scene control", rFixed),
-                         ("NAMED, names shuffled -- floor", rY_shuf)):
-            a, r2, r2d, _, rmse = ridge_cv(rX, Y, alphas_r, folds=5, seed=0)
+        for label, X_, Y in (
+                ("NAMED object position", rX, rY),
+                (f"FIXED ({bodies[0]}) -- scene control", rX, rFixed),
+                ("NAME-ONLY oracle -- ceiling", onehot, rY),
+                ("NAMED, names shuffled -- floor", rX, rY_shuf)):
+            a, r2, r2d, _, rmse = ridge_cv(X_, Y, alphas_r, folds=5, seed=0, groups=grp)
             rows_r.append((label, r2, r2d, rmse * 1000.0))
         w = max(len(r[0]) for r in rows_r) + 2
         print(f"\n{'probe':<{w}}{'CV R^2':>9}{'R2 x':>8}{'R2 y':>8}{'mm x':>8}{'mm y':>8}")
         print("-" * (w + 41))
         for label, r2, r2d, mm in rows_r:
             print(f"{label:<{w}}{r2:>9.3f}{r2d[0]:>8.2f}{r2d[1]:>8.2f}{mm[0]:>8.1f}{mm[1]:>8.1f}")
-        named, fixed, floor = rows_r[0][1], rows_r[1][1], rows_r[2][1]
-        print(f"\n  named {named:.3f}   floor {floor:.3f}   margin {named - floor:+.3f}")
-        if named - floor < 0.05:
-            print("  -> the NAMED probe does not beat the shuffled floor. Swapping which "
-                  "object the instruction names leaves the representation unable to say "
-                  "where the referent is, i.e. the name is NOT bound to a region. The "
-                  "scene control below shows the positions themselves are present, so "
-                  "this isolates naming rather than blaming the features.")
+        named, fixed, oracle, floor = (rows_r[0][1], rows_r[1][1],
+                                       rows_r[2][1], rows_r[3][1])
+        # Position the measurement on the floor->ceiling line instead of reading
+        # R^2 against 0: the scale is set by the between-object spread, so
+        # "above zero" says almost nothing.
+        span = oracle - floor
+        frac = (named - floor) / span if span > 1e-6 else float("nan")
+        within = np.stack([pos_all[i][b][:2] for i in range(len(frames))
+                           for b in bodies]).reshape(len(frames), K, 2).std(0).mean() * 1000
+        print(f"\n  floor {floor:.3f}  ->  NAMED {named:.3f}  ->  ceiling {oracle:.3f}")
+        print(f"  the name is read {frac * 100:.0f}% of the way from chance to a perfect "
+              f"name-reader")
+        print(f"  a perfect reader would err by the WITHIN-object jitter, ~{within:.1f}mm; "
+              f"measured x/y {rows_r[0][3][0]:.1f}/{rows_r[0][3][1]:.1f}mm, "
+              f"chance {rows_r[3][3][0]:.1f}/{rows_r[3][3][1]:.1f}mm")
+        if frac < 0.15:
+            print("  -> the name is essentially NOT bound to a region: swapping which "
+                  "object the instruction names barely moves where the probe points.")
+        elif frac < 0.6:
+            print("  -> PARTIAL binding. The name shifts the readout but nowhere near "
+                  "enough to identify the referent, so a policy relying on it would "
+                  "aim between the candidates rather than at one.")
         else:
-            print("  -> the NAMED probe beats the floor, so the name DOES select a "
-                  "region. Since the image is identical across names within a layout, "
-                  "that margin came from the language.")
-        print(f"  scene control {fixed:.3f} -- if this is also at the floor the features "
-              f"carry nothing and the naming result is uninterpretable.")
+            print("  -> the name selects the referent. Since the image is identical "
+                  "across names within a layout, that came from the language.")
+        print(f"  scene control {fixed:.3f} -- if this is at the floor the features carry "
+              f"nothing and the result is uninterpretable rather than negative.")
         if not args.text_last and args.read_positions == "vision":
             print("  (text-first + vision positions: the layout where binding is even "
                   "possible, since vision KV is language-conditioned here.)")
