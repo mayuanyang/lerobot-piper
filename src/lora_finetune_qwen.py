@@ -637,6 +637,12 @@ def main():
     p.add_argument("--report_kv_drift", action="store_true",
                    help="After training, measure relative hidden-state drift vs the "
                         "base model -- the size of the shock a resumed MoE absorbs.")
+    p.add_argument("--resume_from", type=str, default=None,
+                   help="Checkpoint dir to continue from. Restores the adapter and, if "
+                        "trainer_state.pt is present, the Adam moments, the cosine "
+                        "position and the step counter. Keep --training_steps the same "
+                        "as the original run: the schedule is defined over it, so a "
+                        "different value silently reshapes the remaining LR curve.")
     p.add_argument("--drift_only", type=str, default=None,
                    help="Adapter dir to measure KV drift on, then exit. Skips training. "
                         "Lets the go/no-go on a MoE resume be made from a mid-run "
@@ -903,18 +909,54 @@ def main():
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
-    model = build_lora(model, args)
+    start_step, resumed_val, resumed_best_step = 0, None, 0
+    if args.resume_from:
+        from peft import PeftModel
+        ck = Path(args.resume_from)
+        # is_trainable=True is not optional: PeftModel.from_pretrained defaults
+        # to inference mode and leaves every LoRA parameter with
+        # requires_grad=False, which would hand AdamW an empty parameter list.
+        model = PeftModel.from_pretrained(model, str(ck), is_trainable=True)
+        n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Resuming adapter from {ck}  ({n_train:,} trainable params)")
+    else:
+        model = build_lora(model, args)
     model.to(device)
     model.train()
 
     params = [p for p in model.parameters() if p.requires_grad]
+    if not params:
+        raise RuntimeError("No trainable parameters -- the adapter loaded frozen.")
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     sched = get_cosine_schedule_with_warmup(opt, args.warmup_steps, args.training_steps)
 
-    print(f"Training {args.training_steps} steps on {device}, "
-          f"batch {args.batch_size} x accum {args.grad_accum}\n")
-    step, run_loss, it = 0, 0.0, iter(loader)
-    best_val, best_step = None, 0
+    if args.resume_from:
+        tr = Path(args.resume_from) / "trainer_state.pt"
+        if tr.exists():
+            st = torch.load(tr, map_location=device, weights_only=False)
+            opt.load_state_dict(st["optimizer"])
+            sched.load_state_dict(st["scheduler"])
+            start_step = int(st.get("step", 0))
+            resumed_val, resumed_best_step = st.get("best_val"), int(st.get("best_step", 0))
+            print(f"  restored optimizer + schedule at step {start_step} "
+                  f"(lr {sched.get_last_lr()[0]:.2e}"
+                  + (f", best val {resumed_val:.4f} @ {resumed_best_step}"
+                     if resumed_val is not None else "") + ")")
+        else:
+            # Adam's moments and the cosine position are NOT in the adapter file.
+            # Without them the run restarts the warmup ramp and takes its first
+            # steps on zeroed moments -- a visible loss bump that reads as the
+            # resume having failed.
+            print(f"  WARNING: no trainer_state.pt in {args.resume_from}. Adapter "
+                  f"weights restored, but Adam moments and the LR schedule restart "
+                  f"from scratch -- expect a transient. Checkpoints written before "
+                  f"this feature existed have this limitation.")
+
+    print(f"Training to {args.training_steps} steps on {device}, "
+          f"batch {args.batch_size} x accum {args.grad_accum}"
+          + (f"  (resuming at {start_step})" if start_step else "") + "\n")
+    step, run_loss, it = start_step, 0.0, iter(loader)
+    best_val, best_step = resumed_val, resumed_best_step
     while step < args.training_steps:
         opt.zero_grad(set_to_none=True)
         for _ in range(args.grad_accum):
@@ -954,10 +996,16 @@ def main():
         if step % args.save_every == 0 or step == args.training_steps:
             out = Path(args.output_dir) / f"checkpoint-{step}"
             model.save_pretrained(out)
-            print(f"  saved adapter -> {out}")
+            torch.save({"optimizer": opt.state_dict(), "scheduler": sched.state_dict(),
+                        "step": step, "best_val": best_val, "best_step": best_step},
+                       out / "trainer_state.pt")
+            print(f"  saved adapter + trainer state -> {out}")
 
     final = Path(args.output_dir) / "final"
     model.save_pretrained(final)
+    torch.save({"optimizer": opt.state_dict(), "scheduler": sched.state_dict(),
+                "step": step, "best_val": best_val, "best_step": best_step},
+               final / "trainer_state.pt")
     print(f"\nAdapter saved to {final}")
 
     if args.report_kv_drift:
