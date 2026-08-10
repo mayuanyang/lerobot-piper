@@ -727,10 +727,29 @@ def train(
         ckpt_state = load_safetensors(model_file, device="cpu")
         policy.train()
         cur_state = policy.state_dict()
+        # NEVER restore the frozen VLM from the checkpoint. save_pretrained writes
+        # the full state_dict -- requires_grad=False does not keep a module out of
+        # it -- so every checkpoint carries a copy of the encoder it was trained
+        # against. The shape filter cannot catch this: a LoRA-merged encoder has
+        # the identical architecture, so all of its tensors "match" and get
+        # overwritten by the stock weights baked into the checkpoint. Combining
+        # --vlm_model_id with --resume_from_checkpoint would silently undo the
+        # former, with no error and no visible sign.
+        #
+        # Dropping them is unconditionally correct, not just a fix for that
+        # combination: the encoder is always loaded by from_pretrained(model_id)
+        # before this point, so the checkpoint's copy is redundant either way.
+        VLM_PREFIXES = ("model.vlm_model.", "model.visual.", "model.language_model.")
+        vlm_keys = [k for k in ckpt_state if k.startswith(VLM_PREFIXES)]
         filtered = {
             k: v for k, v in ckpt_state.items()
             if k in cur_state and cur_state[k].shape == v.shape
+            and not k.startswith(VLM_PREFIXES)
         }
+        if vlm_keys:
+            _src = vlm_model_id or getattr(type(policy.model), "VLM_MODEL_ID", "the stock hub id")
+            print(f"Ignoring {len(vlm_keys)} frozen-VLM tensors in the checkpoint; the "
+                  f"encoder comes from {_src}")
         # Deliberately drop transferable-by-shape weights whose MEANING changed.
         # The shape filter above cannot see this: after cross-embodiment
         # pretraining, action_pos_emb has the same (1, horizon, dit_hidden) shape
