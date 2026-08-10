@@ -147,6 +147,21 @@ def main() -> None:
                     help="initial states to sample. This is the REAL sample size: "
                          "object positions are constant within an episode, so extra "
                          "timesteps add no label diversity.")
+    ap.add_argument("--referent_probe", action="store_true",
+                    help="Ask whether the representation binds a NAME to an object, "
+                         "rather than whether positions are readable. Encodes each "
+                         "layout once per candidate name and fits a probe for the NAMED "
+                         "object's position. Within a layout the image is byte-identical "
+                         "across names, so anything above the shuffled floor had to come "
+                         "from the language.")
+    ap.add_argument("--referent_bodies", type=str, nargs="+", default=None,
+                    help="Bodies to name, one per candidate. Default: --target_body and "
+                         "--distractor_body.")
+    ap.add_argument("--referent_names", type=str, nargs="+", default=None,
+                    help="Phrase naming each --referent_bodies entry, same order. "
+                         "Default: the body name with underscores as spaces.")
+    ap.add_argument("--referent_template", type=str, default="pick up {name}",
+                    help="Instruction built around each name.")
     ap.add_argument("--vlm_model_id", type=str, default="",
                     help="Local dir holding a LoRA-merged Qwen3-VL (from "
                          "lora_finetune_qwen.py --merge_and_save). Empty = stock hub "
@@ -499,6 +514,7 @@ def main() -> None:
         print("!! could not read env._init_states -- every sample may be the SAME "
               "layout, which makes the probe meaningless. Check the wrapper.")
 
+    pos_all = []
     for i in range(args.n_states):
         # LiberoEnv.reset() reads _init_state_id and calls
         # set_init_state(_init_states[id]). reset(seed=...) does NOT select the
@@ -514,6 +530,7 @@ def main() -> None:
         frames.append(Image.fromarray(f).convert("RGB"))
         pos_t.append(p[args.target_body])
         pos_d.append(p[args.distractor_body])
+        pos_all.append(p)
     env.close()
     pos_t, pos_d = np.stack(pos_t), np.stack(pos_d)
 
@@ -552,7 +569,7 @@ def main() -> None:
                         "spatial_merge_size", 2) or 2)
 
     @torch.no_grad()
-    def features(img):
+    def features(img, text=None):
         if args.vision_input_size:
             ts = args.vision_input_size
             img = img.resize((ts, ts), Image.BICUBIC)
@@ -560,9 +577,10 @@ def main() -> None:
         # the vision positions language-conditioned, which is the whole premise
         # of the layout the policy now uses. --text_last reverses it, which is
         # the only ordering where the LANGUAGE positions can see the scene.
-        content = ([{"type": "image", "image": img}, {"type": "text", "text": task_text}]
+        tt = task_text if text is None else text
+        content = ([{"type": "image", "image": img}, {"type": "text", "text": tt}]
                    if args.text_last else
-                   [{"type": "text", "text": task_text}, {"type": "image", "image": img}])
+                   [{"type": "text", "text": tt}, {"type": "image", "image": img}])
         messages = [{"role": "user", "content": content}]
         text = processor.apply_chat_template(messages, tokenize=False,
                                              add_generation_prompt=True)
@@ -613,6 +631,91 @@ def main() -> None:
                 f"pooling needs at least 4. With --read_positions language and an "
                 f"empty --instruction there is nothing to read.")
         return h[idx], n_vis
+
+    # ── referent probe ───────────────────────────────────────────────────
+    # Does the representation bind a NAME to an object? The position probe below
+    # cannot answer this: it showed both bowls localised equally well, which is
+    # consistent both with "names work but the two bowls are interchangeable" and
+    # with "names do nothing".
+    #
+    # Here each layout is encoded once PER CANDIDATE NAME. The image is
+    # byte-identical across those encodings -- only the instruction differs -- so
+    # a probe that predicts the NAMED object's position has no route to the
+    # answer except the language. The shuffled-name fit is the floor: it keeps
+    # every feature vector and every label, and only breaks which name goes with
+    # which, so it isolates naming from everything else in the scene.
+    if args.referent_probe:
+        bodies = args.referent_bodies or [args.target_body, args.distractor_body]
+        names = args.referent_names or [b.replace("_", " ") for b in bodies]
+        if len(names) != len(bodies):
+            raise SystemExit(f"--referent_names has {len(names)} entries for "
+                             f"{len(bodies)} bodies")
+        missing = [b for b in bodies if b not in pos_all[0]]
+        if missing:
+            raise SystemExit(f"bodies not in the scene: {missing}\n"
+                             f"available: {sorted(pos_all[0])}")
+        print(f"\nreferent probe over {len(bodies)} names, "
+              f"{len(frames)} layouts -> {len(frames) * len(bodies)} samples")
+        for b, nm in zip(bodies, names):
+            print(f"    {b:<28} named {args.referent_template.format(name=nm)!r}")
+
+        rX, rY, rFixed, rWhich = [], [], [], []
+        for li, im in enumerate(frames):
+            for ki, (b, nm) in enumerate(zip(bodies, names)):
+                h, _ = features(im, args.referent_template.format(name=nm))
+                L = h.shape[0]
+                bands = np.stack([h[j * L // 4:(j + 1) * L // 4].mean(0) for j in range(4)])
+                rX.append(np.concatenate([h.mean(0), bands.reshape(-1)]))
+                rY.append(pos_all[li][b][:2])
+                rFixed.append(pos_all[li][bodies[0]][:2])
+                rWhich.append(ki)
+            if li == 0:
+                print(f"  feature dim: {rX[0].shape[0]}   layout: "
+                      f"{'image then text' if args.text_last else 'text then image'}")
+        rX = np.stack(rX); rX = (rX - rX.mean(0)) / (rX.std(0) + 1e-6)
+        rY = np.stack(rY).astype(np.float64)
+        rFixed = np.stack(rFixed).astype(np.float64)
+
+        # Shuffle WITHIN each layout: the same set of labels, reassigned to the
+        # wrong names. A global shuffle would also destroy the scene-to-label
+        # correspondence and understate the floor.
+        rng_s = np.random.default_rng(0)
+        rY_shuf = rY.copy()
+        K = len(bodies)
+        for li in range(len(frames)):
+            sl = slice(li * K, (li + 1) * K)
+            rY_shuf[sl] = rY[sl][rng_s.permutation(K)]
+
+        alphas_r = [1e1, 1e2, 1e3, 1e4, 1e5, 1e6]
+        rows_r = []
+        for label, Y in (("NAMED object position", rY),
+                         (f"FIXED ({bodies[0]}) -- scene control", rFixed),
+                         ("NAMED, names shuffled -- floor", rY_shuf)):
+            a, r2, r2d, _, rmse = ridge_cv(rX, Y, alphas_r, folds=5, seed=0)
+            rows_r.append((label, r2, r2d, rmse * 1000.0))
+        w = max(len(r[0]) for r in rows_r) + 2
+        print(f"\n{'probe':<{w}}{'CV R^2':>9}{'R2 x':>8}{'R2 y':>8}{'mm x':>8}{'mm y':>8}")
+        print("-" * (w + 41))
+        for label, r2, r2d, mm in rows_r:
+            print(f"{label:<{w}}{r2:>9.3f}{r2d[0]:>8.2f}{r2d[1]:>8.2f}{mm[0]:>8.1f}{mm[1]:>8.1f}")
+        named, fixed, floor = rows_r[0][1], rows_r[1][1], rows_r[2][1]
+        print(f"\n  named {named:.3f}   floor {floor:.3f}   margin {named - floor:+.3f}")
+        if named - floor < 0.05:
+            print("  -> the NAMED probe does not beat the shuffled floor. Swapping which "
+                  "object the instruction names leaves the representation unable to say "
+                  "where the referent is, i.e. the name is NOT bound to a region. The "
+                  "scene control below shows the positions themselves are present, so "
+                  "this isolates naming rather than blaming the features.")
+        else:
+            print("  -> the NAMED probe beats the floor, so the name DOES select a "
+                  "region. Since the image is identical across names within a layout, "
+                  "that margin came from the language.")
+        print(f"  scene control {fixed:.3f} -- if this is also at the floor the features "
+              f"carry nothing and the naming result is uninterpretable.")
+        if not args.text_last and args.read_positions == "vision":
+            print("  (text-first + vision positions: the layout where binding is even "
+                  "possible, since vision KV is language-conditioned here.)")
+        return
 
     feats, n_vis = [], None
     for i, im in enumerate(frames):
