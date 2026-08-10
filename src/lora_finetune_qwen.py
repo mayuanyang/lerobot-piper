@@ -276,12 +276,13 @@ class LeRobotVLMDataset(torch.utils.data.Dataset):
 
     def __init__(self, ds, camera_keys, target, frame_stride, state_key,
                  grip_threshold=0.02, grip_format="numeric", ds_id="",
-                 decode_retries=8, ep_ids=None, keep_episodes=None):
+                 decode_retries=8, ep_ids=None, keep_episodes=None, cot_ratio=0.25):
         self.ds = ds
         self.ds_id = ds_id
         self.grip_format = grip_format
         self.decode_retries = decode_retries
         self._decode_failures = 0
+        self.cot_ratio = cot_ratio
         self.camera_keys = camera_keys
         self.target = target
         self.state_key = state_key
@@ -324,14 +325,30 @@ class LeRobotVLMDataset(torch.utils.data.Dataset):
         task = item.get("task", "")
         if isinstance(task, (list, tuple)):
             task = task[0] if task else ""
-        if self.target == "pose":
+        kind = self.target_for(i)
+        if kind == "pose":
             st = item[self.state_key].float()
             if self.grip_format == "numeric":
                 return images, POSE_PROMPT_NUMERIC, pose_target_numeric(st)
             return images, POSE_PROMPT_BINARY, pose_target(st, self.grip_threshold)
-        if self.target == "cot":
+        if kind == "cot":
             return images, PROMPT, rewrite_instruction(str(task))
         return images, PROMPT, str(task)
+
+    def target_for(self, i):
+        """Which target this frame carries under a mixed objective.
+
+        Assigned by a deterministic hash of the frame index, not a per-epoch coin
+        flip: the two objectives then partition the data on a fixed boundary, so
+        a frame never appears with both answers and the validation set's
+        composition is identical every time it is measured. A random draw would
+        make each val pass a slightly different mixture and put noise on the
+        curve that has nothing to do with the model.
+        """
+        if self.target != "pose+cot":
+            return self.target
+        return ("cot" if (self.indices[i] * 2654435761) % 1000 < self.cot_ratio * 1000
+                else "pose")
 
 
 def make_collate(processor, max_len):
@@ -590,8 +607,15 @@ def main():
     p.add_argument("--output_dir", type=str, default="./outputs/qwen_lora")
     p.add_argument("--vlm_model_id", type=str, default=VLM_MODEL_ID)
     p.add_argument("--target", type=str, default="cot",
-                   choices=["cot", "instruction", "pose"],
+                   choices=["cot", "instruction", "pose", "pose+cot"],
                    help="What the model is trained to produce. See module docstring.")
+    p.add_argument("--cot_ratio", type=float, default=0.25,
+                   help="Fraction of frames carrying the cot answer under "
+                        "--target pose+cot; the rest carry pose. Below 0.5 on purpose: "
+                        "cot has only ~40 distinct targets across the whole dataset and "
+                        "saturates within a few thousand steps, after which its share of "
+                        "the compute buys almost no gradient, while pose has one target "
+                        "per frame and keeps paying.")
     p.add_argument("--frame_stride", type=int, nargs="+", default=[10],
                    help="Keep 1 frame in N. Neighbouring frames share an instruction "
                         "and nearly the same pixels, so a stride of 1 mostly buys "
@@ -761,7 +785,7 @@ def main():
         print(f"--balance: equalising to the smallest dataset ({target:,} frames); "
               f"--frame_stride overridden -> {strides}")
 
-    subsets, val_subsets, rows, state_dims = [], [], [], {}
+    subsets, val_subsets, rows, state_dims = [], {}, [], {}
     for (did, ds, raw), stride in zip(loaded, strides):
         # Camera keys are resolved PER DATASET and deliberately not required to
         # match. The VLM is handed a list of images and nothing else -- unlike
@@ -810,17 +834,23 @@ def main():
             keep_va = split_episodes(ep_ids, args.val_episodes, args.val_seed)
             keep_tr = set(np.unique(ep_ids).tolist()) - keep_va
 
-        def _mk(keep):
-            return LeRobotVLMDataset(ds, cks, args.target, stride, state_key, grip_t,
-                                     args.gripper_format, did, args.decode_retries,
-                                     ep_ids, keep)
+        def _mk(keep, tgt=None):
+            return LeRobotVLMDataset(ds, cks, tgt or args.target, stride, state_key,
+                                     grip_t, args.gripper_format, did,
+                                     args.decode_retries, ep_ids, keep, args.cot_ratio)
         sub = _mk(keep_tr)
         subsets.append(sub)
         if keep_va is not None:
-            val_subsets.append(_mk(keep_va))
+            # Validation is split by OBJECTIVE, not left as a mixture. cot has
+            # only ~40 distinct targets and is memorised within a few thousand
+            # steps, after which its loss sits near zero; pose plateaus at the
+            # entropy of its last decimal. A single averaged number would let one
+            # curve mask the other exactly when the difference matters.
+            for tk in (["pose", "cot"] if args.target == "pose+cot" else [args.target]):
+                val_subsets.setdefault(tk, []).append(_mk(keep_va, tk))
         eps = getattr(ds, "num_episodes", None)
         rows.append((did, cks, scene, wrist, sd, stride, len(sub), raw, eps, grip_t,
-                     len(val_subsets[-1]) if keep_va is not None else 0,
+                     len(next(iter(val_subsets.values()))[-1]) if keep_va is not None else 0,
                      len(keep_va) if keep_va is not None else 0))
 
     # pose templates observation.state positionally as LIBERO's
@@ -908,18 +938,18 @@ def main():
         collate_fn=make_collate(processor, args.max_len),
     )
 
-    val_loader = None
-    if val_subsets:
-        val_ds = (val_subsets[0] if len(val_subsets) == 1
-                  else torch.utils.data.ConcatDataset(val_subsets))
-        val_loader = DataLoader(
-            val_ds, batch_size=args.batch_size, shuffle=False,
+    val_loaders = {}
+    for tk, subs in val_subsets.items():
+        vds = subs[0] if len(subs) == 1 else torch.utils.data.ConcatDataset(subs)
+        val_loaders[tk] = DataLoader(
+            vds, batch_size=args.batch_size, shuffle=False,
             num_workers=max(1, args.num_workers // 2), drop_last=False,
             pin_memory=(device == "cuda"),
             collate_fn=make_collate(processor, args.max_len))
-        print(f"Validation: {len(val_ds):,} frames from held-out episodes "
-              f"({100 * len(val_ds) / (len(dataset) + len(val_ds)):.1f}% of all frames), "
-              f"every {args.val_every} steps over {args.val_batches} batches\n")
+        print(f"Validation [{tk}]: {len(vds):,} frames from held-out episodes, "
+              f"every {args.val_every} steps over {args.val_batches} batches")
+    if val_loaders:
+        print()
 
     # Show one fully-assembled example. A silently-empty or mis-masked target is
     # the failure mode that looks exactly like normal training.
@@ -1028,15 +1058,21 @@ def main():
             print(f"step {step:6d}/{args.training_steps}  loss {run_loss / n_micro:.4f}  "
                   f"lr {sched.get_last_lr()[0]:.2e}  grad_norm {float(gn):.2f}")
             run_loss = 0.0
-        if val_loader is not None and (step % args.val_every == 0
-                                       or step == args.training_steps):
-            v = evaluate(model, val_loader, device, args.val_batches)
+        if val_loaders and (step % args.val_every == 0 or step == args.training_steps):
+            vals = {tk: evaluate(model, ld, device, args.val_batches)
+                    for tk, ld in val_loaders.items()}
+            # "pose" is the objective aimed at the measured bottleneck, so it
+            # drives checkpoint selection when both are present; cot is reported
+            # but does not decide, since it bottoms out early by construction.
+            key = "pose" if "pose" in vals else next(iter(vals))
+            v = vals[key]
             gap = ""
             if best_val is None or v < best_val - 1e-4:
                 best_val, best_step = v, step
             else:
                 gap = f"   (best {best_val:.4f} @ {best_step}; {step - best_step} steps ago)"
-            print(f"  val {v:.4f}{gap}")
+            cells = "  ".join(f"{tk} {x:.4f}" for tk, x in vals.items())
+            print(f"  val  {cells}{gap}")
         if step % args.save_every == 0 or step == args.training_steps:
             out = Path(args.output_dir) / f"checkpoint-{step}"
             model.save_pretrained(out)
