@@ -523,26 +523,44 @@ def report_kv_drift(model, loader, device, image_token_id,
             a = a.float(); b = b.float()
             d2 = (a - b).pow(2).sum(-1)
             a2 = a.pow(2).sum(-1)
-            s = stats.setdefault(li, [0.0, 0.0, 0.0, 0.0])
-            s[0] += float(d2[vis].sum()); s[1] += float(a2[vis].sum())
+            b2 = b.pow(2).sum(-1)
+            ab = (a * b).sum(-1)
+            s = stats.setdefault(li, [0.0] * 8)
+            s[0] += float(d2[vis].sum());  s[1] += float(a2[vis].sum())
             s[2] += float(d2[lang].sum()); s[3] += float(a2[lang].sum())
+            s[4] += float(b2[vis].sum());  s[5] += float(ab[vis].sum())
+            s[6] += float(b2[lang].sum()); s[7] += float(ab[lang].sum())
 
     def rel(num, den):
         return math.sqrt(num / den) if den > 0 else float("nan")
 
     # hidden_states[0] is the embedding output; layer i is at index i+1.
-    print(f"\n  {'expert band':<22} {'vision':>9} {'language':>9}")
+    # drift alone cannot say WHAT moved: |a-b|/|a| = 1.14 is produced both by a
+    # rotation to cosine 0.35 at unchanged norm and by a 2.14x inflation with no
+    # rotation at all. The distinction decides everything downstream. The
+    # grounding probe standardises its features and is therefore scale-invariant,
+    # so inflation is invisible to it -- but the experts' cross-attention is not:
+    # scaling K rescales the attention logits and scaling V rescales the output.
+    # A large drift with cos near 1 is a gain problem, not a geometry problem.
+    print(f"\n  {'expert band':<22} {'vision: drift  |b|/|a|    cos':>32}"
+          f"   {'language: drift  |b|/|a|    cos':>32}")
     worst = 0.0
     for e in range(n_bands):
         lo, hi = 1 + e * layers_per_band, (e + 1) * layers_per_band
-        agg = [0.0, 0.0, 0.0, 0.0]
+        agg = [0.0] * 8
         for li in range(lo, hi + 1):
             if li in stats:
-                for j in range(4):
+                for j in range(8):
                     agg[j] += stats[li][j]
         v, l = rel(agg[0], agg[1]), rel(agg[2], agg[3])
+        nv = math.sqrt(agg[4] / agg[1]) if agg[1] else float("nan")
+        nl = math.sqrt(agg[6] / agg[3]) if agg[3] else float("nan")
+        cv = agg[5] / math.sqrt(agg[1] * agg[4]) if agg[1] and agg[4] else float("nan")
+        cl = agg[7] / math.sqrt(agg[3] * agg[6]) if agg[3] and agg[6] else float("nan")
         worst = max(worst, max(x for x in (v, l) if not math.isnan(x)) if (agg[1] or agg[3]) else 0.0)
-        print(f"  E{e} (VLM layers {lo - 1:>2}-{hi - 1:<2})    {v:>9.4f} {l:>9.4f}")
+        print(f"  E{e} (VLM layers {lo - 1:>2}-{hi - 1:<2})    "
+              f"{v:>9.4f} {nv:>8.3f} {cv:>7.3f}   "
+              f"{l:>15.4f} {nl:>8.3f} {cl:>7.3f}")
     return worst
 
 
