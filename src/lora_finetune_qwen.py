@@ -529,6 +529,31 @@ def report_kv_drift(model, loader, device, image_token_id,
     return worst
 
 
+def build_loader_for_drift(args, processor, device, n_frames=64):
+    """A small loader for the drift measurement only.
+
+    Drift is a property of the encoder, not of the sampling mix, so this reads
+    the FIRST dataset at a stride wide enough to give roughly n_frames spread
+    across the whole set -- enough batches for a stable ratio without paying for
+    the training pipeline.
+    """
+    did = args.dataset_id[0]
+    ds = LeRobotDataset(did, force_cache_sync=True, revision="main")
+    avail = [k for k in ds.meta.features if k.startswith("observation.images.")]
+    cks, _, _ = order_cameras(args.cameras or avail, args.max_cameras)
+    stride = max(1, len(ds) // max(1, n_frames))
+    grip_t = args.gripper_threshold or gripper_threshold_from_stats(
+        getattr(ds.meta, "stats", None), "observation.state") or 0.02
+    sub = LeRobotVLMDataset(ds, cks, args.target, stride, "observation.state",
+                            grip_t, args.gripper_format, did, args.decode_retries)
+    print(f"  drift probe: {did}, stride {stride} -> {len(sub)} frames, "
+          f"batch {args.batch_size}")
+    return DataLoader(sub, batch_size=args.batch_size, shuffle=False,
+                      num_workers=0, drop_last=False,
+                      pin_memory=(device == "cuda"),
+                      collate_fn=make_collate(processor, args.max_len))
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -612,6 +637,10 @@ def main():
     p.add_argument("--report_kv_drift", action="store_true",
                    help="After training, measure relative hidden-state drift vs the "
                         "base model -- the size of the shock a resumed MoE absorbs.")
+    p.add_argument("--drift_only", type=str, default=None,
+                   help="Adapter dir to measure KV drift on, then exit. Skips training. "
+                        "Lets the go/no-go on a MoE resume be made from a mid-run "
+                        "checkpoint instead of waiting for the full schedule.")
     p.add_argument("--merge_and_save", type=str, default=None,
                    help="Adapter dir to bake into a standalone model. Skips training.")
     p.add_argument("--merged_dir", type=str, default=None,
@@ -619,6 +648,30 @@ def main():
     args = p.parse_args()
 
     device = pick_device()
+
+    # ── drift-only path ──────────────────────────────────────────────────
+    if args.drift_only:
+        from peft import PeftModel
+        print(f"Loading base {args.vlm_model_id} ...")
+        base = Qwen3VLForConditionalGeneration.from_pretrained(
+            args.vlm_model_id, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
+        model = PeftModel.from_pretrained(base, args.drift_only).to(device)
+        processor = AutoProcessor.from_pretrained(args.vlm_model_id)
+        if processor.tokenizer.pad_token is None:
+            processor.tokenizer.pad_token = processor.tokenizer.eos_token
+        loader = build_loader_for_drift(args, processor, device)
+        img_tok = getattr(base.config, "image_token_id", None)
+        if img_tok is None:
+            raise RuntimeError("could not resolve image_token_id")
+        print(f"\nKV drift for {args.drift_only} (adapter on vs off):")
+        worst = report_kv_drift(model, loader, device, img_tok,
+                                n_bands=args.drift_bands,
+                                layers_per_band=args.drift_layers_per_band)
+        print(f"\n  worst band/tower drift: {worst:.4f}")
+        print("  Each expert's ca_q was fit against the ORIGINAL geometry of ITS band.")
+        print("  Above ~0.3 in a band, that expert re-learns its cross-attention rather")
+        print("  than warm-starting.")
+        return
 
     # ── merge-only path ──────────────────────────────────────────────────
     if args.merge_and_save:
