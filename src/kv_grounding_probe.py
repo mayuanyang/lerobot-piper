@@ -147,6 +147,12 @@ def main() -> None:
                     help="initial states to sample. This is the REAL sample size: "
                          "object positions are constant within an episode, so extra "
                          "timesteps add no label diversity.")
+    ap.add_argument("--vlm_model_id", type=str, default="",
+                    help="Local dir holding a LoRA-merged Qwen3-VL (from "
+                         "lora_finetune_qwen.py --merge_and_save). Empty = stock hub "
+                         "weights. Use this to check whether a finetune made the vision "
+                         "representation MORE geometrically informative or merely "
+                         "different -- KV drift cannot tell those apart.")
     ap.add_argument("--vision_input_size", type=int, default=0,
                     help="0 = processor default (matches the policy's current 8x8 "
                          "grid); 512 = the 16x16 grid --vision_input_size 512 gives it.")
@@ -529,7 +535,15 @@ def main() -> None:
     # 2. Frozen VLM features, text FIRST (matches text_first=True) ------------
     device = "cuda" if torch.cuda.is_available() else "cpu"
     from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
-    model_id = "Qwen/Qwen3-VL-4B-Instruct"
+    # A local dir here probes a LoRA-merged encoder from lora_finetune_qwen.py
+    # instead of the stock weights. This is the test that a large KV drift alone
+    # cannot settle: drift says the vision representation MOVED, not whether it
+    # moved somewhere more useful. Finetuning on gripper pose can just as easily
+    # collapse the vision tokens into a gripper-position detector that has
+    # discarded everything else -- and the experts need those tokens for far
+    # more than the gripper. Run this on the merged model and compare the
+    # per-object RMSE against the stock numbers in FINDINGS.md sec 9.
+    model_id = args.vlm_model_id or "Qwen/Qwen3-VL-4B-Instruct"
     print(f"\nloading {model_id} (bf16) ...")
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         model_id, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True).to(device).eval()
