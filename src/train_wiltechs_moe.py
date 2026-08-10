@@ -430,7 +430,7 @@ def train(
     output_directory.mkdir(parents=True, exist_ok=True)
 
     progress_update_freq = 200
-    checkpoint_freq = 1000
+    checkpoint_freq = 2000
     image_transforms = get_augmentations(image_aug_translate, image_aug_scale)
     if image_aug_translate or image_aug_scale:
         print(f"Image aug: GEOMETRIC ON (translate={image_aug_translate}, "
