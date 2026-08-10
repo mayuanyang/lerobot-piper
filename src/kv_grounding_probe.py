@@ -495,10 +495,23 @@ def main() -> None:
         env.close()
         return
 
+    # --referent_probe names its own bodies, so target/distractor are not a
+    # second thing to supply -- default them to the first two candidates. They
+    # still drive the layout-spread report and the fingerprint, which is why
+    # they are filled in rather than skipped.
+    if args.referent_probe and args.referent_bodies:
+        if not args.target_body:
+            args.target_body = args.referent_bodies[0]
+        if not args.distractor_body:
+            args.distractor_body = args.referent_bodies[min(1, len(args.referent_bodies) - 1)]
     if not args.target_body or not args.distractor_body:
-        ap.error("--target_body and --distractor_body are required (see --list_bodies)")
+        ap.error("--target_body and --distractor_body are required (see --list_bodies)"
+                 + ("; or pass --referent_bodies with --referent_probe"
+                    if args.referent_probe else ""))
     known = set(obj_positions(env))
-    for b in (args.target_body, args.distractor_body):
+    check = list(dict.fromkeys([args.target_body, args.distractor_body]
+                               + list(args.referent_bodies or [])))
+    for b in check:
         if b not in known:
             ap.error(f"object {b!r} not in this task. Known: {sorted(known)}")
 
