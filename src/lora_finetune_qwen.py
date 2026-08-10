@@ -529,6 +529,35 @@ def report_kv_drift(model, loader, device, image_token_id,
     return worst
 
 
+def resume_step_from_dir(path):
+    """Infer the step from a `checkpoint-<N>` directory name.
+
+    Checkpoints written before trainer_state.pt existed carry the step nowhere
+    else, and starting such a resume at 0 does more than mislabel the log: the
+    cosine schedule restarts its warmup, so the LR returns to 0 and ramps back
+    to peak over a solution that is already 1500 steps in. The directory name is
+    the only surviving record, and it is exact.
+    """
+    import re
+    m = re.search(r"checkpoint-(\d+)/?$", str(path).rstrip("/"))
+    return int(m.group(1)) if m else 0
+
+
+def build_scheduler(opt, warmup, total, start_step=0):
+    """Cosine schedule positioned at `start_step`.
+
+    last_epoch = start_step - 1, verified to reproduce the LR of a run that took
+    start_step real steps bit-exactly (8.67387075e-05 at 1500/6000). PyTorch
+    demands initial_lr in every param group before last_epoch may be set.
+    """
+    if start_step > 0:
+        for g in opt.param_groups:
+            g.setdefault("initial_lr", g["lr"])
+        return get_cosine_schedule_with_warmup(opt, warmup, total,
+                                               last_epoch=start_step - 1)
+    return get_cosine_schedule_with_warmup(opt, warmup, total)
+
+
 def build_loader_for_drift(args, processor, device, n_frames=64):
     """A small loader for the drift measurement only.
 
@@ -643,6 +672,10 @@ def main():
                         "position and the step counter. Keep --training_steps the same "
                         "as the original run: the schedule is defined over it, so a "
                         "different value silently reshapes the remaining LR curve.")
+    p.add_argument("--resume_step", type=int, default=None,
+                   help="Step to resume at when the checkpoint predates trainer_state.pt. "
+                        "Default: parsed from a `checkpoint-<N>` directory name. Only "
+                        "used when no trainer state is found.")
     p.add_argument("--drift_only", type=str, default=None,
                    help="Adapter dir to measure KV drift on, then exit. Skips training. "
                         "Lets the go/no-go on a MoE resume be made from a mid-run "
@@ -928,16 +961,24 @@ def main():
     if not params:
         raise RuntimeError("No trainable parameters -- the adapter loaded frozen.")
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
-    sched = get_cosine_schedule_with_warmup(opt, args.warmup_steps, args.training_steps)
 
+    state = None
     if args.resume_from:
         tr = Path(args.resume_from) / "trainer_state.pt"
         if tr.exists():
-            st = torch.load(tr, map_location=device, weights_only=False)
-            opt.load_state_dict(st["optimizer"])
-            sched.load_state_dict(st["scheduler"])
-            start_step = int(st.get("step", 0))
-            resumed_val, resumed_best_step = st.get("best_val"), int(st.get("best_step", 0))
+            state = torch.load(tr, map_location=device, weights_only=False)
+            start_step = int(state.get("step", 0))
+        else:
+            start_step = (args.resume_step if args.resume_step is not None
+                          else resume_step_from_dir(args.resume_from))
+    sched = build_scheduler(opt, args.warmup_steps, args.training_steps, start_step)
+
+    if args.resume_from:
+        if state is not None:
+            opt.load_state_dict(state["optimizer"])
+            sched.load_state_dict(state["scheduler"])
+            resumed_val = state.get("best_val")
+            resumed_best_step = int(state.get("best_step", 0))
             print(f"  restored optimizer + schedule at step {start_step} "
                   f"(lr {sched.get_last_lr()[0]:.2e}"
                   + (f", best val {resumed_val:.4f} @ {resumed_best_step}"
@@ -947,10 +988,13 @@ def main():
             # Without them the run restarts the warmup ramp and takes its first
             # steps on zeroed moments -- a visible loss bump that reads as the
             # resume having failed.
-            print(f"  WARNING: no trainer_state.pt in {args.resume_from}. Adapter "
-                  f"weights restored, but Adam moments and the LR schedule restart "
-                  f"from scratch -- expect a transient. Checkpoints written before "
-                  f"this feature existed have this limitation.")
+            print(f"  no trainer_state.pt in {args.resume_from}; step taken as "
+                  f"{start_step} "
+                  f"({'--resume_step' if args.resume_step is not None else 'from the directory name'})"
+                  f" and the schedule fast-forwarded to lr {sched.get_last_lr()[0]:.2e}.")
+            print(f"  WARNING: Adam moments cannot be recovered and start at zero -- "
+                  f"expect a short transient. The LR is correct, so this is a bump, "
+                  f"not a restart. Checkpoints written from now on carry full state.")
 
     print(f"Training to {args.training_steps} steps on {device}, "
           f"batch {args.batch_size} x accum {args.grad_accum}"
