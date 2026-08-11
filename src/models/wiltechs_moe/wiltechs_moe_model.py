@@ -159,7 +159,7 @@ class WiltechsMoETransformer(nn.Module):
         self.num_heads = int(text_cfg.num_attention_heads)
         self.num_kv_heads = int(getattr(text_cfg, "num_key_value_heads", self.num_heads))
         self.head_dim = int(getattr(text_cfg, "head_dim", None) or (self.hidden_size // self.num_heads))
-        self.intermediate_size = int(self.hidden_size * 2)
+        self.intermediate_size = int(self.hidden_size)
         print(f"[wiltechs_moe] VLM hidden_size={self.hidden_size}, num_heads={self.num_heads}, num_kv_heads={self.num_kv_heads}, head_dim={self.head_dim}, intermediate_size={self.intermediate_size}")
         self.rms_norm_eps = float(getattr(text_cfg, "rms_norm_eps", 1e-5))
         vis_cfg = getattr(vlm.config, "vision_config", None)
@@ -187,16 +187,18 @@ class WiltechsMoETransformer(nn.Module):
         if self.dit_hidden % self.head_dim != 0: raise ValueError(f"dit_hidden_size ({self.dit_hidden}) must be divisible by head_dim ({self.head_dim}).")
         ca_nh, ca_nkv, ca_hd = self.num_heads, self.num_kv_heads, self.head_dim
         if self.dit_hidden == self.hidden_size:
-            sa_nh, sa_nkv, sa_hd = self.num_heads, self.num_kv_heads, self.head_dim; dit_intermediate = self.intermediate_size
+            sa_nh, sa_nkv, sa_hd = self.num_heads, self.num_kv_heads, self.head_dim; dit_intermediate = self.dit_hidden
         else:
             sa_hd = self.head_dim; sa_nh = self.dit_hidden // sa_hd
             gqa_ratio = max(1, self.num_heads // max(1, self.num_kv_heads))
             sa_nkv = max(1, sa_nh // gqa_ratio)
             while sa_nh % sa_nkv != 0: sa_nkv -= 1
-            # QFormer cross-attn: ca_num_heads must be divisible by VLM ca_nkv
-            ca_qformer_nh = (sa_nh // ca_nkv) * ca_nkv
-            if ca_qformer_nh == 0: ca_qformer_nh = ca_nkv
             dit_intermediate = self.dit_hidden
+        # QFormer cross-attn: ca_num_heads must be divisible by the VLM's ca_nkv.
+        # Computed AFTER the branch, not inside the narrow one -- living in the
+        # else only meant the full-width path (dit_hidden == VLM hidden) reached
+        # the LatentQFormer construction with the name unbound.
+        ca_qformer_nh = (sa_nh // ca_nkv) * ca_nkv or ca_nkv
         self.experts = nn.ModuleList([ExpertDecoder(hidden_size=self.dit_hidden, num_layers=expert_depth, sa_num_heads=sa_nh, sa_num_kv_heads=sa_nkv, sa_head_dim=sa_hd, ca_num_heads=ca_nh, ca_num_kv_heads=ca_nkv, ca_head_dim=ca_hd, intermediate_size=dit_intermediate, rms_norm_eps=self.rms_norm_eps, dropout=config.dropout) for _ in range(num_experts)])
         self.router = MoERouter(hidden_size=self.dit_hidden, num_experts=num_experts, vlm_hidden_size=self.hidden_size, temperature=float(config.router_temperature), top_k=int(config.router_top_k))
         self.sink_token = nn.Parameter(torch.zeros(1, 1, self.dit_hidden)); nn.init.normal_(self.sink_token, std=0.02)
@@ -260,6 +262,16 @@ class WiltechsMoETransformer(nn.Module):
                 self.thought_vlm_layer = max(self.capture_layers)
             else:
                 self.thought_vlm_layer = thought_layer_cfg
+            # _generate_thoughts indexes kv_cache directly, which only holds the
+            # CAPTURED layers -- an uncaptured index is a KeyError on the first
+            # forward, after the VLM and the dataset have already loaded. Narrow
+            # capture_layers (e.g. 0..17) makes this easy to hit by leaving
+            # --thought_vlm_layer_idx pointing at the old deepest layer.
+            if self.thought_vlm_layer not in set(self.capture_layers):
+                raise ValueError(
+                    f"thought_vlm_layer_idx={self.thought_vlm_layer} is not in the captured "
+                    f"layers {self.capture_layers}. Use -1 for the deepest captured layer "
+                    f"({max(self.capture_layers)}), or add it to --vlm_capture_layers.")
             print(f"[wiltechs_moe] Thought tokens: {self.num_thought_tokens} tokens, "
                   f"Q-Former layers={int(getattr(config, 'thought_qformer_layers', 2))}, "
                   f"VLM layer={self.thought_vlm_layer}")

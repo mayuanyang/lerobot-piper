@@ -1345,5 +1345,16 @@ if __name__ == "__main__":
                      f"= {total_capture} > 36 (Qwen3-VL-4B layer count). Reduce one or both.")
     if args.router_top_k > args.num_experts:
         parser.error(f"--router_top_k ({args.router_top_k}) cannot exceed --num_experts ({args.num_experts}).")
+    # An explicit --vlm_capture_layers list is the ONLY way these two can
+    # disagree (the auto path derives the count from them). When they do,
+    # ExpertDecoder.forward silently cycles its KV blocks with `i % len(...)`:
+    # too few captured layers means DiT layers reuse the same VLM layer, too
+    # many means the tail is captured and never read. Both run fine and train to
+    # a worse model, so fail here instead.
+    if args.vlm_capture_layers is not None and len(args.vlm_capture_layers) != total_capture:
+        parser.error(
+            f"--vlm_capture_layers has {len(args.vlm_capture_layers)} entries but "
+            f"num_experts ({args.num_experts}) x expert_num_layers ({args.expert_num_layers}) "
+            f"= {total_capture}. Each DiT layer reads exactly one captured VLM layer.")
 
     train(**vars(args))
