@@ -17,6 +17,20 @@ from lerobot.optim.optimizers import AdamConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 
 
+# StarVLA's co-training CoT prompt (starvla_cotrain_libero.yaml). Defined once
+# here so the dataclass default and the train script's CLI default cannot drift
+# apart -- two copies of a prompt string is exactly the kind of divergence that
+# produces two runs that look identically configured and are not.
+#
+# The bounding boxes are never produced: this VLM is frozen and never decodes.
+# The prompt earns its place by CONDITIONING the vision K/V -- under text_first
+# it precedes the images, so every vision position is computed with it in scope.
+STARVLA_COT_TEMPLATE = (
+    "Your task is {instruction}. To identify the key objects for your task. "
+    "Locate their bounding boxes in [x1,y1,x2,y2] format."
+)
+
+
 @PreTrainedConfig.register_subclass("wiltechs_moe")
 @dataclass
 class WiltechsMoEConfig(PreTrainedConfig):
@@ -207,6 +221,42 @@ class WiltechsMoEConfig(PreTrainedConfig):
     use_chat_template: bool = False
     chat_directive: str = ""
     use_descriptive_objects: bool = False
+    # Prompt template wrapping each raw instruction, with `{instruction}` marking
+    # where it goes. Unlike chat_directive (prefix only) this allows the
+    # instruction to sit MID-prompt, which is what STARVLA_COT_TEMPLATE above
+    # needs -- see it for the text itself.
+    #
+    # Nothing is generated here -- the VLM is frozen and never decodes, so a
+    # request for bounding boxes cannot be answered. What it does is condition
+    # the vision K/V: under text_first the whole prompt precedes the images, so
+    # every vision position is computed with it in context. Measured with
+    # kv_grounding_probe.py on libero_spatial task 0 (50 layouts, paired, same
+    # images, only the text differs), the StarVLA prompt moved TARGET R^2 from
+    # 0.180 to 0.289 at matched alpha=1e3 and err/motion from 0.905 to 0.835.
+    #
+    # It does NOT improve SELECTION: the target-vs-distractor err/motion gap went
+    # 0.020 -> 0.000, i.e. both bowls got equally easier to localise. Localisation
+    # was never the missing piece; do not expect this to fix referring expressions.
+    #
+    # Empty = use chat_directive (or the bare instruction). A template WITHOUT
+    # `{instruction}` is rejected by the train script: it would drop the
+    # instruction entirely and train every sample on one constant prompt.
+    #
+    # Defaults ON: the measurement above is a paired A/B on identical images, and
+    # three independent axes agree (R^2 at every alpha, err/motion, and how badly
+    # the shuffled-label control overfits at low alpha -- -0.239 here vs -0.433
+    # for the bare instruction, i.e. a better-conditioned feature space). Pass
+    # `--instruction_template ""` for the bare instruction.
+    #
+    # Hand-edited variants tested WORSE: one rewrite kept only 43% of the gain at
+    # alpha=1e1 and fell BELOW the bare instruction by 1e4. Do not tune this by
+    # hand without re-running kv_grounding_probe.py.
+    instruction_template: str = STARVLA_COT_TEMPLATE
+    # Token budget for the instruction. The CoT template above adds ~30 tokens;
+    # combined with use_descriptive_objects (~105) it overflows the old
+    # hardcoded 128 and the truncation takes the TAIL -- which is the template's
+    # own trailing clause, so the experiment silently becomes a no-op.
+    lang_max_len: int = 128
 
     # -------- Language placement in the VLM sequence --------
     # The VLM is CAUSAL. With the legacy layout ([images..., instruction]) a

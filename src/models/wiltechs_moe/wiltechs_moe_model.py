@@ -295,7 +295,11 @@ class WiltechsMoETransformer(nn.Module):
         # the model trained on a prompt that ended partway through the
         # description of where the target is. _report_lang_budget prints the
         # real count every run and says TRUNCATED if this is ever too small.
-        self._lang_max_len = 128
+        self._lang_max_len = int(getattr(config, "lang_max_len", 128) or 128)
+        _tmpl = str(getattr(config, "instruction_template", "") or "").strip()
+        if _tmpl:
+            print(f"[wiltechs_moe] instruction_template ACTIVE (lang_max_len="
+                  f"{self._lang_max_len}):\n  {_tmpl!r}")
         self.text_first = bool(getattr(config, "text_first", True))
         self._template_ids_cpu = None; self._template_format_printed = False
         self._lang_len_printed = False; self._vision_grid_printed = set()
@@ -397,12 +401,30 @@ class WiltechsMoETransformer(nn.Module):
         # REPHRASINGS), so re-resolving an already-rewritten override is safe.
         if descs and getattr(self.config, "use_descriptive_objects", False): descs = [rewrite_instruction(d) for d in descs]
         return descs
+    def _format_instruction(self, descs):
+        """Raw instruction -> the string actually fed to the VLM.
+
+        Deliberately NOT folded into _resolve_descs: the contrastive branch
+        compares descs for equality and builds hard negatives from them, and a
+        constant template wrapper on both sides would only add identical text to
+        every pair. Keeping the raw form there and formatting here means the
+        template affects the VLM input and nothing else.
+
+        instruction_template wins over chat_directive when both are set --
+        the template can place the instruction mid-prompt, which a prefix cannot.
+        """
+        tmpl = str(getattr(self.config, "instruction_template", "") or "").strip()
+        if tmpl:
+            return [tmpl.replace("{instruction}", str(d)) for d in descs]
+        directive = str(getattr(self.config, "chat_directive", "") or "").strip()
+        return [(f"{directive} {d}" if directive else str(d)) for d in descs]
     def _encode_language(self, batch, device):
         descs = self._resolve_descs(batch)
         if not descs or not any(descs): return None
-        inputs = self.processor.tokenizer(descs, return_tensors="pt", padding=True, truncation=True, max_length=self._lang_max_len, add_special_tokens=True)
+        texts = self._format_instruction(descs)
+        inputs = self.processor.tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=self._lang_max_len, add_special_tokens=True)
         input_ids = inputs["input_ids"].to(device); lang_mask = inputs["attention_mask"].bool().to(device)
-        self._report_lang_budget(descs, input_ids, lang_mask)
+        self._report_lang_budget(texts, input_ids, lang_mask)
         lang_tokens = self.language_model.get_input_embeddings()(input_ids)
         return lang_tokens, lang_mask
     def _report_lang_budget(self, texts, lang_ids, lang_mask):
@@ -455,8 +477,7 @@ class WiltechsMoETransformer(nn.Module):
             m = self.spatial_merge_size
             cam_sizes = [int(g[0].item()) * (int(g[1].item()) // m) * (int(g[2].item()) // m) for g in grid_thw_list]
             cam_tokens = list(vis_tokens.split(cam_sizes, dim=1)) if cam_sizes else []
-            directive = str(getattr(self.config, "chat_directive", "") or "").strip()
-            texts = [(f"{directive} {d}" if directive else str(d)) for d in descs]
+            texts = self._format_instruction(descs)
             lang = self.processor.tokenizer(texts, return_tensors="pt", padding=True, truncation=True,
                                             max_length=self._lang_max_len, add_special_tokens=not use_template)
             lang_ids = lang["input_ids"].to(device); lang_mask = lang["attention_mask"].bool().to(device)
@@ -501,8 +522,7 @@ class WiltechsMoETransformer(nn.Module):
             m = self.spatial_merge_size
             cam_sizes = [int(g[0].item()) * (int(g[1].item()) // m) * (int(g[2].item()) // m) for g in grid_thw_list]
             cam_tokens = list(vis_tokens.split(cam_sizes, dim=1)) if cam_sizes else []
-            directive = str(getattr(self.config, "chat_directive", "") or "").strip()
-            texts = [(f"{directive} {d}" if directive else str(d)) + "<|im_end|>\n<|im_start|>assistant\n" for d in descs]
+            texts = [t + "<|im_end|>\n<|im_start|>assistant\n" for t in self._format_instruction(descs)]
             suf = self.processor.tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=self._lang_max_len + 24, add_special_tokens=False)
             suffix_ids = suf["input_ids"].to(device); suffix_mask = suf["attention_mask"].bool().to(device)
             suffix_emb = embed_tokens(suffix_ids); suffix_emb = torch.where(suffix_mask.unsqueeze(-1), suffix_emb, torch.zeros_like(suffix_emb))

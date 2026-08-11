@@ -55,7 +55,7 @@ from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.datasets.compute_stats import aggregate_stats
 
-from models.wiltechs_moe.wiltechs_moe_config import WiltechsMoEConfig
+from models.wiltechs_moe.wiltechs_moe_config import WiltechsMoEConfig, STARVLA_COT_TEMPLATE
 from models.wiltechs_moe.wiltechs_moe_policy import WiltechsMoEPolicy
 from models.wiltechs_moe.processor_wiltechs_moe import make_pre_post_processors
 from models.wiltechs_vla.wiltechs_vla_model import (
@@ -389,6 +389,8 @@ def train(
     vision_kv_dropout_prob: float = 0.0,
     use_chat_template: bool = False,
     chat_directive: str = "",
+    instruction_template: str = STARVLA_COT_TEMPLATE,
+    lang_max_len: int = 128,
     use_descriptive_objects: bool = False,
     text_first: bool = True,
     vision_input_size: int = 0,
@@ -657,6 +659,8 @@ def train(
         vision_dropout_prob=vision_dropout_prob,
         use_chat_template=use_chat_template,
         chat_directive=chat_directive,
+        instruction_template=instruction_template,
+        lang_max_len=lang_max_len,
         use_descriptive_objects=use_descriptive_objects,
         text_first=text_first,
         vision_input_size=vision_input_size,
@@ -699,6 +703,21 @@ def train(
                 with open(cfg_file) as f:
                     saved_cfg_json = json.load(f)
                 break
+        # The prompt is part of the frozen encoder's INPUT, so changing it moves
+        # every KV the experts cross-attend to -- the same class of break as
+        # swapping --vlm_model_id, and the checkpoint's ca_q was fit to the old
+        # geometry. Since instruction_template now DEFAULTS to the StarVLA CoT
+        # form, resuming anything trained before that would silently switch
+        # prompts. Cheap to detect, expensive to discover from a loss curve.
+        saved_tmpl = str(saved_cfg_json.get("instruction_template", "") or "")
+        if saved_cfg_json and saved_tmpl != str(instruction_template or ""):
+            print(f"\n*** PROMPT CHANGED vs the checkpoint ***\n"
+                  f"  checkpoint: {saved_tmpl!r}\n"
+                  f"  this run  : {str(instruction_template or '')!r}\n"
+                  f"  Every expert's cross-attention was fit to the checkpoint's KV geometry, "
+                  f"which this prompt moves. Expect a transient of several thousand steps. "
+                  f"Pass --instruction_template {saved_tmpl!r} to keep the checkpoint's prompt.\n")
+
         if reset_training_state:
             # FINETUNE, not continuation. Without this the counters below come
             # back from the checkpoint, and a checkpoint from a COMPLETED run
@@ -1406,6 +1425,24 @@ if __name__ == "__main__":
     parser.add_argument("--use_descriptive_objects", action="store_true",
                         help="Rewrite ambiguous object/region names into visually-groundable "
                              "descriptions via task_rewrites.py.")
+    parser.add_argument("--instruction_template", type=str, default=STARVLA_COT_TEMPLATE,
+                        help="Prompt template wrapping each instruction; MUST contain the "
+                             "literal '{instruction}'. Unlike --chat_directive (prefix only) "
+                             "the instruction can sit mid-prompt. DEFAULTS to StarVLA's CoT "
+                             "form. Nothing is generated (the VLM never decodes); the effect is "
+                             "on the vision K/V, which text_first makes the whole prompt "
+                             "condition. Measured paired on identical images: TARGET R^2 "
+                             "0.180->0.289 at matched alpha, err/motion 0.905->0.835. It does "
+                             "NOT improve target-vs-distractor SELECTION (gap 0.020->0.000). "
+                             "Pass an EMPTY string for the bare instruction -- required to "
+                             "reproduce any checkpoint trained before this became the default, "
+                             "whose cross-attention was fit to the un-templated KV geometry.")
+    parser.add_argument("--lang_max_len", type=int, default=128,
+                        help="Instruction token budget. Raise it when combining "
+                             "--instruction_template (~30 tok) with --use_descriptive_objects "
+                             "(~105 tok): truncation takes the TAIL, which is the template's "
+                             "own trailing clause, so the run silently loses the thing being "
+                             "tested. Startup prints TRUNCATED if this is too small.")
     parser.add_argument("--vision_input_size", type=int, default=0,
                         help="Square side length (px) fed to the Qwen image processor. "
                              "Qwen3-VL emits one merged vision token per 32x32 input px, so "
@@ -1556,6 +1593,14 @@ if __name__ == "__main__":
                      f"= {total_capture} > 36 (Qwen3-VL-4B layer count). Reduce one or both.")
     if args.router_top_k > args.num_experts:
         parser.error(f"--router_top_k ({args.router_top_k}) cannot exceed --num_experts ({args.num_experts}).")
+    # Without the placeholder the template REPLACES the instruction rather than
+    # wrapping it, so every sample in the run trains on one constant prompt and
+    # the model is language-blind -- a failure with no error and no visible sign.
+    if args.instruction_template and "{instruction}" not in args.instruction_template:
+        parser.error(
+            "--instruction_template must contain the literal '{instruction}' marking where "
+            "the task text goes. Without it every sample gets the SAME prompt and no "
+            "instruction reaches the VLM. Use --chat_directive for a plain prefix.")
     # An explicit --vlm_capture_layers list is the ONLY way these two can
     # disagree (the auto path derives the count from them). When they do,
     # ExpertDecoder.forward silently cycles its KV blocks with `i % len(...)`:
