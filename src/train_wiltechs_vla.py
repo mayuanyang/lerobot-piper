@@ -337,9 +337,12 @@ def train(
     training_steps: int = 300000,
     reset_lang_params: bool = False,
     gradient_checkpointing: bool = False,
-    num_dit_layers: int = 36,
+    num_dit_layers: int = 16,
     vlm_capture_layers: Optional[list] = None,
-    num_latent_tokens: int = 8,
+    vlm_capture_mode: str = "last",
+    num_register_tokens: int = 32,
+    num_latent_tokens: int = 0,
+    use_robot_cnn: bool = False,
     vision_input_size: int = 0,
     vision_hires_cameras: Optional[list] = None,
     text_last: bool = False,
@@ -477,6 +480,9 @@ def train(
         action_dim=action_dim,
         num_vlm_layers=num_dit_layers,
         vlm_capture_layers=list(vlm_capture_layers or []),
+        vlm_capture_mode=vlm_capture_mode,
+        num_register_tokens=num_register_tokens,
+        use_robot_cnn=use_robot_cnn,
         dit_hidden_size=dit_hidden_size,
         num_cameras=len(camera_keys),
         cameras_for_vision_state_concat=camera_keys,
@@ -984,22 +990,44 @@ if __name__ == "__main__":
                         help="Recompute DiT layer activations in backward to save GPU memory "
                              "(trades ~extra forward compute; frozen VLM is unaffected). "
                              "Recommended when using the contrastive loss, which runs a 2nd DiT forward.")
-    parser.add_argument("--num_dit_layers", type=int, default=36,
+    parser.add_argument("--num_dit_layers", type=int, default=16,
                         help="DiT decoder depth = number of VLM layers whose KV the DiT "
-                             "cross-attends to, one per DiT layer. 36 (default) = every layer, "
-                             "the same LAYER COUNT as WiltechsMoE (4 experts x 9 layers, all of "
-                             "which run every forward) but as one sequential stack -- to match its "
+                             "cross-attends to, one per DiT layer. 36 = every layer, the same "
+                             "LAYER COUNT as WiltechsMoE (4 experts x 9 layers, all of which run "
+                             "every forward) but as one sequential stack -- to match its "
                              "PARAMETERS too you also need --dit_hidden_size 1280 (its 92% run's "
-                             "width; 36L at 640 is only 1/3 the params). Below "
-                             "36 the captured layers are spread evenly over the full depth, not "
-                             "taken from the tail. Biggest memory lever; pair with "
-                             "--dit_hidden_size to control per-layer width. Must be <= 36.")
+                             "width; 36L at 640 is only 1/3 the params). Biggest memory lever; "
+                             "pair with --dit_hidden_size to control per-layer width. Must be <= 36.")
+    parser.add_argument("--vlm_capture_mode", type=str, default="last",
+                        choices=["last", "spread"],
+                        help="Which VLM layers the DiT reads when --vlm_capture_layers is empty. "
+                             "'last' (default) takes the deepest N (16 -> layers 20..35); 'spread' "
+                             "spaces them over the full depth. A real trade: the VLM runs all 36 "
+                             "either way, so 'last' discards the shallow layers' KV for free, but "
+                             "gives every DiT layer a fully fused representation. Measured on the "
+                             "MoE variant, cross-attn language share is ~44% at VLM layer 8 vs "
+                             "~91% at layer 35, and under text_first the language K/V never sees "
+                             "the image -- so 'last' reads the least visually grounded band.")
     parser.add_argument("--vlm_capture_layers", type=int, nargs="+", default=[],
-                        help="Explicit VLM layer indices for the DiT to read, overriding the even "
-                             "spread. Must have exactly --num_dit_layers entries.")
-    parser.add_argument("--num_latent_tokens", type=int, default=8,
+                        help="Explicit VLM layer indices for the DiT to read, overriding "
+                             "--vlm_capture_mode. Must have exactly --num_dit_layers entries.")
+    parser.add_argument("--num_register_tokens", type=int, default=32,
+                        help="Learned register tokens placed between the state and the actions: "
+                             "[state(1), register(R), action(H)]. Unlike --num_latent_tokens these "
+                             "hold no observation at init and are rewritten at EVERY DiT layer "
+                             "(self-attention, plus cross-attention, which has no causal mask and "
+                             "covers all DiT positions). 0 disables.")
+    parser.add_argument("--num_latent_tokens", type=int, default=0,
                         help="Learned-query Q-Former 'thought' tokens prepended to the DiT "
-                             "sequence, distilled from the DEEPEST captured VLM layer. 0 disables.")
+                             "sequence, distilled ONCE from the DEEPEST captured VLM layer. "
+                             "Superseded by --num_register_tokens; 0 (default) disables.")
+    parser.add_argument("--use_robot_cnn", action="store_true",
+                        help="Re-enable the parallel ResNet-18 visual encoder (OFF by default). "
+                             "This is the single largest measured lever in the MoE variant of this "
+                             "architecture: removing it took libero_spatial task 0 from 92%% to "
+                             "58%%, and the residual failures were grasp precision, not object "
+                             "selection. With it off the frozen VLM's ~32 px/token grid is the "
+                             "only visual input in the model.")
     parser.add_argument("--vision_input_size", type=int, default=0,
                         help="Square side length (px) fed to the Qwen image processor. 0 = the "
                              "processor's smart-resize default. Qwen3-VL merges 32x32 native px "
