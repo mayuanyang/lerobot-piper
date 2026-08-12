@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import argparse
+import hashlib
 from pathlib import Path
 from typing import Optional
 
@@ -389,7 +390,11 @@ def train(
     contrastive_margin: float = 0.05,
     contrastive_hard_negatives: bool = False,
     vision_kv_dropout_prob: float = 0.0,
-    use_chat_template: bool = False,
+    use_chat_template: bool = True,
+    val_episodes: float = 0.0,
+    val_every: int = 500,
+    val_seed: int = 42,
+    val_max_batches: int = 8,
     chat_directive: str = "",
     use_descriptive_objects: bool = False,
     robot_encoder_tokens: int = 16,
@@ -702,6 +707,12 @@ def train(
     sub_datasets = []
     ep_from: list[int] = []
     ep_to: list[int] = []
+    # Stratification label per episode, for the validation split below. Task
+    # rather than suite: a LIBERO suite is a bundle of ~10 tasks, so covering
+    # every task covers every suite, and it additionally rules out a val set that
+    # samples a suite but misses the tasks in it the model is worst at.
+    ep_group: list[str] = []
+    no_task_col: list[str] = []
     offset = 0
     first_root = None
     for did in dataset_ids:
@@ -712,6 +723,11 @@ def train(
         if first_root is None:
             first_root = ds.root
         ep_ids = np.array(ds.hf_dataset["episode_index"])
+        try:
+            task_ids = np.array(ds.hf_dataset["task_index"])
+        except (KeyError, ValueError, TypeError):
+            task_ids = None
+            no_task_col.append(did)
         changes = np.where(np.diff(ep_ids) != 0)[0] + 1
         starts = np.concatenate([[0], changes])
         ends = np.concatenate([changes, [len(ep_ids)]])
@@ -721,6 +737,9 @@ def train(
                 continue
             ep_from.append(offset + int(s))
             ep_to.append(offset + int(e))
+            # Prefixed by dataset id so a multi-dataset run stratifies across
+            # datasets too -- task_index restarts at 0 in each of them.
+            ep_group.append(f"{did}#{int(task_ids[s])}" if task_ids is not None else did)
             kept += 1
         suffix = f" (<= ep {max_episode_index})" if max_episode_index is not None else ""
         print(f"  {did}: {len(ds)} frames, {kept} episodes{suffix}")
@@ -730,6 +749,75 @@ def train(
     dataset = ConcatDataset(sub_datasets)
     print(f"Combined dataset: {len(dataset)} frames, {len(ep_from)} episodes "
           f"across {len(sub_datasets)} dataset(s)")
+
+    # ── Held-out validation split, BY EPISODE ────────────────────────────
+    # Never by frame. Consecutive frames are 0.1 s apart and are near copies of
+    # each other, so a frame split puts a sample's own neighbours on the other
+    # side of the line: val loss then tracks train loss forever and detects
+    # nothing, which is exactly the failure mode a val loss exists to catch.
+    val_ep: list[int] = []
+    val_indices: list[int] = []
+    if val_episodes > 0:
+        n_ep = len(ep_from)
+        n_val = int(round(n_ep * val_episodes)) if val_episodes < 1 else int(val_episodes)
+        n_val = max(1, min(n_val, n_ep - 1))
+        rng = np.random.default_rng(val_seed)
+        # STRATIFIED by ep_group (dataset#task). A flat draw is only stratified
+        # in expectation: at 40 LIBERO tasks and n_val=34 the odds that some task
+        # lands zero val episodes are high, and the val loss silently stops
+        # covering it. Proportional allocation with largest-remainder, floored at
+        # one per group, capped so no group loses all its episodes.
+        by_group: dict[str, list[int]] = {}
+        for i, g in enumerate(ep_group):
+            by_group.setdefault(g, []).append(i)
+        keys = sorted(by_group)
+        exact = {k: n_val * len(by_group[k]) / n_ep for k in keys}
+        alloc = {k: int(exact[k]) for k in keys}
+        for k in sorted(keys, key=lambda k: exact[k] - alloc[k],
+                        reverse=True)[:n_val - sum(alloc.values())]:
+            alloc[k] += 1
+        for k in keys:  # every group represented, funded by the largest donor
+            if alloc[k] == 0:
+                donor = max(keys, key=lambda j: alloc[j])
+                if alloc[donor] > 1:
+                    alloc[donor] -= 1
+                    alloc[k] = 1
+        for k in keys:  # never hold out a whole group
+            alloc[k] = min(alloc[k], max(0, len(by_group[k]) - 1))
+        val_ep = sorted(int(i) for k in keys
+                        for i in rng.choice(by_group[k], size=alloc[k], replace=False))
+        val_set = set(val_ep)
+        for i in val_ep:
+            val_indices.extend(range(ep_from[i], ep_to[i]))
+        # The train sampler must see ONLY the training episodes -- dropping the
+        # val frames from the val loader alone would leave them in the training
+        # stream and the split would measure nothing.
+        ep_from_tr = [f for i, f in enumerate(ep_from) if i not in val_set]
+        ep_to_tr = [t for i, t in enumerate(ep_to) if i not in val_set]
+        empty = [k for k in keys if alloc[k] == 0]
+        print(f"Stratified over {len(keys)} groups (dataset#task): "
+              f"{min(alloc.values())}-{max(alloc.values())} val episodes each"
+              + (f"  *** {len(empty)} group(s) got NONE -- raise --val_episodes to "
+                 f"at least {len(keys)}: {empty[:5]} ***" if empty else ""))
+        if no_task_col:
+            print(f"  [WARN] no 'task_index' column in {no_task_col}: those datasets "
+                  f"are ONE group, so the split is not stratified by task inside them.")
+        # Fingerprint of the split. Comparing two runs is only valid if they held
+        # out the SAME episodes; a different --max_episode_index or dataset order
+        # silently reshuffles it, and two val curves over different data are not
+        # comparable.
+        fp = hashlib.sha1(",".join(map(str, val_ep)).encode()).hexdigest()[:8]
+        print(f"Validation split: {len(val_ep)}/{n_ep} episodes held out "
+              f"({len(val_indices)} frames), {len(ep_from_tr)} episodes train. "
+              f"seed={val_seed} fingerprint={fp}")
+        if len(val_indices) < batch_size:
+            raise ValueError(
+                f"--val_episodes {val_episodes} holds out {len(val_indices)} frames, "
+                f"fewer than one batch ({batch_size}). Raise --val_episodes.")
+    else:
+        ep_from_tr, ep_to_tr = ep_from, ep_to
+        print("Validation: DISABLED (--val_episodes 0). Training loss alone cannot "
+              "separate a better model from a better-memorised one.")
 
     # Optionally move augmentation + Qwen image preprocessing into the workers.
     if preprocess_in_workers:
@@ -796,8 +884,8 @@ def train(
               "only disambiguates if each batch also carries the task string.")
 
     sampler = EpisodeAwareSampler(
-        dataset_from_indices=ep_from,
-        dataset_to_indices=ep_to,
+        dataset_from_indices=ep_from_tr,
+        dataset_to_indices=ep_to_tr,
         drop_n_first_frames=0,
         drop_n_last_frames=0,
         shuffle=True,
@@ -813,64 +901,146 @@ def train(
     )
     print(f"\nDataLoader: {len(dataloader)} batches/epoch, batch_size={batch_size}")
 
+    # Fixed frame subset, fixed order, no shuffling: the val loss has to move
+    # only because the MODEL moved. Capped at --val_max_batches so a pass stays a
+    # rounding error against --val_every training steps.
+    val_loader = None
+    if val_indices:
+        cap = val_max_batches * batch_size
+        if len(val_indices) > cap:
+            val_indices = np.random.default_rng(val_seed + 1).choice(
+                val_indices, size=cap, replace=False).tolist()
+            val_indices.sort()
+        # augment=None: the val loss must not include augmentation noise, or it
+        # measures the augmentation as much as the model.
+        val_base = dataset
+        if preprocess_in_workers:
+            val_base = VLMImagePreprocDataset(
+                dataset.dataset, policy.model.processor.image_processor, camera_keys,
+                augment=None,
+                cam_target_sizes={k: policy.model.cam_target_size(k) for k in camera_keys},
+            )
+        val_loader = torch.utils.data.DataLoader(
+            torch.utils.data.Subset(val_base, val_indices),
+            num_workers=2, batch_size=batch_size, shuffle=False,
+            pin_memory=device.type != "cpu", drop_last=True,
+        )
+        print(f"Validation loader: {len(val_loader)} batches x {batch_size} "
+              f"= {len(val_loader) * batch_size} frames, every {val_every} steps")
+
     # ── Training loop ────────────────────────────────────────────────────
     print(f"\nStarting training loop ({training_steps} steps, batch_size={batch_size})...")
     done = False
     lang_check_done = False  # one-shot: fires on first batch even when resuming
-    prog_bar = tqdm(total=training_steps, desc="Training Progress", initial=step)
 
-    while not done:
-        epoch += 1
-        for batch in dataloader:
-            for key in list(batch.keys()):
-                # Keep the worker-computed VLM pixels on CPU; _encode_images moves
-                # them to GPU just-in-time (transient) so they aren't resident
-                # through the backward pass and don't inflate the memory peak.
-                if isinstance(batch[key], torch.Tensor) and not key.startswith(_VLM_PIX_PREFIX):
-                    batch[key] = batch[key].to(device, non_blocking=True)
+    def _prep_batch(batch, augment: bool):
+        """Device move + instruction resolution + preprocessor.
 
-            # ── Task description handling ────────────────────────────
-            # Preferred: the batch already carries the instruction TEXT.
-            if ("task" in batch and isinstance(batch["task"], (list, tuple))
-                    and all(isinstance(t, str) for t in batch["task"])):
-                batch["task_description"] = batch["task"]
-            else:
-                # Otherwise resolve an INDEX through the map. The index can
-                # arrive under either key: some datasets expose "task_index",
-                # others put the integer in "task" itself (which then collates
-                # to a (B,) tensor and is NOT the text, however it is named).
-                idx_src = None
-                for k in ("task_index", "task"):
-                    v = batch.get(k)
-                    if isinstance(v, torch.Tensor):
-                        idx_src = v[:, 0] if v.dim() > 1 else v
-                        break
-                if idx_src is not None:
-                    batch["task_description"] = [
-                        task_idx_to_description.get(int(ti), "") for ti in idx_src
-                    ]
-                    # An index outside the map yields "" — silently vision-only
-                    # for that sample, so surface it rather than let it ride.
-                    n_unmapped = sum(1 for d in batch["task_description"] if not d)
-                    if n_unmapped and not lang_check_done:
-                        print(f"⚠️  {n_unmapped}/{len(idx_src)} task indices are not "
-                              f"in the description map (known: "
-                              f"{sorted(task_idx_to_description)[:10]}). Those "
-                              f"samples train with an EMPTY instruction.")
+        Shared by training and validation so the two cannot drift apart -- a val
+        batch built even slightly differently from a train batch makes the gap
+        between the two losses report the difference in PREPARATION, which is
+        indistinguishable from the overfitting it is meant to detect. `augment`
+        is the one deliberate difference.
+        """
+        for key in list(batch.keys()):
+            # Keep the worker-computed VLM pixels on CPU; _encode_images moves
+            # them to GPU just-in-time (transient) so they aren't resident
+            # through the backward pass and don't inflate the memory peak.
+            if isinstance(batch[key], torch.Tensor) and not key.startswith(_VLM_PIX_PREFIX):
+                batch[key] = batch[key].to(device, non_blocking=True)
 
+        # ── Task description handling ────────────────────────────
+        # Preferred: the batch already carries the instruction TEXT.
+        if ("task" in batch and isinstance(batch["task"], (list, tuple))
+                and all(isinstance(t, str) for t in batch["task"])):
+            batch["task_description"] = batch["task"]
+        else:
+            # Otherwise resolve an INDEX through the map. The index can
+            # arrive under either key: some datasets expose "task_index",
+            # others put the integer in "task" itself (which then collates
+            # to a (B,) tensor and is NOT the text, however it is named).
+            idx_src = None
+            for k in ("task_index", "task"):
+                v = batch.get(k)
+                if isinstance(v, torch.Tensor):
+                    idx_src = v[:, 0] if v.dim() > 1 else v
+                    break
+            if idx_src is not None:
+                batch["task_description"] = [
+                    task_idx_to_description.get(int(ti), "") for ti in idx_src
+                ]
+                # An index outside the map yields "" — silently vision-only
+                # for that sample, so surface it rather than let it ride.
+                n_unmapped = sum(1 for d in batch["task_description"] if not d)
+                if n_unmapped and not lang_check_done:
+                    print(f"⚠️  {n_unmapped}/{len(idx_src)} task indices are not "
+                          f"in the description map (known: "
+                          f"{sorted(task_idx_to_description)[:10]}). Those "
+                          f"samples train with an EMPTY instruction.")
+
+        if augment:
             # Image augmentation: in-loop only when the workers aren't doing it.
             if not preprocess_in_workers:
                 present_cams = [c for c in camera_keys if c in batch]
                 batch = apply_image_augmentations(batch, present_cams, image_transforms)
-
             if "observation.state" in batch:
                 batch = apply_joint_augmentations(batch, "observation.state")
 
-            # Hold out the worker-computed VLM pixels so the LeRobot preprocessor
-            # (normalizer / device / add-batch-dim steps) never touches them.
-            vlm_pix = {k: batch.pop(k) for k in list(batch) if k.startswith(_VLM_PIX_PREFIX)}
-            batch = preprocessor(batch)
-            batch.update(vlm_pix)
+        # Hold out the worker-computed VLM pixels so the LeRobot preprocessor
+        # (normalizer / device / add-batch-dim steps) never touches them.
+        vlm_pix = {k: batch.pop(k) for k in list(batch) if k.startswith(_VLM_PIX_PREFIX)}
+        batch = preprocessor(batch)
+        batch.update(vlm_pix)
+        return batch
+
+    def _autocast():
+        return (torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+                if device.type == "cuda"
+                else torch.autocast(device_type="cpu", enabled=False))
+
+    @torch.no_grad()
+    def _validate():
+        """Mean MAIN loss over the held-out episodes. Lower than the train loss
+        is normal (no augmentation, no dropout); what matters is the GAP and
+        whether the val curve turns up while the train curve keeps falling.
+
+        Two things are pinned so the number moves only when the model does:
+          * the frame subset and its order (fixed Subset, shuffle=False)
+          * the flow-matching draws -- sample_time and sample_noise are random
+            per call, and at these batch sizes their variance swamps the model
+            improvement between two validations. Re-seeding makes every pass
+            score the SAME (t, noise) pairs, then restores the training RNG so
+            the run is otherwise byte-identical to one without validation.
+        """
+        was_training = policy.training
+        policy.eval()   # kills dropout, vision-KV dropout and the contrastive
+                        # branch -- all gated on self.training
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        torch.manual_seed(val_seed)
+        tot, nb = 0.0, 0
+        try:
+            for vb in val_loader:
+                vb = _prep_batch(vb, augment=False)
+                with _autocast():
+                    policy.model.compute_loss(vb)
+                tot += float(policy.model._last_loss_components["main"])
+                nb += 1
+        finally:
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
+            if was_training:
+                policy.train()
+        return tot / max(1, nb)
+
+    prog_bar = tqdm(total=training_steps, desc="Training Progress", initial=step)
+    val_hist: list[tuple[int, float]] = []
+
+    while not done:
+        epoch += 1
+        for batch in dataloader:
+            batch = _prep_batch(batch, augment=True)
 
             # One-time language-reaches-model sanity check (step 0). The model's
             # _encode_language reads task_description, falling back to task; if
@@ -936,12 +1106,7 @@ def train(
                 vp_now = vision_dropout_start + (vision_dropout_prob - vision_dropout_start) * frac
                 policy.model.config.vision_dropout_prob = float(vp_now)
 
-            autocast_ctx = (
-                torch.autocast(device_type=device.type, dtype=torch.bfloat16)
-                if device.type == "cuda"
-                else torch.autocast(device_type="cpu", enabled=False)
-            )
-            with autocast_ctx:
+            with _autocast():
                 loss, _ = policy.forward(batch)
 
             loss.backward()
@@ -964,6 +1129,27 @@ def train(
                     "lr": f"{lr:.2e}",
                     "grad_norm": f"{grad_norm:.2f}",
                 })
+
+            # After the optimizer step and after _log_gradient_analysis: a
+            # validation forward overwrites every _last_* diagnostic on the model
+            # (attention stats, loss components), so running it earlier would
+            # make the gradient report describe the HELD-OUT batch while
+            # labelling it as the training step.
+            if val_loader is not None and step > 0 and step % val_every == 0:
+                # BEFORE _validate: its forwards overwrite _last_loss_components,
+                # so reading the train loss afterwards would report the last VAL
+                # batch and print a gap of ~0 no matter how bad the fit is.
+                tr = float(policy.model._last_loss_components["main"])
+                v = _validate()
+                val_hist.append((step, v))
+                trend = ""
+                if len(val_hist) >= 2:
+                    d = v - val_hist[-2][1]
+                    trend = f" ({d:+.4f} vs step {val_hist[-2][0]})"
+                    if d > 0 and len(val_hist) >= 3 and val_hist[-2][1] > val_hist[-3][1]:
+                        trend += "  *** val rising 2x -- overfitting ***"
+                print(f"\n[val] step {step}: val_main={v:.4f}  train_main={tr:.4f}  "
+                      f"gap={v - tr:+.4f}{trend}")
 
             if step > 0 and step % checkpoint_freq == 0:
                 checkpoint_dir = output_directory / f"checkpoint-{step}"
@@ -1088,6 +1274,25 @@ if __name__ == "__main__":
     parser.add_argument("--use_8bit_adam", action="store_true",
                         help="Use bitsandbytes 8-bit Adam (int8 optimizer state) instead of fp32 Adam, "
                              "cutting optimizer memory ~4x. Requires `pip install bitsandbytes` + CUDA.")
+    parser.add_argument("--val_episodes", type=float, default=0.0,
+                        help="Held-out EPISODES for validation: <1 a fraction, >=1 a count, "
+                             "0 (default) disables. The split is on EPISODES, never frames -- "
+                             "consecutive frames are 0.1s apart and near copies, so a frame "
+                             "split leaves a sample's own neighbours on the other side and the "
+                             "val loss tracks the train loss forever, detecting nothing. "
+                             "STRATIFIED by dataset#task, so every task is covered; the value "
+                             "must resolve to at least as many episodes as there are tasks or "
+                             "some get none (the startup line says so if it happens).")
+    parser.add_argument("--val_every", type=int, default=500,
+                        help="Steps between validation passes.")
+    parser.add_argument("--val_seed", type=int, default=42,
+                        help="Seeds BOTH the episode split and the flow-matching (t, noise) "
+                             "draws used to score it. Two runs being compared must share this "
+                             "value or they are scored on different data with different noise; "
+                             "the startup line prints a fingerprint of the resulting split.")
+    parser.add_argument("--val_max_batches", type=int, default=8,
+                        help="Cap on validation batches per pass, so a pass stays cheap "
+                             "relative to --val_every training steps.")
     parser.add_argument("--max_episode_index", type=int, default=None,
                         help="Filter to episodes with index <= this value "
                              "(piper_arm holdout convention; omit for full dataset).")
