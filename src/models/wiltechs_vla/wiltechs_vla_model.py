@@ -883,7 +883,11 @@ class WiltechsVLATransformer(nn.Module):
         # WiltechsMoE) render up to ~105 tokens, and truncation is silent and
         # lands exactly on the disambiguating tail. _report_lang_budget makes
         # the headroom visible at startup.
-        self._lang_max_len = 128
+        self._lang_max_len = int(getattr(config, "lang_max_len", 128) or 128)
+        _tmpl = str(getattr(config, "instruction_template", "") or "").strip()
+        if _tmpl:
+            print(f"[wiltechs_vla] instruction_template ACTIVE (lang_max_len="
+                  f"{self._lang_max_len}):\n  {_tmpl!r}")
         self.text_first = bool(getattr(config, "text_first", True))
 
         # Chat-template static token ids (lazy; only built when
@@ -1102,6 +1106,24 @@ class WiltechsVLATransformer(nn.Module):
             descs = [rewrite_instruction(d) for d in descs]
         return descs
 
+    def _format_instruction(self, descs):
+        """Raw instruction -> the string actually fed to the VLM.
+
+        Deliberately NOT folded into _resolve_descs: the contrastive branch
+        compares descs for equality and builds hard negatives from them, and a
+        constant template wrapper on both sides of a pair would only add
+        identical text to every negative. Keeping the raw form there and
+        formatting here means the template affects the VLM input and nothing else.
+
+        instruction_template wins over chat_directive when both are set -- the
+        template can place the instruction mid-prompt, which a prefix cannot.
+        """
+        tmpl = str(getattr(self.config, "instruction_template", "") or "").strip()
+        if tmpl:
+            return [tmpl.replace("{instruction}", str(d)) for d in descs]
+        directive = str(getattr(self.config, "chat_directive", "") or "").strip()
+        return [(f"{directive} {d}" if directive else str(d)) for d in descs]
+
     def _report_lang_budget(self, texts, lang_ids, lang_mask) -> None:
         """One-time print of the token budget vs. the longest instruction.
 
@@ -1127,8 +1149,9 @@ class WiltechsVLATransformer(nn.Module):
         descs = self._resolve_descs(batch)
         if not descs or not any(descs):
             return None
+        texts = self._format_instruction(descs)
         inputs = self.processor.tokenizer(
-            descs, return_tensors="pt", padding=True, truncation=True,
+            texts, return_tensors="pt", padding=True, truncation=True,
             max_length=self._lang_max_len, add_special_tokens=True,
         )
         input_ids = inputs["input_ids"].to(device)
@@ -1229,8 +1252,7 @@ class WiltechsVLATransformer(nn.Module):
             ]
             cam_tokens = list(vis_tokens.split(cam_sizes, dim=1)) if cam_sizes else []
 
-            directive = str(getattr(self.config, "chat_directive", "") or "").strip()
-            texts = [(f"{directive} {d}" if directive else str(d)) for d in descs]
+            texts = self._format_instruction(descs)
             lang = self.processor.tokenizer(
                 texts, return_tensors="pt", padding=True, truncation=True,
                 max_length=self._lang_max_len, add_special_tokens=not use_template,
@@ -1312,11 +1334,9 @@ class WiltechsVLATransformer(nn.Module):
             ]
             cam_tokens = list(vis_tokens.split(cam_sizes, dim=1)) if cam_sizes else []
 
-            directive = str(getattr(self.config, "chat_directive", "") or "").strip()
             texts = [
-                (f"{directive} {d}" if directive else str(d))
-                + "<|im_end|>\n<|im_start|>assistant\n"
-                for d in descs
+                t + "<|im_end|>\n<|im_start|>assistant\n"
+                for t in self._format_instruction(descs)
             ]
             suf = self.processor.tokenizer(
                 texts, return_tensors="pt", padding=True, truncation=True,

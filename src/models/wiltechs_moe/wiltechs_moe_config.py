@@ -17,18 +17,10 @@ from lerobot.optim.optimizers import AdamConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 
 
-# StarVLA's co-training CoT prompt (starvla_cotrain_libero.yaml). Defined once
-# here so the dataclass default and the train script's CLI default cannot drift
-# apart -- two copies of a prompt string is exactly the kind of divergence that
-# produces two runs that look identically configured and are not.
-#
-# The bounding boxes are never produced: this VLM is frozen and never decodes.
-# The prompt earns its place by CONDITIONING the vision K/V -- under text_first
-# it precedes the images, so every vision position is computed with it in scope.
-STARVLA_COT_TEMPLATE = (
-    "Your task is {instruction}. To identify the key objects for your task. "
-    "Locate their bounding boxes in [x1,y1,x2,y2] format."
-)
+# Re-exported, not redefined. The prompt lives in the VLA config because the
+# dependency runs moe -> vla and the string must exist exactly once; a second
+# copy here is how two runs end up looking identically configured and are not.
+from ..wiltechs_vla.wiltechs_vla_config import STARVLA_COT_TEMPLATE  # noqa: E402
 
 
 @PreTrainedConfig.register_subclass("wiltechs_moe")

@@ -36,6 +36,20 @@ from lerobot.optim.optimizers import AdamConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 
 
+# StarVLA's co-training CoT prompt (starvla_cotrain_libero.yaml). Defined HERE
+# rather than in the MoE config that first used it, because the dependency runs
+# moe -> vla and the string must exist exactly once: two copies is the kind of
+# divergence that produces two runs which look identically configured and are not.
+#
+# The bounding boxes are never produced -- the VLM is frozen and never decodes.
+# The prompt earns its place by CONDITIONING the vision K/V: under text_first it
+# precedes the images, so every vision position is computed with it in scope.
+STARVLA_COT_TEMPLATE = (
+    "Your task is {instruction}. To identify the key objects for your task. "
+    "Locate their bounding boxes in [x1,y1,x2,y2] format."
+)
+
+
 @PreTrainedConfig.register_subclass("wiltechs_vla")
 @dataclass
 class WiltechsVLAConfig(PreTrainedConfig):
@@ -265,6 +279,30 @@ class WiltechsVLAConfig(PreTrainedConfig):
     # changes the KV geometry, so a checkpoint trained with it off does NOT warm-
     # start cleanly -- its ca_q was fit to the untemplated features.
     use_chat_template: bool = True
+    # Prompt template wrapping each raw instruction, with `{instruction}` marking
+    # where it goes. Unlike chat_directive (prefix only) the instruction can sit
+    # MID-prompt, which is what STARVLA_COT_TEMPLATE above needs.
+    #
+    # Defaults ON. Measured with kv_grounding_probe.py on libero_spatial task 0,
+    # paired on identical images with only the text differing:
+    #   TARGET R^2 at matched alpha    0.180 -> 0.289   (holds across 1e1..1e4)
+    #   err/motion, target             0.905 -> 0.835
+    #   shuffled-label control @1e1   -0.433 -> -0.239  (better-conditioned)
+    #
+    # It does NOT improve SELECTION: the target-vs-distractor err/motion gap goes
+    # 0.020 -> 0.000, i.e. both objects get equally easier to localise.
+    # Localisation was never the missing piece; do not expect this to fix
+    # referring expressions.
+    #
+    # A hand-edited variant tested WORSE -- 43% of the gain at alpha=1e1, and
+    # below the bare instruction by 1e4 -- so do not tune this without re-running
+    # the probe. Empty string = bare instruction (or chat_directive).
+    instruction_template: str = STARVLA_COT_TEMPLATE
+    # Token budget for the instruction. The template adds ~30 tokens; combined
+    # with use_descriptive_objects (~105) it overflows the old hardcoded 128 and
+    # the truncation takes the TAIL -- which is the template's own trailing
+    # clause, so the experiment silently becomes a no-op.
+    lang_max_len: int = 128
     # Optional short directive prepended to the task inside the user turn,
     # e.g. "Identify the objects mentioned in the instruction and where they
     # are, then perform:". Empty disables. Only used with use_chat_template.

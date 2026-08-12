@@ -54,7 +54,7 @@ from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.datasets.compute_stats import aggregate_stats
 
-from models.wiltechs_vla.wiltechs_vla_config import WiltechsVLAConfig
+from models.wiltechs_vla.wiltechs_vla_config import WiltechsVLAConfig, STARVLA_COT_TEMPLATE
 from models.wiltechs_vla.wiltechs_vla_policy import WiltechsVLAPolicy
 from models.wiltechs_vla.processor_wiltechs_vla import make_pre_post_processors
 from models.wiltechs_vla.wiltechs_vla_model import (
@@ -391,6 +391,8 @@ def train(
     contrastive_hard_negatives: bool = False,
     vision_kv_dropout_prob: float = 0.0,
     use_chat_template: bool = True,
+    instruction_template: str = STARVLA_COT_TEMPLATE,
+    lang_max_len: int = 128,
     val_episodes: float = 0.0,
     val_every: int = 500,
     val_seed: int = 42,
@@ -540,6 +542,8 @@ def train(
         vision_kv_dropout_prob=vision_kv_dropout_prob,
         vision_dropout_prob=vision_dropout_prob,
         use_chat_template=use_chat_template,
+        instruction_template=instruction_template,
+        lang_max_len=lang_max_len,
         chat_directive=chat_directive,
         use_descriptive_objects=use_descriptive_objects,
         robot_encoder_tokens=robot_encoder_tokens,
@@ -579,6 +583,24 @@ def train(
         if step == 0 and local_ckpt.name.startswith("checkpoint-"):
             step = int(local_ckpt.name.split("-")[1])
         print(f"Resuming from step {step}, epoch {epoch}")
+
+        # The prompt is the frozen encoder's INPUT, so changing it moves every KV
+        # the DiT cross-attends to and the checkpoint's ca_q was fit to the old
+        # geometry. Both instruction_template and use_chat_template now default
+        # ON, so resuming anything trained before that silently switches prompts.
+        # Cheap to detect, expensive to discover from a loss curve.
+        for key, now in (("instruction_template", str(instruction_template or "")),
+                         ("use_chat_template", bool(use_chat_template))):
+            if not saved_cfg_json:
+                break
+            was = saved_cfg_json.get(key, "" if isinstance(now, str) else False)
+            if (str(was) if isinstance(now, str) else bool(was)) != now:
+                print(f"\n*** {key} CHANGED vs the checkpoint ***\n"
+                      f"  checkpoint: {was!r}\n"
+                      f"  this run  : {now!r}\n"
+                      f"  Every DiT layer's cross-attention was fit to the checkpoint's KV "
+                      f"geometry, which this moves. Expect a transient of several thousand "
+                      f"steps, or pass the checkpoint's value to keep its prompt.\n")
 
         # Load the checkpoint onto CPU, NOT the GPU. model.safetensors holds the
         # WHOLE policy (frozen 4B VLM + DiT, ~11GB) and the freshly-built `policy`
@@ -1338,6 +1360,23 @@ if __name__ == "__main__":
                              "KV the DiT reads is computed from it. Required to reproduce a "
                              "checkpoint trained before this became the default -- the "
                              "template moves the KV geometry its ca_q was fit to.")
+    parser.add_argument("--instruction_template", type=str, default=STARVLA_COT_TEMPLATE,
+                        help="Prompt template wrapping each instruction; MUST contain the "
+                             "literal '{instruction}'. Unlike --chat_directive (prefix only) "
+                             "the instruction can sit mid-prompt. DEFAULTS to StarVLA's CoT "
+                             "form. Nothing is generated (the VLM never decodes); the effect "
+                             "is on the vision K/V, which text_first makes the whole prompt "
+                             "condition. Measured paired on identical images: TARGET R^2 "
+                             "0.180->0.289 at matched alpha, err/motion 0.905->0.835. It does "
+                             "NOT improve target-vs-distractor SELECTION (gap 0.020->0.000). "
+                             "Pass an EMPTY string for the bare instruction -- required to "
+                             "reproduce a checkpoint trained before this became the default.")
+    parser.add_argument("--lang_max_len", type=int, default=128,
+                        help="Instruction token budget. Raise it when combining "
+                             "--instruction_template (~30 tok) with --use_descriptive_objects "
+                             "(~105 tok): truncation takes the TAIL, which is the template's "
+                             "own trailing clause, so the run silently loses what it tests. "
+                             "Startup prints TRUNCATED if this is too small.")
     parser.add_argument("--chat_directive", type=str, default="",
                         help="Optional short directive prepended to the task inside the user "
                              "turn (only with --use_chat_template), e.g. 'Identify the objects "
@@ -1380,5 +1419,13 @@ if __name__ == "__main__":
     # Argparse can't express None for an int, so use -1 sentinel.
     if args.lock_joint_index is not None and args.lock_joint_index < 0:
         args.lock_joint_index = None
+    # Without the placeholder the template REPLACES the instruction rather than
+    # wrapping it, so every sample in the run trains on one constant prompt and
+    # the model is language-blind -- a failure with no error and no visible sign.
+    if args.instruction_template and "{instruction}" not in args.instruction_template:
+        parser.error(
+            "--instruction_template must contain the literal '{instruction}' marking where "
+            "the task text goes. Without it every sample gets the SAME prompt and no "
+            "instruction reaches the VLM. Use --chat_directive for a plain prefix.")
 
     train(**vars(args))
