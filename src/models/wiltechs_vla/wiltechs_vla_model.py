@@ -1529,6 +1529,11 @@ class WiltechsVLATransformer(nn.Module):
 
         action_emb = self.action_in_proj(noisy_actions) + self.action_pos_emb[:, :H]
         action_emb = action_emb.to(dtype)
+        # Reference scale for the register-token diagnostic. Each DiT layer
+        # RMSNorms per token, so a small ratio is not by itself "inert" -- a
+        # ratio that never MOVES off its init is.
+        self._last_action_emb_rms = float(
+            action_emb.detach().float().pow(2).mean().sqrt())
 
         # Layout: [state(1), register(R), (robot(R'))?, (latent(K))?, action(H)]
         # State FIRST so that under the causal mask every later token -- the

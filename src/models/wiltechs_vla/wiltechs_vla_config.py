@@ -258,9 +258,13 @@ class WiltechsVLAConfig(PreTrainedConfig):
     #   {chat_directive }{task}<|im_end|>\n<|im_start|>assistant\n
     # instead of the raw [vision | task] concatenation. In-distribution for
     # the instruct-tuned VLM; the trailing assistant header adds "answer
-    # preparation" registers the DiT can cross-attend to. Off by default
-    # (exact legacy behavior, checkpoint-compatible).
-    use_chat_template: bool = False
+    # preparation" positions the DiT can cross-attend to.
+    #
+    # ON by default. The raw concatenation feeds the VLM a token sequence it was
+    # never trained on, and every KV the DiT reads is computed from it. Note this
+    # changes the KV geometry, so a checkpoint trained with it off does NOT warm-
+    # start cleanly -- its ca_q was fit to the untemplated features.
+    use_chat_template: bool = True
     # Optional short directive prepended to the task inside the user turn,
     # e.g. "Identify the objects mentioned in the instruction and where they
     # are, then perform:". Empty disables. Only used with use_chat_template.

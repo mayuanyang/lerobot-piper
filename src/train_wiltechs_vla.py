@@ -205,37 +205,72 @@ def _log_gradient_analysis(policy, step: int) -> None:
     print(f"\n--- Gradient Analysis at Step {step} ---")
 
     def _grad_stats(prefix: str):
-        total, g_norm_sq, count = 0.0, 0.0, 0
+        """Returns (mean|grad|, grad RMS/param, params with grad, params present).
+
+        The last one separates the two ways a module can report nothing:
+        DISABLED (no such parameter — RobotCNN off, latent Q-Former at 0 tokens)
+        from BROKEN (parameters exist and received no gradient). The old version
+        printed "no grad" for both, so three permanently-dead lines sat in every
+        report and the one that would actually matter was camouflaged among them.
+        """
+        total, g_norm_sq, count, present = 0.0, 0.0, 0, 0
         for name, param in policy.model.named_parameters():
-            if param.requires_grad and prefix in name and param.grad is not None:
+            if not (param.requires_grad and prefix in name):
+                continue
+            present += param.numel()
+            if param.grad is not None:
                 total += param.grad.abs().mean().item() * param.numel()
                 g_norm_sq += param.grad.norm().item() ** 2
                 count += param.numel()
         if count == 0:
-            return None, None, 0
+            return None, None, 0, present
         # `Avg Abs Grad` = mean|grad| over ALL params — rounds to ~0 for large
         # modules whose gradient is concentrated in a few sub-params (gates,
         # norms), making them look dead. `RMS/param` = grad_L2_norm / sqrt(N) is
         # scale-fair across modules of any size, so it's the honest comparison.
-        return (total / count, (g_norm_sq ** 0.5) / (count ** 0.5), count)
+        return (total / count, (g_norm_sq ** 0.5) / (count ** 0.5), count, present)
 
     for label, prefix in [
-        ("Robot CNN",      "robot_visual_encoder"),
         ("State Enc",      "state_encoder"),
-        ("Sink Token",     "sink_token"),
+        ("Register Tok",   "register_tokens"),
         ("Action Pos Emb", "action_pos_emb"),
         ("Time Embedder",  "time_embedder"),
         ("DiT Layers",     "dit_layers"),
         ("Action In/Out",  "action_"),
         ("Final Norm",     "final_norm"),
+        ("Robot CNN",      "robot_visual_encoder"),
         ("Latent QFormer", "latent_qformer"),
     ]:
-        grad, rms_pp, n = _grad_stats(prefix)
+        grad, rms_pp, n, present = _grad_stats(prefix)
         if grad is not None:
             print(f"  {label:14s} - Avg Abs Grad: {grad:.6f}   RMS/param: {rms_pp:.2e} "
                   f"({n} params)")
-        else:
-            print(f"  {label:14s} - no grad")
+        elif present:
+            print(f"  {label:14s} - *** {present} params, NO GRAD ***")
+        # present == 0 -> module disabled; say nothing.
+
+    reg = getattr(policy.model, "register_tokens", None)
+    if reg is not None:
+        r = reg.detach().float()                       # (1, R, H)
+        rms = r.pow(2).mean().sqrt().item()
+        # How much of a register's magnitude is its OWN, as opposed to a direction
+        # all R of them share. The registers are pure parameters with no input, so
+        # the only thing that can make them 32 tokens rather than 1 is that they
+        # point in different directions. If they collapse onto a common vector
+        # this ratio falls and the block is one token wearing 32 hats -- the same
+        # failure the MoE's thought tokens showed as vary/total decay.
+        #
+        # At std=0.02 iid init the mean of R samples still absorbs a 1/R share, so
+        # the ceiling is sqrt(1 - 1/R), printed alongside rather than assumed 1.0.
+        R = r.shape[1]
+        spread = (r - r.mean(dim=1, keepdim=True)).pow(2).mean().sqrt().item()
+        ceil = (1.0 - 1.0 / R) ** 0.5
+        a_rms = getattr(policy.model, "_last_action_emb_rms", None)
+        ratio = f"   vs action_emb: {rms / a_rms:.3f}" if a_rms else ""
+        g = reg.grad
+        gstr = f"{g.norm().item():.2e}" if g is not None else "None"
+        print(f"  Register Tok   : RMS {rms:.4f}  distinct {spread / max(rms, 1e-9):.3f} "
+              f"(ceiling {ceil:.3f} at R={R}; 0.0 = all identical)  grad_norm {gstr}{ratio}")
 
     if hasattr(policy.model, "latent_qformer"):
         qf = policy.model.latent_qformer
@@ -279,8 +314,8 @@ def _log_gradient_analysis(policy, step: int) -> None:
 
     stats = getattr(policy.model, "_last_attention_stats", None)
     if stats:
-        # Match DiT sequence order: [SINK, state, robot, latent, action]
-        order = ["sink", "state", "robot", "latent", "action"]
+        # Match DiT sequence order: [state, register, robot, latent, action]
+        order = ["state", "register", "robot", "latent", "action"]
         ordered = [(k, stats[k]) for k in order if k in stats]
         cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in ordered)
         print(f"  Action→ self-attn : {cells}    (last DiT layer)")
@@ -1088,12 +1123,16 @@ if __name__ == "__main__":
     parser.add_argument("--vision_dropout_anneal_steps", type=int, default=0,
                         help="Steps to anneal RobotCNN dropout from --vision_dropout_start to "
                              "--vision_dropout_prob. 0 disables the schedule. E.g. 20000.")
-    parser.add_argument("--use_chat_template", action="store_true",
-                        help="Wrap the VLM input as a Qwen ChatML turn: <|im_start|>user + "
+    parser.add_argument("--no_chat_template", dest="use_chat_template",
+                        action="store_false", default=True,
+                        help="Disable the Qwen ChatML wrapping (<|im_start|>user + "
                              "<|vision_start|>[cam]<|vision_end|> per camera + task + "
-                             "<|im_end|> + assistant header, instead of the raw "
-                             "[vision|task] concat. In-distribution for the instruct-tuned "
-                             "VLM; off = exact legacy behavior.")
+                             "<|im_end|> + assistant header) and feed the raw [vision|task] "
+                             "concat instead. The template is ON by default: the raw concat "
+                             "is a token sequence the instruct-tuned VLM never saw, and every "
+                             "KV the DiT reads is computed from it. Required to reproduce a "
+                             "checkpoint trained before this became the default -- the "
+                             "template moves the KV geometry its ca_q was fit to.")
     parser.add_argument("--chat_directive", type=str, default="",
                         help="Optional short directive prepended to the task inside the user "
                              "turn (only with --use_chat_template), e.g. 'Identify the objects "

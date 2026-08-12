@@ -358,7 +358,14 @@ FFN        3·h·intermediate  (SwiGLU)            adaLN       9·h²
 | 16L @ 640, FFN 640 | 11.1M | 178M |
 | 36L @ 640, FFN 640 | 11.1M | 401M |
 | 36L @ 1280, FFN 1280 | 34.1M | 1227M |
-| 16L @ 2560, FFN 2560 | 116.0M | 1856M |
+| 16L @ 2560, FFN **9728** | 180.9M | **2895M** |
+
+> The last row is not a typo. When `dit_hidden_size` equals the VLM's 2560 the
+> model takes the full-width branch, where the FFN inherits the VLM's
+> `intermediate_size` of **9728** rather than `dit_hidden` — so leaving
+> `--dit_hidden_size` at its default 0 gives a **2.89B** DiT, 5.3× the 1280 row.
+> Confirmed against a run's own report (`Time Embedder` 13,112,320 = 2(h²+h) at
+> h=2560; `DiT Layers` 2,894,561,280 = 16 × 180,910,080).
 
 > `num_dit_layers` dropped 36 → 16, so at a fixed width the stack is **44%** of
 > its former size. `dit_hidden_size` is the other lever and it is quadratic:
