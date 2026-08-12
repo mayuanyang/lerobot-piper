@@ -18,13 +18,11 @@ graph TB
         SpatialMerger["Spatial Merger<br/>2×2 → 1 token"]
         LangEmbed["Language Embedding<br/>Qwen3-VL Tokenizer"]
         
-        VLMSeq["VLM Sequence<br/>[vision | language]"]
+        VLMSeq["VLM Sequence<br/>[language | vision]<br/>text_first (default)"]
         
-        VLM1["VLM Layer 0"]
-        VLM2["VLM Layer 1"]
-        VLM3["VLM Layer ..."]
-        VLMN["VLM Layer 35"]
-        
+        VLM1["VLM Layer 0..19<br/>(run, KV discarded)"]
+        VLMN["VLM Layer 20..35<br/>(run, KV captured)"]
+
         KV0["KV Cache Layer 20"]
         KV1["KV Cache Layer 21"]
         KV2["KV Cache Layer ..."]
@@ -32,20 +30,18 @@ graph TB
     end
     
     subgraph "Stage B: DiT Decoder (Trainable, Run N times)"
-        Sink["🔵 SINK Token"]
         State["🟢 State<br/>observation.state"]
-        RobotCNN["🤖 Robot CNN<br/>Visual Features"]
-        Latent["💭 Latent Tokens<br/>Task-Conditioned"]
+        Register["🟣 Register Tokens ×32<br/>learned, no observation at init"]
         Action["🔴 Noisy Actions<br/>x_t (flow matching)"]
-        
-        DiTSeq["DiT Sequence<br/>[sink, state, robot, latent, action_0..T-1]"]
+
+        DiTSeq["DiT Sequence<br/>[state, register×32, action_0..T-1]"]
         
         Time["⏱ Time Embedding<br/>Sinusoidal + MLP"]
         
         DiT1["DiT Layer 0"]
         DiT2["DiT Layer 1"]
         DiT3["DiT Layer ..."]
-        DiTN["DiT Layer N-1"]
+        DiTN["DiT Layer 15"]
         
         FinalNorm["Final RMSNorm"]
         ActionOut["Action Output<br/>Velocity v_t"]
@@ -54,13 +50,11 @@ graph TB
     Images --> VisionTower --> SpatialMerger --> VLMSeq
     Language --> LangEmbed --> VLMSeq
     
-    VLMSeq --> VLM1 --> VLM2 --> VLM3 --> VLMN
+    VLMSeq --> VLM1 --> VLMN
     VLMN --> KV0 & KV1 & KV2 & KV3
-    
-    Sink --> DiTSeq
+
     State --> DiTSeq
-    RobotCNN --> DiTSeq
-    Latent --> DiTSeq
+    Register --> DiTSeq
     Action --> DiTSeq
     
     Time --> DiT1 & DiT2 & DiT3 & DiTN
@@ -72,6 +66,12 @@ graph TB
     
     DiTN --> FinalNorm --> ActionOut
 ```
+
+> **Both optional visual paths are OFF by default.** The Robot CNN
+> (`use_robot_cnn`) and the latent Q-Former (`num_latent_tokens`) still exist and
+> still slot into the sequence between the registers and the actions when
+> enabled — see [Input Tokens](#3-input-tokens). With both off, the frozen VLM's
+> ~32 px/token grid is the only visual input anywhere in the model.
 
 ---
 
@@ -109,14 +109,15 @@ graph TB
 │  ┌──────────────────────────────────────────────────────────┐          │
 │  │  Qwen3-VL Text Layers (ALL 36 layers, frozen)            │          │
 │  │                                                           │          │
-│  │  Layer 0 → Layer 1 → Layer 2 → ... → Layer 34 → Layer 35 │          │
-│  │     │         │         │                │          │     │          │
-│  │     ▼         ▼         ▼                ▼          ▼     │          │
+│  │  Layer 0 → ... → Layer 19 → Layer 20 → ... → Layer 35    │          │
+│  │                                 │                  │      │          │
+│  │      (KV discarded)             ▼                  ▼      │          │
 │  │     Capture KV from self.capture_layers                   │          │
-│  │     (num_dit_layers=36 → every layer; fewer → an even     │          │
-│  │      spread over the full depth, NOT the tail)            │          │
+│  │     vlm_capture_mode="last" (default): the deepest 16     │          │
+│  │       → VLM 20..35, one per DiT layer                     │          │
+│  │     vlm_capture_mode="spread": np.linspace over 0..35     │          │
 │  │                                                           │          │
-│  │     KV Cache: [(K_0,V_0), (K_1,V_1), ..., (K_35,V_35)]    │          │
+│  │     KV Cache: [(K_20,V_20), (K_21,V_21), ..., (K_35,V_35)]│          │
 │  │     Each: (B, num_kv_heads, L_vlm, head_dim)              │          │
 │  │     K is post-M-RoPE rotation                              │         │
 │  └───────────────────────────────────────────────────────────┘          │
@@ -137,11 +138,11 @@ graph TB
 │  ┌──────────────────────────────────────────────────────────────┐      │
 │  │  DiT Input Assembly                                         │      │
 │  │                                                              │      │
-│  │  ┌──────┐  ┌───────┐  ┌───────────┐  ┌──────────┐  ┌──────┐│      │
-│  │  │ SINK │  │ State │  │ Robot CNN │  │ Latents  │  │Action││      │
-│  │  │ (1)  │  │  (1)  │  │ (per cam) │  │ (8 toks) │  │ (H)  ││      │
-│  │  └──┬───┘  └───┬───┘  └─────┬─────┘  └────┬─────┘  └──┬───┘│      │
-│  │     └──────────┴────────────┴──────────────┴───────────┘    │      │
+│  │  ┌───────┐  ┌───────────┐  ┌─ off by default ─┐  ┌──────┐  │      │
+│  │  │ State │  │ Register  │  │ RobotCNN Latents │  │Action│  │      │
+│  │  │  (1)  │  │ (32 toks) │  │  (per cam) (K)   │  │ (H)  │  │      │
+│  │  └───┬───┘  └─────┬─────┘  └────────┬─────────┘  └──┬───┘  │      │
+│  │      └────────────┴─────────────────┴───────────────┘      │      │
 │  │                         │                                    │      │
 │  │              ┌──────────▼──────────┐                         │      │
 │  │              │  DiT Sequence       │                         │      │
@@ -224,14 +225,26 @@ graph TB
 | **Vision** | Dynamic resolution, spatial_merge_size=2 |
 | **Position Encoding** | M-RoPE (3D: t, h, w for vision; monotonic for language) |
 | **Sequence Order** | `[language, vision]` by default (`text_first`). The VLM is causal, so this is what makes the captured vision K/V language-conditioned; `--text_last` restores the legacy language-blind layout |
-| **KV Capture** | `self.capture_layers` — all 36 when `num_dit_layers=36`, otherwise an even spread (`np.linspace`) over the full depth. Before 2026-08-04 this was the trailing window only, discarding layers 0-19 |
+| **KV Capture** | `self.capture_layers`, chosen by `vlm_capture_mode` — `"last"` (default) takes the deepest `num_dit_layers` (16 → VLM 20-35); `"spread"` spaces them over the full depth. `vlm_capture_layers` overrides both |
 | **KV Geometry** | Each KV: (B, 8, L_vlm, 128) — 8 KV heads, head_dim 128 |
+
+> **`"last"` vs `"spread"` is a real trade, not a preference.** All 36 layers run
+> either way, so `"last"` computes layers 0-19 and throws their KV away. What it
+> buys is that every DiT layer reads a representation that has already been
+> through 20 layers of vision-language fusion, where the referring expression is
+> resolved. What it costs is the shallow, geometric layers — which is what a DiT
+> layer needs if its job is precise placement rather than object selection.
+>
+> Measured on the MoE variant, cross-attention language share runs **~44% at VLM
+> layer 8 against ~91% at layer 35**. Under `text_first` the language K/V cannot
+> see the image at all (the instruction precedes it under a causal mask), so a
+> pure-tail DiT spends most of its cross-attention on image-independent content.
 
 ### 2. DiT Decoder (Trainable)
 
 | Component | Details |
 |-----------|---------|
-| **Layers** | `num_dit_layers` (default: **36**, one per VLM layer) |
+| **Layers** | `num_dit_layers` (default: **16**, one per captured VLM layer) |
 | **Hidden Size** | `dit_hidden_size` — decoupled from VLM's 2560 for param savings (640 matches WiltechsMoE) |
 | **Self-Attention** | `dit_hidden/128` heads × 128 dim, GQA at the VLM's 4:1 ratio, causal mask over full DiT sequence |
 | **Cross-Attention** | **32 heads × 128 dim**, 8 KV heads (matches VLM KV geometry); Q from DiT, K/V from VLM cache (no RoPE on Q) |
@@ -242,13 +255,33 @@ graph TB
 
 ### 3. Input Tokens
 
-| Token | Source | Shape | Notes |
-|-------|--------|-------|-------|
-| **SINK** | Learnable | (1, 1, H) | Normal init, std=0.02 |
-| **State** | observation.state | (1, H) | Linear + RMSNorm, last obs step |
-| **Robot CNN** | RobotVisualEncoder | (per_cam × tokens, H) | Optional, configurable grid |
-| **Latents** | LatentQFormer | (num_latent_tokens, H) | Learned queries cross-attend the top VLM KV layer (vision+lang); zero-init gates (no-op at start) |
-| **Actions** | noisy actions x_t | (horizon, H) | action_in_proj + action_pos_emb |
+Sequence order: `[state(1), register(32), (robot)?, (latent)?, action(H)]`
+
+| Token | Source | Shape | Default | Notes |
+|-------|--------|-------|---------|-------|
+| **State** | observation.state | (1, H) | on | Linear + RMSNorm, last obs step. **First**, so every later token can read it under the causal mask |
+| **Register** | Learnable | (32, H) | **32** | `num_register_tokens`. std=0.02 init |
+| **Robot CNN** | RobotVisualEncoder | (per_cam × tokens, H) | **off** | `use_robot_cnn` |
+| **Latents** | LatentQFormer | (num_latent_tokens, H) | **0 (off)** | Learned queries cross-attend the top VLM KV layer; zero-init gates |
+| **Actions** | noisy actions x_t | (horizon, H) | on | action_in_proj + action_pos_emb — the **only** positional signal in the DiT |
+
+**Registers are not the latent Q-Former's tokens.** The latents are computed
+once, outside the stack, from a single VLM layer, and arrive already fixed. The
+registers start as pure parameters holding no observation at all and are
+rewritten at *every* DiT layer: they take part in self-attention, and since
+cross-attention carries no causal mask and covers all DiT positions, they
+cross-attend to the VLM in each layer too. They are a scratchpad the stack
+writes to across depth, not a summary handed to it.
+
+They reach the actions only through causal self-attention, which they precede,
+so every action token can read all 32.
+
+Init is `std=0.02`, not zero: outside the action slice the DiT has no positional
+embedding, so identical registers would be indistinguishable to self-attention
+and could never differentiate.
+
+> The **SINK** token was removed. It held position 0 as a no-op attention target
+> and carried no capacity, so `state` could not be first while it existed.
 
 ### 4. Flow Matching
 
@@ -276,16 +309,24 @@ graph TB
 ### DiT Self-Attention (Full Causal)
 
 ```
-Position:  SINK  State  Robot  Latent  Act_0  Act_1  ...  Act_T-1
-SINK        ✓      -      -      -       -      -           -
-State       ✓      ✓      -      -       -      -           -
-Robot       ✓      ✓      ✓      -       -      -           -
-Latent      ✓      ✓      ✓      ✓       -      -           -
-Act_0       ✓      ✓      ✓      ✓       ✓      -           -
-Act_1       ✓      ✓      ✓      ✓       ✓      ✓           -
-...         ✓      ✓      ✓      ✓       ✓      ✓     ✓     -
-Act_T-1     ✓      ✓      ✓      ✓       ✓      ✓     ✓     ✓
+Position:  State  Reg_0  Reg_1  ...  Reg_31  Act_0  Act_1  ...  Act_T-1
+State        ✓      -      -            -      -      -            -
+Reg_0        ✓      ✓      -            -      -      -            -
+Reg_1        ✓      ✓      ✓            -      -      -            -
+...          ✓      ✓      ✓      ✓     -      -      -            -
+Reg_31       ✓      ✓      ✓      ✓     ✓      -      -            -
+Act_0        ✓      ✓      ✓      ✓     ✓      ✓      -            -
+Act_1        ✓      ✓      ✓      ✓     ✓      ✓      ✓            -
+...          ✓      ✓      ✓      ✓     ✓      ✓      ✓      ✓     -
+Act_T-1      ✓      ✓      ✓      ✓     ✓      ✓      ✓      ✓     ✓
 ```
+
+Note the registers are **causal among themselves** — `Reg_0` cannot see
+`Reg_31`. Only the last register sees the whole block. If they are meant to act
+as a jointly-addressable scratchpad rather than a left-to-right one, this mask
+is the thing to change; nothing else in the model assumes register causality.
+
+With `num_register_tokens=32` and `horizon=64`, `L_dit = 1 + 32 + 64 = 97`.
 
 ### DiT Cross-Attention (to VLM KV)
 
@@ -312,13 +353,16 @@ FFN        3·h·intermediate  (SwiGLU)            adaLN       9·h²
 
 | Config | Per layer | DiT total |
 |--------|-----------|-----------|
-| 16L @ 1280, FFN 4864 (pre-2026-08-04 default) | 47.9M | **766M** |
-| **36L @ 640, FFN 640 (current default)** | 11.1M | **401M** |
+| 16L @ 1280, FFN 4864 (pre-2026-08-04 default) | 47.9M | 766M |
+| **16L @ 1280, FFN 1280 (current default depth)** | 34.1M | **546M** |
+| 16L @ 640, FFN 640 | 11.1M | 178M |
+| 36L @ 640, FFN 640 | 11.1M | 401M |
 | 36L @ 1280, FFN 1280 | 34.1M | 1227M |
-| 18L @ 640, FFN 640 | 11.1M | 201M |
+| 16L @ 2560, FFN 2560 | 116.0M | 1856M |
 
-> The current default reads **every** VLM layer yet is roughly **half** the old
-> 16-layer stack, because the width and FFN shrink outweigh the extra depth.
+> `num_dit_layers` dropped 36 → 16, so at a fixed width the stack is **44%** of
+> its former size. `dit_hidden_size` is the other lever and it is quadratic:
+> 16L @ 1280 is 3.1× 16L @ 640.
 
 > **To compare against WiltechsMoE, match the WIDTH, not just the layer count.**
 > The MoE's 92% checkpoint runs `dit_hidden=1280` — 4 experts × 9 layers at
@@ -331,9 +375,10 @@ FFN        3·h·intermediate  (SwiGLU)            adaLN       9·h²
 > confounded (width, gradient-update count, topology). Use
 > `--dit_hidden_size 1280` for a controlled comparison.
 
-Non-DiT components (at `dit_hidden=640`): state encoder ~7K, action in/out ~5K
-each, action pos emb ~41K, Robot CNN ~5M, latent Q-Former ~17M, time embedder
-~820K, SINK ~640.
+Non-DiT components at `dit_hidden=1280`: register tokens 41K, state encoder 10K,
+action in/out ~5K each, action pos emb 82K, time embedder 3.3M. Off by default:
+Robot CNN ~5M, latent Q-Former ~17M. (At 640, halve the linear terms and quarter
+the time embedder.)
 
 > **Calibration**: the formula above reproduces the one measured figure on
 > record — 16L @ 1280 predicts 766M against a reported 803,033,675 total
@@ -346,8 +391,36 @@ each, action pos emb ~41K, Robot CNN ~5M, latent Q-Former ~17M, time embedder
 ## Key Design Decisions
 
 1. **VLM runs once per inference** — 10× speedup vs interleaved at N=10 denoising steps
-2. **All 36 VLM layers used** — earlier layers refine features that later layers cache
-3. **No RoPE on DiT cross-attention Q** — VLM K already carries M-RoPE rotation
-4. **adaLN-Zero zero-init** — gates start at 0, each block acts as identity at init
-5. **Output projection zero-init** — prevents dead-init deadlock with adaLN gates
+2. **All 36 VLM layers run; the deepest 16 are captured** — `vlm_capture_mode="last"`. Layers 0-19 are computed and discarded; see the trade above
+3. **State first, then 32 registers, then actions** — the only ordering where the registers can read the state and every action can read the registers
+4. **No RoPE on DiT cross-attention Q** — VLM K already carries M-RoPE rotation
+5. **adaLN-Zero zero-init** — gates start at 0, each block acts as identity at init
+6. **Output projection zero-init** — prevents dead-init deadlock with adaLN gates
+7. **Cross-attention Q comes from the residual stream, not the self-attn output** — it reads `x + gate_sa · sa`, and at init `gate_sa = 0`, so CA sees the layer input unchanged
+
+---
+
+## Known Asymmetries
+
+**Cross-attention K is rotated, Q is not.** `_run_vlm_and_cache_kv` applies RoPE
+before caching, so the VLM keys carry absolute M-RoPE phase while `ca_q`'s output
+carries none — the DiT query is not part of the VLM sequence and has no position
+to encode. In ordinary RoPE attention both sides rotate and only *relative*
+position survives the dot product; here the query faces absolute phase.
+
+This matters because `_build_mrope_position_ids` offsets the image block by the
+text length, and that length is the **padded max instruction length in the
+batch** — so the vision keys' phase shifts from batch to batch. The code comment
+calling this offset "harmless under RoPE" is correct for the VLM's own
+self-attention and *not* for this cross-attention.
+
+Not fatal (models train, vision cross-attention share stays healthy), but it is a
+noise source the model has to average over. Cheap to test: pad the language to a
+fixed length (`padding="max_length"`) so the vision block starts at a constant
+position, then compare the vision cross-attention share and val loss.
+
+**Cross-attention is ~31% of the DiT's parameters.** `ca_q` and `ca_o` must
+bridge `dit_hidden` to the VLM's 32×128 = 4096 head geometry, because the K/V are
+the VLM's own projections and there is no `k_proj`/`v_proj` to meet them halfway.
+At `dit_hidden=1280` that is 2 × 1280 × 4096 = 10.5M of the 34.1M per layer.
 6. **Gradient checkpointing** — optional, recomputes DiT activations in backward
