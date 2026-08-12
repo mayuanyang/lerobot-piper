@@ -1697,28 +1697,26 @@ class WiltechsVLATransformer(nn.Module):
         per_depth: list[dict] = []
 
         for i, layer in enumerate(self.dit_layers):
-            if capture and i in depth_idx:
-                per_depth.append(cross_attention_mass(
-                    layer, x, t_emb, kv_cache[i], vlm_kv_pad_mask,
-                    action_start_idx, H_horizon, vis_mask,
-                ))
-            # Self-attn mass is only meaningful at the LAST layer — the "final
-            # say" before the action readout.
-            if capture and i == n_l - 1:
-                self._last_attention_stats = self._compute_attention_mass(
-                    x, t_emb, causal_mask, regions,
-                )
-                # one-shot: don't capture again if _run_dit is called twice
-                # (e.g. for the contrastive-language v_wrong forward).
-                self._capture_attention_stats = False
-                self._last_cross_attention_stats = _merge_depths(
-                    per_depth, [self.capture_layers[j] for j in depth_idx])
-                # The no_grad captures above populated the autocast weight cache
-                # with GRAD-LESS bf16 casts of these layers' sa_q/sa_k/ca_q/adaLN
-                # weights. Clear it so the real forward re-casts them WITH grad
-                # tracking — otherwise those weights silently receive no
-                # gradient on every capture step.
-                torch.clear_autocast_cache()
+            # The diagnostics measure this layer's INPUT, so hold onto it and
+            # run them AFTER the real forward. Ordering, not decoration:
+            #
+            # A no_grad capture fills the autocast weight cache with GRAD-LESS
+            # bf16 casts of this layer's sa_q/sa_k/ca_q/adaLN weights. Running
+            # it first meant the real forward reused those casts and the weights
+            # received no gradient, so the old code called
+            # torch.clear_autocast_cache() to undo it -- one line before this
+            # layer's CHECKPOINTED call. That is what raised CheckpointError:
+            # the forward then ran with an empty cache and recorded the weight
+            # casts, while the backward recompute (autocast context long since
+            # exited) recorded a different set, so the saved tensor list came
+            # back shifted by one and every entry mismatched.
+            #
+            # Capturing after the forward fixes both at once: the real forward
+            # populates the cache with grad-tracking casts, the capture merely
+            # reuses them, and nothing mutates global cast state between a
+            # checkpoint's forward and its recompute. Each layer owns its
+            # weights, so a later layer cannot inherit an earlier capture's cast.
+            x_in = x if capture else None
 
             vlm_k, vlm_v = kv_cache[i]
             if use_ckpt:
@@ -1733,6 +1731,23 @@ class WiltechsVLATransformer(nn.Module):
                     vlm_kv_pad_mask=vlm_kv_pad_mask,
                     self_attn_mask=causal_mask,
                 )
+
+            if capture and i in depth_idx:
+                per_depth.append(cross_attention_mass(
+                    layer, x_in, t_emb, kv_cache[i], vlm_kv_pad_mask,
+                    action_start_idx, H_horizon, vis_mask,
+                ))
+            # Self-attn mass is only meaningful at the LAST layer — the "final
+            # say" before the action readout.
+            if capture and i == n_l - 1:
+                self._last_attention_stats = self._compute_attention_mass(
+                    x_in, t_emb, causal_mask, regions,
+                )
+                # one-shot: don't capture again if _run_dit is called twice
+                # (e.g. for the contrastive-language v_wrong forward).
+                self._capture_attention_stats = False
+                self._last_cross_attention_stats = _merge_depths(
+                    per_depth, [self.capture_layers[j] for j in depth_idx])
 
         action_out = self.final_norm(x[:, action_start_idx:])
         return self.action_out_proj(action_out)
