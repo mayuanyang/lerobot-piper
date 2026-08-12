@@ -105,11 +105,27 @@ class WiltechsVLAConfig(PreTrainedConfig):
     # dit_hidden_size, and the MoE's 92% checkpoint runs 1280, i.e. 1.23B expert
     # params against 401M for 36L at 640. Match the width too.
     #
-    # Below 36 the captured layers are spread evenly over the full depth
-    # (np.linspace), NOT taken from the tail: the old behaviour read only layers
-    # 20..35 and discarded the KV of the first 20, which cost nothing to keep.
-    num_vlm_layers: int = 36
-    # Explicit VLM layer indices to capture, overriding the even spread. Must
+    num_vlm_layers: int = 16
+    # How the captured VLM layers are chosen when vlm_capture_layers is empty.
+    #
+    #   "last"   the deepest num_vlm_layers (16 -> VLM 20..35). The default.
+    #   "spread" evenly over the full depth (np.linspace, 16 -> 0,2,4,...,35).
+    #
+    # These are a real trade, not a preference. The VLM runs all 36 layers
+    # regardless, so "last" computes layers 0..19 and throws their KV away --
+    # free information discarded. What it buys is that every DiT layer reads a
+    # representation that has been through at least 20 layers of vision-language
+    # fusion, where the referring expression has actually been resolved.
+    # "spread" keeps the shallow, geometric layers, which is what a DiT layer
+    # needs if its job is precise placement rather than object selection.
+    #
+    # Measured on the MoE variant, cross-attention language share runs ~44% at
+    # VLM layer 8 against ~91% at layer 35: the deep layers are overwhelmingly
+    # language-weighted, and under text_first the language K/V cannot see the
+    # image at all. A pure-tail DiT is therefore reading the most
+    # language-dominated, least visually grounded band of the encoder.
+    vlm_capture_mode: str = "last"
+    # Explicit VLM layer indices to capture, overriding vlm_capture_mode. Must
     # have exactly num_vlm_layers entries. Empty = automatic.
     vlm_capture_layers: list[int] = field(default_factory=list)
 
@@ -163,7 +179,13 @@ class WiltechsVLAConfig(PreTrainedConfig):
     robot_encoder_tokens: int = 16
     robot_encoder_input_size: int = 224
     # Enable / disable the parallel ResNet visual encoder entirely.
-    use_robot_cnn: bool = True
+    #
+    # OFF by default. Note this is the single largest measured lever in the MoE
+    # variant of this architecture: removing it took libero_spatial task 0 from
+    # 92% to 58%, and the residual failures there were grasp precision, not
+    # object selection. Turning it off makes the frozen VLM's ~32 px/token grid
+    # the only visual input, so nothing in the model sees finer detail than that.
+    use_robot_cnn: bool = False
     # Cameras the trainable RobotCNN ingests. EMPTY = use every camera in
     # `cameras_for_vision_state_concat` (legacy behavior: the CNN re-encodes the
     # same scene views as the frozen VLM, so it competes with — instead of
@@ -193,10 +215,28 @@ class WiltechsVLAConfig(PreTrainedConfig):
     # the 36 LM layers only, under no_grad).
     text_first: bool = True
 
+    # -------- Register tokens --------
+    # Learned constants inserted between the state token and the actions:
+    #   [state(1), register(R), action(H)]
+    #
+    # Deliberately NOT the latent Q-Former below. Those latents are computed
+    # ONCE, outside the stack, by cross-attending to a single VLM layer, and
+    # enter the DiT already fixed. Registers start as pure parameters carrying
+    # no observation at all and are refilled at EVERY DiT layer -- they take
+    # part in self-attention and, because cross-attention applies to all DiT
+    # positions with no causal mask, they cross-attend to the VLM in each layer
+    # too. So they are a scratchpad the stack writes to across depth, not a
+    # summary handed to it.
+    #
+    # They reach the actions only through causal self-attention, which they
+    # precede, so every action token can read all R of them.
+    num_register_tokens: int = 32
+
     # -------- Latent "thought" tokens --------
     # Prepended to the DiT sequence, produced by a learned-query Q-Former
     # cross-attending to the DEEPEST captured VLM layer. 0 disables.
-    num_latent_tokens: int = 8
+    # Superseded by num_register_tokens above; off by default.
+    num_latent_tokens: int = 0
     # Number of Q-Former cross-attention blocks that distill the VLM KV cache
     # into the latent tokens (learned queries → cross-attn to VLM vision+lang).
     num_latent_qformer_layers: int = 2

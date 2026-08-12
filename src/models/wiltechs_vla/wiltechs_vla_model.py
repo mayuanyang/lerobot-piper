@@ -10,7 +10,7 @@ Architecture (Xiaomi-Robotics-0 / pi0-style MoT, NOT SmolVLA interleaved):
              (these become the cross-attention memory for the DiT)
 
   Stage B (run num_inference_steps times during denoising): DiT decoder
-    Input:   [SINK, state, robot_cnn_tokens, latent_tokens, action_tokens(t)]
+    Input:   [state, register_tokens, (robot_cnn)?, (latent)?, action_tokens(t)]
     Each layer:
        1. Self-attention with full causal mask
        2. Cross-attention to ONE captured VLM KV pair (Q from DiT, K/V from cache)
@@ -27,7 +27,7 @@ Architecture (Xiaomi-Robotics-0 / pi0-style MoT, NOT SmolVLA interleaved):
       M-RoPE rotation, which is sufficient for positional alignment.
 
   Mask semantics (DiT self-attention):
-    Full left-to-right causal mask over [SINK, state, robot, latent, action_0..T-1].
+    Full left-to-right causal mask over [state, register, robot, latent, action_0..T-1].
     Every position can only attend to itself and earlier positions. Action
     tokens get an action_pos_emb so they can distinguish their position.
 
@@ -725,11 +725,13 @@ class WiltechsVLATransformer(nn.Module):
                 f"num_dit_layers ({self.num_dit_layers}) > VLM layers "
                 f"({self.num_vlm_layers}); not enough KV caches to source from."
             )
-        # Which VLM layers to read. The VLM runs all 36 either way, so a layer
-        # left out is one whose KV was computed and thrown away -- the old
-        # trailing-window behaviour discarded layers 0..19 for free. Spread the
-        # captures over the FULL depth instead, so a shallower DiT still spans
-        # early (geometric) through late (semantic) representations.
+        # Which VLM layers to read -- see vlm_capture_mode in the config for the
+        # trade. The VLM runs all 36 either way, so any layer left out is one
+        # whose KV was computed and discarded.
+        capture_mode = str(getattr(config, "vlm_capture_mode", "last") or "last").lower()
+        if capture_mode not in ("last", "spread"):
+            raise ValueError(
+                f"vlm_capture_mode must be 'last' or 'spread', got {capture_mode!r}.")
         explicit = list(getattr(config, "vlm_capture_layers", None) or [])
         if explicit:
             if len(explicit) != self.num_dit_layers:
@@ -745,6 +747,9 @@ class WiltechsVLATransformer(nn.Module):
             self.capture_layers = sorted(explicit)
         elif self.num_dit_layers == self.num_vlm_layers:
             self.capture_layers = list(range(self.num_vlm_layers))
+        elif capture_mode == "last":
+            self.capture_layers = list(
+                range(self.num_vlm_layers - self.num_dit_layers, self.num_vlm_layers))
         else:
             self.capture_layers = np.linspace(
                 0, self.num_vlm_layers - 1, self.num_dit_layers, dtype=int
@@ -752,8 +757,8 @@ class WiltechsVLATransformer(nn.Module):
         # kv_cache stays a LIST ordered by increasing VLM layer index, so DiT
         # layer i reads capture_layers[i] and kv_cache[-1] is still the deepest
         # captured layer (what the latent Q-Former distils).
-        print(f"DiT: {self.num_dit_layers} layers, sourcing KV from VLM layers "
-              f"{self.capture_layers}")
+        print(f"DiT: {self.num_dit_layers} layers (mode={capture_mode}), sourcing KV "
+              f"from VLM layers {self.capture_layers}")
 
         # ── DiT width (may be < VLM width to save params) ───────────────
         # 0 → match the VLM hidden size (original behavior). Otherwise the DiT
@@ -801,10 +806,23 @@ class WiltechsVLATransformer(nn.Module):
         ])
 
         # ─────────────────────────────────────────────────────────────
-        # 3. DiT-side embeddings: SINK, state, action, time MLP
+        # 3. DiT-side embeddings: register, state, action, time MLP
         # ─────────────────────────────────────────────────────────────
-        self.sink_token = nn.Parameter(torch.zeros(1, 1, self.dit_hidden))
-        nn.init.normal_(self.sink_token, std=0.02)
+        # Registers replace the old single SINK token. The sink sat at position
+        # 0 as a no-op attention target; these sit AFTER the state and carry
+        # actual capacity -- see num_register_tokens in the config.
+        #
+        # std=0.02 like every other learned token here. They are not zero-init:
+        # the DiT sequence has no positional embedding outside the action slice,
+        # so identical registers would be indistinguishable to self-attention
+        # and could never differentiate.
+        self.num_register_tokens = int(getattr(config, "num_register_tokens", 0) or 0)
+        if self.num_register_tokens > 0:
+            self.register_tokens = nn.Parameter(
+                torch.zeros(1, self.num_register_tokens, self.dit_hidden))
+            nn.init.normal_(self.register_tokens, std=0.02)
+        else:
+            self.register_tokens = None
 
         self.state_encoder = nn.Sequential(
             nn.Linear(config.state_dim, self.dit_hidden),
@@ -1501,8 +1519,6 @@ class WiltechsVLATransformer(nn.Module):
         B, H, _ = noisy_actions.shape
         dtype = noisy_actions.dtype
 
-        sink = self.sink_token.expand(B, -1, -1).to(dtype)
-
         state = batch["observation.state"].float()
         if state.dim() == 2:
             state = state.unsqueeze(1)
@@ -1514,7 +1530,14 @@ class WiltechsVLATransformer(nn.Module):
         action_emb = self.action_in_proj(noisy_actions) + self.action_pos_emb[:, :H]
         action_emb = action_emb.to(dtype)
 
-        parts = [sink, state_tok]
+        # Layout: [state(1), register(R), (robot(R'))?, (latent(K))?, action(H)]
+        # State FIRST so that under the causal mask every later token -- the
+        # registers included -- can read it. The registers then sit between the
+        # state and the actions, which is the only placement where they both see
+        # the state and are visible to every action token.
+        parts = [state_tok]
+        if self.register_tokens is not None:
+            parts.append(self.register_tokens.expand(B, -1, -1).to(dtype))
         if robot_tokens is not None:
             parts.append(robot_tokens.to(dtype))
         if latents is not None:
@@ -1527,7 +1550,7 @@ class WiltechsVLATransformer(nn.Module):
         return seq, action_start_idx
 
     def _build_dit_self_attn_mask(self, L_dit: int, device, dtype) -> torch.Tensor:
-        """Full left-to-right causal mask. SINK / state / robot / latent all
+        """Full left-to-right causal mask. state / register / robot / latent all
         share the same causal regime as action tokens — they only see earlier
         positions, action tokens see everything before them including
         themselves at their position. Action_pos_emb gives each action_t a
@@ -1549,7 +1572,7 @@ class WiltechsVLATransformer(nn.Module):
         regions: dict[str, Optional[tuple[int, int]]],
     ) -> dict[str, float]:
         """Re-run the LAST DiT layer's self-attn Q·K^T softmax manually and
-        report, for each region (sink/state/robot/latent/action), the average
+        report, for each region (state/register/robot/latent/action), the average
         attention mass that the action queries place on it.
 
         SDPA doesn't expose softmax weights, so this re-projects Q/K once;
@@ -1639,17 +1662,20 @@ class WiltechsVLATransformer(nn.Module):
         causal_mask = self._build_dit_self_attn_mask(L_dit, device, dtype)
 
         # Region boundaries (used by attention-mass diagnostic). Layout:
-        #   [SINK(1), state(1), (robot(R))?, (latent(K))?, action(H)]
+        #   [state(1), register(R), (robot(R'))?, (latent(K))?, action(H)]
+        # Offsets are ACCUMULATED rather than written as literals: the previous
+        # version hardcoded 2 for the robot/latent starts, which was only correct
+        # while the sink occupied position 0.
+        reg_len = self.register_tokens.shape[1] if self.register_tokens is not None else 0
         robot_len = robot_tokens.shape[1] if robot_tokens is not None else 0
         latent_len = latents.shape[1] if latents is not None else 0
         H_horizon = noisy_actions.shape[1]
-        regions: dict[str, Optional[tuple[int, int]]] = {
-            "sink":   (0, 1),
-            "state":  (1, 1),
-            "robot":  (2, robot_len) if robot_len > 0 else None,
-            "latent": (2 + robot_len, latent_len) if latent_len > 0 else None,
-            "action": (action_start_idx, H_horizon),
-        }
+        off = 1  # state occupies position 0
+        regions: dict[str, Optional[tuple[int, int]]] = {"state": (0, 1)}
+        for name, n in (("register", reg_len), ("robot", robot_len), ("latent", latent_len)):
+            regions[name] = (off, n) if n > 0 else None
+            off += n
+        regions["action"] = (action_start_idx, H_horizon)
 
         # Run DiT layers, each cross-attending to its paired VLM cache.
         # When `gradient_checkpointing` is on we recompute the layer in
