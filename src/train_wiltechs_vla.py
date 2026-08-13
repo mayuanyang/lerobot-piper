@@ -400,6 +400,7 @@ def train(
     chat_directive: str = "",
     use_descriptive_objects: bool = False,
     robot_encoder_tokens: int = 16,
+    robot_encoder_input_size: int = 224,
     noise_temporal_correlation: float = 0.0,
     vision_dropout_prob: float = 0.3,
     vision_dropout_start: float = -1.0,
@@ -547,6 +548,7 @@ def train(
         chat_directive=chat_directive,
         use_descriptive_objects=use_descriptive_objects,
         robot_encoder_tokens=robot_encoder_tokens,
+        robot_encoder_input_size=robot_encoder_input_size,
         noise_temporal_correlation=noise_temporal_correlation,
     )
 
@@ -1396,6 +1398,17 @@ if __name__ == "__main__":
     parser.add_argument("--robot_encoder_tokens", type=int, default=16,
                         help="Robot CNN tokens per camera. Must be a perfect square "
                              "(grid side = sqrt). Default: 16 (4x4).")
+    parser.add_argument("--robot_encoder_input_size", type=int, default=224,
+                        help="Square input side (px) for the RobotCNN. With "
+                             "--robot_encoder_tokens this fixes the granularity: the encoder "
+                             "is ResNet-18 through layer3 (stride 16), so the feature map is "
+                             "input/16 per side and is avg-pooled to sqrt(tokens). Native "
+                             "px/token = input / sqrt(tokens), and SMALLER IS FINER. The frozen "
+                             "VLM runs 32 px/token, so anything above that adds a visual stream "
+                             "COARSER than the one already there -- the defaults 224/16 give "
+                             "56.0, which is exactly the wrong side of it. 224/64 = 28.0 and "
+                             "256/100 = 25.6 are the useful settings. Tokens above "
+                             "(input/16)^2 buy nothing: the feature map caps the real detail.")
     parser.add_argument("--robot_cnn_cameras", type=str, nargs="+", default=None,
                         help="Explicit camera key(s) the trainable RobotCNN ingests "
                              "(must be among the detected cameras). Default: all of them "
