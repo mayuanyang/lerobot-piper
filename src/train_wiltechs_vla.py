@@ -214,7 +214,7 @@ def _log_gradient_analysis(policy, step: int) -> None:
         printed "no grad" for both, so three permanently-dead lines sat in every
         report and the one that would actually matter was camouflaged among them.
         """
-        total, g_norm_sq, count, present = 0.0, 0.0, 0, 0
+        total, g_norm_sq, w_norm_sq, count, present = 0.0, 0.0, 0.0, 0, 0
         for name, param in policy.model.named_parameters():
             if not (param.requires_grad and prefix in name):
                 continue
@@ -222,14 +222,22 @@ def _log_gradient_analysis(policy, step: int) -> None:
             if param.grad is not None:
                 total += param.grad.abs().mean().item() * param.numel()
                 g_norm_sq += param.grad.norm().item() ** 2
+                w_norm_sq += param.detach().norm().item() ** 2
                 count += param.numel()
         if count == 0:
-            return None, None, 0, present
+            return None, None, 0, present, None
         # `Avg Abs Grad` = mean|grad| over ALL params — rounds to ~0 for large
         # modules whose gradient is concentrated in a few sub-params (gates,
         # norms), making them look dead. `RMS/param` = grad_L2_norm / sqrt(N) is
-        # scale-fair across modules of any size, so it's the honest comparison.
-        return (total / count, (g_norm_sq ** 0.5) / (count ** 0.5), count, present)
+        # scale-fair in COUNT but not in SCALE: it says nothing about how large
+        # the weights being moved are. A pretrained ResNet carries much bigger
+        # conv weights than a freshly-initialised projection, so the same
+        # absolute gradient is a far smaller relative step — reading the two
+        # side by side makes the pretrained module look dead when it is not.
+        # g/w is the scale-free version: gradient RMS over weight RMS.
+        g_rms = (g_norm_sq ** 0.5) / (count ** 0.5)
+        w_rms = (w_norm_sq ** 0.5) / (count ** 0.5)
+        return (total / count, g_rms, count, present, (g_rms / w_rms) if w_rms > 0 else None)
 
     for label, prefix in [
         ("State Enc",      "state_encoder"),
@@ -242,10 +250,11 @@ def _log_gradient_analysis(policy, step: int) -> None:
         ("Robot CNN",      "robot_visual_encoder"),
         ("Latent QFormer", "latent_qformer"),
     ]:
-        grad, rms_pp, n, present = _grad_stats(prefix)
+        grad, rms_pp, n, present, gw = _grad_stats(prefix)
         if grad is not None:
-            print(f"  {label:14s} - Avg Abs Grad: {grad:.6f}   RMS/param: {rms_pp:.2e} "
-                  f"({n} params)")
+            gw_s = f"   g/w: {gw:.2e}" if gw is not None else ""
+            print(f"  {label:14s} - Avg Abs Grad: {grad:.6f}   RMS/param: {rms_pp:.2e}"
+                  f"{gw_s}   ({n} params)")
         elif present:
             print(f"  {label:14s} - *** {present} params, NO GRAD ***")
         # present == 0 -> module disabled; say nothing.
