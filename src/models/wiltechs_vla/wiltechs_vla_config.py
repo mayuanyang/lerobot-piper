@@ -215,6 +215,40 @@ class WiltechsVLAConfig(PreTrainedConfig):
     # "attn" fixes the token count at construction (the queries are parameters),
     # so per-camera overrides need "avg".
     robot_cnn_pool: str = "avg"
+
+    # -------- Gripper auxiliary loss --------
+    # The gripper is the one CATEGORICAL dimension in the action vector: its
+    # error is "grasped or not", while a same-sized error in x/y/z is usually
+    # recoverable on the next replan. The flow-matching MSE weights all 7 dims
+    # equally, so the dimension that decides the task gets 1/7 of the signal.
+    #
+    # NOTE this is not the "L2 collapses to the mean" argument -- that applies to
+    # direct regression. Flow matching learns a velocity field whose ODE integral
+    # SAMPLES the conditional distribution, so a bimodal gripper is represented
+    # correctly in principle. The case here is purely about weighting and about
+    # the loss being quadratic on a quantity whose cost is a step function.
+    #
+    # Implemented on the action recovered in closed form from the velocity
+    # prediction, a_hat = x_t - t * v_hat, so it costs no extra forward pass.
+    # A plain MSE on a_hat would be worthless -- it is algebraically identical to
+    # the velocity MSE reweighted by t^2 -- but a BCE is not, because it is not
+    # quadratic.
+    #
+    # Caveat worth knowing: d(a_hat)/d(v_hat) = -t, so this term has almost no
+    # gradient at small t. That is where x_t already nearly equals the action, so
+    # there is little to supervise; the term does its work at large t.
+    gripper_bce_weight: float = 0.05
+    # Index of the gripper in the ACTION vector. -1 = the last dim (LIBERO and
+    # robosuite convention). The startup report prints the chosen dim's
+    # statistics so a wrong guess is visible rather than silent.
+    gripper_action_dim: int = -1
+    # Decision boundary in NORMALISED action units, filled in by the train
+    # script from the dataset statistics (the loss sees normalised actions, the
+    # stats are raw). NaN = not calibrated, which disables the term.
+    gripper_threshold_norm: float = float("nan")
+    # Logit temperature in normalised units. The BCE logit is
+    # (a_hat_grip - threshold) / temp, so this sets how sharp the decision is.
+    gripper_bce_temp: float = 0.25
     # Enable / disable the parallel ResNet visual encoder entirely.
     #
     # OFF by default. Note this is the single largest measured lever in the MoE

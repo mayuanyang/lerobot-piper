@@ -411,6 +411,9 @@ def train(
     robot_encoder_tokens: int = 16,
     robot_encoder_input_size: int = 224,
     robot_cnn_pool: str = "avg",
+    gripper_bce_weight: float = 0.05,
+    gripper_action_dim: int = -1,
+    gripper_bce_temp: float = 0.25,
     noise_temporal_correlation: float = 0.0,
     vision_dropout_prob: float = 0.3,
     vision_dropout_start: float = -1.0,
@@ -506,6 +509,35 @@ def train(
         combined_stats = aggregate_stats([metas[did].stats for did in dataset_ids])
         print(f"Aggregated normalization stats across {len(dataset_ids)} datasets.")
 
+    # ── Gripper threshold, in NORMALISED action units ────────────────────
+    # The loss and the validation metrics see actions after MEAN_STD
+    # normalisation; the dataset statistics are raw. Calibrate here, once, from
+    # the data rather than hardcoding a number: the gripper column is bimodal
+    # (LIBERO's observation.state gripper piles ~10% of its mass in each of two
+    # narrow bands with the median floating in the empty gap between), so a
+    # guessed threshold can easily land INSIDE one of the modes and silently
+    # label a large fraction of the frames wrong.
+    #
+    # The midpoint of q10 and q90 sits in that gap by construction.
+    gripper_threshold_norm = float("nan")
+    _g_report = "not calibrated"
+    try:
+        _a = combined_stats["action"]
+        _g = int(gripper_action_dim) % len(_a["mean"])
+        _q10, _q90 = float(_a["q10"][_g]), float(_a["q90"][_g])
+        _mu, _sd = float(_a["mean"][_g]), float(_a["std"][_g])
+        _thr_raw = 0.5 * (_q10 + _q90)
+        gripper_threshold_norm = (_thr_raw - _mu) / max(_sd, 1e-8)
+        _g_report = (f"dim {_g}: raw q10={_q10:.4f} q50={float(_a['q50'][_g]):.4f} "
+                     f"q90={_q90:.4f} -> threshold {_thr_raw:.4f} raw / "
+                     f"{gripper_threshold_norm:+.3f} normalised")
+    except (KeyError, IndexError, TypeError, ValueError) as e:
+        _g_report = f"FAILED ({type(e).__name__}: {e}) -- gripper BCE disabled"
+    print(f"[gripper] {_g_report}")
+    if gripper_bce_weight > 0.0 and gripper_threshold_norm != gripper_threshold_norm:
+        print("[gripper] *** --gripper_bce_weight > 0 but the threshold could not be "
+              "calibrated; the term will be INACTIVE. ***")
+
     # ── Training parameters ──────────────────────────────────────────────
     obs = 2
     horizon = 64
@@ -560,6 +592,10 @@ def train(
         robot_encoder_tokens=robot_encoder_tokens,
         robot_encoder_input_size=robot_encoder_input_size,
         robot_cnn_pool=robot_cnn_pool,
+        gripper_bce_weight=gripper_bce_weight,
+        gripper_action_dim=gripper_action_dim,
+        gripper_bce_temp=gripper_bce_temp,
+        gripper_threshold_norm=gripper_threshold_norm,
         noise_temporal_correlation=noise_temporal_correlation,
     )
 
@@ -1054,6 +1090,9 @@ def train(
         cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         torch.manual_seed(val_seed)
         tot, nb = 0.0, 0
+        grip_hit, grip_n, term_err, term_n = 0.0, 0, 0.0, 0
+        gdim = int(getattr(policy.config, "gripper_action_dim", -1))
+        gthr = float(getattr(policy.config, "gripper_threshold_norm", float("nan")))
         try:
             for vb in val_loader:
                 vb = _prep_batch(vb, augment=False)
@@ -1061,13 +1100,46 @@ def train(
                     policy.model.compute_loss(vb)
                 tot += float(policy.model._last_loss_components["main"])
                 nb += 1
+
+                # Two metrics that do NOT share the loss's problem. The
+                # flow-matching MSE is bounded below by a floor set by how much
+                # of the action is unpredictable from the observation, so its
+                # LEVEL says little about policy quality. These are a
+                # classification rate and a physical distance; neither has that
+                # floor.
+                #
+                # Both run on the integrated action, not the velocity: sample
+                # the policy the way the robot would, then compare.
+                with _autocast():
+                    pred = policy.model.sample_actions(vb).float()
+                ref = vb["action"].float()[:, :pred.shape[1]]
+
+                if gthr == gthr:
+                    # Binary agreement on the gripper. Failure here is
+                    # categorical -- grasp or no grasp -- unlike a few mm of
+                    # position error, which the next replan usually absorbs.
+                    grip_hit += float(((pred[..., gdim] > gthr)
+                                       == (ref[..., gdim] > gthr)).float().sum())
+                    grip_n += pred[..., gdim].numel()
+
+                # LIBERO actions are OSC deltas (the state is absolute EEF pose
+                # in metres), so the cumulative sum over the horizon is where
+                # the end effector ENDS UP. Errors that cancel along the path
+                # drop out -- which is the whole point: a different path to the
+                # same place is not a failure, and per-step MSE cannot tell the
+                # two apart.
+                d = (pred[..., :3].cumsum(1)[:, -1] - ref[..., :3].cumsum(1)[:, -1])
+                term_err += float(d.norm(dim=-1).sum())
+                term_n += d.shape[0]
         finally:
             torch.set_rng_state(cpu_rng)
             if cuda_rng is not None:
                 torch.cuda.set_rng_state_all(cuda_rng)
             if was_training:
                 policy.train()
-        return tot / max(1, nb)
+        return (tot / max(1, nb),
+                (grip_hit / grip_n) if grip_n else None,
+                (term_err / term_n) if term_n else None)
 
     prog_bar = tqdm(total=training_steps, desc="Training Progress", initial=step)
     val_hist: list[tuple[int, float]] = []
@@ -1175,7 +1247,7 @@ def train(
                 # so reading the train loss afterwards would report the last VAL
                 # batch and print a gap of ~0 no matter how bad the fit is.
                 tr = float(policy.model._last_loss_components["main"])
-                v = _validate()
+                v, v_grip, v_term = _validate()
                 val_hist.append((step, v))
                 b_step, b_val = min(val_hist, key=lambda kv: kv[1])
                 # Overfitting is val leaving its own BEST behind and STAYING
@@ -1191,6 +1263,19 @@ def train(
                       f"gap={v - tr:+.4f}  best={b_val:.4f}@{b_step} ({pct:+.1f}%)"
                       + ("  *** 3 checks >1% above best -- overfitting ***"
                          if sustained else ""))
+                # Reported next to the loss but NOT part of it, so they stay
+                # independent checks. gripper agreement is the exception once
+                # --gripper_bce_weight > 0: it is then also a training target,
+                # and a trained-on number cannot audit the thing it optimises.
+                extra = []
+                if v_grip is not None:
+                    trained_on = float(getattr(policy.config, "gripper_bce_weight", 0.0)) > 0
+                    extra.append(f"gripper_agree={v_grip * 100:.1f}%"
+                                 + (" (TRAINED ON - not an independent check)" if trained_on else ""))
+                if v_term is not None:
+                    extra.append(f"terminal_xyz_err={v_term:.4f} (normalised units)")
+                if extra:
+                    print("[val]   " + "   ".join(extra))
 
             if step > 0 and step % checkpoint_freq == 0:
                 checkpoint_dir = output_directory / f"checkpoint-{step}"
@@ -1421,6 +1506,23 @@ if __name__ == "__main__":
                              "56.0, which is exactly the wrong side of it. 224/64 = 28.0 and "
                              "256/100 = 25.6 are the useful settings. Tokens above "
                              "(input/16)^2 buy nothing: the feature map caps the real detail.")
+    parser.add_argument("--gripper_bce_weight", type=float, default=0.05,
+                        help="Weight of the auxiliary gripper BCE. The gripper is the one "
+                             "CATEGORICAL action dimension -- its error is 'grasped or not', "
+                             "while a same-sized error in x/y/z is usually recoverable on the "
+                             "next replan -- yet the flow MSE gives it 1/7 of the signal. "
+                             "Computed on the action recovered in closed form from the velocity "
+                             "prediction (a_hat = x_t - t*v_hat), so it adds no forward pass. "
+                             "0 disables. NOTE: a plain MSE on a_hat would be pointless (it is "
+                             "algebraically the velocity MSE reweighted by t^2); a BCE is not, "
+                             "because it is not quadratic.")
+    parser.add_argument("--gripper_action_dim", type=int, default=-1,
+                        help="Index of the gripper in the ACTION vector; -1 = last dim (LIBERO "
+                             "and robosuite convention). Startup prints the chosen dim's "
+                             "quantiles so a wrong guess is visible instead of silent.")
+    parser.add_argument("--gripper_bce_temp", type=float, default=0.25,
+                        help="Logit temperature in normalised action units: the BCE logit is "
+                             "(a_hat_grip - threshold) / temp. Smaller = sharper decision.")
     parser.add_argument("--robot_cnn_pool", type=str, default="avg", choices=["avg", "attn"],
                         help="How the ResNet layer3 map becomes tokens. 'avg' (default) "
                              "adaptive-average-pools to a sqrt(tokens) grid; 'attn' uses "

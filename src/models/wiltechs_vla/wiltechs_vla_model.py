@@ -1905,6 +1905,32 @@ class WiltechsVLATransformer(nn.Module):
         denom = (pos_w[None, :, None] * valid_cells).sum().clamp(min=1e-6)
         main_loss = loss.sum() / denom
 
+        # ── Gripper auxiliary BCE ───────────────────────────────────
+        # See gripper_bce_weight in the config for why this exists. The action
+        # is recovered in closed form from the velocity prediction:
+        #
+        #   x_t = t*noise + (1-t)*a   and   u_t = noise - a
+        #   =>  x_t - t*u_t = a       exactly
+        #
+        # so a_hat = x_t - t*v_hat needs no integration and no second forward.
+        gr_w = float(getattr(self.config, "gripper_bce_weight", 0.0) or 0.0)
+        gr_thr = float(getattr(self.config, "gripper_threshold_norm", float("nan")))
+        gripper_v = 0.0
+        if gr_w > 0.0 and gr_thr == gr_thr:   # NaN means "not calibrated"
+            g = int(getattr(self.config, "gripper_action_dim", -1))
+            temp = max(float(getattr(self.config, "gripper_bce_temp", 0.25)), 1e-3)
+            a_hat = x_t - t_exp * v_t
+            logit = (a_hat[..., g] - gr_thr) / temp
+            target = (actions[..., g] > gr_thr).to(logit.dtype)
+            bce = F.binary_cross_entropy_with_logits(logit, target, reduction="none")
+            # Same position weighting and padding mask as the main loss, so the
+            # two terms agree about which cells are real and how much the tail
+            # of the horizon counts.
+            w = pos_w[None, :] * valid_t
+            gripper_loss = (bce * w).sum() / w.sum().clamp(min=1e-6)
+            gripper_v = float(gripper_loss.detach())
+            main_loss = main_loss + gr_w * gripper_loss
+
         # ── Contrastive language loss ───────────────────────────────
         # Build a "wrong-language" prediction and require it to differ from the
         # right-language one by at least `contrastive_margin`.
@@ -2012,9 +2038,15 @@ class WiltechsVLATransformer(nn.Module):
                 contrastive_v = float(loss_contrastive.detach())
                 main_loss = main_loss + contrastive_w * loss_contrastive
 
+        # "main" is the flow-matching term ALONE -- every auxiliary weight is
+        # subtracted back out. The validation loss reads this key, so leaving an
+        # aux term in it would make the val/train comparison shift the moment a
+        # weight changed, for reasons having nothing to do with the model.
         self._last_loss_components = {
-            "main": float(main_loss.detach() - contrastive_w * contrastive_v),
+            "main": float(main_loss.detach() - contrastive_w * contrastive_v
+                          - gr_w * gripper_v),
             "contrastive": contrastive_v,
+            "gripper": gripper_v,
         }
         return main_loss
 
