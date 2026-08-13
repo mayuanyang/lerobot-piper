@@ -1282,14 +1282,20 @@ def train(
                 tr = float(policy.model._last_loss_components["main"])
                 v = _validate()
                 val_hist.append((step, v))
-                trend = ""
-                if len(val_hist) >= 2:
-                    d = v - val_hist[-2][1]
-                    trend = f" ({d:+.4f} vs step {val_hist[-2][0]})"
-                    if d > 0 and len(val_hist) >= 3 and val_hist[-2][1] > val_hist[-3][1]:
-                        trend += "  *** val rising 2x -- overfitting ***"
+                b_step, b_val = min(val_hist, key=lambda kv: kv[1])
+                # Overfitting is val leaving its own BEST behind and STAYING
+                # there. The first version of this test looked only at the SIGN
+                # of two consecutive deltas, so it fired on +0.0052 then +0.0005
+                # -- a 0.006 spread well inside tick-to-tick noise -- while the
+                # actual signal (val plateaued, train still falling) went unnamed.
+                tol = 0.01 * abs(b_val)
+                sustained = (len(val_hist) >= 3
+                             and all(x > b_val + tol for _, x in val_hist[-3:]))
+                pct = 100.0 * (v - b_val) / max(abs(b_val), 1e-9)
                 print(f"\n[val] step {step}: val_main={v:.4f}  train_main={tr:.4f}  "
-                      f"gap={v - tr:+.4f}{trend}")
+                      f"gap={v - tr:+.4f}  best={b_val:.4f}@{b_step} ({pct:+.1f}%)"
+                      + ("  *** 3 checks >1% above best -- overfitting ***"
+                         if sustained else ""))
 
             if step > 0 and step % checkpoint_freq == 0:
                 checkpoint_dir = output_directory / f"checkpoint-{step}"
