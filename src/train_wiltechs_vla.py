@@ -410,6 +410,7 @@ def train(
     use_descriptive_objects: bool = False,
     robot_encoder_tokens: int = 16,
     robot_encoder_input_size: int = 224,
+    robot_cnn_pool: str = "avg",
     noise_temporal_correlation: float = 0.0,
     vision_dropout_prob: float = 0.3,
     vision_dropout_start: float = -1.0,
@@ -558,6 +559,7 @@ def train(
         use_descriptive_objects=use_descriptive_objects,
         robot_encoder_tokens=robot_encoder_tokens,
         robot_encoder_input_size=robot_encoder_input_size,
+        robot_cnn_pool=robot_cnn_pool,
         noise_temporal_correlation=noise_temporal_correlation,
     )
 
@@ -1419,6 +1421,18 @@ if __name__ == "__main__":
                              "56.0, which is exactly the wrong side of it. 224/64 = 28.0 and "
                              "256/100 = 25.6 are the useful settings. Tokens above "
                              "(input/16)^2 buy nothing: the feature map caps the real detail.")
+    parser.add_argument("--robot_cnn_pool", type=str, default="avg", choices=["avg", "attn"],
+                        help="How the ResNet layer3 map becomes tokens. 'avg' (default) "
+                             "adaptive-average-pools to a sqrt(tokens) grid; 'attn' uses "
+                             "--robot_encoder_tokens learned queries attending over all H*W "
+                             "positions. At input 224 layer3 emits 14x14 = 196 positions, so "
+                             "the default 4x4 pooling averages ~12 of them per token and "
+                             "discards ~92%% of the spatial detail that excluding ResNet "
+                             "layer4 was meant to preserve. 'attn' adds a fixed 2D sinusoidal "
+                             "encoding to the KEYS -- required, since learned queries have no "
+                             "tie to the grid and would otherwise be permutation-invariant "
+                             "over space. 'attn' fixes the token count at construction, so "
+                             "per-camera overrides need 'avg'.")
     parser.add_argument("--robot_cnn_cameras", type=str, nargs="+", default=None,
                         help="Explicit camera key(s) the trainable RobotCNN ingests "
                              "(must be among the detected cameras). Default: all of them "

@@ -194,6 +194,27 @@ class WiltechsVLAConfig(PreTrainedConfig):
     # -------- Robot visual encoder (parallel ResNet-18) --------
     robot_encoder_tokens: int = 16
     robot_encoder_input_size: int = 224
+    # How the ResNet layer3 feature map becomes tokens.
+    #
+    #   "avg"   AdaptiveAvgPool2d to a sqrt(tokens) grid. Position is carried
+    #           implicitly by token ORDER -- output token 5 IS grid cell 5.
+    #   "attn"  `robot_encoder_tokens` learned queries attend over all H*W
+    #           positions, so a token can concentrate wherever the evidence is
+    #           instead of on a fixed rectangle.
+    #
+    # Why it matters: at input 224 layer3 emits a 14x14 = 196 position map, and
+    # pooling that to the default 4x4 averages ~12 positions into each token --
+    # ~92% of the spatial detail gone, the very detail that excluding ResNet
+    # layer4 was meant to preserve. 10x10 still discards ~49%.
+    #
+    # "attn" adds a fixed 2D sinusoidal encoding to the KEYS. That is not
+    # optional: learned queries have no tie to the grid, so without it the
+    # attention is permutation-invariant over space and every spatial relation
+    # is destroyed -- strictly worse than the pooling it replaces.
+    #
+    # "attn" fixes the token count at construction (the queries are parameters),
+    # so per-camera overrides need "avg".
+    robot_cnn_pool: str = "avg"
     # Enable / disable the parallel ResNet visual encoder entirely.
     #
     # OFF by default. Note this is the single largest measured lever in the MoE

@@ -849,11 +849,18 @@ class WiltechsVLATransformer(nn.Module):
         # 4. Robot CNN (optional parallel visual path)
         # ─────────────────────────────────────────────────────────────
         if config.use_robot_cnn:
+            _pool = str(getattr(config, "robot_cnn_pool", "avg") or "avg")
             self.robot_visual_encoder = RobotVisualEncoder(
                 input_size=config.robot_encoder_input_size,
                 out_tokens=config.robot_encoder_tokens,
                 out_dim=self.dit_hidden,
+                pool=_pool,
             )
+            _side = config.robot_encoder_input_size / max(config.robot_encoder_tokens, 1) ** 0.5
+            print(f"[wiltechs_vla] RobotCNN: pool={_pool}, "
+                  f"{config.robot_encoder_tokens} tokens/cam at "
+                  f"{config.robot_encoder_input_size}px = {_side:.1f} px/token "
+                  f"({'FINER' if _side < 32 else 'COARSER'} than the VLM's 32)")
         else:
             self.robot_visual_encoder = None
             print("[wiltechs_vla] use_robot_cnn=False — RobotVisualEncoder disabled")
