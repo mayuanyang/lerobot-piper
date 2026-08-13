@@ -1555,18 +1555,28 @@ class WiltechsVLATransformer(nn.Module):
         self._last_action_emb_rms = float(
             action_emb.detach().float().pow(2).mean().sqrt())
 
-        # Layout: [state(1), register(R), (robot(R'))?, (latent(K))?, action(H)]
-        # State FIRST so that under the causal mask every later token -- the
-        # registers included -- can read it. The registers then sit between the
-        # state and the actions, which is the only placement where they both see
-        # the state and are visible to every action token.
+        # Layout: [state(1), (robot(R'))?, (latent(K))?, register(R), action(H)]
+        #
+        # Ordered by role, and the order is load-bearing because self-attention
+        # is causal. Everything that CARRIES observation comes first: state, then
+        # the RobotCNN pixels, then the latent Q-Former's VLM summary. The
+        # registers come last before the actions, so they can read all of it --
+        # they are the scratchpad the stack accumulates into, and a scratchpad
+        # that cannot see its inputs is just 32 more learned constants.
+        #
+        # The registers used to sit directly after the state, ahead of the robot
+        # tokens, which left them blind to the one module that supplies fine
+        # visual detail while still taking ~26-38% of the action tokens' self
+        # attention. Moving them behind costs nothing: no parameter is indexed by
+        # sequence position (action_pos_emb covers the action slice only), so
+        # this is a pure reordering.
         parts = [state_tok]
-        if self.register_tokens is not None:
-            parts.append(self.register_tokens.expand(B, -1, -1).to(dtype))
         if robot_tokens is not None:
             parts.append(robot_tokens.to(dtype))
         if latents is not None:
             parts.append(latents.to(dtype))
+        if self.register_tokens is not None:
+            parts.append(self.register_tokens.expand(B, -1, -1).to(dtype))
         parts.append(action_emb)
         seq = torch.cat(parts, dim=1)
 
@@ -1687,19 +1697,24 @@ class WiltechsVLATransformer(nn.Module):
         causal_mask = self._build_dit_self_attn_mask(L_dit, device, dtype)
 
         # Region boundaries (used by attention-mass diagnostic). Layout:
-        #   [state(1), register(R), (robot(R'))?, (latent(K))?, action(H)]
-        # Offsets are ACCUMULATED rather than written as literals: the previous
-        # version hardcoded 2 for the robot/latent starts, which was only correct
-        # while the sink occupied position 0.
+        #   [state(1), (robot(R'))?, (latent(K))?, register(R), action(H)]
+        # Offsets are ACCUMULATED rather than written as literals, and the tuple
+        # below MUST list the blocks in the same order _build_dit_input
+        # concatenates them -- get that wrong and every region is mislabelled
+        # while the percentages still sum to 100, which looks entirely fine.
         reg_len = self.register_tokens.shape[1] if self.register_tokens is not None else 0
         robot_len = robot_tokens.shape[1] if robot_tokens is not None else 0
         latent_len = latents.shape[1] if latents is not None else 0
         H_horizon = noisy_actions.shape[1]
         off = 1  # state occupies position 0
         regions: dict[str, Optional[tuple[int, int]]] = {"state": (0, 1)}
-        for name, n in (("register", reg_len), ("robot", robot_len), ("latent", latent_len)):
+        for name, n in (("robot", robot_len), ("latent", latent_len), ("register", reg_len)):
             regions[name] = (off, n) if n > 0 else None
             off += n
+        assert off == action_start_idx, (
+            f"region offsets ({off}) disagree with action_start_idx "
+            f"({action_start_idx}) -- the loop above is out of sync with "
+            f"_build_dit_input's concatenation order.")
         regions["action"] = (action_start_idx, H_horizon)
 
         # Run DiT layers, each cross-attending to its paired VLM cache.

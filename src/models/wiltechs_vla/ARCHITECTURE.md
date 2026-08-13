@@ -35,7 +35,7 @@ graph TB
         RobotCNN["🤖 RobotCNN (R)<br/>ResNet-18 → layer3, per camera<br/>off by default"]
         Action["🔴 Noisy Actions (H)<br/>x_t (flow matching)"]
 
-        DiTSeq["DiT Sequence<br/>[state, register×32, robot×R, action_0..H-1]<br/>⚠ causal: registers precede robot"]
+        DiTSeq["DiT Sequence<br/>[state, robot×R, register×32, action_0..H-1]<br/>observations first, registers read them all"]
         
         Time["⏱ Time Embedding<br/>Sinusoidal + MLP"]
         
@@ -71,9 +71,9 @@ graph TB
 
 > **Both optional visual paths are OFF by default.** The Robot CNN
 > (`use_robot_cnn`) and the latent Q-Former (`num_latent_tokens`) still exist and
-> still slot into the sequence between the registers and the actions when
-> enabled — see [Input Tokens](#3-input-tokens). With both off, the frozen VLM's
-> ~32 px/token grid is the only visual input anywhere in the model.
+> slot into the sequence between the state and the registers when enabled — see
+> [Input Tokens](#3-input-tokens). With both off, the frozen VLM's ~32 px/token
+> grid is the only visual input anywhere in the model.
 
 ---
 
@@ -140,14 +140,14 @@ graph TB
 │  ┌──────────────────────────────────────────────────────────────┐      │
 │  │  DiT Input Assembly                                         │      │
 │  │                                                              │      │
-│  │   pos 0        1 .. 32       33 .. 32+R        L-H .. L-1   │      │
-│  │  ┌───────┐  ┌───────────┐  ┌──────────────┐   ┌─────────┐  │      │
-│  │  │ State │  │ Register  │  │   RobotCNN   │   │ Action  │  │      │
-│  │  │  (1)  │  │ (32 toks) │  │ (R, per cam) │   │   (H)   │  │      │
-│  │  └───┬───┘  └─────┬─────┘  └──────┬───────┘   └────┬────┘  │      │
-│  │      └────────────┴───────────────┴────────────────┘       │      │
+│  │   pos 0       1 .. R        R+1 .. R+32      L-H .. L-1    │      │
+│  │  ┌───────┐  ┌──────────────┐  ┌───────────┐   ┌─────────┐  │      │
+│  │  │ State │  │   RobotCNN   │  │ Register  │   │ Action  │  │      │
+│  │  │  (1)  │  │ (R, per cam) │  │ (32 toks) │   │   (H)   │  │      │
+│  │  └───┬───┘  └──────┬───────┘  └─────┬─────┘   └────┬────┘  │      │
+│  │      └─────────────┴────────────────┴──────────────┘       │      │
 │  │        (optional latents, if enabled, sit between          │      │
-│  │         RobotCNN and Action)                               │      │
+│  │         RobotCNN and Register)                             │      │
 │  │                         │                                    │      │
 │  │              ┌──────────▼──────────┐                         │      │
 │  │              │  DiT Sequence       │                         │      │
@@ -260,12 +260,12 @@ graph TB
 
 ### 3. Input Tokens
 
-Sequence order: `[state(1), register(32), (robot)?, (latent)?, action(H)]`
+Sequence order: `[state(1), (robot)?, (latent)?, register(32), action(H)]`
 
 | Token | Source | Shape | Default | Notes |
 |-------|--------|-------|---------|-------|
 | **State** | observation.state | (1, H) | on | Linear + RMSNorm, last obs step. **First**, so every later token can read it under the causal mask |
-| **Register** | Learnable | (32, H) | **32** | `num_register_tokens`. std=0.02 init. Sits **before** the robot tokens, so it cannot see them |
+| **Register** | Learnable | (32, H) | **32** | `num_register_tokens`. std=0.02 init. Sits **last before the actions**, so it reads state + robot + latents |
 | **Robot CNN** | RobotVisualEncoder | (per_cam × tokens, H) | **off** | `use_robot_cnn`. Granularity is `robot_encoder_input_size / sqrt(robot_encoder_tokens)` px/token — the defaults 224/16 give **56**, coarser than the VLM's 32, which defeats the purpose. 224/64 = 28 or 256/100 = 25.6 |
 | **Latents** | LatentQFormer | (num_latent_tokens, H) | **0 (off)** | Learned queries cross-attend the top VLM KV layer; zero-init gates |
 | **Actions** | noisy actions x_t | (horizon, H) | on | action_in_proj + action_pos_emb — the **only** positional signal in the DiT |
@@ -314,35 +314,32 @@ and could never differentiate.
 ### DiT Self-Attention (Full Causal)
 
 Sequence order is fixed in `_build_dit_input`:
-`[state(1), register(32), robot(R), latent(K), action(H)]`
+`[state(1), robot(R), latent(K), register(32), action(H)]`
+
+Ordered by ROLE, and the order is load-bearing because self-attention is causal.
+Everything carrying an observation comes first — state, then RobotCNN pixels,
+then the latent Q-Former's VLM summary. The registers come last before the
+actions so they can read all of it.
 
 ```
-Position:  State  Reg_0 .. Reg_31  Rob_0 .. Rob_R  Act_0  Act_1 .. Act_H-1
-State        ✓      -        -       -       -       -      -         -
-Reg_0        ✓      ✓        -       -       -       -      -         -
-Reg_31       ✓      ✓        ✓       -       -       -      -         -   ← blind to robot
-Rob_0        ✓      ✓        ✓       ✓       -       -      -         -
-Rob_R        ✓      ✓        ✓       ✓       ✓       -      -         -
-Act_0        ✓      ✓        ✓       ✓       ✓       ✓      -         -
-Act_1        ✓      ✓        ✓       ✓       ✓       ✓      ✓         -
-Act_H-1      ✓      ✓        ✓       ✓       ✓       ✓      ✓         ✓
+Position:  State  Rob_0 .. Rob_R  Reg_0 .. Reg_31  Act_0  Act_1 .. Act_H-1
+State        ✓      -       -       -        -       -      -         -
+Rob_0        ✓      ✓       -       -        -       -      -         -
+Rob_R        ✓      ✓       ✓       -        -       -      -         -
+Reg_0        ✓      ✓       ✓       ✓        -       -      -         -
+Reg_31       ✓      ✓       ✓       ✓        ✓       -      -         -   ← sees everything
+Act_0        ✓      ✓       ✓       ✓        ✓       ✓      -         -
+Act_1        ✓      ✓       ✓       ✓        ✓       ✓      ✓         -
+Act_H-1      ✓      ✓       ✓       ✓        ✓       ✓      ✓         ✓
 ```
 
-> ### The registers sit BEFORE the RobotCNN, so they cannot read it
->
-> Under this mask no register attends to any robot token. Whatever the registers
-> accumulate is built from the state and from cross-attention to the VLM only —
-> the fine visual detail the RobotCNN exists to supply never reaches them.
->
-> The action tokens see both, so the information does arrive; but the registers
-> take a large share of action self-attention (25.8% measured with the RobotCNN
-> on, 38.2% without), and that share is computed blind to the pixels.
->
-> If the registers are meant to be a scratchpad that integrates *everything*
-> before handing off to the actions, the fix is to put the robot tokens ahead of
-> them — `[state, robot, register, action]` — which costs nothing and is a
-> one-line reorder in `_build_dit_input`. Left as-is deliberately for now: it is
-> a live variable, not a settled choice.
+> Until 2026-08-13 the registers sat directly after the state, ahead of the robot
+> tokens, so **no register could attend to any robot token** — the scratchpad was
+> blind to the one module supplying fine visual detail while still taking 26–38%
+> of the action tokens' self-attention. The reorder costs nothing: no parameter
+> is indexed by sequence position (`action_pos_emb` covers the action slice
+> only). It does move the learned attention pattern, so a checkpoint from before
+> it will show a transient on resume.
 
 The registers are also **causal among themselves** — `Reg_0` cannot see
 `Reg_31`. Only the last register sees the whole block. If they are meant to be

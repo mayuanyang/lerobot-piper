@@ -324,8 +324,8 @@ def _log_gradient_analysis(policy, step: int) -> None:
 
     stats = getattr(policy.model, "_last_attention_stats", None)
     if stats:
-        # Match DiT sequence order: [state, register, robot, latent, action]
-        order = ["state", "register", "robot", "latent", "action"]
+        # Match DiT sequence order: [state, robot, latent, register, action]
+        order = ["state", "robot", "latent", "register", "action"]
         ordered = [(k, stats[k]) for k in order if k in stats]
         cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in ordered)
         print(f"  Action→ self-attn : {cells}    (last DiT layer)")
@@ -1273,7 +1273,8 @@ if __name__ == "__main__":
                              "--vlm_capture_mode. Must have exactly --num_dit_layers entries.")
     parser.add_argument("--num_register_tokens", type=int, default=32,
                         help="Learned register tokens placed between the state and the actions: "
-                             "[state(1), register(R), action(H)]. Unlike --num_latent_tokens these "
+                             "[state(1), (robot)?, (latent)?, register(R), action(H)] -- LAST before the "
+                             "actions, so they read every observation block. Unlike --num_latent_tokens these "
                              "hold no observation at init and are rewritten at EVERY DiT layer "
                              "(self-attention, plus cross-attention, which has no causal mask and "
                              "covers all DiT positions). 0 disables.")

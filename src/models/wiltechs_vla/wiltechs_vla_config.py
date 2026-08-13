@@ -15,9 +15,11 @@ Architecture: Mixture-of-Transformers (MoT) — encoder-decoder with KV cache.
     flow-matching time t. DiT runs `num_inference_steps` times per
     inference, but the VLM cache is computed only once.
 
-  - **DiT input sequence**: [SINK, state, robot_cnn_tokens, latent_tokens,
-    action_tokens]. The VLM never sees state/action tokens, preserving
-    its pretrained vision-language capabilities exactly.
+  - **DiT input sequence**: [state, robot_cnn_tokens, latent_tokens,
+    register_tokens, action_tokens]. Observation-carrying blocks first,
+    registers last before the actions so the causal mask lets them read
+    everything. The VLM never sees state/action tokens, preserving its
+    pretrained vision-language capabilities exactly.
 
 Relationship to WiltechsMoE: same frozen backbone and the same total DiT
 layer budget (MoE's 4 experts x 9 layers all run on every forward), but one
@@ -231,7 +233,9 @@ class WiltechsVLAConfig(PreTrainedConfig):
 
     # -------- Register tokens --------
     # Learned constants inserted between the state token and the actions:
-    #   [state(1), register(R), action(H)]
+    #   [state(1), (robot)?, (latent)?, register(R), action(H)]
+    # LAST before the actions, so under the causal mask they read every
+    # observation block -- state, RobotCNN pixels, latent summary.
     #
     # Deliberately NOT the latent Q-Former below. Those latents are computed
     # ONCE, outside the stack, by cross-attending to a single VLM layer, and
