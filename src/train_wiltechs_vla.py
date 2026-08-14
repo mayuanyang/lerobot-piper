@@ -1090,7 +1090,8 @@ def train(
         cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         torch.manual_seed(val_seed)
         tot, nb = 0.0, 0
-        grip_hit, grip_n, term_err, term_n = 0.0, 0, 0.0, 0
+        grip_hit, grip_n, tr_hit, tr_n = 0.0, 0, 0.0, 0
+        term_err, term_ref, term_n = 0.0, 0.0, 0
         gdim = int(getattr(policy.config, "gripper_action_dim", -1))
         gthr = float(getattr(policy.config, "gripper_threshold_norm", float("nan")))
         try:
@@ -1118,9 +1119,19 @@ def train(
                     # Binary agreement on the gripper. Failure here is
                     # categorical -- grasp or no grasp -- unlike a few mm of
                     # position error, which the next replan usually absorbs.
-                    grip_hit += float(((pred[..., gdim] > gthr)
-                                       == (ref[..., gdim] > gthr)).float().sum())
-                    grip_n += pred[..., gdim].numel()
+                    p_open, r_open = pred[..., gdim] > gthr, ref[..., gdim] > gthr
+                    grip_hit += float((p_open == r_open).float().sum())
+                    grip_n += p_open.numel()
+                    # Aggregate agreement is dominated by the long stretches
+                    # where the gripper is unambiguous (wide open through the
+                    # whole approach). What decides a grasp is the handful of
+                    # steps where it CHANGES, so score those separately -- a
+                    # policy can sit at 95% overall and still miss every
+                    # transition.
+                    chg = r_open[:, 1:] != r_open[:, :-1]
+                    if chg.any():
+                        tr_hit += float(((p_open[:, 1:] == r_open[:, 1:]) & chg).float().sum())
+                        tr_n += int(chg.sum())
 
                 # LIBERO actions are OSC deltas (the state is absolute EEF pose
                 # in metres), so the cumulative sum over the horizon is where
@@ -1128,18 +1139,35 @@ def train(
                 # drop out -- which is the whole point: a different path to the
                 # same place is not a failure, and per-step MSE cannot tell the
                 # two apart.
-                d = (pred[..., :3].cumsum(1)[:, -1] - ref[..., :3].cumsum(1)[:, -1])
-                term_err += float(d.norm(dim=-1).sum())
-                term_n += d.shape[0]
+                p_end = pred[..., :3].cumsum(1)[:, -1]
+                r_end = ref[..., :3].cumsum(1)[:, -1]
+                term_err += float((p_end - r_end).norm(dim=-1).sum())
+                # Scale reference, WITHOUT which the error is unreadable. The
+                # units are normalised and the sum runs over 64 steps, so the
+                # raw number carries no intuition at all -- exactly the trap
+                # kv_grounding_probe.py had when it read R^2 against a variance
+                # dominated by between-object spread. The denominator here is
+                # how far the demo actually travelled, so the ratio is
+                # error/motion: 1.00 means the prediction is no better than
+                # claiming the arm never moved.
+                term_ref += float(r_end.norm(dim=-1).sum())
+                term_n += p_end.shape[0]
         finally:
             torch.set_rng_state(cpu_rng)
             if cuda_rng is not None:
                 torch.cuda.set_rng_state_all(cuda_rng)
             if was_training:
                 policy.train()
-        return (tot / max(1, nb),
-                (grip_hit / grip_n) if grip_n else None,
-                (term_err / term_n) if term_n else None)
+        return {
+            "loss": tot / max(1, nb),
+            "grip": (grip_hit / grip_n) if grip_n else None,
+            "grip_transition": (tr_hit / tr_n) if tr_n else None,
+            "n_transitions": tr_n,
+            # error / motion, so 1.00 = no better than predicting no movement
+            "term_ratio": (term_err / term_ref) if term_ref > 1e-9 else None,
+            "term_abs": (term_err / term_n) if term_n else None,
+            "term_motion": (term_ref / term_n) if term_n else None,
+        }
 
     prog_bar = tqdm(total=training_steps, desc="Training Progress", initial=step)
     val_hist: list[tuple[int, float]] = []
@@ -1247,7 +1275,8 @@ def train(
                 # so reading the train loss afterwards would report the last VAL
                 # batch and print a gap of ~0 no matter how bad the fit is.
                 tr = float(policy.model._last_loss_components["main"])
-                v, v_grip, v_term = _validate()
+                m = _validate()
+                v = m["loss"]
                 val_hist.append((step, v))
                 b_step, b_val = min(val_hist, key=lambda kv: kv[1])
                 # Overfitting is val leaving its own BEST behind and STAYING
@@ -1267,15 +1296,17 @@ def train(
                 # independent checks. gripper agreement is the exception once
                 # --gripper_bce_weight > 0: it is then also a training target,
                 # and a trained-on number cannot audit the thing it optimises.
-                extra = []
-                if v_grip is not None:
-                    trained_on = float(getattr(policy.config, "gripper_bce_weight", 0.0)) > 0
-                    extra.append(f"gripper_agree={v_grip * 100:.1f}%"
-                                 + (" (TRAINED ON - not an independent check)" if trained_on else ""))
-                if v_term is not None:
-                    extra.append(f"terminal_xyz_err={v_term:.4f} (normalised units)")
-                if extra:
-                    print("[val]   " + "   ".join(extra))
+                trained_on = float(getattr(policy.config, "gripper_bce_weight", 0.0)) > 0
+                if m["grip"] is not None:
+                    tr = (f"  transitions={m['grip_transition'] * 100:.1f}% "
+                          f"(n={m['n_transitions']})" if m["grip_transition"] is not None
+                          else "  transitions=n/a")
+                    print(f"[val]   gripper: all_steps={m['grip'] * 100:.1f}%{tr}"
+                          + ("   [TRAINED ON - not an independent check]" if trained_on else ""))
+                if m["term_ratio"] is not None:
+                    print(f"[val]   terminal xyz: err/motion={m['term_ratio']:.3f} "
+                          f"(1.00 = no better than 'the arm never moved')   "
+                          f"err={m['term_abs']:.2f} vs motion={m['term_motion']:.2f} norm.units")
 
             if step > 0 and step % checkpoint_freq == 0:
                 checkpoint_dir = output_directory / f"checkpoint-{step}"
