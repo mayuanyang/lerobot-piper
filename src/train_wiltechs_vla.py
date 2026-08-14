@@ -1091,6 +1091,7 @@ def train(
         torch.manual_seed(val_seed)
         tot, nb = 0.0, 0
         grip_hit, grip_n, tr_hit, tr_n = 0.0, 0, 0.0, 0
+        n_pred_sw, n_ref_sw, open_p, open_r, open_n = 0, 0, 0.0, 0.0, 0
         term_err, term_ref, term_n = 0.0, 0.0, 0
         gdim = int(getattr(policy.config, "gripper_action_dim", -1))
         gthr = float(getattr(policy.config, "gripper_threshold_norm", float("nan")))
@@ -1132,6 +1133,24 @@ def train(
                     if chg.any():
                         tr_hit += float(((p_open[:, 1:] == r_open[:, 1:]) & chg).float().sum())
                         tr_n += int(chg.sum())
+                    # Exact-step agreement alone cannot separate two very
+                    # different failures, and they score the same ~50%:
+                    #
+                    #   A. the gripper never crosses the threshold at all. Then
+                    #      the aggregate equals the demo's open-fraction, and at
+                    #      reference transitions the two directions alternate, so
+                    #      half are hit by accident.
+                    #   B. it does switch, but at unrelated moments.
+                    #
+                    # Counting the PREDICTED switches separates them outright:
+                    # near zero means A, near the reference count means B. Also
+                    # track the open-fraction of each, since A predicts the
+                    # aggregate and the demo's open-fraction coincide.
+                    n_pred_sw += int((p_open[:, 1:] != p_open[:, :-1]).sum())
+                    n_ref_sw += int(chg.sum())
+                    open_p += float(p_open.float().sum())
+                    open_r += float(r_open.float().sum())
+                    open_n += p_open.numel()
 
                 # LIBERO actions are OSC deltas (the state is absolute EEF pose
                 # in metres), so the cumulative sum over the horizon is where
@@ -1163,6 +1182,10 @@ def train(
             "grip": (grip_hit / grip_n) if grip_n else None,
             "grip_transition": (tr_hit / tr_n) if tr_n else None,
             "n_transitions": tr_n,
+            "pred_switches": n_pred_sw,
+            "ref_switches": n_ref_sw,
+            "open_pred": (open_p / open_n) if open_n else None,
+            "open_ref": (open_r / open_n) if open_n else None,
             # error / motion, so 1.00 = no better than predicting no movement
             "term_ratio": (term_err / term_ref) if term_ref > 1e-9 else None,
             "term_abs": (term_err / term_n) if term_n else None,
@@ -1303,6 +1326,17 @@ def train(
                           else "  transitions=n/a")
                     print(f"[val]   gripper: all_steps={m['grip'] * 100:.1f}%{tr}"
                           + ("   [TRAINED ON - not an independent check]" if trained_on else ""))
+                    op, orf = m["open_pred"], m["open_ref"]
+                    diag = ""
+                    if m["ref_switches"]:
+                        r = m["pred_switches"] / m["ref_switches"]
+                        if r < 0.25:
+                            diag = "  *** gripper barely switches -- stuck, not mistimed ***"
+                        elif m["grip_transition"] is not None and m["grip_transition"] < 0.6:
+                            diag = "  *** switches, but at unrelated moments ***"
+                    print(f"[val]            switches pred={m['pred_switches']} vs "
+                          f"ref={m['ref_switches']}   open-fraction pred="
+                          f"{(op or 0) * 100:.1f}% vs ref={(orf or 0) * 100:.1f}%{diag}")
                 if m["term_ratio"] is not None:
                     print(f"[val]   terminal xyz: err/motion={m['term_ratio']:.3f} "
                           f"(1.00 = no better than 'the arm never moved')   "
