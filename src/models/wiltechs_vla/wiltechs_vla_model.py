@@ -1916,6 +1916,7 @@ class WiltechsVLATransformer(nn.Module):
         gr_w = float(getattr(self.config, "gripper_bce_weight", 0.0) or 0.0)
         gr_thr = float(getattr(self.config, "gripper_threshold_norm", float("nan")))
         gripper_v = 0.0
+        gripper_open_frac = float("nan")
         if gr_w > 0.0 and gr_thr == gr_thr:   # NaN means "not calibrated"
             g = int(getattr(self.config, "gripper_action_dim", -1))
             temp = max(float(getattr(self.config, "gripper_bce_temp", 0.25)), 1e-3)
@@ -1927,6 +1928,45 @@ class WiltechsVLATransformer(nn.Module):
             # two terms agree about which cells are real and how much the tail
             # of the horizon counts.
             w = pos_w[None, :] * valid_t
+
+            # Class balancing. WITHOUT this the term has a strong trivial
+            # optimum and measurably sits in it: the demos are ~89% "open", so
+            # "always open" already scores a low BCE, and validation showed
+            # exactly that signature -- all-steps agreement climbing to 89.2%
+            # (= the demo open-fraction) while agreement AT THE TRANSITIONS,
+            # the only steps that decide a grasp, stayed at chance (42.9%,
+            # 51.0%, 47.8% across checks). Two independently configured runs
+            # converged on the same ~89%, which is what majority-class
+            # prediction looks like, not what learning looks like.
+            #
+            # What balancing buys, stated exactly: the closing class carries
+            # 10.8% of the weight and after balancing carries 50% -- 4.6x more
+            # gradient on the only cells that mark a grasp. And the floor for
+            # an input-independent predictor moves from H(0.892) = 0.342 to
+            # ln 2 = 0.693, so twice as much of the loss is headroom that only
+            # actually predicting the transitions can claim.
+            #
+            # Reweighting so each class carries half the total mass. Done as a per-cell
+            # weight folded into `w` rather than BCEWithLogits' `pos_weight`
+            # because the loss is a WEIGHTED MEAN by the same `w`: the scale
+            # therefore stays interpretable (chance ~= 0.693 at any imbalance)
+            # and gr_w keeps its meaning. `pos_weight` scales only the positive
+            # term against an unchanged denominator, so a batch that happens to
+            # be all-open would drive the whole term to zero.
+            #
+            # p is estimated per batch under the same weights the loss sums
+            # over -- pos_decay_lambda shortens the effective horizon, so the
+            # unweighted prior is the wrong one. The estimate is noisy at ~15%
+            # on the minority weight, which is immaterial next to gr_w=0.05.
+            #
+            # p is measured whether or not it is USED, because it is what tells
+            # the unbalanced floor H(p) apart from the balanced ln 2 -- an
+            # ablation run with no p reported would have no baseline to read its
+            # own loss against.
+            p = ((target * w).sum() / w.sum().clamp(min=1e-6)).clamp(1e-3, 1 - 1e-3)
+            gripper_open_frac = float(p.detach())
+            if bool(getattr(self.config, "gripper_class_balance", True)):
+                w = w * torch.where(target > 0.5, 0.5 / p, 0.5 / (1.0 - p))
             gripper_loss = (bce * w).sum() / w.sum().clamp(min=1e-6)
             gripper_v = float(gripper_loss.detach())
             main_loss = main_loss + gr_w * gripper_loss
@@ -2047,6 +2087,11 @@ class WiltechsVLATransformer(nn.Module):
                           - gr_w * gripper_v),
             "contrastive": contrastive_v,
             "gripper": gripper_v,
+            # Reported so the balancing is auditable from the training log: this
+            # is the class prior the reweighting was derived from, and a
+            # balanced term sitting at ~0.693 means the model is still
+            # predicting the majority class.
+            "gripper_open_frac": gripper_open_frac,
         }
         return main_loss
 

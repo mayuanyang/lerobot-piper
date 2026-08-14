@@ -34,6 +34,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import math
 import argparse
 import hashlib
 from pathlib import Path
@@ -368,6 +369,25 @@ def _log_gradient_analysis(policy, step: int) -> None:
         print(f"  Contrastive    - main: {main_v:.4f}   contrastive: {contr_v:.4f} "
               f"({pct:.0f}% of margin {margin:.3f})   weight: {cw}")
 
+    gw = getattr(policy.model.config, "gripper_bce_weight", 0.0)
+    if comps is not None and gw > 0.0:
+        bal = bool(getattr(policy.model.config, "gripper_class_balance", True))
+        gv = comps.get("gripper", float("nan"))
+        of = comps.get("gripper_open_frac", float("nan"))
+        # ln 2 = 0.693 is the reference point ONLY when balanced: the classes
+        # then carry equal mass, so an input-independent predictor scores
+        # exactly there and anything below is real discrimination. Unbalanced,
+        # that same predictor scores H(open_frac) -- 0.342 at an 89/11 prior --
+        # so a low number proves nothing, which is what this flag exists to fix.
+        floor = (math.log(2.0) if bal
+                 else (-(of * math.log(of) + (1 - of) * math.log(1 - of))
+                       if of == of and 0.0 < of < 1.0 else float("nan")))
+        note = (f"  ({'balanced' if bal else 'UNBALANCED'}; {floor:.3f} = "
+                f"input-independent floor)" if floor == floor else
+                "  (UNBALANCED; floor unknown)")
+        of_s = f"open_frac: {of:.3f}" if of == of else "open_frac: n/a"
+        print(f"  Gripper BCE    - loss: {gv:.4f}   {of_s}   weight: {gw}{note}")
+
     print("--- End Gradient Analysis ---\n")
 
 
@@ -414,6 +434,7 @@ def train(
     gripper_bce_weight: float = 0.05,
     gripper_action_dim: int = -1,
     gripper_bce_temp: float = 0.25,
+    gripper_class_balance: bool = True,
     noise_temporal_correlation: float = 0.0,
     vision_dropout_prob: float = 0.3,
     vision_dropout_start: float = -1.0,
@@ -595,6 +616,7 @@ def train(
         gripper_bce_weight=gripper_bce_weight,
         gripper_action_dim=gripper_action_dim,
         gripper_bce_temp=gripper_bce_temp,
+        gripper_class_balance=gripper_class_balance,
         gripper_threshold_norm=gripper_threshold_norm,
         noise_temporal_correlation=noise_temporal_correlation,
     )
@@ -1588,6 +1610,16 @@ if __name__ == "__main__":
     parser.add_argument("--gripper_bce_temp", type=float, default=0.25,
                         help="Logit temperature in normalised action units: the BCE logit is "
                              "(a_hat_grip - threshold) / temp. Smaller = sharper decision.")
+    parser.add_argument("--no_gripper_class_balance", dest="gripper_class_balance",
+                        action="store_false", default=True,
+                        help="Disable class balancing in the gripper BCE (ablation). Balancing "
+                             "is ON by default: the demos are ~89%% 'open', and the unbalanced "
+                             "term was measured sitting in that trivial optimum -- all-steps "
+                             "agreement rose to 89.2%% (the demo open-fraction) while agreement "
+                             "at the transitions that decide a grasp stayed at chance across "
+                             "three checks. Balancing puts 4.6x more gradient on the closing "
+                             "class and raises the input-independent floor from 0.342 to 0.693. "
+                             "The report prints gripper_open_frac either way.")
     parser.add_argument("--robot_cnn_pool", type=str, default="avg", choices=["avg", "attn"],
                         help="How the ResNet layer3 map becomes tokens. 'avg' (default) "
                              "adaptive-average-pools to a sqrt(tokens) grid; 'attn' uses "

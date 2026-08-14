@@ -249,6 +249,22 @@ class WiltechsVLAConfig(PreTrainedConfig):
     # Logit temperature in normalised units. The BCE logit is
     # (a_hat_grip - threshold) / temp, so this sets how sharp the decision is.
     gripper_bce_temp: float = 0.25
+    # Reweight the BCE so the open and closed classes carry equal total mass.
+    #
+    # ON by default because the unbalanced term demonstrably sits in its trivial
+    # optimum. LIBERO demos are ~89% "open", so "always open" is already cheap;
+    # validation showed all-steps agreement climbing to 89.2% -- the demo's own
+    # open-fraction -- while agreement at the transitions, the handful of steps
+    # that actually decide a grasp, stayed at chance across three checks (47.8%,
+    # 42.9%, 51.0%, n=786). Two differently configured runs both landed on
+    # ~89%, which is majority-class prediction, not learning.
+    #
+    # Balancing moves 4.6x more gradient onto the closing class (10.8% of the
+    # weight -> 50%) and raises the input-independent floor from H(0.892) =
+    # 0.342 to ln 2 = 0.693, doubling the headroom only real transition
+    # prediction can claim. Set False to ablate; `gripper_open_frac` in the
+    # training log reports the measured prior either way.
+    gripper_class_balance: bool = True
     # Enable / disable the parallel ResNet visual encoder entirely.
     #
     # OFF by default. Note this is the single largest measured lever in the MoE
