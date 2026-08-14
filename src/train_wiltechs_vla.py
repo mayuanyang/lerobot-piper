@@ -1144,11 +1144,80 @@ def train(
         cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         torch.manual_seed(val_seed)
         tot, nb = 0.0, 0
-        grip_hit, grip_n, tr_hit, tr_n = 0.0, 0, 0.0, 0
-        n_pred_sw, n_ref_sw, open_p, open_r, open_n = 0, 0, 0.0, 0.0, 0
-        term_err, term_ref, term_n = 0.0, 0.0, 0
         gdim = int(getattr(policy.config, "gripper_action_dim", -1))
         gthr = float(getattr(policy.config, "gripper_threshold_norm", float("nan")))
+
+        # Score every metric on TWO windows. Scoring only the full horizon was
+        # wrong in a way that produced a wrong diagnosis: at n_action_steps=4
+        # the policy replans after 4 steps and DISCARDS the other 60, yet the
+        # switch count ran over all 64. A checkpoint measured at 2.87x the
+        # reference switch count -- read here as "the gripper chatters, that is
+        # the bottleneck" -- scored 90% (45/50) on libero_spatial task 0. The
+        # chatter was almost entirely in steps that never execute, which
+        # loss_exec_steps=8 explicitly down-weights to 0.3.
+        #
+        # exec = what a rollout actually commits to before the next replan.
+        # full = the whole predicted chunk, kept because every earlier number in
+        #        this project was measured that way and the comparison is worth
+        #        preserving.
+        _k = (int(getattr(policy.config, "loss_exec_steps", 0) or 0)
+              or int(getattr(policy.config, "n_action_steps", 0) or 0))
+
+        def _new_acc():
+            return {"grip_hit": 0.0, "grip_n": 0, "tr_hit": 0.0, "tr_n": 0,
+                    "pred_sw": 0, "ref_sw": 0, "open_p": 0.0, "open_r": 0.0,
+                    "open_n": 0, "term_err": 0.0, "term_ref": 0.0, "term_n": 0}
+
+        windows: list[tuple[str, int]] = []
+        accs: dict[str, dict] = {}
+
+        def _score(acc, pw, rw):
+            if gthr == gthr:
+                # Binary agreement on the gripper. Failure here is categorical
+                # -- grasp or no grasp -- unlike a few mm of position error,
+                # which the next replan usually absorbs.
+                p_open, r_open = pw[..., gdim] > gthr, rw[..., gdim] > gthr
+                acc["grip_hit"] += float((p_open == r_open).float().sum())
+                acc["grip_n"] += p_open.numel()
+                if p_open.shape[1] > 1:
+                    # Aggregate agreement is dominated by the long unambiguous
+                    # stretches. What decides a grasp is the handful of steps
+                    # where the gripper CHANGES, so score those separately.
+                    chg = r_open[:, 1:] != r_open[:, :-1]
+                    acc["tr_hit"] += float(
+                        ((p_open[:, 1:] == r_open[:, 1:]) & chg).float().sum())
+                    acc["tr_n"] += int(chg.sum())
+                    # Exact-step agreement cannot separate two failures that
+                    # both score ~50%: (A) the gripper never crosses the
+                    # threshold -- then the aggregate equals the demo's
+                    # open-fraction and alternating reference transitions hand
+                    # it half by accident; (B) it switches at unrelated
+                    # moments. The PREDICTED switch count separates them: near
+                    # zero is A, near the reference count is B.
+                    acc["pred_sw"] += int((p_open[:, 1:] != p_open[:, :-1]).sum())
+                    acc["ref_sw"] += int(chg.sum())
+                acc["open_p"] += float(p_open.float().sum())
+                acc["open_r"] += float(r_open.float().sum())
+                acc["open_n"] += p_open.numel()
+
+            # LIBERO actions are OSC deltas (the state is absolute EEF pose in
+            # metres), so the cumulative sum is where the end effector ENDS UP.
+            # Errors that cancel along the path drop out -- the point being
+            # that a different path to the same place is not a failure, and
+            # per-step MSE cannot tell the two apart.
+            p_end = pw[..., :3].cumsum(1)[:, -1]
+            r_end = rw[..., :3].cumsum(1)[:, -1]
+            acc["term_err"] += float((p_end - r_end).norm(dim=-1).sum())
+            # Scale reference, WITHOUT which the error is unreadable: the units
+            # are normalised and the sum runs over the window, so the raw
+            # number carries no intuition -- exactly the trap
+            # kv_grounding_probe.py had when it read R^2 against a variance
+            # dominated by between-object spread. The denominator is how far
+            # the demo actually travelled, so 1.00 = no better than claiming
+            # the arm never moved.
+            acc["term_ref"] += float(r_end.norm(dim=-1).sum())
+            acc["term_n"] += p_end.shape[0]
+
         try:
             for vb in val_loader:
                 vb = _prep_batch(vb, augment=False)
@@ -1157,96 +1226,62 @@ def train(
                 tot += float(policy.model._last_loss_components["main"])
                 nb += 1
 
-                # Two metrics that do NOT share the loss's problem. The
+                # Metrics that do NOT share the loss's problem. The
                 # flow-matching MSE is bounded below by a floor set by how much
                 # of the action is unpredictable from the observation, so its
-                # LEVEL says little about policy quality. These are a
+                # LEVEL says little about policy quality -- measured directly:
+                # val_main rising 2.3% above its best (the overfitting warning
+                # firing on three consecutive checks) on a checkpoint that then
+                # scored 90% on libero_spatial task 0. These are a
                 # classification rate and a physical distance; neither has that
                 # floor.
                 #
-                # Both run on the integrated action, not the velocity: sample
-                # the policy the way the robot would, then compare.
+                # All run on the integrated action, not the velocity: sample the
+                # policy the way the robot would, then compare.
                 with _autocast():
-                    # full_horizon: these metrics must not change meaning when
-                    # n_action_steps changes -- see sample_actions' docstring.
+                    # full_horizon: the WINDOW is chosen here, not by whatever
+                    # n_action_steps happens to be -- see sample_actions.
                     pred = policy.model.sample_actions(vb, full_horizon=True).float()
                 ref = vb["action"].float()[:, :pred.shape[1]]
 
-                if gthr == gthr:
-                    # Binary agreement on the gripper. Failure here is
-                    # categorical -- grasp or no grasp -- unlike a few mm of
-                    # position error, which the next replan usually absorbs.
-                    p_open, r_open = pred[..., gdim] > gthr, ref[..., gdim] > gthr
-                    grip_hit += float((p_open == r_open).float().sum())
-                    grip_n += p_open.numel()
-                    # Aggregate agreement is dominated by the long stretches
-                    # where the gripper is unambiguous (wide open through the
-                    # whole approach). What decides a grasp is the handful of
-                    # steps where it CHANGES, so score those separately -- a
-                    # policy can sit at 95% overall and still miss every
-                    # transition.
-                    chg = r_open[:, 1:] != r_open[:, :-1]
-                    if chg.any():
-                        tr_hit += float(((p_open[:, 1:] == r_open[:, 1:]) & chg).float().sum())
-                        tr_n += int(chg.sum())
-                    # Exact-step agreement alone cannot separate two very
-                    # different failures, and they score the same ~50%:
-                    #
-                    #   A. the gripper never crosses the threshold at all. Then
-                    #      the aggregate equals the demo's open-fraction, and at
-                    #      reference transitions the two directions alternate, so
-                    #      half are hit by accident.
-                    #   B. it does switch, but at unrelated moments.
-                    #
-                    # Counting the PREDICTED switches separates them outright:
-                    # near zero means A, near the reference count means B. Also
-                    # track the open-fraction of each, since A predicts the
-                    # aggregate and the demo's open-fraction coincide.
-                    n_pred_sw += int((p_open[:, 1:] != p_open[:, :-1]).sum())
-                    n_ref_sw += int(chg.sum())
-                    open_p += float(p_open.float().sum())
-                    open_r += float(r_open.float().sum())
-                    open_n += p_open.numel()
+                if not windows:
+                    H = pred.shape[1]
+                    k = max(1, min(_k or H, H))
+                    if k < H:
+                        windows.append((f"exec[0:{k}]", k))
+                    windows.append((f"full[0:{H}]", H))
+                    accs.update({name: _new_acc() for name, _ in windows})
+                for _name, _kw in windows:
+                    _score(accs[_name], pred[:, :_kw], ref[:, :_kw])
 
-                # LIBERO actions are OSC deltas (the state is absolute EEF pose
-                # in metres), so the cumulative sum over the horizon is where
-                # the end effector ENDS UP. Errors that cancel along the path
-                # drop out -- which is the whole point: a different path to the
-                # same place is not a failure, and per-step MSE cannot tell the
-                # two apart.
-                p_end = pred[..., :3].cumsum(1)[:, -1]
-                r_end = ref[..., :3].cumsum(1)[:, -1]
-                term_err += float((p_end - r_end).norm(dim=-1).sum())
-                # Scale reference, WITHOUT which the error is unreadable. The
-                # units are normalised and the sum runs over 64 steps, so the
-                # raw number carries no intuition at all -- exactly the trap
-                # kv_grounding_probe.py had when it read R^2 against a variance
-                # dominated by between-object spread. The denominator here is
-                # how far the demo actually travelled, so the ratio is
-                # error/motion: 1.00 means the prediction is no better than
-                # claiming the arm never moved.
-                term_ref += float(r_end.norm(dim=-1).sum())
-                term_n += p_end.shape[0]
         finally:
             torch.set_rng_state(cpu_rng)
             if cuda_rng is not None:
                 torch.cuda.set_rng_state_all(cuda_rng)
             if was_training:
                 policy.train()
-        return {
-            "loss": tot / max(1, nb),
-            "grip": (grip_hit / grip_n) if grip_n else None,
-            "grip_transition": (tr_hit / tr_n) if tr_n else None,
-            "n_transitions": tr_n,
-            "pred_switches": n_pred_sw,
-            "ref_switches": n_ref_sw,
-            "open_pred": (open_p / open_n) if open_n else None,
-            "open_ref": (open_r / open_n) if open_n else None,
-            # error / motion, so 1.00 = no better than predicting no movement
-            "term_ratio": (term_err / term_ref) if term_ref > 1e-9 else None,
-            "term_abs": (term_err / term_n) if term_n else None,
-            "term_motion": (term_ref / term_n) if term_n else None,
-        }
+        out = {"loss": tot / max(1, nb), "windows": []}
+        for name, _kw in windows:
+            a = accs[name]
+            out["windows"].append({
+                "name": name,
+                "grip": (a["grip_hit"] / a["grip_n"]) if a["grip_n"] else None,
+                "grip_transition": (a["tr_hit"] / a["tr_n"]) if a["tr_n"] else None,
+                "n_transitions": a["tr_n"],
+                "pred_switches": a["pred_sw"],
+                "ref_switches": a["ref_sw"],
+                # >1 = chatters, <1 = too sluggish, 1 = right amount of switching
+                # (which says nothing about the timing -- read it with
+                # grip_transition, not instead of it).
+                "switch_ratio": (a["pred_sw"] / a["ref_sw"]) if a["ref_sw"] else None,
+                "open_pred": (a["open_p"] / a["open_n"]) if a["open_n"] else None,
+                "open_ref": (a["open_r"] / a["open_n"]) if a["open_n"] else None,
+                # error / motion, so 1.00 = no better than predicting no movement
+                "term_ratio": (a["term_err"] / a["term_ref"]) if a["term_ref"] > 1e-9 else None,
+                "term_abs": (a["term_err"] / a["term_n"]) if a["term_n"] else None,
+                "term_motion": (a["term_ref"] / a["term_n"]) if a["term_n"] else None,
+            })
+        return out
 
     prog_bar = tqdm(total=training_steps, desc="Training Progress", initial=step)
     val_hist: list[tuple[int, float]] = []
@@ -1376,27 +1411,45 @@ def train(
                 # --gripper_bce_weight > 0: it is then also a training target,
                 # and a trained-on number cannot audit the thing it optimises.
                 trained_on = float(getattr(policy.config, "gripper_bce_weight", 0.0)) > 0
-                if m["grip"] is not None:
-                    tr = (f"  transitions={m['grip_transition'] * 100:.1f}% "
-                          f"(n={m['n_transitions']})" if m["grip_transition"] is not None
-                          else "  transitions=n/a")
-                    print(f"[val]   gripper: all_steps={m['grip'] * 100:.1f}%{tr}"
-                          + ("   [TRAINED ON - not an independent check]" if trained_on else ""))
-                    op, orf = m["open_pred"], m["open_ref"]
-                    diag = ""
-                    if m["ref_switches"]:
-                        r = m["pred_switches"] / m["ref_switches"]
-                        if r < 0.25:
-                            diag = "  *** gripper barely switches -- stuck, not mistimed ***"
-                        elif m["grip_transition"] is not None and m["grip_transition"] < 0.6:
-                            diag = "  *** switches, but at unrelated moments ***"
-                    print(f"[val]            switches pred={m['pred_switches']} vs "
-                          f"ref={m['ref_switches']}   open-fraction pred="
-                          f"{(op or 0) * 100:.1f}% vs ref={(orf or 0) * 100:.1f}%{diag}")
-                if m["term_ratio"] is not None:
-                    print(f"[val]   terminal xyz: err/motion={m['term_ratio']:.3f} "
-                          f"(1.00 = no better than 'the arm never moved')   "
-                          f"err={m['term_abs']:.2f} vs motion={m['term_motion']:.2f} norm.units")
+                wins = m.get("windows") or []
+                # The FIRST window is the executed prefix -- the only one a
+                # rollout commits to. Judge on that row; `full` is kept for
+                # continuity with earlier runs, and a large gap between the two
+                # rows means the chunk degrades past the replan point, which
+                # costs nothing at n_action_steps=4.
+                for i, w in enumerate(wins):
+                    tag = "<-- executed" if i == 0 and len(wins) > 1 else ""
+                    if w["grip"] is not None:
+                        sr = (f"  switch_ratio={w['switch_ratio']:.2f}x"
+                              if w["switch_ratio"] is not None else "")
+                        trn = (f"  transitions={w['grip_transition'] * 100:.1f}% "
+                               f"(n={w['n_transitions']})"
+                               if w["grip_transition"] is not None else "  transitions=n/a")
+                        # A ratio near 0 is a gripper stuck on one side; near 1
+                        # with poor transition agreement is right-frequency but
+                        # wrong-timing; >>1 is chatter. Only flagged on the
+                        # executed window -- flagging it on `full` is what
+                        # produced a "chatter is the bottleneck" call on a
+                        # checkpoint that scored 90%.
+                        diag = ""
+                        if i == 0 and w["switch_ratio"] is not None:
+                            if w["switch_ratio"] < 0.25:
+                                diag = "  *** stuck, not mistimed ***"
+                            elif w["switch_ratio"] > 1.75:
+                                diag = "  *** chatters on the executed steps ***"
+                            elif (w["grip_transition"] or 1.0) < 0.6:
+                                diag = "  *** right frequency, wrong moments ***"
+                        print(f"[val]   gripper {w['name']:>10}: agree={w['grip'] * 100:.1f}%"
+                              f"{trn}{sr}{diag}"
+                              + ("   [TRAINED ON]" if trained_on and i == 0 else ""))
+                        print(f"[val]   {'':>18} open-fraction pred="
+                              f"{(w['open_pred'] or 0) * 100:.1f}% vs "
+                              f"ref={(w['open_ref'] or 0) * 100:.1f}%   "
+                              f"switches {w['pred_switches']} vs {w['ref_switches']}")
+                    if w["term_ratio"] is not None:
+                        print(f"[val]   term xyz {w['name']:>9}: err/motion="
+                              f"{w['term_ratio']:.3f}   err={w['term_abs']:.2f} vs "
+                              f"motion={w['term_motion']:.2f} norm.units  {tag}")
 
             if step > 0 and step % checkpoint_freq == 0:
                 checkpoint_dir = output_directory / f"checkpoint-{step}"
