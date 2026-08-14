@@ -1880,7 +1880,16 @@ class WiltechsVLATransformer(nn.Module):
             loss = loss * dim_w[None, None, :]
 
         H = loss.shape[1]
-        n_exec = self.config.n_action_steps
+        # loss_exec_steps owns the loss boundary; n_action_steps is inference-only
+        # (how many actions the queue pops per replan). 0 falls back to the full
+        # horizon = no down-weighting. It used to fall back to n_action_steps,
+        # which coupled the LOSS to an INFERENCE knob -- and since the trainer
+        # pinned n_action_steps to horizon, the slice below was empty and
+        # future_steps_weight did nothing. Falling back to H rather than
+        # n_action_steps changes no existing checkpoint: every one this trainer
+        # produced had n_action_steps == horizon, so the two are the same number.
+        n_exec = int(getattr(self.config, "loss_exec_steps", 0) or 0) or H
+        n_exec = max(1, min(n_exec, H))
         pos_w = torch.ones(H, device=loss.device, dtype=loss.dtype)
         pos_w[n_exec:] = self.config.future_steps_weight
         if self.config.pos_decay_lambda > 0.0:
@@ -2132,7 +2141,18 @@ class WiltechsVLATransformer(nn.Module):
         return x_t
 
     @torch.no_grad()
-    def sample_actions(self, batch: dict) -> torch.Tensor:
+    def sample_actions(self, batch: dict, full_horizon: bool = False) -> torch.Tensor:
+        """(B, n_action_steps, action_dim), or the full horizon if requested.
+
+        full_horizon exists so that MEASUREMENT does not move when an
+        inference knob moves. The validation metrics integrate the chunk to a
+        terminal position and count gripper transitions over it; truncating to
+        n_action_steps would make both quantities mean something different at
+        every setting -- dropping n_action_steps from 64 to 4 would shrink the
+        terminal-error denominator from 6.4s of motion to 0.4s and cut the
+        transition sample from ~786 to a handful, silently ending the
+        comparison with every previous run.
+        """
         B = batch["observation.state"].shape[0]
         device = batch["observation.state"].device
 
@@ -2166,7 +2186,7 @@ class WiltechsVLATransformer(nn.Module):
                 x_t = x_t + dt * v_t
                 t = t + dt
 
-        return x_t[:, : self.config.n_action_steps]
+        return x_t if full_horizon else x_t[:, : self.config.n_action_steps]
 
     def count_parameters(self) -> dict:
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)

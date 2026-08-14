@@ -435,6 +435,9 @@ def train(
     gripper_action_dim: int = -1,
     gripper_bce_temp: float = 0.25,
     gripper_class_balance: bool = True,
+    n_action_steps: int = 4,
+    loss_exec_steps: int = 8,
+    future_steps_weight: float = 0.3,
     noise_temporal_correlation: float = 0.0,
     vision_dropout_prob: float = 0.3,
     vision_dropout_start: float = -1.0,
@@ -562,7 +565,34 @@ def train(
     # ── Training parameters ──────────────────────────────────────────────
     obs = 2
     horizon = 64
-    n_action_steps = 64
+    # Inference-only: how many steps the action queue pops before replanning.
+    # Decoupled from the loss (see loss_exec_steps), so it is safe to set to
+    # whatever the eval actually runs. It IS stored in the checkpoint config, so
+    # an eval that forgets to override inherits this value -- at 10Hz, 64 meant
+    # 6.4s of open-loop execution from a single observation.
+    n_action_steps = max(1, min(int(n_action_steps), horizon))
+
+    # Report the temporal loss weighting explicitly. Before loss_exec_steps
+    # existed this block would have printed a flat profile: the loss read
+    # n_action_steps, the trainer pinned it to horizon, so `pos_w[n_exec:]` was
+    # an empty slice and future_steps_weight applied to nothing. Printing the
+    # resulting share of the executed prefix makes that visible instead of
+    # inferable.
+    _n_exec = min(max(1, loss_exec_steps or horizon), horizon)
+    _total_w = _n_exec + (horizon - _n_exec) * future_steps_weight
+    print(f"Loss horizon weighting: steps 0..{_n_exec - 1} at 1.0, "
+          f"{_n_exec}..{horizon - 1} at {future_steps_weight} "
+          f"(total weight {_total_w:.1f})")
+    for _k in (4, 8):
+        _share = min(_k, _n_exec) + max(0, _k - _n_exec) * future_steps_weight
+        print(f"  first {_k:>2} steps carry {_share / _total_w * 100:5.1f}% of the "
+              f"horizon weight  (uniform would be {_k / horizon * 100:.1f}%)")
+    if _n_exec >= horizon:
+        print("  NOTE: loss_exec_steps >= horizon, so future_steps_weight is inert "
+              "and every step is weighted equally. Pass --loss_exec_steps to "
+              "concentrate the gradient on the part an eval actually executes.")
+    print(f"Inference: n_action_steps={n_action_steps} "
+          f"({n_action_steps / 10:.1f}s open-loop at 10Hz) before replanning")
 
     # action_dim_weights — uniform by default. piper_arm's joint 4 (index 3) is
     # mechanically locked, so pass --lock_joint_index 3 to zero its loss term.
@@ -598,6 +628,8 @@ def train(
         text_first=not text_last,
         action_dim_weights=action_dim_weights,
         pos_decay_lambda=0.0,
+        loss_exec_steps=loss_exec_steps,
+        future_steps_weight=future_steps_weight,
         num_latent_tokens=num_latent_tokens,
         vlm_attends_to_expert=True,
         contrastive_loss_weight=contrastive_loss_weight,
@@ -1135,7 +1167,9 @@ def train(
                 # Both run on the integrated action, not the velocity: sample
                 # the policy the way the robot would, then compare.
                 with _autocast():
-                    pred = policy.model.sample_actions(vb).float()
+                    # full_horizon: these metrics must not change meaning when
+                    # n_action_steps changes -- see sample_actions' docstring.
+                    pred = policy.model.sample_actions(vb, full_horizon=True).float()
                 ref = vb["action"].float()[:, :pred.shape[1]]
 
                 if gthr == gthr:
@@ -1610,6 +1644,24 @@ if __name__ == "__main__":
     parser.add_argument("--gripper_bce_temp", type=float, default=0.25,
                         help="Logit temperature in normalised action units: the BCE logit is "
                              "(a_hat_grip - threshold) / temp. Smaller = sharper decision.")
+    parser.add_argument("--n_action_steps", type=int, default=4,
+                        help="INFERENCE ONLY: how many of the predicted steps the queue pops "
+                             "before replanning. Does not touch the loss (--loss_exec_steps "
+                             "owns that), so it costs nothing to set low -- but it IS stored in "
+                             "the checkpoint, and an eval that forgets to override inherits it. "
+                             "At 10Hz, 4 = 0.4s open-loop; the previous hardcoded 64 was 6.4s "
+                             "from a single observation, which is fatal for grasp precision.")
+    parser.add_argument("--loss_exec_steps", type=int, default=8,
+                        help="Horizon index where --future_steps_weight kicks in; the prefix "
+                             "before it keeps weight 1.0. 0 = the full horizon, i.e. every step "
+                             "weighted equally (what this trainer silently did before this flag "
+                             "existed, because the loss read n_action_steps and that was pinned "
+                             "to horizon). 8 puts 32%% of the gradient on the first 8 steps "
+                             "instead of 12.5%%. Startup prints the resulting profile.")
+    parser.add_argument("--future_steps_weight", type=float, default=0.3,
+                        help="Loss weight on horizon steps at or beyond --loss_exec_steps. Only "
+                             "has any effect once loss_exec_steps < horizon. The far tail of a "
+                             "6.4s chunk is aleatoric, so it is an auxiliary task, not the task.")
     parser.add_argument("--no_gripper_class_balance", dest="gripper_class_balance",
                         action="store_false", default=True,
                         help="Disable class balancing in the gripper BCE (ablation). Balancing "

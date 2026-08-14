@@ -183,6 +183,24 @@ class WiltechsVLAConfig(PreTrainedConfig):
     action_dim_weights: list = field(default_factory=list)
     pos_decay_lambda: float = 0.1
     future_steps_weight: float = 0.3
+    # Horizon index where future_steps_weight starts. 0 = fall back to
+    # n_action_steps (legacy).
+    #
+    # Ported from WiltechsMoE, where this same coupling was found to make the
+    # knob silently inert. n_action_steps serves two unrelated purposes -- the
+    # loss boundary here, and how many actions the queue pops per replan at
+    # inference -- and train_wiltechs_vla.py pinned it to 64 == horizon, so
+    # `pos_w[n_exec:]` was an EMPTY slice and future_steps_weight applied to no
+    # timestep at all. Combined with the trainer also passing
+    # pos_decay_lambda=0.0, every one of the 64 horizon steps carried EXACTLY
+    # equal weight.
+    #
+    # Why that is the wrong default: LIBERO is 10 Hz, so 64 steps is 6.4 s
+    # predicted from one observation, against episodes capped at ~150 steps.
+    # The far end is aleatoric -- no amount of visual grounding says where the
+    # gripper is three seconds out -- yet uniform weighting hands it most of the
+    # gradient, while the ~4-8 steps an eval actually executes get 6-12%.
+    loss_exec_steps: int = 0
 
     # -------- Training presets --------
     optimizer_lr: float = 1e-4
