@@ -411,6 +411,7 @@ def train(
     vision_input_size: int = 0,
     vision_hires_cameras: Optional[list] = None,
     text_last: bool = False,
+    bidirectional_prompt: bool = False,
     dit_hidden_size: int = 0,
     use_8bit_adam: bool = False,
     max_episode_index: Optional[int] = None,
@@ -627,6 +628,7 @@ def train(
         vision_input_size=vision_input_size,
         vision_hires_cameras=list(vision_hires_cameras or []),
         text_first=not text_last,
+        bidirectional_prompt=bidirectional_prompt,
         action_dim_weights=action_dim_weights,
         pos_decay_lambda=0.0,
         loss_exec_steps=loss_exec_steps,
@@ -694,7 +696,8 @@ def train(
         # ON, so resuming anything trained before that silently switches prompts.
         # Cheap to detect, expensive to discover from a loss curve.
         for key, now in (("instruction_template", str(instruction_template or "")),
-                         ("use_chat_template", bool(use_chat_template))):
+                         ("use_chat_template", bool(use_chat_template)),
+                         ("bidirectional_prompt", bool(bidirectional_prompt))):
             if not saved_cfg_json:
                 break
             was = saved_cfg_json.get(key, "" if isinstance(now, str) else False)
@@ -1658,6 +1661,17 @@ if __name__ == "__main__":
                              "leaves every vision K/V the DiT reads LANGUAGE-BLIND and the model "
                              "tends to use the instruction as a coarse location prior rather than "
                              "an object selector. Default is text-first.")
+    parser.add_argument("--bidirectional_prompt", action="store_true",
+                        help="Drop the VLM's causal mask over the prompt so language attends "
+                             "to the images and vice versa (key padding still enforced). "
+                             "--text_first only buys image<-text; the language positions "
+                             "precede every patch and stay vision-BLIND, which is where ~88% "
+                             "of the DiT's cross-attn mass lands. This restores text<-image "
+                             "without growing L_vlm (a text|image|text sandwich would). OOD "
+                             "for Qwen3-VL, but the VLM is frozen and never decodes, so only "
+                             "its K/V matter -- prefix-LM attention is what pi0/PaliGemma run "
+                             "by design. Moves the KV geometry: does NOT warm-start a causal "
+                             "checkpoint's ca_q.")
     parser.add_argument("--dit_hidden_size", type=int, default=0,
                         help="DiT decoder width. 0 (default) = match the VLM hidden size (2560). "
                              "Set a smaller multiple of the VLM head_dim (e.g. 1280) to shrink the "

@@ -320,6 +320,29 @@ class WiltechsVLAConfig(PreTrainedConfig):
     # the 36 LM layers only, under no_grad).
     text_first: bool = True
 
+    # Drop the causal mask over the VLM sequence entirely, so every prompt
+    # position attends to every other one (key padding is still enforced).
+    #
+    # text_first only buys ONE of the two directions: image<-text. The language
+    # positions sit to the LEFT of every patch, so they can never read the
+    # image, and they are what the DiT cross-attention mostly lands on --
+    # measured 88% of the cross-attn mass on language slots that are
+    # structurally vision-blind. Bidirectional restores text<-image at zero
+    # token cost, which the text|image|text sandwich would only buy by growing
+    # L_vlm (and therefore the KV length of every DiT cross-attn layer).
+    #
+    # The cost is distribution: Qwen3-VL was pretrained causal and has never
+    # seen a bidirectional prompt. That is a smaller risk here than it sounds --
+    # this VLM is frozen and never decodes, so its K/V are used purely as a
+    # cross-attention memory and nothing depends on next-token calibration.
+    # Prefix-LM attention over the prompt is what pi0/PaliGemma run by design.
+    # It is still a real distribution shift, so this is OFF by default and the
+    # KV geometry it produces does NOT warm-start a causal checkpoint's ca_q.
+    #
+    # Note the vision tokens already have full mutual context: the Qwen ViT is
+    # bidirectional internally, so intra-image attention was never the gap.
+    bidirectional_prompt: bool = False
+
     # -------- Register tokens --------
     # Learned constants inserted between the state token and the actions:
     #   [state(1), (robot)?, (latent)?, register(R), action(H)]

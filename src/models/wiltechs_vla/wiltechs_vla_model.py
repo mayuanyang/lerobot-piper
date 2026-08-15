@@ -896,6 +896,12 @@ class WiltechsVLATransformer(nn.Module):
             print(f"[wiltechs_vla] instruction_template ACTIVE (lang_max_len="
                   f"{self._lang_max_len}):\n  {_tmpl!r}")
         self.text_first = bool(getattr(config, "text_first", True))
+        self.bidirectional_prompt = bool(getattr(config, "bidirectional_prompt", False))
+        if self.bidirectional_prompt:
+            print("[wiltechs_vla] BIDIRECTIONAL prompt attention ON — the VLM's "
+                  "causal mask is dropped, so language positions attend to the "
+                  "images (and vice versa). OOD for Qwen3-VL; valid here only "
+                  "because the VLM is frozen and never decodes.")
 
         # Chat-template static token ids (lazy; only built when
         # config.use_chat_template is on) + one-shot format print.
@@ -1438,11 +1444,27 @@ class WiltechsVLATransformer(nn.Module):
 
         # Causal mask + key-padding mask for VLM self-attention (matches the
         # mask shape Qwen3-VL was pretrained with). Shape: (B, 1, L, L).
-        causal = torch.triu(
-            torch.full((L_vlm, L_vlm), float("-inf"), device=device, dtype=vlm_seq.dtype),
-            diagonal=1,
-        )
-        full_mask = causal.unsqueeze(0).unsqueeze(0).expand(B, 1, L_vlm, L_vlm).clone()
+        #
+        # bidirectional_prompt drops the causal term. The whole VLM sequence is
+        # prompt -- nothing is ever decoded from it, the K/V are read only as
+        # cross-attention memory -- so the triangular mask buys no correctness
+        # here, it only costs the text<-image direction: under causal masking a
+        # language position placed before the images (text_first) can never
+        # attend to a patch, which is exactly the blind-language K/V the DiT
+        # then spends ~88% of its cross-attn mass on.
+        if self.bidirectional_prompt:
+            full_mask = torch.zeros(
+                (B, 1, L_vlm, L_vlm), device=device, dtype=vlm_seq.dtype,
+            )
+        else:
+            causal = torch.triu(
+                torch.full((L_vlm, L_vlm), float("-inf"), device=device, dtype=vlm_seq.dtype),
+                diagonal=1,
+            )
+            full_mask = causal.unsqueeze(0).unsqueeze(0).expand(B, 1, L_vlm, L_vlm).clone()
+        # Key padding applies either way: padded instruction slots must stay
+        # unreadable, and under text_first they sit MID-sequence, so without
+        # this the images would attend to zero-embedding junk.
         key_pad = ~vlm_kv_pad_mask                            # True = pad
         full_mask.masked_fill_(key_pad.unsqueeze(1).unsqueeze(1), float("-inf"))
 
