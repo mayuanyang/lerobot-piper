@@ -179,13 +179,18 @@ def train(
     batch_size: int = 8,
     grad_accum: int = 1,
     lr: float = 1e-4,
+    weight_decay: float = 1e-6,
     warmup_steps: int = 1000,
     horizon: int = 16,
     n_action_steps: int = 8,
     expert_hidden_size: int = 1024,
     expert_num_layers: int = 0,
+    expert_intermediate_size: int = 0,
+    num_register_tokens: int = 8,
     lora_rank: int = 32,
     lora_alpha: int = 64,
+    lora_dropout: float = 0.0,
+    lora_on_vision_tower: bool = False,
     freeze_vlm: bool = False,
     bidirectional_prefix: bool = True,
     knowledge_insulation: bool = True,
@@ -194,16 +199,29 @@ def train(
     wrist_encoder: bool = True,
     wrist_encoder_id: str = "facebook/dinov2-small",
     wrist_cameras: list[str] | None = None,
+    wrist_tokens: int = 256,
+    wrist_input_size: int = 256,
+    freeze_wrist_encoder: bool = False,
     motion_vectors: bool = True,
     motion_history_len: int = 8,
+    motion_vector_tokens: int = 8,
     progress_head: bool = True,
+    progress_loss_weight: float = 0.1,
     flow_objective: str = "shortcut",
     shortcut_consistency_frac: float = 0.25,
     num_inference_steps: int = 4,
+    sample_noise_scale: float = 1.0,
+    noise_temporal_correlation: float = 0.0,
     vision_input_size: int = 0,
     lang_max_len: int = 48,
+    instruction_template: str = "",
+    action_loss_weight: float = 1.0,
+    loss_exec_steps: int = 0,
+    future_steps_weight: float = 1.0,
     gripper_bce_weight: float = 0.05,
     gripper_action_dim: int = -1,
+    gripper_bce_temp: float = 0.25,
+    no_gripper_class_balance: bool = False,
     use_descriptive_objects: bool = False,
     num_workers: int = 4,
     save_every: int = 5000,
@@ -252,26 +270,42 @@ def train(
         n_obs_steps=obs_steps, horizon=horizon, n_action_steps=n_action_steps,
         state_dim=D["state_dim"], action_dim=D["action_dim"],
         vlm_model_id=vlm_model_id, freeze_vlm=freeze_vlm,
-        lora_rank=lora_rank, lora_alpha=lora_alpha,
+        lora_rank=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+        lora_on_vision_tower=lora_on_vision_tower,
         bidirectional_prefix=bidirectional_prefix,
         num_cameras=len(cameras), cameras_for_vlm=cameras,
         vision_input_size=vision_input_size, lang_max_len=lang_max_len,
+        instruction_template=instruction_template,
         use_descriptive_objects=use_descriptive_objects,
         knowledge_insulation=knowledge_insulation,
         fast_token_head=discrete_head,
         fast_token_loss_weight=fast_token_loss_weight,
-        expert_hidden_size=expert_hidden_size, expert_num_layers=expert_num_layers,
+        expert_hidden_size=expert_hidden_size,
+        expert_intermediate_size=expert_intermediate_size,
+        expert_num_layers=expert_num_layers,
+        num_register_tokens=num_register_tokens,
         use_wrist_encoder=wrist_encoder, wrist_encoder_id=wrist_encoder_id,
-        wrist_cameras=wrist_keys,
+        wrist_cameras=wrist_keys, wrist_tokens=wrist_tokens,
+        wrist_input_size=wrist_input_size,
+        freeze_wrist_encoder=freeze_wrist_encoder,
         use_motion_vectors=motion_vectors, motion_history_len=motion_history_len,
-        progress_head=progress_head,
+        motion_vector_tokens=motion_vector_tokens,
+        progress_head=progress_head, progress_loss_weight=progress_loss_weight,
         flow_objective=flow_objective,
         shortcut_consistency_frac=shortcut_consistency_frac,
         num_inference_steps=num_inference_steps,
+        sample_noise_scale=sample_noise_scale,
+        noise_temporal_correlation=noise_temporal_correlation,
+        action_loss_weight=action_loss_weight,
+        loss_exec_steps=loss_exec_steps,
+        future_steps_weight=future_steps_weight,
         gripper_bce_weight=gripper_bce_weight,
         gripper_action_dim=gripper_action_dim,
+        gripper_bce_temp=gripper_bce_temp,
+        gripper_class_balance=not no_gripper_class_balance,
         gripper_threshold_norm=gthr,
-        optimizer_lr=lr, scheduler_warmup_steps=warmup_steps,
+        optimizer_lr=lr, optimizer_weight_decay=weight_decay,
+        scheduler_warmup_steps=warmup_steps,
         scheduler_decay_steps=training_steps,
         training_steps_total=training_steps,
         device=device,
@@ -303,7 +337,12 @@ def train(
     preprocessor, postprocessor = make_pre_post_processors(cfg, dataset_stats=stats)
 
     params = [p for p in policy.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(params, lr=lr, betas=(0.9, 0.95), weight_decay=1e-6)
+    # Read betas/eps/weight_decay off the config rather than hardcoding them:
+    # the values happened to match the defaults, so changing the config would
+    # have silently had no effect.
+    opt = torch.optim.AdamW(params, lr=lr, betas=tuple(cfg.optimizer_betas),
+                            eps=cfg.optimizer_eps,
+                            weight_decay=cfg.optimizer_weight_decay)
 
     def lr_at(step):
         if step < warmup_steps:
@@ -387,15 +426,25 @@ def main():
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--grad_accum", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-6)
     p.add_argument("--warmup_steps", type=int, default=1000)
     p.add_argument("--horizon", type=int, default=16)
     p.add_argument("--n_action_steps", type=int, default=8,
                    help="Executed in full before replanning (the OFT setting).")
     p.add_argument("--expert_hidden_size", type=int, default=1024)
+    p.add_argument("--expert_intermediate_size", type=int, default=0,
+                   help="0 = match --expert_hidden_size.")
     p.add_argument("--expert_num_layers", type=int, default=0,
-                   help="0 = one expert block per VLM layer.")
+                   help="0 = one expert block per VLM layer. Fewer = a shallower "
+                        "expert attached to the deepest N layers only.")
+    p.add_argument("--num_register_tokens", type=int, default=8)
     p.add_argument("--lora_rank", type=int, default=32)
     p.add_argument("--lora_alpha", type=int, default=64)
+    p.add_argument("--lora_dropout", type=float, default=0.0)
+    p.add_argument("--lora_on_vision_tower", action="store_true",
+                   help="Also adapt the ViT. Off by default: the vision tower is "
+                        "the part most likely to lose general features, and the "
+                        "wrist encoder is the designated trainable visual path.")
     p.add_argument("--freeze_vlm", action="store_true",
                    help="ABLATION ONLY. This is the configuration that produced "
                         "this repo's vision collapse; no top-10 LIBERO method "
@@ -422,20 +471,61 @@ def main():
                    help="DINOv3 ids on HF were NOT verified when this was "
                         "written; confirm before switching off the v2 default.")
     p.add_argument("--wrist_cameras", nargs="+", default=None)
+    p.add_argument("--wrist_tokens", type=int, default=256,
+                   help="Perfect square. Granularity is --wrist_input_size / "
+                        "sqrt(this) px per token and MUST come out below the Qwen "
+                        "grid's 32, or this path supplies nothing the VLM tokens "
+                        "do not already have. 256px/sqrt(64) = 32.0 is a no-op. "
+                        "COST: these sit in the prefix, so they lengthen the K/V "
+                        "every expert layer attends to — the first knob to turn "
+                        "down under memory pressure.")
+    p.add_argument("--wrist_input_size", type=int, default=256,
+                   help="Raising this instead of --wrist_tokens buys the same "
+                        "px/token without lengthening the prefix; the cost moves "
+                        "into the DINO forward. 512 + 64 tokens = 16 px/token at "
+                        "a quarter of the prefix length of 256 tokens @ 256px.")
+    p.add_argument("--freeze_wrist_encoder", action="store_true",
+                   help="Skips the DINO backward. Saves memory, but this is the "
+                        "path this repo measured at 34 points — freeze it only "
+                        "to fit, not as a default.")
     p.add_argument("--no_motion_vectors", dest="motion_vectors",
                    action="store_false", default=True)
     p.add_argument("--motion_history_len", type=int, default=8)
+    p.add_argument("--motion_vector_tokens", type=int, default=8)
     p.add_argument("--no_progress_head", dest="progress_head",
                    action="store_false", default=True)
+    p.add_argument("--progress_loss_weight", type=float, default=0.1)
     p.add_argument("--flow_objective", default="shortcut",
                    choices=["flow", "shortcut"],
                    help="'meanflow' is declared in the config but not implemented.")
     p.add_argument("--shortcut_consistency_frac", type=float, default=0.25)
     p.add_argument("--num_inference_steps", type=int, default=4)
+    p.add_argument("--sample_noise_scale", type=float, default=1.0,
+                   help="Temperature on the initial noise. Matters for stage B: a "
+                        "flow policy annealed to near-determinism cannot explore "
+                        "and RL dies silently.")
+    p.add_argument("--noise_temporal_correlation", type=float, default=0.0,
+                   help="AR(1) correlation across the horizon. 0 = iid.")
     p.add_argument("--vision_input_size", type=int, default=0)
     p.add_argument("--lang_max_len", type=int, default=48)
+    p.add_argument("--instruction_template", type=str, default="",
+                   help="Must contain the literal '{instruction}'. Empty = the "
+                        "bare task string.")
+    p.add_argument("--action_loss_weight", type=float, default=1.0)
+    p.add_argument("--loss_exec_steps", type=int, default=0,
+                   help="Steps the loss treats as executed; the tail beyond is "
+                        "scaled by --future_steps_weight. 0 = full horizon. "
+                        "Deliberately NOT tied to --n_action_steps: coupling the "
+                        "loss to an inference knob is the bug wiltechs_vla had "
+                        "to back out.")
+    p.add_argument("--future_steps_weight", type=float, default=1.0)
     p.add_argument("--gripper_bce_weight", type=float, default=0.05)
     p.add_argument("--gripper_action_dim", type=int, default=-1)
+    p.add_argument("--gripper_bce_temp", type=float, default=0.25)
+    p.add_argument("--no_gripper_class_balance", action="store_true",
+                   help="Without balancing this term sits in the majority-class "
+                        "optimum (~89% open) and transition-time agreement stays "
+                        "at chance. Ablation only.")
     p.add_argument("--use_descriptive_objects", action="store_true")
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--save_every", type=int, default=5000)

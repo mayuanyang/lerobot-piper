@@ -118,10 +118,16 @@ class WiltechsXConfig(PreTrainedConfig):
     # provide the insulation, making this head dead weight.
     fast_token_head: bool = True
     fast_token_loss_weight: float = 0.5
-    # FAST (DCT + BPE) action tokenizer. Empty = use the model's own tokenizer
-    # vocabulary tail; set to a FAST tokenizer id to use a dedicated one.
-    fast_tokenizer_id: str = ""
-    fast_max_tokens: int = 64
+    # NOTE the field names say "fast" for continuity with the design doc, but
+    # the implementation is uniform per-dimension BINNING predicted in
+    # parallel (RT-2/OpenVLA style), not FAST's DCT+BPE with autoregressive
+    # decoding. Knowledge insulation needs *a* discrete token objective on the
+    # VLM side; FAST's contribution is sequence-length efficiency for
+    # autoregressive decoding, which nothing here does.
+    #
+    # `fast_tokenizer_id` and `fast_max_tokens` used to live here and were
+    # read by nothing. Removed rather than left as dead knobs -- a setting
+    # that silently does nothing is worse than no setting.
 
     # =====================================================================
     # Action expert (Mixture-of-Transformers suffix)
