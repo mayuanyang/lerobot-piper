@@ -418,8 +418,14 @@ def train(
     print(f"{len(loader)} batches/epoch, batch_size={batch_size}, "
           f"grad_accum={grad_accum}")
 
+    # `step` counts OPTIMIZER steps, not dataloader iterations. The scheduler
+    # advances once per optimizer step, so counting iterations instead makes
+    # --training_steps and --warmup_steps mean different things at different
+    # --grad_accum: at grad_accum=8 a 60000-"step" run would take only 7500
+    # scheduler steps, i.e. finish at ~peak LR with the cosine barely started,
+    # and warmup would silently last 8x longer than requested.
     policy.train()
-    step, t0, acc = start_step, time.time(), {}
+    step, micro, t0, acc, n_acc = start_step, 0, time.time(), {}, 0
     done = False
     while not done:
         for batch in loader:
@@ -431,25 +437,28 @@ def train(
             for k, v in parts.items():
                 acc[k] = acc.get(k, 0.0) + v
             acc["total"] = acc.get("total", 0.0) + float(loss.detach())
+            n_acc += 1
+            micro += 1
+            if micro % grad_accum:
+                continue
 
-            if (step + 1) % grad_accum == 0:
-                torch.nn.utils.clip_grad_norm_(params, 1.0)
-                opt.step()
-                opt.zero_grad(set_to_none=True)
-                sched.step()
-
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            sched.step()
             step += 1
+
             if step % log_every == 0:
-                n = log_every
-                msg = "  ".join(f"{k}={v / n:.4f}" for k, v in sorted(acc.items()))
+                msg = "  ".join(f"{k}={v / max(n_acc, 1):.4f}"
+                                for k, v in sorted(acc.items()))
                 mem = ""
                 if device == "cuda":
                     mem = (f"  mem={torch.cuda.max_memory_allocated() / 2**30:.1f}/"
                            f"{torch.cuda.get_device_properties(0).total_memory / 2**30:.0f}GiB")
                     torch.cuda.reset_peak_memory_stats()
                 print(f"step {step}/{training_steps}  lr={sched.get_last_lr()[0]:.2e}  "
-                      f"{msg}  {(time.time() - t0) / n:.2f}s/it{mem}")
-                acc, t0 = {}, time.time()
+                      f"{msg}  {(time.time() - t0) / log_every:.2f}s/step{mem}")
+                acc, n_acc, t0 = {}, 0, time.time()
 
             if step % save_every == 0 or step >= training_steps:
                 ck = out / f"checkpoint-{step}"
@@ -479,7 +488,10 @@ def main():
     p.add_argument("--dataset_ids", nargs="+", required=True)
     p.add_argument("--output_dir", default="./outputs/wiltechs_x")
     p.add_argument("--vlm_model_id", default="Qwen/Qwen3-VL-4B-Instruct")
-    p.add_argument("--training_steps", type=int, default=60000)
+    p.add_argument("--training_steps", type=int, default=60000,
+                   help="OPTIMIZER steps, not dataloader iterations. With "
+                        "--grad_accum 8 this is 8x that many batches. "
+                        "--warmup_steps is in the same unit.")
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--grad_accum", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)

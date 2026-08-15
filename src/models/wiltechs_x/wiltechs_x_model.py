@@ -620,16 +620,13 @@ class WiltechsXModel(nn.Module):
             self.wrist_encoder = WristTokenizer(
                 config.wrist_encoder_id, config.wrist_tokens, self.hidden_size,
                 config.freeze_wrist_encoder, config.wrist_input_size)
-            px = config.wrist_input_size / max(config.wrist_tokens, 1) ** 0.5
-            verdict = ("FINER than" if px < 32 else
-                       "EQUAL to" if abs(px - 32) < 1e-6 else "COARSER than")
+            g = int(round(config.wrist_tokens ** 0.5))
             print(f"[wiltechs_x] wrist: {config.wrist_encoder_id}, "
-                  f"{config.wrist_tokens} tok @ {config.wrist_input_size}px "
-                  f"= {px:.1f} px/token — {verdict} the Qwen grid's 32")
-            if px >= 32:
-                print("[wiltechs_x]   ^ this path exists to supply detail the "
-                      "VLM tokens cannot resolve. At >=32 px/token it supplies "
-                      "none. Raise --wrist_tokens or --wrist_input_size.")
+                  f"{config.wrist_tokens} tok = {g}x{g} grid @ "
+                  f"{config.wrist_input_size}px input")
+            # The verdict needs the VLM's own per-camera grid, which is only
+            # known once an image has been through the processor. Printed by
+            # _build_prefix instead.
 
         self.motion_encoder = None
         if config.use_motion_vectors:
@@ -921,6 +918,33 @@ class WiltechsXModel(nn.Module):
                    f"(lang {self._lang_max_len} | vision {n_vis} over "
                    f"{len(cam_tokens)} cams | wrist {n_wri} | "
                    f"motion {self.config.motion_vector_tokens if self.motion_encoder else 0})")
+
+        # Wrist resolution verdict, now that the VLM's own grid is known.
+        #
+        # The comparison is TOKENS PER CAMERA, not pixels per token. An
+        # earlier version of this check divided wrist_input_size by
+        # sqrt(wrist_tokens) and compared against 32, which is wrong twice
+        # over: it ignores the source frame's real resolution, and raising
+        # wrist_input_size only upsamples before a pool that throws the extra
+        # patches away. What decides whether this path resolves anything the
+        # VLM cannot is simply how many cells the image is cut into.
+        if self.wrist_encoder is not None and cam_tokens:
+            vlm_per_cam = sizes[0]
+            wt = int(self.config.wrist_tokens)
+            g_v, g_w = int(round(vlm_per_cam ** 0.5)), int(round(wt ** 0.5))
+            verdict = ("FINER" if wt > vlm_per_cam else
+                       "IDENTICAL" if wt == vlm_per_cam else "COARSER")
+            self._once("wrist_grid",
+                       f"[wiltechs_x] wrist grid {g_w}x{g_w} vs VLM "
+                       f"{g_v}x{g_v} per camera — {verdict}")
+            if wt <= vlm_per_cam:
+                self._once("wrist_warn",
+                           f"[wiltechs_x]   ^ this path exists to resolve detail "
+                           f"the VLM tokens cannot. At {wt} <= {vlm_per_cam} "
+                           f"tokens it resolves nothing extra. Raise "
+                           f"--wrist_tokens above {vlm_per_cam} "
+                           f"(--wrist_input_size does NOT help: it upsamples "
+                           f"before a pool that discards the extra patches).")
         return prefix, pad_mask, segments, spans
 
     # =====================================================================
