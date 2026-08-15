@@ -327,14 +327,21 @@ class MotionVectorEncoder(nn.Module):
     control is a motion-vector-ONLY model, which must not score above chance.
     """
 
-    def __init__(self, state_dim: int, history_len: int, n_tokens: int, d_out: int):
+    def __init__(self, state_dim: int, history_len: int, n_tokens: int, d_out: int,
+                 d_hid: int = 256):
         super().__init__()
         self.history_len = history_len
         self.n_tokens = n_tokens
-        self.d_out = d_out
-        self.proj = nn.Sequential(nn.Linear(state_dim * 2, d_out), nn.SiLU(),
-                                  nn.Linear(d_out, d_out))
-        self.to_tokens = nn.Linear(d_out * history_len, n_tokens * d_out)
+        self.d_hid = d_hid
+        # The mixing Linear runs at d_hid, NOT at the VLM width. Mixing at
+        # d_out=2560 makes this one layer (2560*8) x (8*2560) = 419M
+        # parameters -- 80% of everything trainable in the model, to encode
+        # eight frames of an eight-dimensional proprioceptive vector. Measured
+        # on the first real run; the bottleneck brings it to ~5M.
+        self.proj = nn.Sequential(nn.Linear(state_dim * 2, d_hid), nn.SiLU(),
+                                  nn.Linear(d_hid, d_hid))
+        self.to_tokens = nn.Linear(d_hid * history_len, n_tokens * d_hid)
+        self.out = nn.Linear(d_hid, d_out)
         self.norm = RMSNorm(d_out)
 
     def forward(self, state_history: torch.Tensor) -> torch.Tensor:
@@ -347,8 +354,8 @@ class MotionVectorEncoder(nn.Module):
             h = torch.cat([pad, h], dim=1)
         delta = torch.cat([h[:, :1] * 0.0, h[:, 1:] - h[:, :-1]], dim=1)
         z = self.proj(torch.cat([h, delta], dim=-1))
-        z = self.to_tokens(z.flatten(1)).view(-1, self.n_tokens, self.d_out)
-        return self.norm(z)
+        z = self.to_tokens(z.flatten(1)).view(-1, self.n_tokens, self.d_hid)
+        return self.norm(self.out(z))
 
 
 class ProgressHead(nn.Module):
@@ -442,10 +449,23 @@ class DiscreteActionHead(nn.Module):
         super().__init__()
         self.horizon, self.action_dim, self.n_bins, self.clip = \
             horizon, action_dim, n_bins, clip
+        # RMSNorm FIRST. Without it the head reads a 36-layer Qwen hidden
+        # state whose norm is large, and a default-initialised Linear turns
+        # that into logits far off uniform: measured CE 25.5 at init against
+        # ln(256) = 5.545, i.e. 20 nats of pure initialisation error on the
+        # ONLY gradient path into the VLM.
         self.head = nn.Sequential(
+            RMSNorm(d_in),
             nn.Linear(d_in, d_in // 2), nn.SiLU(),
             nn.Linear(d_in // 2, horizon * action_dim * n_bins),
         )
+        # Start NEAR uniform, not AT it. Exact zero-init would give
+        # dL/d(input) = W^T . dL/d(logits) = 0, so no gradient would reach the
+        # VLM on the first step -- and this head is the only path that ever
+        # does. Small-but-nonzero keeps the initial CE at ~ln(n_bins) while
+        # leaving the backward path open.
+        nn.init.normal_(self.head[-1].weight, std=1e-3)
+        nn.init.zeros_(self.head[-1].bias)
 
     def tokenize(self, actions: torch.Tensor) -> torch.Tensor:
         """(B, H, A) normalized actions -> (B, H, A) long bin indices."""
@@ -583,10 +603,15 @@ class WiltechsXModel(nn.Module):
                 config.wrist_encoder_id, config.wrist_tokens, self.hidden_size,
                 config.freeze_wrist_encoder, config.wrist_input_size)
             px = config.wrist_input_size / max(config.wrist_tokens, 1) ** 0.5
+            verdict = ("FINER than" if px < 32 else
+                       "EQUAL to" if abs(px - 32) < 1e-6 else "COARSER than")
             print(f"[wiltechs_x] wrist: {config.wrist_encoder_id}, "
                   f"{config.wrist_tokens} tok @ {config.wrist_input_size}px "
-                  f"= {px:.1f} px/token ({'finer' if px < 32 else 'coarser'} "
-                  f"than the Qwen grid)")
+                  f"= {px:.1f} px/token — {verdict} the Qwen grid's 32")
+            if px >= 32:
+                print("[wiltechs_x]   ^ this path exists to supply detail the "
+                      "VLM tokens cannot resolve. At >=32 px/token it supplies "
+                      "none. Raise --wrist_tokens or --wrist_input_size.")
 
         self.motion_encoder = None
         if config.use_motion_vectors:
@@ -603,7 +628,32 @@ class WiltechsXModel(nn.Module):
             print("[wiltechs_x] discrete action head ON (knowledge insulation). "
                   "ABLATE THIS FIRST — it may be dead weight at LIBERO's scale.")
 
-        # ---- 5. Misc -----------------------------------------------------
+        # ---- 5. Consistency checks --------------------------------------
+        # With knowledge insulation the K/V cache is detached, so the flow
+        # loss cannot reach anything upstream of it. The discrete head is then
+        # the ONLY gradient path into the prefix -- and the wrist and motion
+        # encoders live in the prefix. Turning the head off therefore does not
+        # just ablate the head: it silently freezes the wrist path this repo
+        # measured at 34 points.
+        #
+        # Refused rather than warned, because the failure looks exactly like a
+        # bad learning rate.
+        if (config.knowledge_insulation and self.discrete_head is None
+                and (self.wrist_encoder is not None or self.motion_encoder is not None)
+                and not config.freeze_vlm):
+            raise ValueError(
+                "knowledge_insulation=True with fast_token_head=False leaves the "
+                "wrist/motion encoders (and LoRA) with NO gradient path: the "
+                "detached K/V cache blocks the flow loss and there is no "
+                "discrete head to replace it.\n"
+                "Pick one:\n"
+                "  --no_discrete_head --no_knowledge_insulation   ablate the head, "
+                "let the flow loss train the prefix\n"
+                "  --no_discrete_head --no_wrist_encoder --no_motion_vectors   "
+                "ablate the head AND the prefix-side trainables\n"
+                "  keep the discrete head")
+
+        # ---- 6. Misc -----------------------------------------------------
         self._lang_max_len = int(config.lang_max_len)
         self._template_ids_cpu = None
         self._printed = set()
@@ -623,8 +673,9 @@ class WiltechsXModel(nn.Module):
 
     def gradient_checkpointing_enable(self):
         self.gradient_checkpointing = True
-        print(f"[wiltechs_x] gradient checkpointing ON "
-              f"({len(self.expert_layers)} joint layers recomputed in backward)")
+        print(f"[wiltechs_x] gradient checkpointing ON — {self.num_vlm_layers} "
+              f"prefix layers + {len(self.expert_layers)} expert layers "
+              f"recomputed in backward. The prefix is the expensive half.")
 
     def gradient_checkpointing_disable(self):
         self.gradient_checkpointing = False
@@ -924,7 +975,26 @@ class WiltechsXModel(nn.Module):
                                         device=device)
         return self.language_model.rotary_emb(ref, pos)
 
-    def _run_prefix(self, prefix, pad_mask, segments, L_suffix):
+    @property
+    def needs_prefix_grad(self) -> bool:
+        """Does anything actually consume the prefix's computation graph?
+
+        With knowledge insulation on, the K/V cache is detached, so the flow
+        loss stops at the cache and the discrete head is the ONLY consumer of
+        `prefix_out`. No head -> no consumer -> the 36-layer prefix can run
+        under no_grad, which is most of this model's training memory.
+
+        The same fact is the landmine __init__ refuses: with KI on and no
+        discrete head, the wrist and motion encoders sit in the prefix with no
+        gradient path at all.
+        """
+        if not self.training:
+            return False
+        if not self.config.knowledge_insulation:
+            return True                       # flow loss flows through the cache
+        return self.discrete_head is not None
+
+    def _run_prefix(self, prefix, pad_mask, segments, L_suffix, needs_grad=None):
         """Phase 1: prefix alone, caching per-layer K/V.
 
         Used by TRAINING AND SAMPLING ALIKE. The prefix cannot see the suffix,
@@ -938,7 +1008,18 @@ class WiltechsXModel(nn.Module):
         opened this cache silently becomes wrong rather than raising, which is
         why test_components.py checks the mask and checks
         forward_cached == forward.
+
+        MEMORY. This is where it goes, not the expert: 36 layers over a
+        ~420-token prefix stores roughly 9 GiB of activations at B=8, on top
+        of 8 GiB of bf16 weights. Two mitigations, both automatic:
+
+          * `needs_prefix_grad` -- with knowledge insulation ON the only
+            consumer of the prefix graph is the discrete head, so without that
+            head the whole stack runs under no_grad.
+          * gradient checkpointing covers these layers too. It used to wrap
+            only the expert, which is the cheap half.
         """
+        needs_grad = self.needs_prefix_grad if needs_grad is None else needs_grad
         B, L_p = prefix.shape[0], prefix.shape[1]
         dtype = prefix.dtype
         cos, sin = self._rope(segments, B, L_suffix, prefix.device, prefix)
@@ -950,22 +1031,40 @@ class WiltechsXModel(nn.Module):
                 torch.full((L_p, L_p), neg, device=prefix.device, dtype=dtype), 1)
         pre_mask.masked_fill_((~pad_mask).unsqueeze(1).unsqueeze(1), neg)
 
-        cache = []
-        for i, layer in enumerate(self.language_model.layers):
-            if i < self.first_joint_layer:
-                prefix, _ = self._prefix_only_layer(layer, prefix, pre_mask, cos_p, sin_p)
-                continue
-            exp = self.expert_layers[i - self.first_joint_layer]
-            pq, pk, pv = exp.prefix_qkv(prefix, layer)
+        n_rep = self.num_heads // self.num_kv_heads
+
+        def joint_prefix_step(layer, exp, hidden):
+            pq, pk, pv = exp.prefix_qkv(hidden, layer)
             pq, pk = _apply_rope(pq, pk, cos_p, sin_p)
-            cache.append((pk, pv))
-            n_rep = self.num_heads // self.num_kv_heads
             o = F.scaled_dot_product_attention(
                 pq, _repeat_kv(pk, n_rep), _repeat_kv(pv, n_rep),
                 attn_mask=pre_mask.to(pq.dtype), is_causal=False)
             o = o.transpose(1, 2).contiguous().view(B, L_p, -1)
-            prefix = prefix + layer.self_attn.o_proj(o)
-            prefix = prefix + layer.mlp(layer.post_attention_layernorm(prefix))
+            hidden = hidden + layer.self_attn.o_proj(o)
+            hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
+            return hidden, pk, pv
+
+        ckpt = self.gradient_checkpointing and self.training and needs_grad
+        ctx = nullcontext() if needs_grad else torch.no_grad()
+        cache = []
+        with ctx:
+            for i, layer in enumerate(self.language_model.layers):
+                if i < self.first_joint_layer:
+                    if ckpt:
+                        prefix, _ = torch.utils.checkpoint.checkpoint(
+                            self._prefix_only_layer, layer, prefix, pre_mask,
+                            cos_p, sin_p, use_reentrant=False)
+                    else:
+                        prefix, _ = self._prefix_only_layer(
+                            layer, prefix, pre_mask, cos_p, sin_p)
+                    continue
+                exp = self.expert_layers[i - self.first_joint_layer]
+                if ckpt:
+                    prefix, pk, pv = torch.utils.checkpoint.checkpoint(
+                        joint_prefix_step, layer, exp, prefix, use_reentrant=False)
+                else:
+                    prefix, pk, pv = joint_prefix_step(layer, exp, prefix)
+                cache.append((pk, pv))
         return prefix, cache, (cos, sin)
 
     def _run_suffix_cached(self, suffix, cache, rope, pad_mask, t_emb):

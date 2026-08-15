@@ -153,9 +153,19 @@ class WiltechsXConfig(PreTrainedConfig):
     wrist_cameras: list[str] = field(default_factory=list)
     wrist_input_size: int = 256
     # Tokens kept per wrist camera after pooling. Must be a perfect square.
-    # 256px / sqrt(64) = 32 px/token, matching the Qwen grid rather than the
-    # 56 px/token the old RobotCNN defaults produced.
-    wrist_tokens: int = 64
+    #
+    # Granularity is wrist_input_size / sqrt(wrist_tokens) px per token, and it
+    # MUST come out below the Qwen grid's 32 or this path buys nothing -- it is
+    # here for high-frequency detail the VLM tokens cannot resolve, not for a
+    # second copy of the same information. 256/sqrt(64) = 32.0 is exactly the
+    # VLM grid, i.e. the setting this defaulted to on the first run was a
+    # no-op on resolution. 256 tokens -> 16 px/token.
+    #
+    # This is the same trap wiltechs_vla documented for RobotCNN (224/16 = 56
+    # px/token, "coarser than the VLM's 32, which defeats the purpose").
+    # COST: these tokens sit in the prefix, so they lengthen the K/V every
+    # expert layer attends to.
+    wrist_tokens: int = 256
     freeze_wrist_encoder: bool = False
 
     # =====================================================================

@@ -23,6 +23,7 @@ it before trusting anything.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from pathlib import Path
@@ -60,7 +61,7 @@ def make_config(args) -> WiltechsXConfig:
         vlm_model_id=args.vlm_model_id, freeze_vlm=args.freeze_vlm,
         num_cameras=len(cams), cameras_for_vlm=cams,
         wrist_cameras=[cams[1]], wrist_encoder_id=args.wrist_encoder_id,
-        use_wrist_encoder=not args.no_wrist,
+        use_wrist_encoder=not args.no_wrist, wrist_tokens=args.wrist_tokens,
         expert_hidden_size=args.expert_hidden, expert_num_layers=args.expert_layers,
         lang_max_len=16, motion_history_len=8,
         flow_objective=args.flow_objective,
@@ -108,6 +109,12 @@ def main():
     p.add_argument("--expert_layers", type=int, default=2)
     p.add_argument("--flow_objective", default="shortcut", choices=["flow", "shortcut"])
     p.add_argument("--num_inference_steps", type=int, default=4)
+    p.add_argument("--batch_size", type=int, default=2,
+                   help="Raise this to find the OOM boundary before committing "
+                        "to a training run; the peak-memory line scales roughly "
+                        "linearly in it.")
+    p.add_argument("--wrist_tokens", type=int, default=256)
+    p.add_argument("--gradient_checkpointing", action="store_true")
     p.add_argument("--device", default=None)
     args = p.parse_args()
 
@@ -120,27 +127,67 @@ def main():
     model = WiltechsXModel(cfg)
     if args.tiny:
         install_tiny_backbone(model, cfg)
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
     model = model.to(device)
     print(f"built in {time.time() - t0:.1f}s")
     counts = model.count_parameters()
     print(f"params: trainable={counts['trainable']:,} frozen={counts['frozen']:,}")
 
-    batch = make_batch(cfg, device=device)
+    batch = make_batch(cfg, device=device, B=args.batch_size)
 
     # ---- forward / backward -----------------------------------------
     print("\ncompute_loss")
     model.train()
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+        w = torch.cuda.memory_allocated() / 2 ** 30
     t0 = time.time()
     loss, parts = model.compute_loss(batch, return_parts=True)
     loss.backward()
     print(f"  terms: {parts}   ({time.time() - t0:.1f}s)")
+    if device == "cuda":
+        peak = torch.cuda.max_memory_allocated() / 2 ** 30
+        total = torch.cuda.get_device_properties(0).total_memory / 2 ** 30
+        print(f"  memory: weights {w:.2f} GiB, peak {peak:.2f} GiB of "
+              f"{total:.1f} GiB  (B={args.batch_size}, prefix grad="
+              f"{model.needs_prefix_grad}, ckpt={model.gradient_checkpointing})")
+        print(f"  -> AdamW will add ~"
+              f"{counts['trainable'] * 12 / 2 ** 30:.2f} GiB of optimizer state "
+              f"on top of this; budget for it before choosing --batch_size")
     check("loss is finite", torch.isfinite(loss), f"{float(loss):.4f}")
     check("every term is finite", all(v == v and abs(v) < 1e6 for v in parts.values()))
     check("flow term present", "flow" in parts)
-    if cfg.flow_objective == "shortcut":
-        check("shortcut consistency term present", "shortcut" in parts)
     if cfg.progress_head:
         check("progress term present (targets reached the model)", "progress" in parts)
+
+    if model.discrete_head is not None:
+        # The discrete head is the ONLY gradient path into the VLM, so its
+        # starting point matters. ln(n_bins) is the uniform-prediction value;
+        # far above it means the head's own initialisation scale, not the
+        # task, dominates the first thousand LoRA updates.
+        uniform = math.log(model.discrete_head.n_bins)
+        check(f"discrete CE starts near uniform (ln {model.discrete_head.n_bins} "
+              f"= {uniform:.2f})", abs(parts["discrete"] - uniform) < 1.0,
+              f"{parts['discrete']:.2f}")
+
+    # Parameter budget. A single oversized Linear is easy to write and
+    # invisible in the loss: the motion encoder was 419M -- 80% of everything
+    # trainable -- for encoding eight frames of an 8-dim vector.
+    print("\nparameter budget")
+    groups = {"expert": model.expert_layers, "wrist": model.wrist_encoder,
+              "motion": model.motion_encoder, "discrete": model.discrete_head,
+              "lora": None}
+    lora_n = sum(p.numel() for n, p in model.named_parameters() if "lora_" in n)
+    for name, mod in groups.items():
+        n = lora_n if name == "lora" else (
+            sum(p.numel() for p in mod.parameters() if p.requires_grad) if mod else 0)
+        if n:
+            print(f"  {name:9s} {n:>13,}  ({100 * n / counts['trainable']:.1f}%)")
+    if model.motion_encoder is not None:
+        n_mv = sum(p.numel() for p in model.motion_encoder.parameters())
+        check("motion encoder is not a parameter sink (<10% of trainable)",
+              n_mv < 0.10 * counts["trainable"], f"{n_mv:,}")
 
     # ---- gradient reaches every module it should ---------------------
     print("\ngradient coverage")
@@ -175,6 +222,26 @@ def main():
     check("frozen VLM base weights got no gradient",
           all(g == 0 for g in base_grads) or not base_grads)
 
+    # ---- shortcut term, on a NON-degenerate network -------------------
+    # At init adaLN and action_out_proj are zero, so the velocity is
+    # identically zero and every shortcut evaluation agrees at 0.0. That
+    # reports as a pass while testing nothing. Perturb the output head and
+    # re-check, which is the only way to tell "correctly zero" from
+    # "silently disconnected".
+    if cfg.flow_objective == "shortcut":
+        print("\nshortcut term (after perturbing action_out_proj)")
+        check("shortcut term is exactly 0 at init (zero-init velocity)",
+              parts.get("shortcut", -1) == 0.0)
+        with torch.no_grad():
+            model.action_out_proj.weight.normal_(std=0.1)
+            for layer in model.expert_layers:
+                layer.ada[1].bias.normal_(std=0.1)
+        model.zero_grad(set_to_none=True)
+        _, parts2 = model.compute_loss(make_batch(cfg, B=args.batch_size, device=device),
+                                       return_parts=True)
+        check("shortcut term becomes non-zero once velocity is non-zero",
+              parts2.get("shortcut", 0.0) > 0.0, f"{parts2.get('shortcut', 0):.4f}")
+
     # ---- sampling, and the once-per-chunk invariant -------------------
     print("\nsample_actions")
     model.eval()
@@ -192,12 +259,14 @@ def main():
     dt = time.time() - t0
     model._build_prefix = orig
 
-    check("action shape", actions.shape == (2, cfg.horizon, cfg.action_dim),
+    check("action shape",
+          actions.shape == (args.batch_size, cfg.horizon, cfg.action_dim),
           str(tuple(actions.shape)))
     check("actions are finite", bool(torch.isfinite(actions).all()))
     check(f"prefix computed ONCE for {cfg.num_inference_steps} denoising steps",
           calls["prefix"] == 1, f"got {calls['prefix']}")
-    print(f"  {dt * 1000:.0f} ms for B=2 at {cfg.num_inference_steps} NFE")
+    print(f"  {dt * 1000:.0f} ms for B={args.batch_size} at "
+          f"{cfg.num_inference_steps} NFE")
 
     print("\nRESULT:", "ALL PASS" if OK else "FAILURES ABOVE")
     sys.exit(0 if OK else 1)

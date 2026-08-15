@@ -292,6 +292,11 @@ def train(
 
     counts = policy.model.count_parameters()
     print(f"params: trainable={counts['trainable']:,}  frozen={counts['frozen']:,}")
+    print(f"prefix gradient needed: {policy.model.needs_prefix_grad} "
+          f"(False = the 36-layer prefix runs under no_grad, which is most of "
+          f"the training memory)")
+    if device == "cuda":
+        print(f"AdamW state will be ~{counts['trainable'] * 12 / 2**30:.2f} GiB")
     if counts["trainable"] == 0:
         raise RuntimeError("nothing is trainable — check --freeze_vlm / LoRA targets")
 
@@ -341,8 +346,13 @@ def train(
             if step % log_every == 0:
                 n = log_every
                 msg = "  ".join(f"{k}={v / n:.4f}" for k, v in sorted(acc.items()))
+                mem = ""
+                if device == "cuda":
+                    mem = (f"  mem={torch.cuda.max_memory_allocated() / 2**30:.1f}/"
+                           f"{torch.cuda.get_device_properties(0).total_memory / 2**30:.0f}GiB")
+                    torch.cuda.reset_peak_memory_stats()
                 print(f"step {step}/{training_steps}  lr={sched.get_last_lr()[0]:.2e}  "
-                      f"{msg}  {(time.time() - t0) / n:.2f}s/it")
+                      f"{msg}  {(time.time() - t0) / n:.2f}s/it{mem}")
                 acc, t0 = {}, time.time()
 
             if step % save_every == 0 or step >= training_steps:
