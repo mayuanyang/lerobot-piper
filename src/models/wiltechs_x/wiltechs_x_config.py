@@ -137,6 +137,12 @@ class WiltechsXConfig(PreTrainedConfig):
     # decoder read" question -- the one `spread` already answered badly.
     expert_hidden_size: int = 1024
     expert_intermediate_size: int = 0     # 0 = match expert_hidden_size
+    # Rank of the adaLN-Zero modulation factorisation. A plain Linear(d, 6d)
+    # is 32% of the whole expert -- 226M parameters over 36 layers at d=1024,
+    # spent producing six vectors per layer, and it OOM'd a 22 GiB card at the
+    # optimizer step. 7*d*r instead: 465K per layer at r=64.
+    # 0 restores the full-rank form.
+    ada_rank: int = 64
     # 0 = one expert block per VLM layer (the pi0 form). A smaller number
     # attaches experts only to the deepest N layers.
     expert_num_layers: int = 0

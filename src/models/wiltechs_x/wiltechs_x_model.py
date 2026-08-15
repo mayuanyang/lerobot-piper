@@ -192,7 +192,7 @@ class JointExpertLayer(nn.Module):
 
     def __init__(self, expert_hidden: int, expert_intermediate: int,
                  num_heads: int, num_kv_heads: int, head_dim: int,
-                 rms_norm_eps: float = 1e-6):
+                 rms_norm_eps: float = 1e-6, ada_rank: int = 64):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -209,12 +209,27 @@ class JointExpertLayer(nn.Module):
         self.ffn = SwiGLU(expert_hidden, expert_intermediate)
 
         # adaLN-Zero on the suffix only: the flow time modulates the action
-        # tokens, never the prefix. Zero-init makes each block an identity at
-        # step 0, which keeps a fresh expert from wrecking the pretrained
-        # prefix representation before it has learned anything.
-        self.ada = nn.Sequential(nn.SiLU(), nn.Linear(expert_hidden, 6 * expert_hidden))
-        nn.init.zeros_(self.ada[1].weight)
-        nn.init.zeros_(self.ada[1].bias)
+        # tokens, never the prefix. Zero-init on the LAST layer makes each
+        # block an identity at step 0, which keeps a fresh expert from
+        # wrecking the pretrained prefix representation before it has learned
+        # anything.
+        #
+        # LOW RANK, and not for elegance. A plain Linear(d, 6d) is d*6d
+        # parameters: at d=1024 that is 6.3M per layer, 226M over 36 layers,
+        # 32% of the entire expert -- spent on six vectors per layer. The
+        # factorisation is 7*d*r, i.e. 465K at r=64, and it was the difference
+        # between OOM and fitting on a 22 GiB card. ada_rank<=0 restores the
+        # full-rank form.
+        if ada_rank and ada_rank > 0:
+            self.ada = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(expert_hidden, min(ada_rank, expert_hidden), bias=False),
+                nn.Linear(min(ada_rank, expert_hidden), 6 * expert_hidden))
+        else:
+            self.ada = nn.Sequential(nn.SiLU(),
+                                     nn.Linear(expert_hidden, 6 * expert_hidden))
+        nn.init.zeros_(self.ada[-1].weight)
+        nn.init.zeros_(self.ada[-1].bias)
 
     @staticmethod
     def _modulate(x, shift, scale):
@@ -563,11 +578,14 @@ class WiltechsXModel(nn.Module):
         self.first_joint_layer = self.num_vlm_layers - n_exp
         self.expert_layers = nn.ModuleList([
             JointExpertLayer(self.d_exp, d_ffn, self.num_heads, self.num_kv_heads,
-                             self.head_dim, self.rms_norm_eps)
+                             self.head_dim, self.rms_norm_eps,
+                             ada_rank=int(config.ada_rank))
             for _ in range(n_exp)
         ])
+        n_e = sum(p.numel() for p in self.expert_layers.parameters())
         print(f"[wiltechs_x] expert: {n_exp} layers @ {self.d_exp} "
-              f"(joined at VLM layer {self.first_joint_layer})")
+              f"(joined at VLM layer {self.first_joint_layer}) — "
+              f"{n_e / 1e6:.0f}M params, {n_e / max(n_exp, 1) / 1e6:.1f}M/layer")
 
         # ---- 3. Suffix embeddings ---------------------------------------
         self.state_encoder = nn.Sequential(

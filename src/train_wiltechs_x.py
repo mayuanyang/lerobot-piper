@@ -148,6 +148,49 @@ def build_datasets(dataset_ids, obs_steps, horizon, max_episode_index):
     }
 
 
+def report_memory_budget(model, counts, device) -> None:
+    """Print the FIXED memory cost and compare it to the card, before step 1.
+
+    Everything here is allocated regardless of batch size, so if it alone does
+    not fit, no --batch_size will help. This exists because the first OOM
+    landed inside `torch._foreach_sqrt` at opt.step() -- 40 minutes of dataset
+    download and model load to learn something computable in a millisecond.
+    """
+    if device != "cuda":
+        return
+    w = sum(p.numel() * p.element_size() for p in model.parameters()) / 2 ** 30
+    tr = counts["trainable"]
+    grads = tr * 4 / 2 ** 30
+    adam = tr * 8 / 2 ** 30
+    fixed = w + grads + adam
+    total = torch.cuda.get_device_properties(0).total_memory / 2 ** 30
+
+    groups = {"expert": model.expert_layers, "wrist": model.wrist_encoder,
+              "motion": model.motion_encoder, "discrete": model.discrete_head}
+    print("\nmemory budget (fixed, independent of batch size)")
+    for name, mod in groups.items():
+        n = sum(p.numel() for p in mod.parameters() if p.requires_grad) if mod else 0
+        if n:
+            print(f"  {name:9s} {n / 1e6:>7.1f}M params  ({100 * n / tr:.0f}% of trainable)")
+    lora = sum(p.numel() for n, p in model.named_parameters() if "lora_" in n)
+    if lora:
+        print(f"  {'lora':9s} {lora / 1e6:>7.1f}M params  ({100 * lora / tr:.0f}% of trainable)")
+    print(f"  weights {w:.2f} + grads {grads:.2f} + Adam {adam:.2f} = "
+          f"{fixed:.2f} GiB of {total:.1f} GiB")
+    print(f"  -> {total - fixed:.2f} GiB left for activations")
+
+    if fixed > 0.80 * total:
+        print(
+            "\n  *** this will very likely OOM ***\n"
+            "  The fixed cost alone is >80% of the card. Batch size will not\n"
+            "  save it. In order of effect:\n"
+            "    --expert_num_layers 12       expert params scale linearly in this\n"
+            "    --expert_hidden_size 512     and roughly quadratically in this\n"
+            "    --ada_rank 32                adaLN factorisation rank\n"
+            "    --freeze_wrist_encoder       drops the DINO backward\n"
+            "    --gradient_checkpointing     activations only, not the fixed cost\n")
+
+
 def calibrate_gripper_threshold(stats, gripper_dim):
     """Threshold in NORMALIZED action units.
 
@@ -186,6 +229,7 @@ def train(
     expert_hidden_size: int = 1024,
     expert_num_layers: int = 0,
     expert_intermediate_size: int = 0,
+    ada_rank: int = 64,
     num_register_tokens: int = 8,
     lora_rank: int = 32,
     lora_alpha: int = 64,
@@ -282,6 +326,7 @@ def train(
         fast_token_loss_weight=fast_token_loss_weight,
         expert_hidden_size=expert_hidden_size,
         expert_intermediate_size=expert_intermediate_size,
+        ada_rank=ada_rank,
         expert_num_layers=expert_num_layers,
         num_register_tokens=num_register_tokens,
         use_wrist_encoder=wrist_encoder, wrist_encoder_id=wrist_encoder_id,
@@ -329,8 +374,7 @@ def train(
     print(f"prefix gradient needed: {policy.model.needs_prefix_grad} "
           f"(False = the 36-layer prefix runs under no_grad, which is most of "
           f"the training memory)")
-    if device == "cuda":
-        print(f"AdamW state will be ~{counts['trainable'] * 12 / 2**30:.2f} GiB")
+    report_memory_budget(policy.model, counts, device)
     if counts["trainable"] == 0:
         raise RuntimeError("nothing is trainable — check --freeze_vlm / LoRA targets")
 
@@ -340,9 +384,22 @@ def train(
     # Read betas/eps/weight_decay off the config rather than hardcoding them:
     # the values happened to match the defaults, so changing the config would
     # have silently had no effect.
-    opt = torch.optim.AdamW(params, lr=lr, betas=tuple(cfg.optimizer_betas),
-                            eps=cfg.optimizer_eps,
-                            weight_decay=cfg.optimizer_weight_decay)
+    #
+    # fused, NOT the default foreach. The multi-tensor path allocates a
+    # full-size temporary per operation -- `torch._foreach_sqrt` on the
+    # exp_avg_sq list is another 4 bytes/param, 3 GiB at 800M trainable, and
+    # it is where this OOM'd on a 22 GiB card. The fused kernel does the same
+    # arithmetic in place.
+    adam_kw = dict(lr=lr, betas=tuple(cfg.optimizer_betas), eps=cfg.optimizer_eps,
+                   weight_decay=cfg.optimizer_weight_decay)
+    try:
+        opt = torch.optim.AdamW(params, fused=True, **adam_kw)
+        print("optimizer: fused AdamW")
+    except (RuntimeError, ValueError, TypeError):
+        opt = torch.optim.AdamW(params, foreach=False, **adam_kw)
+        print("optimizer: AdamW with foreach=False (fused unavailable) — "
+              "slower per step, but it does not allocate the full-size "
+              "temporaries the default path does")
 
     def lr_at(step):
         if step < warmup_steps:
@@ -437,6 +494,10 @@ def main():
     p.add_argument("--expert_num_layers", type=int, default=0,
                    help="0 = one expert block per VLM layer. Fewer = a shallower "
                         "expert attached to the deepest N layers only.")
+    p.add_argument("--ada_rank", type=int, default=64,
+                   help="Rank of the adaLN modulation factorisation. A full "
+                        "Linear(d,6d) is 32%% of the expert (226M at 36L/1024) "
+                        "and OOM'd a 22 GiB card. 0 = full rank.")
     p.add_argument("--num_register_tokens", type=int, default=8)
     p.add_argument("--lora_rank", type=int, default=32)
     p.add_argument("--lora_alpha", type=int, default=64)
