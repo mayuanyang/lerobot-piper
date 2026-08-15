@@ -423,6 +423,7 @@ def train(
     instruction_template: str = STARVLA_COT_TEMPLATE,
     lang_max_len: int = 128,
     val_episodes: float = 0.0,
+    val_per_task: int = 3,
     val_every: int = 500,
     val_seed: int = 42,
     val_max_batches: int = 8,
@@ -1170,6 +1171,17 @@ def train(
 
         windows: list[tuple[str, int]] = []
         accs: dict[str, dict] = {}
+        # Same accumulator, split by instruction. The aggregate hides exactly
+        # the thing that matters: the same step-7000 checkpoint scored 90%
+        # (45/50) on libero_spatial task 0 and ~30% on task 1, and no single
+        # averaged number could have shown that. task 0 is also the task every
+        # architecture decision in this project has been evaluated against for
+        # months, so its number is a biased estimate of the rest.
+        #
+        # Scored on the EXECUTED window only -- per-task rows are already the
+        # long part of the output, and the executed prefix is the one a rollout
+        # commits to.
+        per_task: dict[str, dict] = {}
 
         def _score(acc, pw, rw):
             if gthr == gthr:
@@ -1254,6 +1266,16 @@ def train(
                 for _name, _kw in windows:
                     _score(accs[_name], pred[:, :_kw], ref[:, :_kw])
 
+                if val_per_task:
+                    _tasks = vb.get("task_description")
+                    if _tasks and len(_tasks) == pred.shape[0]:
+                        _kx = windows[0][1]
+                        for _t in set(_tasks):
+                            _sel = torch.tensor([x == _t for x in _tasks],
+                                                device=pred.device)
+                            _score(per_task.setdefault(_t, _new_acc()),
+                                   pred[_sel][:, :_kx], ref[_sel][:, :_kx])
+
         finally:
             torch.set_rng_state(cpu_rng)
             if cuda_rng is not None:
@@ -1281,6 +1303,23 @@ def train(
                 "term_abs": (a["term_err"] / a["term_n"]) if a["term_n"] else None,
                 "term_motion": (a["term_ref"] / a["term_n"]) if a["term_n"] else None,
             })
+        rows = []
+        for name, a in per_task.items():
+            if not a["term_n"]:
+                continue
+            rows.append({
+                "task": name,
+                "n": a["term_n"],
+                "term_ratio": (a["term_err"] / a["term_ref"]) if a["term_ref"] > 1e-9 else None,
+                "grip": (a["grip_hit"] / a["grip_n"]) if a["grip_n"] else None,
+                "grip_transition": (a["tr_hit"] / a["tr_n"]) if a["tr_n"] else None,
+                "n_transitions": a["tr_n"],
+                "switch_ratio": (a["pred_sw"] / a["ref_sw"]) if a["ref_sw"] else None,
+            })
+        # Worst first: the question a per-task table exists to answer is which
+        # tasks are being left behind, not which are already fine.
+        rows.sort(key=lambda r: (r["term_ratio"] is None, -(r["term_ratio"] or 0.0)))
+        out["per_task"] = rows
         return out
 
     prog_bar = tqdm(total=training_steps, desc="Training Progress", initial=step)
@@ -1451,6 +1490,58 @@ def train(
                               f"{w['term_ratio']:.3f}   err={w['term_abs']:.2f} vs "
                               f"motion={w['term_motion']:.2f} norm.units  {tag}")
 
+                rows = m.get("per_task") or []
+                if rows:
+                    k = min(int(val_per_task), len(rows) // 2 or 1)
+                    span = ""
+                    if len(rows) > 1 and rows[0]["term_ratio"] and rows[-1]["term_ratio"]:
+                        span = (f"   spread {rows[-1]['term_ratio']:.3f}"
+                                f"-{rows[0]['term_ratio']:.3f}")
+                        # A wide spread is the finding. The aggregate is an
+                        # average over tasks that are NOT interchangeable: 90%
+                        # and 30% on two tasks of the same suite average to a
+                        # number describing neither.
+                    # Strip the boilerplate every task shares. LIBERO names are
+                    # "pick up the black bowl <RELATION> and place it on the
+                    # plate" -- the only part that differs sits in the MIDDLE,
+                    # so both a tail truncation and a middle elision destroy
+                    # exactly the words two rows must be told apart by.
+                    names = [r["task"] for r in rows]
+                    pre = suf = ""
+                    if len(names) > 1:
+                        a, b = min(names), max(names)
+                        i = 0
+                        while i < min(len(a), len(b)) and a[i] == b[i]:
+                            i += 1
+                        pre = a[:i] if i >= 8 else ""
+                        j = 0
+                        while (j < min(len(a), len(b)) - i
+                               and a[len(a) - 1 - j] == b[len(b) - 1 - j]):
+                            j += 1
+                        suf = a[len(a) - j:] if j >= 8 else ""
+                    ctx = (f"   [all: '{pre}' ... '{suf}']" if pre or suf else "")
+                    print(f"[val]   per-task err/motion on the executed window, "
+                          f"{len(rows)} tasks{span}{ctx}")
+                    sel = rows[:k] + ([None] + rows[-k:] if len(rows) > 2 * k else rows[k:])
+                    for r in sel:
+                        if r is None:
+                            print(f"[val]        ... {len(rows) - 2 * k} more ...")
+                            continue
+                        gt = (f" trans={r['grip_transition'] * 100:3.0f}%"
+                              if r["grip_transition"] is not None else " trans= n/a")
+                        sw = (f" sw={r['switch_ratio']:.2f}x"
+                              if r["switch_ratio"] is not None else "")
+                        nm = r["task"]
+                        if pre and nm.startswith(pre):
+                            nm = nm[len(pre):]
+                        if suf and nm.endswith(suf):
+                            nm = nm[:len(nm) - len(suf)]
+                        nm = nm.strip() or r["task"]
+                        if len(nm) > 56:
+                            nm = nm[:53] + "..."
+                        print(f"[val]        {r['term_ratio']:.3f}  n={r['n']:<4d}"
+                              f"{gt}{sw}  {nm}")
+
             if step > 0 and step % checkpoint_freq == 0:
                 checkpoint_dir = output_directory / f"checkpoint-{step}"
                 checkpoint_dir.mkdir(exist_ok=True)
@@ -1584,6 +1675,15 @@ if __name__ == "__main__":
                              "STRATIFIED by dataset#task, so every task is covered; the value "
                              "must resolve to at least as many episodes as there are tasks or "
                              "some get none (the startup line says so if it happens).")
+    parser.add_argument("--val_per_task", type=int, default=3,
+                        help="Print the N worst and N best tasks by executed-window "
+                             "err/motion each validation pass; 0 disables. The aggregate "
+                             "hides the thing that decides what to do next: the same "
+                             "step-7000 checkpoint scored 90%% on libero_spatial task 0 and "
+                             "~30%% on task 1, and one averaged number describes neither. "
+                             "Pure logging -- _validate is @torch.no_grad, runs under "
+                             "policy.eval() so the ResNet's BatchNorm stats stay frozen, and "
+                             "restores the RNG, so training is bit-identical with it on.")
     parser.add_argument("--val_every", type=int, default=500,
                         help="Steps between validation passes.")
     parser.add_argument("--val_seed", type=int, default=42,
