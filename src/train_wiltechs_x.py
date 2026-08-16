@@ -533,7 +533,7 @@ def main():
     p.add_argument("--dataset_ids", nargs="+", required=True)
     p.add_argument("--output_dir", default="./outputs/wiltechs_x")
     p.add_argument("--vlm_model_id", default="Qwen/Qwen3-VL-4B-Instruct")
-    p.add_argument("--training_steps", type=int, default=60000,
+    p.add_argument("--training_steps", type=int, default=20000,
                    help="OPTIMIZER steps, not dataloader iterations. With "
                         "--grad_accum 8 this is 8x that many batches. "
                         "--warmup_steps is in the same unit.")
