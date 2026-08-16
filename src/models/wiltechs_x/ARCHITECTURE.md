@@ -4,10 +4,17 @@
 > evaluated.** The memory budget fits (13.5 GiB fixed + ~5–8 GiB activations at
 > `batch_size=8–12`, `grad_accum=8`, gradient checkpointing on) and every loss
 > term now starts on its chance baseline (§5). No success rate has been measured
-> — **there is still no eval entry point for this policy anywhere in the repo**,
-> which is a tighter bottleneck than training time. Runs started before
+> yet; `src/eval_wiltechs_x.py` is the entry point, and it reports the per-task
+> **min** and the §6 stage-A gate rather than the average. Runs started before
 > 2026-08-15 carry three fixed defects and should be discarded, not evaluated
 > (§8.0).
+>
+> ```
+> python src/models/wiltechs_x/test_components.py        # pure torch, seconds
+> python src/train_wiltechs_x.py --dataset_ids ... --training_steps 30 \
+>        --profile_steps 20                              # where the time goes
+> python src/eval_wiltechs_x.py --checkpoint outputs/wx_a/checkpoint-5000
+> ```
 >
 > Before training:
 > ```
