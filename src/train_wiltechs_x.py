@@ -2,7 +2,13 @@
 
     python src/train_wiltechs_x.py \
         --dataset_ids physical-intelligence/libero \
-        --output_dir ./outputs/wx_a --training_steps 60000 --batch_size 8
+        --output_dir ./outputs/wx_a --batch_size 12 --grad_accum 8
+
+--training_steps is in OPTIMIZER steps. At batch 12 x grad_accum 8 one epoch
+over LIBERO's ~273k frames is ~2848 of them, and the trainer prints the epoch
+count at startup -- read it before committing to a number. The step rate is
+dominated by the 452-token prefix through 36 layers; --profile_steps attributes
+it, and the first thing to check is whether "data wait" is large.
 
 WHAT TO WATCH, and it is not the average loss:
 
@@ -40,6 +46,11 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetad
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.utils.utils import init_logging
 
+from models.wiltechs_vla.wiltechs_vla_model import (
+    preprocess_camera_to_pixels,
+    vlm_grid_key,
+    vlm_pixels_key,
+)
 from models.wiltechs_x.processor_wiltechs_x import make_pre_post_processors
 from models.wiltechs_x.wiltechs_x_config import WiltechsXConfig
 from models.wiltechs_x.wiltechs_x_policy import WiltechsXPolicy
@@ -85,6 +96,51 @@ class ProgressDataset(torch.utils.data.Dataset):
         item = self.base[i]
         item["progress"] = torch.tensor(self.prog[i], dtype=torch.float32)
         return item
+
+
+class VlmPixelDataset(torch.utils.data.Dataset):
+    """Runs the Qwen image processor in the DataLoader worker rather than on
+    the training loop's critical path.
+
+    `_encode_images` already prefers `vlm_pixels_key(cam)` / `vlm_grid_key(cam)`
+    when present and falls back to running the processor inline, so this moves
+    WHERE the work happens without changing what is computed. Confirm with the
+    `vision grid <cam>: [1, 16, 16]` line at startup: it is printed from
+    whichever path produced the grid, so a mismatch between the two shows up
+    there rather than as a silent difference.
+
+    The raw camera tensors are kept — the wrist encoder consumes those, not the
+    Qwen pixels.
+
+    Ported from `train_wiltechs_vla.VLMImagePreprocDataset`, minus the image
+    augmentation this trainer does not do.
+    """
+
+    def __init__(self, base, image_processor, camera_keys, target_size=0):
+        self.base = base
+        self.image_processor = image_processor
+        self.camera_keys = list(camera_keys)
+        # Must match what _encode_images would have passed inline, or the two
+        # paths build different vision grids for the same frame.
+        self.target_size = int(target_size or 0)
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, i):
+        s = self.base[i]
+        for k in self.camera_keys:
+            v = s.get(k)
+            if not isinstance(v, torch.Tensor):
+                continue
+            # delta_timestamps gives cameras a leading T=1; the inline path
+            # takes [:, -1] for the same reason.
+            img = v[-1] if v.dim() == 4 else v
+            pv, thw = preprocess_camera_to_pixels(self.image_processor, img,
+                                                  target_size=self.target_size)
+            s[vlm_pixels_key(k)] = pv                          # (P, dim)
+            s[vlm_grid_key(k)] = thw[0]                        # (3,)
+        return s
 
 
 def build_datasets(dataset_ids, obs_steps, horizon, max_episode_index):
@@ -272,6 +328,8 @@ def train(
     gripper_bce_temp: float = 0.25,
     no_gripper_class_balance: bool = False,
     use_descriptive_objects: bool = False,
+    preprocess_in_workers: bool = True,
+    profile_steps: int = 20,
     num_workers: int = 4,
     save_every: int = 5000,
     log_every: int = 20,
@@ -416,6 +474,18 @@ def train(
     for _ in range(start_step):
         sched.step()
 
+    if preprocess_in_workers:
+        dataset = VlmPixelDataset(dataset, policy.model.processor.image_processor,
+                                  cameras, target_size=vision_input_size)
+        where = (f"{num_workers} DataLoader workers (parallel, overlapped with "
+                 f"GPU)" if num_workers > 0
+                 else "the MAIN process — --num_workers is 0, so this buys "
+                      "nothing; raise it or pass --no_preprocess_in_workers")
+        print(f"Qwen image preprocessing runs in {where}.")
+    else:
+        print("Qwen image preprocessing runs INLINE in _encode_images, on the "
+              "critical path. --profile_steps will show what that costs.")
+
     loader = torch.utils.data.DataLoader(
         dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
         pin_memory=(device == "cuda"), drop_last=True,
@@ -457,14 +527,58 @@ def train(
     # --grad_accum: at grad_accum=8 a 60000-"step" run would take only 7500
     # scheduler steps, i.e. finish at ~peak LR with the cosine barely started,
     # and warmup would silently last 8x longer than requested.
+    # ---- stage timing ---------------------------------------------------
+    # Attribution, not a total: `s/step` in the log already gives the total,
+    # and it cannot tell a dataloader stall from a slow backward. Each lap
+    # needs a cuda synchronize to be meaningful, which itself costs time, so
+    # this runs for a bounded window and then turns itself off -- the steady
+    # state must not pay for the measurement. The first two optimizer steps
+    # are discarded (allocator warmup, cuDNN autotune, worker spin-up).
+    prof: dict[str, float] = {}
+    prof_done, profiling = 0, profile_steps > 0
+    PROF_WARMUP = 2
+
+    def _sync():
+        if device == "cuda":
+            torch.cuda.synchronize()
+
+    def _lap(name, t_from):
+        _sync()
+        t_now = time.perf_counter()
+        prof[name] = prof.get(name, 0.0) + (t_now - t_from)
+        return t_now
+
+    def _report_profile(n_steps):
+        total = sum(prof.values())
+        per = total / max(n_steps, 1)
+        print(f"\nstage timing over {n_steps} optimizer steps "
+              f"({grad_accum} micro-batches each, batch_size={batch_size})")
+        for name in sorted(prof):
+            v = prof[name]
+            print(f"  {name:<22s} {v / max(n_steps, 1):7.3f} s/step "
+                  f"({100 * v / max(total, 1e-9):5.1f}%)")
+        print(f"  {'TOTAL':<22s} {per:7.3f} s/step "
+              f"= {batch_size * grad_accum / max(per, 1e-9):.1f} samples/s")
+        print(f"  {training_steps} steps -> {training_steps * per / 3600:.1f} h "
+              f"({training_steps / max(steps_per_epoch, 1):.1f} epochs)")
+        print("  'data wait' is the loop blocked on the DataLoader. High = the "
+              "workers cannot keep up;\n  raise --num_workers or check "
+              "--preprocess_in_workers. It is NOT the cost of preprocessing,\n"
+              "  only the part that failed to overlap.\n")
+
     policy.train()
     step, micro, t0, acc, n_acc = start_step, 0, time.time(), {}, 0
     done, checked = False, False
+    t_prev = time.perf_counter()
     while not done:
         for batch in loader:
+            if profiling:
+                t_mark = _lap("1 data wait", t_prev)
             batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
                      for k, v in batch.items()}
             batch = prepare(batch)
+            if profiling:
+                t_mark = _lap("2 H2D + normalize", t_mark)
             if not checked:
                 checked = True
                 # One line that would have caught all of the above. RMS 1.0 is
@@ -477,7 +591,11 @@ def train(
                       f" -> flow should start at "
                       f"{cfg.sample_noise_scale ** 2 + a2:.2f}")
             loss, parts = policy.model.compute_loss(batch, return_parts=True)
+            if profiling:
+                t_mark = _lap("3 forward", t_mark)
             (loss / grad_accum).backward()
+            if profiling:
+                t_mark = _lap("4 backward", t_mark)
 
             for k, v in parts.items():
                 acc[k] = acc.get(k, 0.0) + v
@@ -485,6 +603,7 @@ def train(
             n_acc += 1
             micro += 1
             if micro % grad_accum:
+                t_prev = time.perf_counter()
                 continue
 
             torch.nn.utils.clip_grad_norm_(params, 1.0)
@@ -492,6 +611,15 @@ def train(
             opt.zero_grad(set_to_none=True)
             sched.step()
             step += 1
+
+            if profiling:
+                _lap("5 clip + opt.step", t_mark)
+                prof_done += 1
+                if prof_done == PROF_WARMUP:
+                    prof.clear()                       # discard warmup
+                elif prof_done >= PROF_WARMUP + profile_steps:
+                    _report_profile(profile_steps)
+                    profiling = False                  # stop paying for syncs
 
             if step % log_every == 0:
                 msg = "  ".join(f"{k}={v / max(n_acc, 1):.4f}"
@@ -515,6 +643,10 @@ def train(
                 torch.save({"model": policy.state_dict(), "opt": opt.state_dict(),
                             "step": step}, ck / "training_state.pth")
                 print(f"saved {ck}")
+
+            # LAST, so logging and checkpoint writes are not charged to the
+            # next iteration's "data wait".
+            t_prev = time.perf_counter()
 
             if step >= training_steps:
                 done = True
@@ -590,18 +722,20 @@ def main():
                         "written; confirm before switching off the v2 default.")
     p.add_argument("--wrist_cameras", nargs="+", default=None)
     p.add_argument("--wrist_tokens", type=int, default=256,
-                   help="Perfect square. Granularity is --wrist_input_size / "
-                        "sqrt(this) px per token and MUST come out below the Qwen "
-                        "grid's 32, or this path supplies nothing the VLM tokens "
-                        "do not already have. 256px/sqrt(64) = 32.0 is a no-op. "
-                        "COST: these sit in the prefix, so they lengthen the K/V "
-                        "every expert layer attends to — the first knob to turn "
-                        "down under memory pressure.")
+                   help="Perfect square, and it MUST exceed the VLM's own "
+                        "per-camera token count — (grid_h/2)*(grid_w/2), which is "
+                        "64 at a 16x16 patch grid — or this path resolves nothing "
+                        "the prefix already has. The startup banner prints the "
+                        "verdict FINER/IDENTICAL/COARSER once the real grid is "
+                        "known. COST: these sit in the prefix, so they lengthen "
+                        "the K/V every expert layer attends to — the first knob "
+                        "to turn down under memory or throughput pressure.")
     p.add_argument("--wrist_input_size", type=int, default=256,
-                   help="Raising this instead of --wrist_tokens buys the same "
-                        "px/token without lengthening the prefix; the cost moves "
-                        "into the DINO forward. 512 + 64 tokens = 16 px/token at "
-                        "a quarter of the prefix length of 256 tokens @ 256px.")
+                   help="Feeds the DINO forward only. It does NOT substitute for "
+                        "--wrist_tokens: the features are adaptive-avg-pooled to "
+                        "a sqrt(wrist_tokens) grid, so a larger input is averaged "
+                        "away rather than resolved. Raise it to give DINO more to "
+                        "look at, not to buy token resolution.")
     p.add_argument("--freeze_wrist_encoder", action="store_true",
                    help="Skips the DINO backward. Saves memory, but this is the "
                         "path this repo measured at 34 points — freeze it only "
@@ -645,6 +779,18 @@ def main():
                         "optimum (~89% open) and transition-time agreement stays "
                         "at chance. Ablation only.")
     p.add_argument("--use_descriptive_objects", action="store_true")
+    p.add_argument("--no_preprocess_in_workers", dest="preprocess_in_workers",
+                   action="store_false", default=True,
+                   help="Run the Qwen image processor inline in _encode_images "
+                        "instead of in the DataLoader workers. Inline is on the "
+                        "critical path with the GPU idle; the only reason to "
+                        "pick it is to rule the worker path out as a suspect.")
+    p.add_argument("--profile_steps", type=int, default=20,
+                   help="Optimizer steps to attribute across data wait / "
+                        "forward / backward / optimizer, after a 2-step warmup. "
+                        "Prints once and then disables itself -- each lap needs "
+                        "a cuda synchronize, so the steady state must not pay "
+                        "for it. 0 = off.")
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--save_every", type=int, default=5000)
     p.add_argument("--log_every", type=int, default=20)
