@@ -280,6 +280,120 @@ The only suite with headroom. Two cheap additions:
   runs at 1–4 NFE. **This is for the RL rollout budget, not for a headline Hz
   number.** At 5 Euler steps, stage B costs 5× per env step.
 
+### 3.7 Component internals
+
+#### One `JointExpertLayer` — the whole architecture in one box
+
+Head geometry is **shared** with the VLM (q 32×128, k/v 8×128, GQA 4:1) because
+Q and K meet in a single dot product. The expert's *width* is free: it projects
+from `d_exp` into that head space and back. That is what removes the
+cross-attention bridge `wiltechs_vla` spent 31% of its decoder on.
+
+```
+ ══ PREFIX half — VLM weights + LoRA ══   ══ SUFFIX half — expert weights ══
+ h_p                                      h_s              t_emb
+  │                                        │                 │
+  ▼                                        ▼                 ▼
+ vlm.input_layernorm                     attn_norm          ada  (SiLU→r=64→6d)
+  │                                        │                 │
+  │                                        ▼        shift_a scale_a gate_a
+  │                                   modulate(shift_a, scale_a)  shift_f
+  ▼                                        │                      scale_f gate_f
+ vlm.self_attn.q/k/v_proj                q/k/v_proj (expert, no bias)
+ (LoRALinear r=32 a=64)                    │
+  │  pq (32h) pk,pv (8h)                   │  sq (32h) sk,sv (8h)
+  └──────────────────┬─────────────────────┘
+                     ▼
+        q = cat[pq,sq]   k = cat[pk,sk]   v = cat[pv,sv]        ← ONE sequence
+                     │
+              M-RoPE, then ONE scaled_dot_product_attention
+              mask: prefix↔prefix full · suffix→prefix full
+                    suffix→suffix causal · prefix→suffix BLOCKED
+                     │
+          ┌──────────┴──────────┐
+     p_attn[:, :L_p]       s_attn[:, L_p:]
+          │                     │
+     ┌────▼─────┐               │
+     │ .detach()│ ← knowledge insulation: the expert READS the VLM,
+     └────┬─────┘   it never rewrites it (§3.3)
+          ▼                     ▼
+ h_p += vlm.o_proj(p_attn)   h_s += gate_a · o_proj(s_attn)
+ h_p += vlm.mlp(post_ln)     h_s += gate_f · SwiGLU(modulate(shift_f, scale_f))
+```
+
+Per layer at `d_exp=1024`, `ada_rank=64`, `ffn=d_exp` — this reconciles with the
+`expert 253.8M params` line the trainer prints (18 × 14.1M):
+
+| Block | Shapes | Params |
+|---|---|---|
+| `q_proj` | 1024 → 32·128 | 4.19M |
+| `k_proj`, `v_proj` | 1024 → 8·128, ×2 | 2.10M |
+| `o_proj` | 4096 → 1024 | 4.19M |
+| `ffn` SwiGLU | gate/up/down, 3 × 1024² | 3.15M |
+| `ada` low rank | 1024→64→6·1024 | 0.47M |
+| `attn_norm`, `ffn_norm` | RMSNorm ×2 | 0.002M |
+| **per layer** | | **14.10M** |
+
+`ada` is factorised for a measured reason: a plain `Linear(d, 6d)` is 6.29M per
+layer, 226M over 36 — 32% of the expert, spent on six vectors per layer. It was
+the difference between OOM and fitting on a 22 GiB card.
+
+**Layers 0…`first_joint_layer`-1** have no expert and run `_prefix_only_layer`:
+a plain Qwen block (LoRA still active on q/k/v/o) over the prefix alone, with
+`bidirectional_prefix` deciding whether the causal triangle is applied.
+
+#### Leaf modules
+
+| Module | Stack | Out | Params |
+|---|---|---|---|
+| `LoRALinear` | frozen `base(x)` + `B(A(dropout(x))) · α/r`, **B zero-init** so it is an exact identity at step 0 | — | 23.6M total (4 projections × 36 layers) |
+| `WristTokenizer` | DINOv2 → drop CLS → `(B,D,s,s)` → `adaptive_avg_pool2d(√N)` → `Linear(384→2560)` → RMSNorm | (B, `wrist_tokens`, 2560) | 23.0M |
+| `MotionVectorEncoder` | `cat[h, Δh]` → `Linear(2D→256)` → SiLU → `Linear(256→256)` → flatten → `Linear(256·T → n_tok·256)` → `Linear(256→2560)` → RMSNorm | (B, 8, 2560) | 4.9M |
+| `DiscreteActionHead` | **RMSNorm first** → `Linear(2560→1280)` → SiLU → `Linear(1280→H·A·256)`, last weight init `std=1e-3` | (B, 16, 7, 256) | 40.0M |
+| `ProgressHead` | RMSNorm → `Linear(1024→256)` → SiLU → `Linear(256→1)` → sigmoid, reads `suffix_out[:, 0]` (the state token) | (B,) | 0.26M |
+| suffix embeds | `state_encoder` = Linear+RMSNorm · `action_in_proj` = Linear · `action_pos_emb` (H, d) std 0.02 · `register_tokens` (R, d) std 0.02 | — | small |
+| `time_embedder` | sinusoid(t) [‖ sinusoid(d) under shortcut] → `Linear→SiLU→Linear` | (B, d) | small |
+| velocity head | `final_norm` → `action_out_proj`, **weight and bias zero-init** | (B, 16, 7) | small |
+
+Three of those initialisations are load-bearing, not style:
+
+- **`action_out_proj` zero** makes `v(0) = 0` exactly, which is why the `flow`
+  loss has a closed-form value at step 0 and why §5's init column can be checked
+  against a log.
+- **`DiscreteActionHead`'s leading RMSNorm** exists because without it the head
+  reads a 36-layer Qwen hidden state whose norm is large, and a default-init
+  `Linear` turned that into **CE 25.5 at init against ln(256) = 5.545** — 20 nats
+  of pure initialisation error on the only gradient path into the VLM. The final
+  weight is `std=1e-3` rather than zero for the same reason in reverse: exact
+  zero gives `dL/d(input) = 0`, so nothing would reach the VLM on step 1.
+- **`register_tokens` std 0.02, not zero.** Outside the action slice the suffix
+  has no positional embedding, so identical registers would be
+  indistinguishable to self-attention and could never differentiate.
+
+#### Two execution paths, and why they are the same computation
+
+```
+ forward()                       _run_prefix()  →  forward_cached() × N
+ ─────────                       ────────────────────────────────────
+ joint attention over            phase 1: prefix alone, per-layer K/V cached
+ [prefix | suffix] in one go     phase 2: suffix vs that cache, once per
+ REFERENCE ONLY                           denoising step
+```
+
+This is not an inference-time approximation. `prefix→suffix` is masked, so the
+prefix's per-layer K/V are *the same tensors* the joint forward produces —
+running it once and reusing it is exact. `test_components.py` asserts
+`forward_cached == forward`; if that ever fails, the fast path is wrong.
+
+Both training and sampling take the cached path, deliberately: a separate
+training path is where train/inference skew comes from. It is also what makes
+the shortcut consistency term affordable — three extra *suffix* passes on a
+fraction of the batch, with the VLM not re-run.
+
+Gradient checkpointing wraps **both** halves (36 prefix layers + `n_exp` expert
+layers). It used to wrap only the expert, which is the cheap half: at B=8 the
+prefix stores roughly 9 GiB of activations against 8 GiB of bf16 weights.
+
 ---
 
 ## 4. Sequence layout and masks

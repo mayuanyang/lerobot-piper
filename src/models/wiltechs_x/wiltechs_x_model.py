@@ -716,6 +716,52 @@ class WiltechsXModel(nn.Module):
             self._printed.add(key)
             print(msg)
 
+    def _check_motion_history(self, hist: torch.Tensor, src: str) -> None:
+        """Measure the motion window ONCE instead of trusting the plumbing.
+
+        A single frame is not an error on this path, which is the problem:
+        MotionVectorEncoder left-pads it, the first difference comes out
+        identically zero, and the motion tokens quietly degrade into a fixed
+        function of the current state. Nothing raises, the run just loses the
+        LIBERO-Long mechanism (ARCHITECTURE.md 3.5) and keeps paying
+        `motion_vector_tokens` prefix positions for it. This repo has already
+        paid once for a feature that was not actually in the forward batch.
+
+        Training REFUSES rather than warns: the symptom there is a slightly
+        worse long-horizon score, which reads as a hyperparameter problem for
+        weeks. At inference a short window is legitimate (an env hands over one
+        frame at a time), so that path warns and continues.
+        """
+        if "motion" in self._printed:
+            return
+        t_req = int(self.config.motion_history_len)
+        w = hist[:, -t_req:].float()
+        t_got = int(w.shape[1])
+        d = float((w[:, 1:] - w[:, :-1]).abs().mean()) if t_got > 1 else 0.0
+        self._once("motion",
+                   f"[wiltechs_x] motion: {t_got}/{t_req} frames from {src}, "
+                   f"mean |delta| = {d:.4f} per step (normalized units; "
+                   f"0 = this path is a no-op)")
+        if t_got >= 2 and d > 0.0:
+            return
+
+        why = (f"only {t_got} frame(s) reached the model" if t_got < 2
+               else "the frames are identical, so every delta is zero")
+        msg = (f"[wiltechs_x] motion vectors are DEAD: {why}. The encoder "
+               f"left-pads, so this does not raise on its own -- it just "
+               f"removes the LIBERO-Long mechanism (ARCHITECTURE.md 3.5) and "
+               f"costs {self.config.motion_vector_tokens} prefix tokens for "
+               f"nothing.\n"
+               f"  training: n_obs_steps must be >= motion_history_len "
+               f"({t_req}) so delta_timestamps stacks the window into "
+               f"observation.state.\n"
+               f"  inference: keep a rolling window yourself -- see "
+               f"StateHistory in src/eval_wiltechs_x.py -- or pass "
+               f"observation.state_history as (B, T, D).")
+        if self.training and t_req > 1:
+            raise ValueError(msg)
+        self._once("motion_dead", msg)
+
     def _encode_images(self, batch: dict, B: int):
         """-> (vis_tokens (B, N, hidden), [grid_thw per camera])."""
         device = batch["observation.state"].device
@@ -897,10 +943,18 @@ class WiltechsXModel(nn.Module):
 
         # motion vectors (hindsight)
         if self.motion_encoder is not None:
-            hist = batch.get("observation.state_history")
+            # `observation.state_history` is an OPTIONAL override. The normal
+            # path is the fallback: the trainer sets n_obs_steps =
+            # motion_history_len and gives `observation.state` matching
+            # delta_timestamps, so it arrives as (B, T, D) already.
+            src = "observation.state_history"
+            hist = batch.get(src)
             if hist is None:
-                st = batch["observation.state"]
+                src = "observation.state"
+                st = batch[src]
                 hist = st if st.dim() == 3 else st.unsqueeze(1)
+
+            self._check_motion_history(hist, src)
             mv = self.motion_encoder(hist.float())
             spans["motion"] = add(mv.to(vs_e.dtype), ("text", mv.shape[1]))
 

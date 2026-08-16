@@ -207,10 +207,60 @@ def test_long_horizon():
     check("progress shape", p.shape == (B,))
 
 
+def test_motion_history_guard():
+    """_check_motion_history is bound to a stub: the real _build_prefix needs a
+    Qwen3-VL, but the guard is the part that has to be right. A degraded motion
+    window does not raise on its own -- the encoder left-pads and the deltas go
+    to zero -- so these branches are the only thing standing between a dead
+    feature and a run nobody questions."""
+    print("\n_check_motion_history")
+
+    class Stub:
+        config = type("C", (), {"motion_history_len": 8,
+                                "motion_vector_tokens": 8})()
+
+        def __init__(self, training):
+            self.training = training
+            self._printed = set()
+
+        _once = M.WiltechsXModel._once
+        run = M.WiltechsXModel._check_motion_history
+
+    def run(hist, training=True):
+        s = Stub(training)
+        try:
+            s.run(hist, "observation.state")
+            return None, s._printed
+        except ValueError as e:
+            return str(e), s._printed
+
+    good = torch.randn(B, 8, 8).cumsum(1)                 # a real trajectory
+    err, printed = run(good)
+    check("healthy (8 frames, moving) passes", err is None and "motion" in printed)
+    check("healthy does not emit the DEAD warning", "motion_dead" not in printed)
+
+    err, _ = run(torch.randn(B, 1, 8))
+    check("training + 1 frame RAISES", err is not None and "DEAD" in err)
+
+    frozen = torch.randn(B, 1, 8).expand(B, 8, 8).contiguous()
+    err, _ = run(frozen)
+    check("training + identical frames RAISES", err is not None)
+
+    err, printed = run(torch.randn(B, 1, 8), training=False)
+    check("inference + 1 frame warns, does NOT raise",
+          err is None and "motion_dead" in printed)
+
+    s = Stub(True)
+    s._printed.add("motion")
+    s.run(torch.randn(B, 1, 8), "observation.state")      # would raise if it ran
+    check("runs once, then is a no-op on every later step", True)
+
+
 if __name__ == "__main__":
     mask = test_mask()
     test_cached_equals_reference(*test_joint_layer(mask))
     test_lora_and_discrete()
     test_long_horizon()
+    test_motion_history_guard()
     print("\nRESULT:", "ALL PASS" if _ok else "FAILURES ABOVE")
     sys.exit(0 if _ok else 1)

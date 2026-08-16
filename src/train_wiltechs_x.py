@@ -22,10 +22,11 @@ WHAT TO WATCH, and it is not the average loss:
   * `shortcut`. If it stays high, few-step inference is not valid and
     `--num_inference_steps 4` is silently under-integrating.
 
-This trainer deliberately does NOT do image preprocessing in DataLoader
-workers (the model's `_encode_images` fallback runs the Qwen processor inline).
-That is slower per step and simpler to get right; port the worker path from
-train_wiltechs_vla.py if throughput becomes the binding constraint.
+Qwen image preprocessing runs in the DataLoader workers by default
+(`VlmPixelDataset`); `--no_preprocess_in_workers` puts it back on the critical
+path inside `_encode_images`, which is useful only for ruling that path out as
+a suspect. Both produce identical vision grids -- the `vision grid <cam>` line
+at startup is printed from whichever one ran.
 """
 from __future__ import annotations
 
@@ -792,7 +793,7 @@ def main():
                         "a cuda synchronize, so the steady state must not pay "
                         "for it. 0 = off.")
     p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--save_every", type=int, default=5000)
+    p.add_argument("--save_every", type=int, default=1000)
     p.add_argument("--log_every", type=int, default=20)
     p.add_argument("--max_episode_index", type=int, default=None)
     p.add_argument("--gradient_checkpointing", action="store_true")
