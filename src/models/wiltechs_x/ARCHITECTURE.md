@@ -1,9 +1,13 @@
 # WiltechsX Architecture
 
-> **Status: implemented, never run against a real backbone.** Every method is
-> written; 27 component tests pass on pure torch. Nothing has touched a real
-> Qwen3-VL, a real dataset, or a GPU, so treat the first Colab run as debugging,
-> not as an experiment.
+> **Status: runs against a real Qwen3-VL-4B on a 22 GiB card; not yet
+> evaluated.** The memory budget fits (13.5 GiB fixed + ~5–8 GiB activations at
+> `batch_size=8–12`, `grad_accum=8`, gradient checkpointing on) and every loss
+> term now starts on its chance baseline (§5). No success rate has been measured
+> — **there is still no eval entry point for this policy anywhere in the repo**,
+> which is a tighter bottleneck than training time. Runs started before
+> 2026-08-15 carry three fixed defects and should be discarded, not evaluated
+> (§8.0).
 >
 > Before training:
 > ```
@@ -100,23 +104,87 @@ here rather than forking OpenVLA-OFT:
 
 ## 3. Architecture
 
+### 3.0 Data flow
+
+Token counts below are the **observed 2-camera LIBERO run** (`--expert_num_layers
+18 --wrist_tokens 64`), so the arithmetic can be checked against the startup
+banner. §4 gives the same layout with the config defaults.
+
 ```
-                     ┌──────────── ONE joint attention per layer ────────────┐
- images ──► Qwen3-VL ViT ──┐
- wrist  ──► DINOv2/v3 ─────┤
- language ► embed_tokens ──┤  PREFIX (bidirectional, VLM weights + LoRA)
- motion  ► MV encoder ─────┘
-                            ├─────────────────────────────────────────────────┤
- state   ► state proj ─────┐
- x_t     ► action proj ────┤  SUFFIX (causal, EXPERT weights, full gradient)
- t       ► time embed  ────┘
-                            └─────────────────────────────────────────────────┘
-                                        │              │
-                       FAST token head ─┘              └─ velocity head + progress
-                       (VLM side, discrete)               (expert side, continuous)
-                                ▲                                │
-                                └──── stop-grad ─────────────────┘
+   task string        base cam         wrist cam                  state history
+  "pick up the…"     (B,3,H,W)      ┌──(B,3,H,W)──┐               (B, T=8, 8)
+        │                 │         │             │                     │
+        ▼                 ▼         ▼             ▼                     ▼
+ ┌────────────┐    ┌────────────┐ ┌────────────┐ ┌───────────┐  ┌──────────────┐
+ │embed_tokens│    │ Qwen3-VL   │ │ Qwen3-VL   │ │ DINOv2-S  │  │ MotionVector │
+ │  FROZEN    │    │ ViT + 2×2  │ │ ViT + 2×2  │ │ + avgpool │  │   encoder    │
+ │            │    │  merger    │ │  merger    │ │ TRAINABLE │  │  TRAINABLE   │
+ │  48 tok    │    │  64 tok    │ │  64 tok    │ │  64 tok   │  │    8 tok     │
+ └─────┬──────┘    └─────┬──────┘ └─────┬──────┘ └─────┬─────┘  └──────┬───────┘
+       └─────────────────┴──────────────┴──────────────┴───────────────┘
+                                        │   all projected to d = 2560 (VLM width)
+                                        ▼
+ PREFIX (B, 260, 2560) — bidirectional, M-RoPE, lang block key-padded
+ ┌──────┬─────────┬──────────────────┬──────────────────┬────────┬────────┬──────┐
+ │ user │ lang 48 │ <v> cam0 64 </v> │ <v> cam1 64 </v> │wrist 64│motion 8│ asst │
+ │  3   │         │        66        │        66        │        │        │  5   │
+ └──────┴─────────┴──────────────────┴──────────────────┴────────┴────────┴───┬──┘
+                                                        discrete-head readout ─┘
+
+ ┌──────────────────────────────── THE STACK ─────────────────────────────────┐
+ │  VLM layer  0 … 17   prefix ONLY — plain Qwen layer, suffix does not exist  │
+ │  VLM layer 18 … 35   ONE SDPA over [prefix | suffix], per-segment weights:  │
+ │                        prefix half → Qwen3-VL weights + LoRA (r=32)         │
+ │                        suffix half → expert weights, adaLN-Zero on t        │
+ └────────────────────────────────────────────────────────────────────────────┘
+                                        ▲
+ SUFFIX (B, 25, 1024) — causal ─────────┘        t ──► time embedder ──► adaLN
+ ┌─────────┬──────────────┬───────────────────┐        (modulation only —
+ │ state 1 │ register × 8 │ x_t × 16 (horizon)│         t is NOT a token)
+ └─────────┴──────────────┴───────────────────┘
+
+        prefix_out[readout]                          suffix_out
+                │                                        │
+   ┌────────────▼────────────┐           ┌───────────────▼───────────────┐
+   │ discrete action head    │           │ action_out_proj → v_t (B,16,7)│
+   │ 16×7×256 bins, CE       │           │ progress head   → scalar      │
+   │ (VLM side, insulation)  │           │ (expert side, continuous)     │
+   └────────────┬────────────┘           └───────────────┬───────────────┘
+                │                                        │
+                └───────────── stop-grad ────────────────┘
+                        (the K/V cache is detached)
 ```
+
+### 3.0.1 Input composition
+
+Every input is a token in **one shared sequence**. There is no side channel and
+no cross-attention module — that is the whole architectural claim (§2, §3.4).
+
+| Segment | Source key | Encoder | Tokens | Grad path |
+|---|---|---|---|---|
+| header | `<\|im_start\|>user\n` | `embed_tokens` | 3 | frozen |
+| **lang** | `task` / `task_description` | `embed_tokens`, `padding="max_length"` | `lang_max_len` = **48** | frozen embed; LoRA downstream |
+| **vision** | every key in `cameras_for_vlm` | Qwen3-VL ViT → 2×2 spatial merge | `(grid_h/2)·(grid_w/2)` per camera = **64** at a 16×16 patch grid, **+2** for the `<\|vision_start\|>`/`<\|vision_end\|>` brackets | frozen unless `lora_on_vision_tower` |
+| **wrist** | keys matching `WRIST_HINTS` (`image2`, `wrist`, `gripper`, `eye_in_hand`, `hand`) | DINOv2 → drop CLS → adaptive-avg-pool to a √N×√N grid → Linear | `wrist_tokens` = **256** default | trainable (backbone + proj) |
+| **motion** | `observation.state` history, `T = motion_history_len` | `[h, Δh]` → 256-d MLP → mix → Linear | `motion_vector_tokens` = **8** | trainable |
+| tail | `<\|im_end\|>\n<\|im_start\|>assistant\n` | `embed_tokens` | 5 | frozen; **last position is the discrete-head readout** |
+| **state** | `observation.state` (last step) | Linear + RMSNorm | 1 | trainable (expert) |
+| **register** | learned parameter | — | `num_register_tokens` = **8**, std=0.02 init | trainable (expert) |
+| **x_t** | noisy action chunk | `action_in_proj` + `action_pos_emb` | `horizon` = **16** | trainable (expert) |
+| *t (and step size d)* | flow time | sinusoid → MLP → per-layer adaLN | **not a token** | trainable (expert) |
+
+Three things this table is meant to make un-missable:
+
+- **The wrist camera is encoded twice.** `train_wiltechs_x.py` passes *all*
+  cameras to `cameras_for_vlm`, and then selects the wrist-like ones again for
+  the DINO path. That is deliberate — the two towers carry different features —
+  but it means the wrist frame costs `64 + wrist_tokens` prefix positions, and
+  the DINO path only earns them if `wrist_tokens > 64` (§3.4).
+- **`motion` is the only path that sees more than one timestep.** There is no
+  frame stacking anywhere; history enters as 8 low-dimensional tokens.
+- **The prefix is a function of the observation ONLY.** No suffix token, no
+  noise level, and no flow time appears in it. §4 explains why that is
+  load-bearing rather than incidental.
 
 ### 3.1 Backbone: Qwen3-VL, LoRA, unfrozen
 
@@ -172,6 +240,13 @@ detail near the gripper. Two changes to how it is supplied:
 - **A self-supervised ViT (DINOv2/v3) instead of a from-scratch CNN.**
   Self-supervised features carry far better dense spatial correspondence than
   SigLIP-style contrastive ones; OpenVLA fuses SigLIP+DINOv2 for exactly this.
+- **The budget test is TOKENS PER CAMERA, not pixels per token.** `wrist_tokens`
+  must exceed the VLM's own per-camera count — `(grid_h/2)·(grid_w/2)`, 64 at a
+  16×16 patch grid — or this path resolves nothing the prefix does not already
+  have and is pure parameter cost. `wrist_input_size` does **not** help: it
+  upsamples before an adaptive pool that discards the extra patches. The startup
+  banner prints the verdict (`FINER` / `IDENTICAL` / `COARSER`) once the
+  processor has revealed the real grid.
 - **Its tokens go in the shared prefix, not into a side channel.** The observed
   "reliance migrated to the RobotCNN" is a *consequence* of privileged-side-channel
   placement — gradient descent takes the trainable shortcut. In the shared
@@ -203,11 +278,22 @@ The only suite with headroom. Two cheap additions:
 ## 4. Sequence layout and masks
 
 ```
-              ┌──────────────────── PREFIX (bidirectional) ─────────────────────┐┌── SUFFIX (causal) ──┐
- position:    lang₀..lang_L  vis₀..vis_N  wrist₀..wrist_W  mv₀..mv_M  │ state  x_t⁰ .. x_t^{H-1}
- weights:     ├──────────── Qwen3-VL layer i + LoRA ──────────────────┤ ├── expert layer i ────┤
- gradient:    └──── LoRA only, + FAST CE head ──────────────────────┘ └── full, stop-grad in ─┘
+   ┌──────────────────────── PREFIX (bidirectional) ───────────────────────┐┌───── SUFFIX (causal) ─────┐
+ seg   hdr  lang₀..₄₇  <v>vis₀..₆₃</v> ×cams  wrist₀..W  mv₀..₇  tail │ state  reg₀..₇  x_t⁰..x_t^{H-1}
+ wts   ├──────────── Qwen3-VL layer i + LoRA (r=32) ──────────────────┤ ├──── expert layer i, adaLN(t) ────┤
+ grad  └──── LoRA + wrist + motion, via the discrete CE head ─────────┘ └── full; stop-grad into the prefix ┘
 ```
+
+**Length arithmetic** — `L_prefix = 3 + lang + Σ_cams(vis_c + 2) + wrist + motion + 5`:
+
+| Config | lang | vision | wrist | motion | `L_prefix` | `L_suffix` | total |
+|---|---|---|---|---|---|---|---|
+| defaults, 2 cams, `wrist_tokens=256` | 48 | 2×66 | 256 | 8 | **452** | 25 | 477 |
+| the run in the banner (`wrist_tokens=64`) | 48 | 2×66 | 64 | 8 | **260** | 25 | 285 |
+| `--lang_max_len 24`, 1 wrist cam @ 256 | 24 | 2×66 | 256 | 8 | 428 | 25 | 453 |
+
+`L_suffix = 1 + num_register_tokens + horizon`. It is paid **in every joint
+layer**, which is why `horizon` is 16 and not WiltechsVLA's 64.
 
 - Prefix ↔ prefix: **full** (both directions, key padding enforced)
 - Suffix → prefix: **full**
@@ -225,15 +311,38 @@ which layer's KV the decoder reads.
 
 ## 5. Losses
 
-| Term | Side | Default weight | Purpose |
-|---|---|---|---|
-| Flow / mean-flow velocity | expert | 1.0 | main objective |
-| Gripper BCE (class-balanced) | expert | 0.05 | ported from `wiltechs_vla`; the gripper dim sits in the majority-class optimum otherwise |
-| FAST token CE | VLM | 0.5 | knowledge insulation |
-| Progress regression | expert | 0.1 | long-horizon phase signal |
+`total` printed by the trainer is the weighted sum of exactly these terms, so it
+reconciles arithmetically — useful for confirming a term is actually on.
+
+| Term (log key) | Side | Weight | Value at init | Purpose |
+|---|---|---|---|---|
+| `flow` — velocity MSE | expert | `action_loss_weight` 1.0 | **2.0** on normalized data (`action_out_proj` is zero-init, so `v=0` and the loss is `E‖noise−a‖²`) | main objective |
+| `shortcut` — self-consistency | expert | 1.0, on `shortcut_consistency_frac` = 0.25 of the batch | **≈0** — an untrained near-constant field satisfies the identity trivially | makes 1–4 NFE inference valid rather than an under-integrated Euler solve |
+| `gripper` — BCE, class-balanced | expert | 0.05 | ln2 = **0.693** | the gripper dim sits in the majority-class optimum otherwise |
+| `discrete` — binned action CE | VLM | `fast_token_loss_weight` 0.5 | ln(256) = **5.545** | knowledge insulation |
+| `progress` — regression | expert | 0.1 | 1/12 = **0.083** (variance of uniform progress) | long-horizon phase signal |
+
+The init column is the whole point of the table: at step 20 every term should be
+sitting on its chance baseline, and any term that is *not* is miswired. Two bugs
+were found by exactly this check and are fixed as of 2026-08-15 — if you are
+reading a log from before it, both are visible in the first line:
+
+- **`flow` started at 8.5, not 2.0.** Two independent causes multiplying:
+  `cells.sum()` was taken on a `(B, H, 1)` tensor while the numerator summed
+  `(B, H, A)`, so the mean was short by a factor of `action_dim` (7); and the
+  trainer never applied the preprocessor, so `E[a²]` was the raw 0.21 rather
+  than 1.0. `7 × (1 + 0.21) = 8.48`, against 8.42 and 8.59 measured on two runs.
+- The A-factor was **not** cosmetic. `shortcut`, `gripper` and `progress` are
+  added to the same `main` and share the expert, so every one of them ran at
+  1/7 of its stated weight. A `shortcut` term pinned near 0.003 while `flow`
+  is at 1.5 is the signature.
+
+`shortcut ≈ 0` is ambiguous, not good: a collapsed constant field satisfies the
+identity as well as a correct one does. It should **rise** as `flow` falls, then
+settle. Flat-zero alongside a flat `flow` is a collapse, not convergence.
 
 No contrastive term. If language-following regresses, the diagnosis goes to the
-FAST head weight, not to a new hinge.
+discrete head's weight, not to a new hinge.
 
 ---
 
@@ -277,6 +386,21 @@ hypotheses.
 
 ## 8. Known risks
 
+0. **Checkpoints from before 2026-08-15 are not comparable.** Three defects,
+   all fixed, all of which changed what was optimized rather than only what was
+   printed:
+   - the trainer never applied the preprocessor, so state and action reached
+     the loss raw. On this dataset's stats the three rotation dims carry
+     std 0.04–0.08 against the gripper's 1.0, so rotation took **0.79%** of the
+     flow loss where MEAN_STD gives it 42.9% — grasp pose was barely trained.
+     Fixed in `train_wiltechs_x.py` (`prepare()`), which also has to restore
+     `progress`: LeRobot's `transition_to_batch` keeps only
+     `observation.*` / `action` / `*_is_pad` / `task` / `index` / `task_index`.
+   - the flow loss divided by `cells.sum()` on a `(B, H, 1)` tensor, making it
+     `action_dim`× too large and every term sharing the expert
+     correspondingly under-weighted (§5).
+   - the LR schedule stepped per micro-batch, stretching warmup by
+     `grad_accum` (fixed earlier, in `51c616e`).
 1. **KI may be unnecessary at this data scale** (§3.3). First ablation.
 2. **Motion vectors may leak the demonstrator's action**, reintroducing causal
    confusion through the back door — the exact failure frame stacking has. Check

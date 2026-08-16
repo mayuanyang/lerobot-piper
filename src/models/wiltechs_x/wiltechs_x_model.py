@@ -1198,7 +1198,22 @@ class WiltechsXModel(nn.Module):
         n_exec = min(max(int(cfg.loss_exec_steps or H), 1), H)
         pos_w[n_exec:] = float(cfg.future_steps_weight)
         cells = valid_t.unsqueeze(-1) * pos_w[None, :, None]
-        main = (loss * cells).sum() / cells.sum().clamp(min=1e-6) * cfg.action_loss_weight
+        # expand_as, NOT a bare cells.sum(). `cells` is (B, H, 1) and `loss` is
+        # (B, H, A), so the numerator sums B*H*A terms while cells.sum() counts
+        # only B*H -- the mean was short by exactly action_dim, making `flow`
+        # 7x too large on a 7-DOF arm.
+        #
+        # Not a display bug. `shortcut`, `gripper` and `progress` are added to
+        # the same `main` and share the expert with the flow term, so all three
+        # had their effective weights divided by 7 -- which is why the shortcut
+        # consistency term, the thing that makes 1-4 NFE inference valid at
+        # all, sat at 0.003 while flow was at 1.55.
+        #
+        # The discrete CE below already expands correctly, and that is what
+        # dated this: it starts at exactly ln(n_bins), while flow started at
+        # 7x its own baseline of (sample_noise_scale^2 + E[a^2]).
+        denom = cells.expand_as(loss).sum().clamp(min=1e-6)
+        main = (loss * cells).sum() / denom * cfg.action_loss_weight
         parts = {"flow": float(main.detach())}
 
         # ---- shortcut self-consistency ----------------------------------

@@ -218,7 +218,12 @@ def train(
     dataset_ids: list[str],
     output_dir: str = "./outputs/wiltechs_x",
     vlm_model_id: str = "Qwen/Qwen3-VL-4B-Instruct",
-    training_steps: int = 60000,
+    # OPTIMIZER steps, and the cosine schedule is sized from it, so this is not
+    # a "stop whenever" budget -- shortening it later changes the LR curve
+    # rather than truncating it. 20000 is ~7 epochs on LIBERO's ~273k frames at
+    # batch 12 x grad_accum 8 (2848 optimizer steps/epoch). The previous 60000
+    # was 21 epochs and ~95 wall-clock hours at the 256-token wrist setting.
+    training_steps: int = 20000,
     batch_size: int = 8,
     grad_accum: int = 1,
     lr: float = 1e-4,
@@ -415,8 +420,36 @@ def train(
         dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
         pin_memory=(device == "cuda"), drop_last=True,
         persistent_workers=num_workers > 0)
+    steps_per_epoch = max(len(loader) // max(grad_accum, 1), 1)
     print(f"{len(loader)} batches/epoch, batch_size={batch_size}, "
           f"grad_accum={grad_accum}")
+    print(f"{steps_per_epoch} OPTIMIZER steps/epoch -> {training_steps} steps = "
+          f"{training_steps / steps_per_epoch:.1f} epochs "
+          f"(warmup {warmup_steps} = {warmup_steps / steps_per_epoch:.2f} epochs)")
+
+    # The batch MUST go through the preprocessor before the loss sees it.
+    # Everything downstream is written for MEAN_STD-normalized state and
+    # action: the flow target, the discrete head's binning (clip=3.0, i.e.
+    # +-3 sigma), and the threshold `calibrate_gripper_threshold` returns
+    # (which it explicitly documents as being in normalized units). And
+    # `select_action` applies this same pipeline at inference, so skipping it
+    # here trains a different model than the one that gets deployed.
+    #
+    # Measured cost of the omission on this dataset's action stats: the three
+    # rotation dims have std 0.04-0.08 against the gripper's 1.0, so raw
+    # training gave rotation 0.8% of the flow loss where normalization gives
+    # it 43%. Grasp pose was effectively not being trained.
+    #
+    # The restore loop is not optional. `transition_to_batch` rebuilds the
+    # dict from observation.* / action / *_is_pad / task / index / task_index
+    # ONLY, so every other key is dropped on the round trip -- including
+    # `progress` from ProgressDataset, whose absence makes the progress head
+    # silently skip its term instead of failing.
+    def prepare(batch):
+        out = preprocessor(batch)
+        for k, v in batch.items():
+            out.setdefault(k, v)
+        return out
 
     # `step` counts OPTIMIZER steps, not dataloader iterations. The scheduler
     # advances once per optimizer step, so counting iterations instead makes
@@ -426,11 +459,23 @@ def train(
     # and warmup would silently last 8x longer than requested.
     policy.train()
     step, micro, t0, acc, n_acc = start_step, 0, time.time(), {}, 0
-    done = False
+    done, checked = False, False
     while not done:
         for batch in loader:
             batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
                      for k, v in batch.items()}
+            batch = prepare(batch)
+            if not checked:
+                checked = True
+                # One line that would have caught all of the above. RMS 1.0 is
+                # what MEAN_STD normalization means; the predicted flow value
+                # is exact because action_out_proj is zero-init, so v(0) = 0.
+                a2 = float(batch["action"].float().pow(2).mean())
+                print(f"[wiltechs_x] first batch after preprocessor: action "
+                      f"RMS={a2 ** 0.5:.3f} (1.000 = normalized), "
+                      f"progress={'present' if 'progress' in batch else 'MISSING'}"
+                      f" -> flow should start at "
+                      f"{cfg.sample_noise_scale ** 2 + a2:.2f}")
             loss, parts = policy.model.compute_loss(batch, return_parts=True)
             (loss / grad_accum).backward()
 
