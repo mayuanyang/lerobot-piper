@@ -248,6 +248,106 @@ def report_memory_budget(model, counts, device) -> None:
             "    --gradient_checkpointing     activations only, not the fixed cost\n")
 
 
+# Two sides, because knowledge insulation makes them structurally different.
+# Everything in PREFIX_GROUPS lives upstream of the detached K/V cache, so the
+# flow loss cannot reach it -- the discrete head is its ONLY gradient source.
+# Everything in EXPERT_GROUPS is trained by the flow/shortcut/gripper/progress
+# terms and never sees the discrete CE.
+PREFIX_GROUPS = [
+    ("LoRA (q/k/v/o)", "lora_"),
+    ("wrist encoder", "wrist_encoder"),
+    ("  wrist proj", "wrist_encoder.proj"),
+    ("motion encoder", "motion_encoder"),
+    ("discrete head", "discrete_head"),
+]
+EXPERT_GROUPS = [
+    ("expert layers", "expert_layers"),
+    ("  adaLN", ".ada."),
+    ("state encoder", "state_encoder"),
+    ("registers", "register_tokens"),
+    ("action pos emb", "action_pos_emb"),
+    ("action in", "action_in_proj"),
+    ("action out", "action_out_proj"),
+    ("time embedder", "time_embedder"),
+    ("final norm", "final_norm"),
+    ("progress head", "progress_head"),
+]
+
+
+def _grad_stats(model, needle: str):
+    """-> (mean|g|, g_rms/param, g/w, n_with_grad, n_trainable).
+
+    `n_trainable` separates the two ways a group reports nothing: DISABLED (the
+    module does not exist -- no wrist encoder, no discrete head) from BROKEN
+    (parameters are there and got no gradient). Printing "no grad" for both
+    buries the one that matters.
+    """
+    total, g_sq, w_sq, n, present = 0.0, 0.0, 0.0, 0, 0
+    for name, p in model.named_parameters():
+        if not (p.requires_grad and needle in name):
+            continue
+        present += p.numel()
+        if p.grad is not None:
+            total += p.grad.abs().mean().item() * p.numel()
+            g_sq += p.grad.norm().item() ** 2
+            w_sq += p.detach().norm().item() ** 2
+            n += p.numel()
+    if n == 0:
+        return None, None, None, 0, present
+    g_rms = (g_sq ** 0.5) / (n ** 0.5)
+    w_rms = (w_sq ** 0.5) / (n ** 0.5)
+    return total / n, g_rms, (g_rms / w_rms if w_rms > 0 else None), n, present
+
+
+def log_gradient_analysis(model, step: int, knowledge_insulation: bool) -> None:
+    """Per-component gradient health, on the RAW accumulated gradient.
+
+    Called BEFORE clip_grad_norm_, so the magnitudes are what the model
+    produced rather than what survived rescaling.
+
+    Read the `g/w` column. `avg|g|` alone rounds to zero for a large module
+    whose gradient concentrates in a few sub-parameters, and `rms/param` is
+    fair in COUNT but not in SCALE -- a pretrained DINOv2 weight is far larger
+    than a freshly initialised projection, so the same absolute gradient is a
+    much smaller relative step. g/w (gradient RMS over weight RMS) is the
+    scale-free version and the only column that compares across modules.
+    """
+    print(f"\n--- gradients at step {step} (raw, pre-clip) ---")
+
+    def section(title, groups):
+        tot = 0.0
+        print(f"  {title}")
+        for label, needle in groups:
+            g, rms, gw, n, present = _grad_stats(model, needle)
+            if g is None:
+                if present:
+                    print(f"    {label:<16s} *** {present:,} trainable params, "
+                          f"NO GRAD ***")
+                continue                       # present == 0 -> disabled, be quiet
+            if not label.startswith("  "):     # sub-rows must not double-count
+                tot += rms * (n ** 0.5)
+            gw_s = f"  g/w {gw:.2e}" if gw is not None else ""
+            print(f"    {label:<16s} avg|g| {g:.3e}  rms/param {rms:.2e}"
+                  f"{gw_s}  ({n / 1e6:.1f}M)")
+        return tot
+
+    pre = section("PREFIX side — reachable ONLY via the discrete CE head:",
+                  PREFIX_GROUPS)
+    exp = section("EXPERT side — trained by flow / shortcut / gripper / progress:",
+                  EXPERT_GROUPS)
+
+    if pre > 0 and exp > 0:
+        print(f"  prefix/expert gradient L2 = {pre / exp:.3f}")
+    if knowledge_insulation and pre == 0.0:
+        print("  *** PREFIX SIDE IS DEAD ***\n"
+              "  knowledge_insulation detaches the K/V cache, so the discrete "
+              "head is the only\n  gradient path into LoRA, the wrist encoder "
+              "and the motion encoder. Zero here\n  means the backbone is "
+              "frozen in practice while still costing full forward time.\n"
+              "  Check that --fast_token_loss_weight is non-zero and that "
+              "`discrete` is falling.")
+
+
 def calibrate_gripper_threshold(stats, gripper_dim):
     """Threshold in NORMALIZED action units.
 
@@ -331,6 +431,7 @@ def train(
     use_descriptive_objects: bool = False,
     preprocess_in_workers: bool = True,
     profile_steps: int = 20,
+    grad_log_every: int = 1000,
     num_workers: int = 4,
     save_every: int = 5000,
     log_every: int = 20,
@@ -569,6 +670,7 @@ def train(
 
     policy.train()
     step, micro, t0, acc, n_acc = start_step, 0, time.time(), {}, 0
+    gn_sum, gn_clipped, gn_n = 0.0, 0, 0
     done, checked = False, False
     t_prev = time.perf_counter()
     while not done:
@@ -607,7 +709,19 @@ def train(
                 t_prev = time.perf_counter()
                 continue
 
-            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            if grad_log_every and (step + 1) % grad_log_every == 0:
+                log_gradient_analysis(policy.model, step + 1, knowledge_insulation)
+
+            # The pre-clip norm is free -- clip_grad_norm_ already computes it
+            # and the old code threw it away. It is the cheapest way to see
+            # that the LR you set is the LR you get: once this sits above
+            # max_norm every step, every update is rescaled by max_norm/‖g‖ and
+            # the effective step size is set by the clip, not by --lr.
+            gnorm = float(torch.nn.utils.clip_grad_norm_(params, 1.0))
+            gn_sum += gnorm
+            gn_clipped += int(gnorm > 1.0)
+            gn_n += 1
+
             opt.step()
             opt.zero_grad(set_to_none=True)
             sched.step()
@@ -630,9 +744,16 @@ def train(
                     mem = (f"  mem={torch.cuda.max_memory_allocated() / 2**30:.1f}/"
                            f"{torch.cuda.get_device_properties(0).total_memory / 2**30:.0f}GiB")
                     torch.cuda.reset_peak_memory_stats()
+                # gnorm is per OPTIMIZER step, so it cannot go in `acc` (which
+                # is averaged over micro-batches). clip% is the part that
+                # matters: at 100% the update direction is still yours but the
+                # magnitude is the clip's, not --lr's.
+                gn = (f"  gnorm={gn_sum / max(gn_n, 1):.2f}"
+                      f"(clip {100 * gn_clipped / max(gn_n, 1):.0f}%)")
                 print(f"step {step}/{training_steps}  lr={sched.get_last_lr()[0]:.2e}  "
-                      f"{msg}  {(time.time() - t0) / log_every:.2f}s/step{mem}")
+                      f"{msg}{gn}  {(time.time() - t0) / log_every:.2f}s/step{mem}")
                 acc, n_acc, t0 = {}, 0, time.time()
+                gn_sum, gn_clipped, gn_n = 0.0, 0, 0
 
             if step % save_every == 0 or step >= training_steps:
                 ck = out / f"checkpoint-{step}"
@@ -786,6 +907,13 @@ def main():
                         "instead of in the DataLoader workers. Inline is on the "
                         "critical path with the GPU idle; the only reason to "
                         "pick it is to rule the worker path out as a suspect.")
+    p.add_argument("--grad_log_every", type=int, default=1000,
+                   help="Per-component gradient report, on the raw pre-clip "
+                        "gradient. Read the g/w column: it is the only one that "
+                        "compares fairly across a pretrained DINOv2 and a fresh "
+                        "projection. The load-bearing check is that the PREFIX "
+                        "side is non-zero -- under knowledge insulation the "
+                        "discrete head is its only gradient path. 0 = off.")
     p.add_argument("--profile_steps", type=int, default=20,
                    help="Optimizer steps to attribute across data wait / "
                         "forward / backward / optimizer, after a 2-step warmup. "
