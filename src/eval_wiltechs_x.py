@@ -224,14 +224,21 @@ def build_batch(obs_list, tasks, hist: StateHistory, preprocessor, device):
 def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
               task_id: int, episodes: int, num_envs: int, device: str,
               max_episode_steps: int, seed: int, expected_cams: list[str],
-              video_cb=None, videos_per_task: int = 0):
+              video_cb=None, videos_per_task: int = 0, heartbeat: int = 50):
     """-> (n_success, n_episodes, mean_success_steps, n_chunks, task_description)."""
     from lerobot.envs.libero import LiberoEnv
 
+    # Building an OffScreenRenderEnv takes seconds and there are num_envs of
+    # them PER TASK (LiberoEnv binds its bddl file at construction, so they
+    # cannot be reused across tasks). Say so: this is minutes of silence
+    # before a single rollout step happens.
+    t_build = time.time()
+    print(f"  task {task_id:2d}: building {num_envs} envs...", end="", flush=True)
     envs = [LiberoEnv(task_suite=suite, task_id=task_id,
                       task_suite_name=suite_name, obs_type="pixels_agent_pos",
                       init_states=True, episode_index=0)
             for _ in range(num_envs)]
+    print(f" {time.time() - t_build:.0f}s", flush=True)
     try:
         probe, _ = envs[0].reset(seed=seed)
         got = sorted(probe["pixels"].keys())
@@ -255,8 +262,13 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
                     if device == "cuda"
                     else torch.autocast(device_type="cpu", enabled=False))
 
+        n_batches = (episodes + num_envs - 1) // num_envs
+        print(f"    {episodes} episodes in {n_batches} batch(es) of {num_envs}, "
+              f"cap {horizon_cap} steps: {task_desc[:52]}", flush=True)
+
         successes, steps_to_success, n_chunks = [], [], 0
         for start in range(0, episodes, num_envs):
+            t_batch = time.time()
             n_live = min(num_envs, episodes - start)
             policy.reset()
             obs_list, frames = [], [[] for _ in range(num_envs)]
@@ -309,6 +321,25 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
                         done[i] = True
                         succ[i] = bool(info.get("is_success", False))
                 t += 1
+
+                # Heartbeat. Without it a batch that runs to the cap is many
+                # minutes of total silence, and there is no way to tell a slow
+                # rollout from a hung one. `live` falling to 0 early means the
+                # episodes are terminating; live staying at num_envs to the cap
+                # means everything is timing out, i.e. failing.
+                if heartbeat and t % heartbeat == 0:
+                    live = sum(1 for i in range(n_live) if not done[i])
+                    hit = sum(succ[:n_live])
+                    el = time.time() - t_batch
+                    print(f"      t={t:4d}/{horizon_cap}  live={live}/{n_live}  "
+                          f"success={hit}  {el:5.0f}s  "
+                          f"({el / max(t, 1) * horizon_cap:.0f}s if it runs to cap)",
+                          flush=True)
+
+            hit = sum(succ[:n_live])
+            print(f"    batch {start // num_envs + 1}/{n_batches}: "
+                  f"{hit}/{n_live} success in {t} steps, "
+                  f"{time.time() - t_batch:.0f}s", flush=True)
 
             for i in range(n_live):
                 successes.append(succ[i])
@@ -387,6 +418,11 @@ def main():
                         "This repo's grasp-vs-selection diagnoses came from "
                         "watching these, not from the success rate.")
     p.add_argument("--videos_per_task", type=int, default=2)
+    p.add_argument("--heartbeat", type=int, default=50,
+                   help="Env steps between progress lines inside a rollout. A "
+                        "batch that runs to the episode cap is minutes of "
+                        "silence otherwise, with no way to tell slow from hung. "
+                        "0 = off.")
     p.add_argument("--out", default=None, help="JSON results path.")
     a = p.parse_args()
 
@@ -419,17 +455,22 @@ def main():
         task_ids = a.task_ids if a.task_ids is not None else list(range(n_tasks))
         print(f"\n=== {suite_name}: {len(task_ids)} tasks x {a.episodes} episodes ===")
         per_task = {}
-        for tid in task_ids:
+        for k, tid in enumerate(task_ids):
+            t_task = time.time()
             n_ok, n_ep, mean_steps, n_chunks, desc = eval_task(
                 policy, pre, post, suite, suite_name, tid, a.episodes,
                 a.num_envs, device, a.max_episode_steps, a.seed, cams, video_cb,
-                a.videos_per_task)
+                a.videos_per_task, a.heartbeat)
             sr = 100.0 * n_ok / max(n_ep, 1)
             per_task[tid] = {"success_rate": sr, "n_success": n_ok,
                              "n_episodes": n_ep, "mean_success_steps": mean_steps,
                              "policy_chunks": n_chunks, "task": desc}
+            done_n, total_n = k + 1, len(task_ids)
+            eta = (time.time() - t0) / done_n * (total_n - done_n) / 60
             print(f"  task {tid:2d}  SR {sr:5.1f}%  ({n_ok}/{n_ep})  "
-                  f"steps~{mean_steps:.0f}  {desc[:58]}")
+                  f"steps~{mean_steps:.0f}  [{done_n}/{total_n}, "
+                  f"{(time.time() - t_task) / 60:.1f} min, ETA {eta:.0f} min]  "
+                  f"{desc[:44]}", flush=True)
         rates = [v["success_rate"] for v in per_task.values()]
         results[suite_name] = {
             "per_task": per_task,
