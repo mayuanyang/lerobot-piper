@@ -288,7 +288,11 @@ def _grad_stats(model, needle: str):
             continue
         present += p.numel()
         if p.grad is not None:
-            total += p.grad.abs().mean().item() * p.numel()
+            # norm(1), not abs().mean(): this runs at PEAK memory (every
+            # gradient is live, opt.zero_grad has not happened yet) and
+            # .abs() would materialise a full-size copy of the largest
+            # tensor to compute one scalar.
+            total += p.grad.norm(1).item()
             g_sq += p.grad.norm().item() ** 2
             w_sq += p.detach().norm().item() ** 2
             n += p.numel()
@@ -526,13 +530,17 @@ def train(
     if gradient_checkpointing:
         policy.model.gradient_checkpointing_enable()
 
-    start_step = 0
+    start_step, resume_state = 0, None
     if resume_from_checkpoint:
         ck = Path(resume_from_checkpoint)
         print(f"resuming from {ck}")
-        sd = torch.load(ck / "training_state.pth", map_location=device)
-        policy.load_state_dict(sd["model"])
-        start_step = sd.get("step", 0)
+        # map to CPU, not to `device`: this file holds the full model AND the
+        # Adam moments (~9.5 + 2.6 GiB here), and loading it straight onto the
+        # GPU doubles the weights for as long as the dict is alive.
+        # load_state_dict copies into the already-placed parameters either way.
+        resume_state = torch.load(ck / "training_state.pth", map_location="cpu")
+        policy.load_state_dict(resume_state["model"])
+        start_step = resume_state.get("step", 0)
 
     counts = policy.model.count_parameters()
     print(f"params: trainable={counts['trainable']:,}  frozen={counts['frozen']:,}")
@@ -565,6 +573,29 @@ def train(
         print("optimizer: AdamW with foreach=False (fused unavailable) — "
               "slower per step, but it does not allocate the full-size "
               "temporaries the default path does")
+
+    # Restore the Adam moments. The checkpoint has always written them and the
+    # resume path has never read them, so every resume so far restarted
+    # exp_avg/exp_avg_sq at zero. At betas=(0.9, 0.95) the second moment is
+    # rebuilt over ~20 steps, and until it is the updates are effectively
+    # unnormalised -- a loss spike on resume that looks like a real regression
+    # and is not.
+    if resume_state is not None:
+        if "opt" in resume_state:
+            try:
+                opt.load_state_dict(resume_state["opt"])
+                print("optimizer state restored (Adam moments continue)")
+            except (ValueError, KeyError) as e:
+                # Param groups differ -- a flag that changes what is trainable
+                # was toggled between the two runs. Continue rather than kill a
+                # multi-day resume, but do not let it pass silently.
+                print(f"*** optimizer state NOT restored: {e}\n"
+                      f"    The parameter set differs from the checkpoint's, so "
+                      f"a flag affecting which modules train was changed. "
+                      f"Expect a transient for ~20 steps.")
+        else:
+            print("*** checkpoint has no optimizer state; Adam restarts cold")
+        resume_state = None                    # free the CPU copy
 
     def lr_at(step):
         if step < warmup_steps:
