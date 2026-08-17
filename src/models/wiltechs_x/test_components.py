@@ -222,6 +222,7 @@ def test_motion_history_guard():
         def __init__(self, training):
             self.training = training
             self._printed = set()
+            self._motion_grace = 0
 
         _once = M.WiltechsXModel._once
         run = M.WiltechsXModel._check_motion_history
@@ -246,9 +247,23 @@ def test_motion_history_guard():
     err, _ = run(frozen)
     check("training + identical frames RAISES", err is not None)
 
-    err, printed = run(torch.randn(B, 1, 8), training=False)
-    check("inference + 1 frame warns, does NOT raise",
-          err is None and "motion_dead" in printed)
+    # At inference the first call is always t=0, where StateHistory.reset has
+    # filled the window with one repeated frame. That is a correct left-pad,
+    # not a fault, and judging it reported every healthy rollout as dead.
+    s = Stub(False)
+    frozen1 = torch.randn(B, 1, 8).expand(B, 8, 8).contiguous()
+    s.run(frozen1, "observation.state")
+    check("inference: episode start is NOT reported dead", not s._printed)
+
+    for _ in range(8):                                    # window fills up
+        s.run(frozen1, "observation.state")
+    check("inference: still-frozen window IS reported after the grace period",
+          "motion_dead" in s._printed)
+
+    s = Stub(False)
+    for _ in range(8):
+        s.run(good, "observation.state")
+    check("inference: a moving window never warns", "motion_dead" not in s._printed)
 
     s = Stub(True)
     s._printed.add("motion")

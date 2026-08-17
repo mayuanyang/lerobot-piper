@@ -672,6 +672,7 @@ class WiltechsXModel(nn.Module):
         self._lang_max_len = int(config.lang_max_len)
         self._template_ids_cpu = None
         self._printed = set()
+        self._motion_grace = 0
         self.gradient_checkpointing = False
 
     # =====================================================================
@@ -735,6 +736,16 @@ class WiltechsXModel(nn.Module):
         if "motion" in self._printed:
             return
         t_req = int(self.config.motion_history_len)
+        # At inference the FIRST call is always t=0, where the window is one
+        # frame repeated -- that is what a correct left-pad looks like at
+        # episode start (StateHistory.reset), not a fault. Judging there
+        # reported every healthy rollout as dead. Training has no such phase:
+        # every batch is a random mid-episode frame, so a degenerate window on
+        # call 1 is a real error there.
+        if not self.training:
+            self._motion_grace += 1
+            if self._motion_grace <= t_req:
+                return
         w = hist[:, -t_req:].float()
         t_got = int(w.shape[1])
         d = float((w[:, 1:] - w[:, :-1]).abs().mean()) if t_got > 1 else 0.0
