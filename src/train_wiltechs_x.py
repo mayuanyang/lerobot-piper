@@ -352,6 +352,80 @@ def log_gradient_analysis(model, step: int, knowledge_insulation: bool) -> None:
               "`discrete` is falling.")
 
 
+def resolve_checkpoint(path_or_repo: str) -> Path:
+    """Accept a local directory OR a Hugging Face repo id.
+
+    `--resume_from_checkpoint ISdept/wiltech-x-6k` used to fail with a bare
+    FileNotFoundError on `<repo>/training_state.pth`, which reads like a
+    corrupt checkpoint rather than "that is a Hub id and this function only
+    knew about disk".
+    """
+    p = Path(path_or_repo)
+    if p.exists():
+        return p
+    if "/" not in path_or_repo or path_or_repo.startswith((".", "/", "~")):
+        raise SystemExit(f"no such checkpoint directory: {path_or_repo}")
+    from huggingface_hub import list_repo_files, snapshot_download
+
+    print(f"'{path_or_repo}' is not a local path; fetching from the Hub...")
+    files = set(list_repo_files(path_or_repo))
+    if "training_state.pth" in files:
+        # NOT lerobot's allow_patterns (*.safetensors/*.json): that filter
+        # drops training_state.pth and would silently downgrade a full resume
+        # to a weights-only one. And since the .pth already carries the model,
+        # pulling model.safetensors too is ~9.5 GiB of redundant download.
+        patterns = ["training_state.pth", "*.json"]
+        print("  repo has training_state.pth -> full resume "
+              "(skipping the redundant model.safetensors)")
+    else:
+        patterns = ["*.safetensors", "*.json"]
+        print("  repo has no training_state.pth -> weights-only resume")
+    local = Path(snapshot_download(repo_id=path_or_repo, allow_patterns=patterns))
+    print(f"  -> {local}")
+    return local
+
+
+def load_resume_state(policy, ck: Path, device: str):
+    """-> (resume_state | None, start_step | None).
+
+    Two kinds of checkpoint reach this. `training_state.pth` is what this
+    trainer writes: weights + optimizer + step, a real resume. A directory
+    holding only `model.safetensors` is what `save_pretrained`/`push_to_hub`
+    produces -- the weights are all that survived, and BOTH the Adam moments
+    and the step counter are gone. The second case is silently destructive:
+    start_step 0 restarts the LR schedule from warmup on a model that is
+    thousands of steps in, so it is reported loudly and --start_step exists to
+    repair it.
+    """
+    state_file = ck / "training_state.pth"
+    if state_file.exists():
+        # CPU, not `device`: this file holds the full model AND the Adam
+        # moments (~9.5 + 2.6 GiB here), and mapping it straight onto the GPU
+        # doubles the weights for as long as the dict is alive.
+        st = torch.load(state_file, map_location="cpu")
+        policy.load_state_dict(st["model"])
+        return st, st.get("step", 0)
+
+    from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
+    from safetensors.torch import load_model as load_model_as_safetensor
+
+    weights = ck / SAFETENSORS_SINGLE_FILE
+    if not weights.exists():
+        found = sorted(f.name for f in ck.iterdir()) if ck.is_dir() else []
+        raise SystemExit(
+            f"{ck} has neither training_state.pth nor {SAFETENSORS_SINGLE_FILE}.\n"
+            f"  contents: {found}")
+    load_model_as_safetensor(policy, str(weights))
+    print(f"*** WEIGHTS-ONLY resume from {weights.name}.\n"
+          f"    No optimizer state: the Adam moments restart at zero, which is "
+          f"a transient of ~20 steps at betas=(0.9, 0.95).\n"
+          f"    No step counter: the LR schedule would RESTART FROM WARMUP "
+          f"unless you pass --start_step.\n"
+          f"    A full resume needs training_state.pth, which "
+          f"save_pretrained/push_to_hub does not write.")
+    return None, None
+
+
 def calibrate_gripper_threshold(stats, gripper_dim):
     """Threshold in NORMALIZED action units.
 
@@ -442,6 +516,7 @@ def train(
     max_episode_index: int | None = None,
     gradient_checkpointing: bool = False,
     resume_from_checkpoint: str | None = None,
+    start_step_override: int = -1,
     seed: int = 42,
 ):
     init_logging()
@@ -532,15 +607,16 @@ def train(
 
     start_step, resume_state = 0, None
     if resume_from_checkpoint:
-        ck = Path(resume_from_checkpoint)
+        ck = resolve_checkpoint(resume_from_checkpoint)
         print(f"resuming from {ck}")
-        # map to CPU, not to `device`: this file holds the full model AND the
-        # Adam moments (~9.5 + 2.6 GiB here), and loading it straight onto the
-        # GPU doubles the weights for as long as the dict is alive.
-        # load_state_dict copies into the already-placed parameters either way.
-        resume_state = torch.load(ck / "training_state.pth", map_location="cpu")
-        policy.load_state_dict(resume_state["model"])
-        start_step = resume_state.get("step", 0)
+        resume_state, ckpt_step = load_resume_state(policy, ck, device)
+        start_step = ckpt_step if ckpt_step is not None else 0
+        if start_step_override >= 0:
+            print(f"start_step: {start_step} -> {start_step_override} (--start_step)")
+            start_step = start_step_override
+        if start_step == 0:
+            print("*** starting the LR schedule from step 0 on a resumed model. "
+                  "If this checkpoint is not from step 0, pass --start_step.")
 
     counts = policy.model.count_parameters()
     print(f"params: trainable={counts['trainable']:,}  frozen={counts['frozen']:,}")
@@ -956,7 +1032,16 @@ def main():
     p.add_argument("--log_every", type=int, default=20)
     p.add_argument("--max_episode_index", type=int, default=None)
     p.add_argument("--gradient_checkpointing", action="store_true")
-    p.add_argument("--resume_from_checkpoint", default=None)
+    p.add_argument("--resume_from_checkpoint", default=None,
+                   help="Local checkpoint directory OR a Hugging Face repo id. "
+                        "A full resume needs training_state.pth (weights + "
+                        "optimizer + step); a directory holding only "
+                        "model.safetensors resumes the WEIGHTS alone.")
+    p.add_argument("--start_step", dest="start_step_override", type=int, default=-1,
+                   help="Override the step the LR schedule resumes at. Needed "
+                        "for a weights-only checkpoint, where the step counter "
+                        "did not survive and the schedule would otherwise "
+                        "restart from warmup. -1 = take it from the checkpoint.")
     p.add_argument("--seed", type=int, default=42)
     train(**vars(p.parse_args()))
 
