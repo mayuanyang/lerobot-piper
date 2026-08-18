@@ -1336,11 +1336,35 @@ class WiltechsXModel(nn.Module):
         if cw > 0.0 and lang_span is not None and B > 1:
             k = max(1, min(int(B * float(cfg.contrastive_frac)), B))
             idx = torch.randperm(B, device=device)[:k]
-            # roll, so no sample is handed back its own instruction. Two
-            # samples of the SAME task can still collide, which dilutes the
-            # term by ~1/n_tasks (2.5% on LIBERO's 40) -- not worth a
-            # per-step string comparison to remove.
+            # Roll, so no sample is handed back its own index. That is not
+            # enough on its own: two samples of the SAME task carry the same
+            # instruction, so a rolled partner can be a CORRECT instruction,
+            # and the hinge would then penalise the model for agreeing with
+            # itself. Rare (~1/n_tasks, about 1.5% at batch 96 over LIBERO's
+            # 40 tasks) but systematically wrong rather than noise, so repair
+            # it against the instruction strings rather than the indices.
             other = torch.roll(idx, 1)
+            descs = self._resolve_descs(batch)
+            if descs is not None and len(descs) == B:
+                ii, oo = idx.tolist(), other.tolist()
+                fixed = 0
+                for j, (i, o) in enumerate(zip(ii, oo)):
+                    if descs[o] != descs[i]:
+                        continue
+                    # scan forward from the collision so repairs spread out
+                    alt = next((m for m in
+                                ((o + 1 + q) % B for q in range(B))
+                                if descs[m] != descs[i]), None)
+                    if alt is not None:
+                        oo[j] = alt
+                        fixed += 1
+                if fixed:
+                    other = torch.tensor(oo, device=device)
+                self._once("contrastive",
+                           f"[wiltechs_x] contrastive hinge ON (weight "
+                           f"{cw}, margin {cfg.contrastive_margin}, "
+                           f"{k}/{B} of the batch). Same-task collisions "
+                           f"repaired in the first batch: {fixed}/{k}.")
             s, e = lang_span
             _, sub_rope, sub_pad = self._subset(cache, rope, pad_mask, idx)
             wrong_cache = [
