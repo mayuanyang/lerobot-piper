@@ -224,7 +224,8 @@ def build_batch(obs_list, tasks, hist: StateHistory, preprocessor, device):
 def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
               task_id: int, episodes: int, num_envs: int, device: str,
               max_episode_steps: int, seed: int, expected_cams: list[str],
-              video_cb=None, videos_per_task: int = 0, heartbeat: int = 50):
+              video_cb=None, videos_per_task: int = 0, heartbeat: int = 50,
+              instruction: str | None = None):
     """-> (n_success, n_episodes, mean_success_steps, n_chunks, task_description)."""
     from lerobot.envs.libero import LiberoEnv
 
@@ -263,8 +264,17 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
                     else torch.autocast(device_type="cpu", enabled=False))
 
         n_batches = (episodes + num_envs - 1) // num_envs
+        # Never truncate the instruction. LIBERO's tasks share a prefix and
+        # differ at the END ("...between the plate and the ramekin"), so
+        # clipping the tail hides the only part that distinguishes them -- and
+        # makes a display limit look like the tokenizer dropping text.
+        # The success criterion always comes from the env, i.e. from the REAL
+        # task. Only what the policy is told changes.
+        told = instruction if instruction is not None else task_desc
         print(f"    {episodes} episodes in {n_batches} batch(es) of {num_envs}, "
-              f"cap {horizon_cap} steps: {task_desc[:52]}", flush=True)
+              f"cap {horizon_cap} steps\n    task: {task_desc!r}", flush=True)
+        if instruction is not None:
+            print(f"    ABLATED, policy is told: {told!r}", flush=True)
 
         successes, steps_to_success, n_chunks = [], [], 0
         for start in range(0, episodes, num_envs):
@@ -289,7 +299,7 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
                 # The batch dim stays at num_envs even as envs finish: the action
                 # queue inside select_action is keyed on batch size, and resizing
                 # it mid-chunk would drop the actions the live envs still owe.
-                batch = build_batch(obs_list, [task_desc] * num_envs, hist,
+                batch = build_batch(obs_list, [told] * num_envs, hist,
                                     preprocessor, device)
                 # An empty queue means this call will run the prefix. Counting
                 # it here rather than after the call keeps it correct at
@@ -418,6 +428,15 @@ def main():
                         "This repo's grasp-vs-selection diagnoses came from "
                         "watching these, not from the success rate.")
     p.add_argument("--videos_per_task", type=int, default=2)
+    p.add_argument("--ablate_lang", action="store_true",
+                   help="Tell the policy ANOTHER task's instruction while "
+                        "scoring against the real one. The bridge between "
+                        "'the CE depends on language a little' and 'behaviour "
+                        "depends on language': if the success rate does not "
+                        "move, the instruction is not driving the policy and "
+                        "no amount of further training changes that. Run it "
+                        "against an identical non-ablated run -- same "
+                        "checkpoint, seed, episodes and cap.")
     p.add_argument("--heartbeat", type=int, default=50,
                    help="Env steps between progress lines inside a rollout. A "
                         "batch that runs to the episode cap is minutes of "
@@ -427,9 +446,9 @@ def main():
     a = p.parse_args()
 
     device = a.device or pick_device()
-    ckpt = Path(a.checkpoint)
-    if not ckpt.exists():
-        raise SystemExit(f"no such checkpoint: {ckpt}")
+    from train_wiltechs_x import resolve_checkpoint
+
+    ckpt = resolve_checkpoint(a.checkpoint, for_resume=False)
 
     patch_lerobot_libero(enable=not a.stock_init)
     patch_control_freq(a.control_freq, a.render_gpu)
@@ -453,14 +472,34 @@ def main():
         suite = _get_suite(suite_name)
         n_tasks = getattr(suite, "n_tasks", None) or len(suite.tasks)
         task_ids = a.task_ids if a.task_ids is not None else list(range(n_tasks))
-        print(f"\n=== {suite_name}: {len(task_ids)} tasks x {a.episodes} episodes ===")
+        # Read the instructions off the suite rather than off an env: LiberoEnv
+        # binds one task at construction, so collecting them the other way
+        # would mean building (and rendering) every task just to read a string.
+        wrong = {}
+        if a.ablate_lang:
+            if n_tasks < 2:
+                raise SystemExit(
+                    f"--ablate_lang needs a suite with >1 task; {suite_name} "
+                    f"has {n_tasks}, so the 'wrong' instruction would be the "
+                    f"right one and the run would report a false null.")
+            all_desc = {t: suite.get_task(t).language for t in range(n_tasks)}
+            # A fixed half-suite offset: deterministic, and it never lands on
+            # the task itself. Every libero_spatial task shares one tabletop,
+            # so the wrong instruction is still valid FOR THAT SCENE -- it asks
+            # for a different object, which is exactly the confusion to test.
+            # A random or out-of-scene string would test novelty instead.
+            wrong = {t: all_desc[(t + max(n_tasks // 2, 1)) % n_tasks]
+                     for t in task_ids}
+
+        print(f"\n=== {suite_name}: {len(task_ids)} tasks x {a.episodes} episodes"
+              f"{'  [LANGUAGE ABLATED]' if a.ablate_lang else ''} ===")
         per_task = {}
         for k, tid in enumerate(task_ids):
             t_task = time.time()
             n_ok, n_ep, mean_steps, n_chunks, desc = eval_task(
                 policy, pre, post, suite, suite_name, tid, a.episodes,
                 a.num_envs, device, a.max_episode_steps, a.seed, cams, video_cb,
-                a.videos_per_task, a.heartbeat)
+                a.videos_per_task, a.heartbeat, wrong.get(tid))
             sr = 100.0 * n_ok / max(n_ep, 1)
             per_task[tid] = {"success_rate": sr, "n_success": n_ok,
                              "n_episodes": n_ep, "mean_success_steps": mean_steps,
@@ -470,7 +509,7 @@ def main():
             print(f"  task {tid:2d}  SR {sr:5.1f}%  ({n_ok}/{n_ep})  "
                   f"steps~{mean_steps:.0f}  [{done_n}/{total_n}, "
                   f"{(time.time() - t_task) / 60:.1f} min, ETA {eta:.0f} min]  "
-                  f"{desc[:44]}", flush=True)
+                  f"{desc}", flush=True)
         rates = [v["success_rate"] for v in per_task.values()]
         results[suite_name] = {
             "per_task": per_task,
@@ -500,12 +539,23 @@ def main():
             print(f"  {s} task {t}: {results[s]['per_task'][t]['task']}")
     print(f"{(time.time() - t0) / 60:.1f} min")
 
+    if a.ablate_lang:
+        print("\nThis was a LANGUAGE ABLATION -- the policy was given another "
+              "task's instruction.\nCompare it against a non-ablated run with "
+              "the same checkpoint, seed, episodes\nand cap. An unchanged "
+              "success rate means the instruction is not driving the\npolicy, "
+              "which no amount of further training changes.")
+
     payload = {"checkpoint": str(ckpt), "control_freq": a.control_freq,
                "fixed_init_states": not a.stock_init,
                "num_inference_steps": policy.config.num_inference_steps,
-               "episodes_per_task": a.episodes, "overall_avg": avg,
-               "overall_min": mn, "gate_pass": gate, "suites": results}
-    out = Path(a.out) if a.out else ckpt / "eval_libero.json"
+               "episodes_per_task": a.episodes, "ablate_lang": a.ablate_lang,
+               "overall_avg": avg, "overall_min": mn, "gate_pass": gate,
+               "suites": results}
+    # A separate filename: an ablation result overwriting the real one is a
+    # mistake you only notice much later.
+    default_name = "eval_libero_ablated.json" if a.ablate_lang else "eval_libero.json"
+    out = Path(a.out) if a.out else ckpt / default_name
     out.write_text(json.dumps(payload, indent=2))
     print(f"wrote {out}")
 

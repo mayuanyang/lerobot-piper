@@ -352,13 +352,17 @@ def log_gradient_analysis(model, step: int, knowledge_insulation: bool) -> None:
               "`discrete` is falling.")
 
 
-def resolve_checkpoint(path_or_repo: str) -> Path:
+def resolve_checkpoint(path_or_repo: str, *, for_resume: bool = True) -> Path:
     """Accept a local directory OR a Hugging Face repo id.
 
     `--resume_from_checkpoint ISdept/wiltech-x-6k` used to fail with a bare
     FileNotFoundError on `<repo>/training_state.pth`, which reads like a
     corrupt checkpoint rather than "that is a Hub id and this function only
     knew about disk".
+
+    `for_resume` picks what to download. Resuming reads training_state.pth,
+    which already carries the model, so model.safetensors would be ~9.5 GiB of
+    waste. Loading a policy for eval or a probe needs exactly the opposite.
     """
     p = Path(path_or_repo)
     if p.exists():
@@ -369,7 +373,7 @@ def resolve_checkpoint(path_or_repo: str) -> Path:
 
     print(f"'{path_or_repo}' is not a local path; fetching from the Hub...")
     files = set(list_repo_files(path_or_repo))
-    if "training_state.pth" in files:
+    if for_resume and "training_state.pth" in files:
         # NOT lerobot's allow_patterns (*.safetensors/*.json): that filter
         # drops training_state.pth and would silently downgrade a full resume
         # to a weights-only one. And since the .pth already carries the model,
@@ -377,9 +381,11 @@ def resolve_checkpoint(path_or_repo: str) -> Path:
         patterns = ["training_state.pth", "*.json"]
         print("  repo has training_state.pth -> full resume "
               "(skipping the redundant model.safetensors)")
-    else:
+    elif for_resume:
         patterns = ["*.safetensors", "*.json"]
         print("  repo has no training_state.pth -> weights-only resume")
+    else:
+        patterns = ["*.safetensors", "*.json"]
     local = Path(snapshot_download(repo_id=path_or_repo, allow_patterns=patterns))
     print(f"  -> {local}")
     return local

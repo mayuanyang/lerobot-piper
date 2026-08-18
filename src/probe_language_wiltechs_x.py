@@ -49,7 +49,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from eval_wiltechs_x import load_policy, load_processors, pick_device
-from train_wiltechs_x import ProgressDataset, build_datasets
+from train_wiltechs_x import ProgressDataset, build_datasets, resolve_checkpoint
 
 
 def shuffle_language(tasks, rng):
@@ -94,7 +94,8 @@ def corrupt(batch, mode, cameras, rng):
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--checkpoint", required=True,
+                   help="Local checkpoint directory OR a Hugging Face repo id.")
     p.add_argument("--dataset_ids", nargs="+", required=True)
     p.add_argument("--batches", type=int, default=8,
                    help="Paired comparison, so the batch-to-batch variance "
@@ -107,7 +108,7 @@ def main():
     a = p.parse_args()
 
     device = a.device or pick_device()
-    ckpt = Path(a.checkpoint)
+    ckpt = resolve_checkpoint(a.checkpoint, for_resume=False)
     policy = load_policy(ckpt, device, None)
     pre, _ = load_processors(ckpt, device, None)
     cfg = policy.config
