@@ -266,6 +266,23 @@ class WiltechsXConfig(PreTrainedConfig):
     # Fraction of the batch that gets the extra suffix pass. The prefix is NOT
     # recomputed (see compute_loss), so this is priced like the shortcut term.
     contrastive_frac: float = 0.5
+    # Token-Jaccard above which two instructions count as the same "suite", and
+    # so as valid hard negatives for one another. The negative is drawn
+    # UNIFORMLY from the bucket, not argmax-similar: argmax collapses to one
+    # fixed partner per task (40 ordered pairs over LIBERO) and invites
+    # overfitting to that specific contrast, while the bucket keeps 9 and every
+    # one of them hard.
+    #
+    # Why the bucket is the right grain rather than a cheap approximation: the
+    # hinge keeps sample i's IMAGE and swaps in j's instruction. Draw j from
+    # another suite and its nouns are absent from the scene, so the model
+    # separates the two predictions by noticing the referent is not there --
+    # object-presence, no relation parsing. Within a suite every referent IS
+    # present and only the relation disambiguates, which is the gradient we
+    # are paying for. Measured on LIBERO's 40 instructions: within-suite
+    # Jaccard 0.67-0.79, across-suite 0.21-0.38, so 0.5 separates them with
+    # room on both sides. Set to 0.0 to restore uniform-random negatives.
+    contrastive_suite_jaccard: float = 0.5
 
     # =====================================================================
     # Optimizer / schedule

@@ -271,11 +271,110 @@ def test_motion_history_guard():
     check("runs once, then is a no-op on every later step", True)
 
 
+SPATIAL = [f"pick up the black bowl {r} and place it on the plate" for r in (
+    "between the plate and the ramekin", "next to the ramekin",
+    "from table center", "on the cookie box", "on the ramekin",
+    "next to the cookie box", "on the stove", "next to the plate",
+    "on the wooden cabinet", "in the top drawer of the wooden cabinet")]
+OBJECT = [f"pick up the {o} and place it in the basket" for o in (
+    "alphabet soup", "cream cheese", "salad dressing", "bbq sauce",
+    "ketchup", "tomato sauce", "butter", "milk", "orange juice", "chocolate pudding")]
+GOAL = ["open the top drawer and put the bowl inside",
+        "put the bowl on the stove", "put the wine bottle on top of the cabinet",
+        "push the plate to the front of the stove", "turn on the stove"]
+
+
+def test_hinge_negatives():
+    """The hinge swaps sample i's INSTRUCTION while keeping sample i's IMAGE.
+    A cross-suite partner names objects that are not in that image, so the two
+    predictions can be separated by object presence alone -- no relation
+    parsing, which is the whole point of the term. These checks are about the
+    negative being drawn from the bucket where every referent IS present."""
+    print("\n_suite_map / _hinge_pairs")
+
+    class Stub:
+        def __init__(self, thr=0.5):
+            self.config = type("C", (), {"contrastive_suite_jaccard": thr})()
+            self._printed = set()
+            self._suite_tokens = {}
+            self._suite_id = {}
+        _once = M.WiltechsXModel._once
+        _suite_map = M.WiltechsXModel._suite_map
+        _hinge_pairs = M.WiltechsXModel._hinge_pairs
+
+    # ---- clustering ----------------------------------------------------
+    s = Stub()
+    sid = s._suite_map(SPATIAL + OBJECT + GOAL)
+    check("LIBERO's suites separate at Jaccard 0.5",
+          len({sid[d] for d in SPATIAL}) == 1
+          and len({sid[d] for d in OBJECT}) == 1
+          and sid[SPATIAL[0]] != sid[OBJECT[0]])
+    check("goal tasks do not collapse into spatial",
+          all(sid[g] != sid[SPATIAL[0]] for g in GOAL))
+
+    # Clustering must not depend on which tasks a batch happens to sample.
+    s2 = Stub()
+    s2._suite_map(SPATIAL[:3])
+    s2._suite_map(OBJECT + SPATIAL)                    # arrives later
+    sid2 = s2._suite_map(GOAL)
+    check("grouping is stable when instructions arrive across batches",
+          len({sid2[d] for d in SPATIAL}) == 1 and sid2[SPATIAL[0]] != sid2[OBJECT[0]])
+
+    # ---- pairing -------------------------------------------------------
+    descs = [SPATIAL[i % 10] for i in range(20)] + [OBJECT[i % 10] for i in range(20)]
+    order = list(range(40))
+    s = Stub()
+    keep, other, hard, dropped = s._hinge_pairs(descs, order, [0.5] * 40)
+    check("every sample gets a partner", len(keep) == 40 and dropped == 0)
+    check("all negatives are same-suite", hard == 40)
+    check("no partner carries the CORRECT instruction",
+          all(descs[o] != descs[i] for i, o in zip(keep, other)))
+    check("partner is always in the same suite",
+          all(sid[descs[o]] == sid[descs[i]] for i, o in zip(keep, other)))
+
+    # The point of a bucket over argmax: the partner varies with the draw, so
+    # the model cannot overfit one fixed contrast per task.
+    seen = set()
+    for d in (0.0, 0.2, 0.4, 0.6, 0.8, 0.99):
+        _, o, _, _ = s._hinge_pairs(descs, [0], [d])
+        seen.add(o[0])
+    check("bucket yields several distinct partners, not one fixed pair",
+          len(seen) >= 5)
+
+    # ---- degenerate batches -------------------------------------------
+    one = [SPATIAL[0]] * 8
+    keep, other, hard, dropped = s._hinge_pairs(one, list(range(8)), [0.5] * 8)
+    check("single-instruction batch is dropped, never self-paired",
+          keep == [] and dropped == 8)
+
+    # A suite with only one task present must fall back, not drop: a
+    # cross-suite negative is weak but still trains language sensitivity.
+    lone = [SPATIAL[0]] * 4 + [OBJECT[0]] * 4
+    keep, other, hard, dropped = s._hinge_pairs(lone, list(range(8)), [0.5] * 8)
+    check("lone-task suite falls back to a cross-suite negative",
+          len(keep) == 8 and dropped == 0 and hard == 0)
+    check("fallback partner is still a different instruction",
+          all(lone[o] != lone[i] for i, o in zip(keep, other)))
+
+    # ---- the off switch ------------------------------------------------
+    s0 = Stub(thr=0.0)
+    check("suite buckets off -> no clustering", s0._suite_map(SPATIAL) is None)
+    keep, other, hard, dropped = s0._hinge_pairs(descs, order, [0.5] * 40)
+    check("buckets off still pairs every sample with a different instruction",
+          len(keep) == 40 and hard == 0
+          and all(descs[o] != descs[i] for i, o in zip(keep, other)))
+
+    # draw=1.0 would index one past the end without the clamp
+    keep, other, _, _ = s._hinge_pairs(descs, [0], [1.0])
+    check("draw at the open end of [0,1) stays in range", len(other) == 1)
+
+
 if __name__ == "__main__":
     mask = test_mask()
     test_cached_equals_reference(*test_joint_layer(mask))
     test_lora_and_discrete()
     test_long_horizon()
     test_motion_history_guard()
+    test_hinge_negatives()
     print("\nRESULT:", "ALL PASS" if _ok else "FAILURES ABOVE")
     sys.exit(0 if _ok else 1)

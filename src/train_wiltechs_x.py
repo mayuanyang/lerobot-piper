@@ -515,6 +515,7 @@ def train(
     contrastive_loss_weight: float = 0.0,
     contrastive_margin: float = 0.05,
     contrastive_frac: float = 0.5,
+    contrastive_suite_jaccard: float = 0.5,
     use_descriptive_objects: bool = False,
     preprocess_in_workers: bool = True,
     profile_steps: int = 20,
@@ -605,6 +606,7 @@ def train(
         contrastive_loss_weight=contrastive_loss_weight,
         contrastive_margin=contrastive_margin,
         contrastive_frac=contrastive_frac,
+        contrastive_suite_jaccard=contrastive_suite_jaccard,
         optimizer_lr=lr, optimizer_weight_decay=weight_decay,
         scheduler_warmup_steps=warmup_steps,
         scheduler_decay_steps=training_steps,
@@ -1033,6 +1035,17 @@ def main():
                         "hinge saturated around 15k steps at this value.")
     p.add_argument("--contrastive_frac", type=float, default=0.5,
                    help="Fraction of the batch given the extra suffix pass.")
+    p.add_argument("--contrastive_suite_jaccard", type=float, default=0.5,
+                   help="Token-Jaccard above which two instructions count as "
+                        "the same suite and so as HARD negatives for each "
+                        "other. The hinge keeps sample i's image and swaps in "
+                        "j's instruction, so a cross-suite j names objects "
+                        "absent from the scene and can be rejected on object "
+                        "presence alone -- no relation parsing. Drawn "
+                        "uniformly within the bucket, not argmax-similar, "
+                        "which would collapse to one fixed partner per task. "
+                        "0 = uniform-random negatives (behaviour before "
+                        "2026-08-18).")
     p.add_argument("--use_descriptive_objects", action="store_true")
     p.add_argument("--no_preprocess_in_workers", dest="preprocess_in_workers",
                    action="store_false", default=True,

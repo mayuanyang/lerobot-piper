@@ -104,7 +104,7 @@ here rather than forking OpenVLA-OFT:
 | Frozen VLM | Nothing in the top-10 freezes its backbone. Freezing produced the vision collapse this repo has been fighting for months |
 | KV-cache capture + `capture_layers` + `vlm_capture_mode` | "Which layers should the decoder read" has no good answer — `spread` scored 39.8→13.3 and reliance migrated to the trainable CNN. Joint attention deletes the question |
 | External cross-attention (`ca_q`/`ca_o`) | ~31% of decoder params spent bridging to the frozen VLM's 32×128 head geometry, plus the rotated-K/unrotated-Q asymmetry |
-| Contrastive language hinge | Knowledge insulation (§3.3) is the principled version of the same goal |
+| ~~Contrastive language hinge~~ **RESTORED 2026-08-17** | Removed on the theory that knowledge insulation (§3.3) was the principled version of the same goal. Measurement disagreed: `d(lang)` flat at 4.2% of the best control, wrong-instruction rollouts at p = 1.000. Back on, with same-suite hard negatives (§3.3.1) |
 | RobotCNN as a privileged side channel | Worth 34 points, which is the problem: a trainable side channel is the path of least gradient resistance. Same information, put in the shared sequence (§3.4) |
 
 ---
@@ -229,15 +229,86 @@ Two couplings, deliberately asymmetric:
   cross-entropy. The VLM still learns the task — through a token objective it
   was pretrained for, not through a regression objective it was not.
 
-This is the principled form of what `contrastive_loss_weight` /
-`contrastive_hard_negatives` were approximating: *keep the language pathway
-alive under action supervision*. The hinge attacked the symptom (the model
-ignores language) with a hand-built negative; KI removes the cause.
+KI was *intended* as the principled form of what `contrastive_loss_weight` was
+approximating: keep the language pathway alive under action supervision, by
+removing the cause rather than pricing the symptom.
 
-> **First ablation to run in stage A.** The KI result comes from large
-> cross-embodiment corpora. On LIBERO's 50 demos/task, LoRA's own rank
-> constraint may already supply the insulation, making the FAST head dead
-> weight. Measure it; do not assume it transfers.
+> **Measured 2026-08-17: KI alone is not sufficient here, and the hinge is
+> back.** The language probe at checkpoints 7000–10000 put `d(lang)` at
+> +0.039 nats — 4.2% of the strongest control input — and **flat** (slope
+> −0.00014 per 1000 steps) while `d(vision)` and `d(state)` grew. The rollout
+> ablation agreed: feeding the wrong instruction moved success 25% → 20%,
+> Fisher p = 1.000, where a language-conditioned policy should have collapsed
+> to ~0.
+>
+> The reason KI does not cover this: KI keeps the VLM's language pathway from
+> being *degraded*, but nothing in the objective prices the *expert* producing
+> the same action under a different instruction. The discrete CE rewards
+> predicting the action, and in one fixed scene vision plus proprioception
+> already explain 96% of it. The KI result comes from large cross-embodiment
+> corpora; on LIBERO's 50 demos/task it does not transfer on its own.
+
+### 3.3.1 The hinge, and why its negatives are drawn within a suite
+
+`contrastive_loss_weight > 0` permutes the **language span of the cached
+per-layer K/V** across the batch: each sample keeps its own vision, wrist and
+motion tokens and receives another sample's instruction. That is why it costs
+one extra **suffix** pass (25 tokens) and not a second prefix pass (452 tokens
+through 36 VLM layers).
+
+Two properties the implementation depends on:
+
+- **One-sided.** `v_right` is detached, so the term can only push the
+  wrong-instruction prediction away. Otherwise the cheapest way to satisfy a
+  margin is to move the correct prediction — the one `flow` is trying to fix.
+- **Correct text everywhere else.** The prefix is built once, from the correct
+  instructions. `flow`, `shortcut`, `gripper`, `discrete` and `progress` all
+  read that pass. The permuted K/V exists only inside the hinge, and
+  `wrong_cache` is built with `torch.cat` into new tensors, so the main branch
+  is never mutated.
+
+**Negatives are drawn uniformly from the same suite** (`contrastive_suite_jaccard`,
+default 0.5), where a "suite" is a connected component of instructions under
+token-Jaccard. This matters more than it looks. The hinge keeps sample *i*'s
+**image** and swaps in *j*'s instruction; if *j* comes from another suite, its
+nouns are simply **absent from that scene**, so the two predictions can be
+separated by object presence alone — no relation parsing, which is the entire
+point of the term. Within a suite every referent *is* present and only the
+relation disambiguates:
+
+```
+pick up the black bowl BETWEEN THE PLATE AND THE RAMEKIN and place it on the plate
+pick up the black bowl NEXT TO THE RAMEKIN               and place it on the plate
+```
+
+Uniform-random negatives spend most of their budget on the easy case: training
+on all 40 LIBERO tasks, a `libero_spatial` sample draws a spatial sibling only
+~9/39 ≈ 23% of the time.
+
+Uniform *within* the bucket, not argmax-similar. Argmax collapses to one fixed
+partner per task — 40 ordered pairs over LIBERO, against 360 for the bucket —
+and invites overfitting to that one contrast. The bucket keeps 9 candidates and
+every one of them hard.
+
+Suites are clustered from the instruction **strings**, not from `task_index`,
+which would assume the merged dataset orders tasks by suite. Clustering is
+union-find over every instruction seen so far, so the grouping does not flicker
+as batches sample different tasks. `libero_goal` and `libero_10` instructions
+are heterogeneous and mostly land in singleton components; those fall back to a
+cross-suite negative, which is exactly the old behaviour and no worse.
+
+Degenerate case: if a batch carries a **single** instruction, every candidate
+partner is a *correct* instruction, and the hinge is skipped rather than made to
+punish the model for agreeing with itself.
+
+> **Reading `contrastive` in the step log.** It is `relu(margin − apart)`, so
+> `apart ≥ margin − contrastive`. It doubles as an online language-sensitivity
+> probe: falling = the expert's output is becoming instruction-dependent. It is
+> necessary, not sufficient — it is the quantity being optimised, so confirm
+> with the probe (VLM-side readout, which the hinge does not touch) or the
+> rollout ablation. Raising `contrastive_suite_jaccard` from 0 makes the task
+> harder, so expect the value to **jump back up** on the step it turns on; read
+> the slope from the new baseline, not the level.
 
 ### 3.4 Precision path: DINO features in the shared sequence
 
@@ -462,8 +533,12 @@ reading a log from before it, both are visible in the first line:
 identity as well as a correct one does. It should **rise** as `flow` falls, then
 settle. Flat-zero alongside a flat `flow` is a collapse, not convergence.
 
-No contrastive term. If language-following regresses, the diagnosis goes to the
-discrete head's weight, not to a new hinge.
+`contrastive` is off by default (`contrastive_loss_weight = 0`) but is **not**
+optional in practice — see §3.3, where KI alone measured as insufficient. When
+on, it is logged unweighted, so its contribution to `total` is
+`contrastive_loss_weight × contrastive`; at 0.1 × 0.04 that is 0.2% of the
+objective. If `flow` starts rising as `contrastive` falls, the model is buying
+instruction-sensitivity with action precision — lower the weight.
 
 ---
 

@@ -673,6 +673,8 @@ class WiltechsXModel(nn.Module):
         self._template_ids_cpu = None
         self._printed = set()
         self._motion_grace = 0
+        self._suite_tokens = {}       # instruction -> token set  (hinge buckets)
+        self._suite_id = {}           # instruction -> suite representative
         self.gradient_checkpointing = False
 
     # =====================================================================
@@ -840,6 +842,90 @@ class WiltechsXModel(nn.Module):
         if self.config.use_descriptive_objects:
             descs = [rewrite_instruction(d) for d in descs]
         return descs
+
+    def _suite_map(self, descs):
+        """Group instructions into "suites" by token overlap.
+
+        Returns instruction -> suite representative. Built by union-find over
+        EVERY instruction seen so far, not just this batch, so the grouping
+        does not flicker as batches sample different tasks; LIBERO has 40
+        unique strings, so the O(n^2) rebuild is trivial and only runs on the
+        steps that introduce a new one.
+
+        Clustering the strings avoids depending on task_index -> suite, which
+        would assume the merged dataset orders tasks by suite. libero_spatial's
+        ten instructions differ only in a prepositional phrase, so they fall
+        out as one component on their own.
+        """
+        thr = float(getattr(self.config, "contrastive_suite_jaccard", 0.0) or 0.0)
+        if thr <= 0.0:
+            return None
+        fresh = [d for d in set(descs) if d not in self._suite_tokens]
+        if fresh:
+            for d in fresh:
+                self._suite_tokens[d] = frozenset(str(d).lower().split())
+            keys = list(self._suite_tokens)
+            parent = {k: k for k in keys}
+
+            def find(x):
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            for a in range(len(keys)):
+                ta = self._suite_tokens[keys[a]]
+                for b in range(a + 1, len(keys)):
+                    tb = self._suite_tokens[keys[b]]
+                    u = len(ta | tb)
+                    if u and len(ta & tb) / u >= thr:
+                        ra, rb = find(keys[a]), find(keys[b])
+                        if ra != rb:
+                            parent[ra] = rb
+            self._suite_id = {k: find(k) for k in keys}
+            n = len(set(self._suite_id.values()))
+            self._once(f"suites::{len(keys)}::{n}",
+                       f"[wiltechs_x] hinge negatives: {len(keys)} instructions "
+                       f"seen -> {n} suite(s) at Jaccard {thr}")
+        return self._suite_id
+
+    def _hinge_pairs(self, descs, order, draw):
+        """Pick a wrong-instruction partner for each index in `order`.
+
+        Returns (keep, other, n_same_suite, n_dropped). `keep` can be shorter
+        than `order`: a sample with no differently-worded partner anywhere in
+        the batch is dropped rather than paired, because every candidate would
+        be a CORRECT instruction and the hinge would then punish the model for
+        agreeing with itself.
+
+        `draw` is a list of floats in [0, 1), one per entry of `order`, so the
+        caller owns the randomness and the test can make it deterministic.
+        """
+        suites = self._suite_map(descs)
+        B = len(descs)
+        buckets = {}
+        if suites is not None:
+            for p, d in enumerate(descs):
+                buckets.setdefault(suites[d], []).append(p)
+        keep, other, hard, dropped = [], [], 0, 0
+        for j, i in enumerate(order):
+            pool = ()
+            if suites is not None:
+                pool = tuple(p for p in buckets[suites[descs[i]]]
+                             if descs[p] != descs[i])
+            if pool:
+                hard += 1
+            else:
+                # Suite has no second task in THIS batch (or buckets are off).
+                # Any different instruction still trains language sensitivity,
+                # just more cheaply than a same-suite one would.
+                pool = tuple(p for p in range(B) if descs[p] != descs[i])
+            if not pool:
+                dropped += 1
+                continue
+            keep.append(i)
+            other.append(pool[min(int(draw[j] * len(pool)), len(pool) - 1)])
+        return keep, other, hard, dropped
 
     def _format_instruction(self, descs):
         tmpl = str(self.config.instruction_template or "").strip()
@@ -1333,7 +1419,8 @@ class WiltechsXModel(nn.Module):
         # prediction, which is the one the flow loss is trying to get right.
         cw = float(cfg.contrastive_loss_weight or 0.0)
         lang_span = spans.get("lang")
-        if cw > 0.0 and lang_span is not None and B > 1:
+        run_hinge = cw > 0.0 and lang_span is not None and B > 1
+        if run_hinge:
             k = max(1, min(int(B * float(cfg.contrastive_frac)), B))
             idx = torch.randperm(B, device=device)[:k]
             # Roll, so no sample is handed back its own index. That is not
@@ -1343,28 +1430,40 @@ class WiltechsXModel(nn.Module):
             # itself. Rare (~1/n_tasks, about 1.5% at batch 96 over LIBERO's
             # 40 tasks) but systematically wrong rather than noise, so repair
             # it against the instruction strings rather than the indices.
+            #
+            # When suite buckets are on, this is replaced outright: the
+            # partner is drawn uniformly from the same suite, which excludes
+            # the same instruction by construction AND makes every negative a
+            # hard one. See contrastive_suite_jaccard in the config for why
+            # a cross-suite negative teaches object presence, not relations.
             other = torch.roll(idx, 1)
             descs = self._resolve_descs(batch)
             if descs is not None and len(descs) == B:
-                ii, oo = idx.tolist(), other.tolist()
-                fixed = 0
-                for j, (i, o) in enumerate(zip(ii, oo)):
-                    if descs[o] != descs[i]:
-                        continue
-                    # scan forward from the collision so repairs spread out
-                    alt = next((m for m in
-                                ((o + 1 + q) % B for q in range(B))
-                                if descs[m] != descs[i]), None)
-                    if alt is not None:
-                        oo[j] = alt
-                        fixed += 1
-                if fixed:
+                # one draw per pair, taken up front so this stays O(k) on CPU
+                keep, oo, hard, dropped = self._hinge_pairs(
+                    descs, idx.tolist(), torch.rand(k).tolist())
+                # No fallback when keep is empty: that means the whole batch
+                # carries ONE instruction, so every available partner is a
+                # CORRECT instruction and the hinge would punish the model for
+                # agreeing with itself. Skipping is the only sound option.
+                if not keep:
+                    run_hinge = False
+                    self._once("contrastive_skip",
+                               "[wiltechs_x] contrastive hinge SKIPPED: the "
+                               "batch holds a single instruction, so it has no "
+                               "valid negative. Expected only if the sampler "
+                               "groups by task -- check it if this repeats.")
+                else:
+                    idx = torch.tensor(keep, device=device)
                     other = torch.tensor(oo, device=device)
-                self._once("contrastive",
-                           f"[wiltechs_x] contrastive hinge ON (weight "
-                           f"{cw}, margin {cfg.contrastive_margin}, "
-                           f"{k}/{B} of the batch). Same-task collisions "
-                           f"repaired in the first batch: {fixed}/{k}.")
+                    self._once("contrastive",
+                               f"[wiltechs_x] contrastive hinge ON (weight "
+                               f"{cw}, margin {cfg.contrastive_margin}, "
+                               f"{k}/{B} of the batch). First batch: "
+                               f"{hard}/{k} negatives drawn same-suite, "
+                               f"{dropped} dropped for having no distinct "
+                               f"instruction.")
+        if run_hinge:
             s, e = lang_span
             _, sub_rope, sub_pad = self._subset(cache, rope, pad_mask, idx)
             wrong_cache = [
