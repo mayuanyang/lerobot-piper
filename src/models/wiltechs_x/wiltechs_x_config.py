@@ -242,8 +242,30 @@ class WiltechsXConfig(PreTrainedConfig):
     # normalized action value separating open from closed, so it depends on
     # the dataset statistics -- the train script must compute it.
     gripper_threshold_norm: float = float("nan")
-    # Deliberately absent: contrastive_loss_weight. If language-following
-    # regresses, the diagnosis goes to fast_token_loss_weight, not to a hinge.
+
+    # -------- Contrastive language hinge --------
+    # This was "deliberately absent" on the premise that knowledge insulation
+    # replaces it (3.3). MEASURED FALSE on 2026-08-17 at checkpoints
+    # 7000-10000: the discrete CE does depend on the instruction, but only by
+    # 4.2% of the strongest control, and that share is FLAT over 3000 steps
+    # while reliance on vision and state both grow. A rollout ablation
+    # confirmed it behaviourally -- feeding libero_spatial task 0 the wrong
+    # instruction moved the success rate 25% -> 20% (Fisher p = 1.0) where
+    # following the instruction would have driven it to ~0.
+    #
+    # The cause is that nothing in the objective penalises producing the same
+    # action under a different instruction. The discrete CE rewards predicting
+    # the action, and in one fixed scene vision plus proprioception already
+    # explain 96% of it. Only a hinge prices instruction-invariance directly.
+    # 0.0 keeps the term off, which is the pre-2026-08-17 behaviour.
+    contrastive_loss_weight: float = 0.0
+    # How far apart the two velocity predictions must be, in the same units as
+    # the flow loss. wiltechs_vla ran 0.05 and saw the hinge saturate around
+    # 15k steps, so treat this as a floor to raise rather than a ceiling.
+    contrastive_margin: float = 0.05
+    # Fraction of the batch that gets the extra suffix pass. The prefix is NOT
+    # recomputed (see compute_loss), so this is priced like the shortcut term.
+    contrastive_frac: float = 0.5
 
     # =====================================================================
     # Optimizer / schedule

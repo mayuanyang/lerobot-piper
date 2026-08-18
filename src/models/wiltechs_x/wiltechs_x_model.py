@@ -1241,6 +1241,13 @@ class WiltechsXModel(nn.Module):
         # stop-grad inside JointExpertLayer, applied once instead of per layer:
         # the expert reads the VLM, the flow loss never rewrites it. The
         # discrete head below still trains the backbone, through prefix_out.
+        # `raw_cache` keeps the undetached graph for the contrastive hinge
+        # below. Knowledge insulation exists to stop the flow REGRESSION
+        # gradient from rewriting the VLM; the hinge is the term KI replaced,
+        # and its whole purpose is to reach the language pathway. Insulating it
+        # too would leave it able to train the expert and nothing else, which
+        # cannot move the 4% the probe measured on the VLM side.
+        raw_cache = cache
         if cfg.knowledge_insulation:
             cache = [(k.detach(), v.detach()) for k, v in cache]
 
@@ -1312,6 +1319,44 @@ class WiltechsXModel(nn.Module):
             sc = F.mse_loss(s_full, target)
             main = main + sc
             parts["shortcut"] = float(sc.detach())
+
+        # ---- contrastive language hinge ---------------------------------
+        # Permutes the LANGUAGE SPAN of the cached per-layer K/V across the
+        # batch: every sample keeps its own vision, wrist and motion and gets
+        # another sample's instruction. That is why this costs one extra
+        # SUFFIX pass (25 tokens) rather than a second prefix pass (452 tokens
+        # through 36 VLM layers) -- the same trick wiltechs_vla used.
+        #
+        # The hinge is one-sided on purpose: v_right is detached, so the term
+        # can only push the WRONG-instruction prediction away. Without that,
+        # the cheapest way to satisfy a margin is to move the correct
+        # prediction, which is the one the flow loss is trying to get right.
+        cw = float(cfg.contrastive_loss_weight or 0.0)
+        lang_span = spans.get("lang")
+        if cw > 0.0 and lang_span is not None and B > 1:
+            k = max(1, min(int(B * float(cfg.contrastive_frac)), B))
+            idx = torch.randperm(B, device=device)[:k]
+            # roll, so no sample is handed back its own instruction. Two
+            # samples of the SAME task can still collide, which dilutes the
+            # term by ~1/n_tasks (2.5% on LIBERO's 40) -- not worth a
+            # per-step string comparison to remove.
+            other = torch.roll(idx, 1)
+            s, e = lang_span
+            _, sub_rope, sub_pad = self._subset(cache, rope, pad_mask, idx)
+            wrong_cache = [
+                (torch.cat([pk[idx][:, :, :s], pk[other][:, :, s:e],
+                            pk[idx][:, :, e:]], dim=2),
+                 torch.cat([pv[idx][:, :, :s], pv[other][:, :, s:e],
+                            pv[idx][:, :, e:]], dim=2))
+                for pk, pv in raw_cache]
+            d0_sub = d0[idx] if d0 is not None else None
+            v_wrong, _ = self._suffix_pass(state[idx], x_t[idx], t[idx], d0_sub,
+                                           wrong_cache, sub_rope, sub_pad)
+            apart = F.mse_loss(v_wrong, v_t[idx].detach(),
+                               reduction="none").mean(dim=(1, 2))
+            hinge = F.relu(float(cfg.contrastive_margin) - apart).mean()
+            main = main + cw * hinge
+            parts["contrastive"] = float(hinge.detach())
 
         # ---- gripper BCE (class-balanced) -------------------------------
         gw = float(cfg.gripper_bce_weight or 0.0)

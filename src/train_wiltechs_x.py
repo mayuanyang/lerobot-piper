@@ -512,6 +512,9 @@ def train(
     gripper_action_dim: int = -1,
     gripper_bce_temp: float = 0.25,
     no_gripper_class_balance: bool = False,
+    contrastive_loss_weight: float = 0.0,
+    contrastive_margin: float = 0.05,
+    contrastive_frac: float = 0.5,
     use_descriptive_objects: bool = False,
     preprocess_in_workers: bool = True,
     profile_steps: int = 20,
@@ -599,6 +602,9 @@ def train(
         gripper_bce_temp=gripper_bce_temp,
         gripper_class_balance=not no_gripper_class_balance,
         gripper_threshold_norm=gthr,
+        contrastive_loss_weight=contrastive_loss_weight,
+        contrastive_margin=contrastive_margin,
+        contrastive_frac=contrastive_frac,
         optimizer_lr=lr, optimizer_weight_decay=weight_decay,
         scheduler_warmup_steps=warmup_steps,
         scheduler_decay_steps=training_steps,
@@ -1013,6 +1019,20 @@ def main():
                    help="Without balancing this term sits in the majority-class "
                         "optimum (~89% open) and transition-time agreement stays "
                         "at chance. Ablation only.")
+    p.add_argument("--contrastive_loss_weight", type=float, default=0.0,
+                   help="Hinge forcing the action to DEPEND on the instruction: "
+                        "with another sample's instruction the predicted "
+                        "velocity must differ by at least --contrastive_margin. "
+                        "0 = off, which is what shipped until 2026-08-17 and "
+                        "what the language probe and the rollout ablation "
+                        "showed leaves the policy ignoring the instruction. "
+                        "This repo measured 0.1 as sufficient on the sibling "
+                        "model. Costs one extra SUFFIX pass, not a prefix one.")
+    p.add_argument("--contrastive_margin", type=float, default=0.05,
+                   help="A floor to raise, not a ceiling: the sibling model's "
+                        "hinge saturated around 15k steps at this value.")
+    p.add_argument("--contrastive_frac", type=float, default=0.5,
+                   help="Fraction of the batch given the extra suffix pass.")
     p.add_argument("--use_descriptive_objects", action="store_true")
     p.add_argument("--no_preprocess_in_workers", dest="preprocess_in_workers",
                    action="store_false", default=True,
