@@ -640,8 +640,19 @@ class WiltechsXModel(nn.Module):
         if config.fast_token_head and not config.freeze_vlm:
             self.discrete_head = DiscreteActionHead(
                 self.hidden_size, config.horizon, config.action_dim)
-            print("[wiltechs_x] discrete action head ON (knowledge insulation). "
+            print("[wiltechs_x] discrete action head ON. "
                   "ABLATE THIS FIRST — it may be dead weight at LIBERO's scale.")
+        # Printed unconditionally and on its own line: this flag changes WHICH
+        # LOSSES CAN TRAIN THE BACKBONE, and until 2026-08-19 nothing in the
+        # log distinguished the two runs. The discrete-head banner above used
+        # to say "(knowledge insulation)" whether or not it was on, which is
+        # worse than silence.
+        _ki = ("ON  — K/V cache DETACHED: flow/shortcut/gripper/progress "
+               "cannot reach the prefix; the discrete head is the only path"
+               if config.knowledge_insulation else
+               "OFF — flow gradients reach the prefix (LoRA, wrist, motion) "
+               "as well as the discrete head")
+        print(f"[wiltechs_x] knowledge insulation {_ki}")
 
         # ---- 5. Consistency checks --------------------------------------
         # With knowledge insulation the K/V cache is detached, so the flow

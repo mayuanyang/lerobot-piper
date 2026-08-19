@@ -895,10 +895,25 @@ def train(
                 done = True
                 break
 
+    # Every field below CHANGES WHAT THE RUN OPTIMISED. Recording only the
+    # dataset and the step count left two runs that differ in their objective
+    # looking identical on disk, which is how "is this one KI or not?" became
+    # unanswerable after the fact.
     (out / "run_config.json").write_text(json.dumps(
         {"dataset_ids": dataset_ids, "steps": training_steps,
          "cameras": cameras, "wrist": wrist_keys,
-         "trainable": counts["trainable"]}, indent=2))
+         "trainable": counts["trainable"],
+         "batch_size": batch_size, "grad_accum": grad_accum,
+         "start_step": start_step,
+         "resumed_from": str(resume_from_checkpoint) if resume_from_checkpoint else None,
+         "knowledge_insulation": knowledge_insulation,
+         "discrete_head": bool(policy.model.discrete_head is not None),
+         "contrastive_loss_weight": contrastive_loss_weight,
+         "contrastive_margin": contrastive_margin,
+         "contrastive_frac": contrastive_frac,
+         "contrastive_suite_jaccard": contrastive_suite_jaccard,
+         "freeze_wrist_encoder": policy.config.freeze_wrist_encoder,
+         "gradient_checkpointing": gradient_checkpointing}, indent=2))
     print("done")
 
 
