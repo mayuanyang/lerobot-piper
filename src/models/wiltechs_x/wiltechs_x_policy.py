@@ -21,6 +21,7 @@ class WiltechsXPolicy(PreTrainedPolicy):
         self._queue_batch_size: int | None = None
         self._state_queue: deque | None = None
         self._state_batch_size: int | None = None
+        self._episode_noise: torch.Tensor | None = None
 
     def get_optim_params(self) -> dict:
         return self.model.parameters()
@@ -30,6 +31,10 @@ class WiltechsXPolicy(PreTrainedPolicy):
         self._queue_batch_size = None
         self._state_queue = None
         self._state_batch_size = None
+        # Dropping this is what makes the noise per-EPISODE rather than
+        # per-policy: a harness that forgets to call reset() would otherwise
+        # carry one branch across every episode it runs.
+        self._episode_noise = None
 
     def _with_state_history(self, batch: dict) -> dict:
         """Stack `observation.state` into the (B, T, D) window the model trains on.
@@ -92,8 +97,28 @@ class WiltechsXPolicy(PreTrainedPolicy):
 
         if not self._action_queue:
             self.model.eval()
-            chunk = self.model.sample_actions(batch)
+            chunk = self.model.sample_actions(
+                batch, noise=self._chunk_noise(batch_size))
             chunk = chunk[:, : min(n_steps, chunk.shape[1])]
             self._action_queue.extend(chunk.transpose(0, 1))
 
         return self._action_queue.popleft()
+
+    def _chunk_noise(self, batch_size: int) -> torch.Tensor | None:
+        """The x_1 to integrate from, or None to let the model draw a fresh one.
+
+        Under `fixed_episode_noise` this is drawn once per episode and reused
+        by every replan, so consecutive chunks are the SAME sample of
+        p(action | obs) re-evaluated at the new observation rather than
+        independent samples that may sit in different modes. See the config
+        field for why that is the stumbling-vs-decisive axis.
+        """
+        if not getattr(self.config, "fixed_episode_noise", False):
+            return None
+        cfg = self.config
+        if (self._episode_noise is None
+                or self._episode_noise.shape[0] != batch_size):
+            device = next(self.model.parameters()).device
+            self._episode_noise = self.model.sample_noise(
+                (batch_size, cfg.horizon, cfg.action_dim), device)
+        return self._episode_noise

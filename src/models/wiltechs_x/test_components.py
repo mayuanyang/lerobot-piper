@@ -369,6 +369,136 @@ def test_hinge_negatives():
     check("draw at the open end of [0,1) stays in range", len(other) == 1)
 
 
+def test_episode_noise():
+    """`fixed_episode_noise` is a claim about WHEN the noise is redrawn: once
+    per episode, not once per replan. The Euler integration is deterministic
+    given x_1, so reusing it is what keeps consecutive chunks on one branch of
+    a multimodal action distribution. Getting the lifetime wrong fails
+    silently -- redraw too often and nothing changes, too rarely and every
+    episode of a run shares one branch."""
+    print("\n_chunk_noise lifetime")
+
+    class Stub:
+        def __init__(self, fixed):
+            self.config = type("C", (), {"horizon": 16, "action_dim": 7,
+                                         "n_action_steps": 8,
+                                         "fixed_episode_noise": fixed})()
+            self._episode_noise = None
+            self.model = type("M", (), {
+                "sample_noise": staticmethod(lambda shape, device: torch.randn(shape)),
+                "parameters": staticmethod(lambda: iter([torch.zeros(1)])),
+            })()
+
+    # Bind the REAL method rather than reimplementing it: a test that restates
+    # the logic passes even when the shipped logic is wrong. The policy module
+    # cannot be imported (it pulls in lerobot), and _chunk_noise is the last
+    # method in the file, so slice from its def to EOF.
+    src = (ROOT / "wiltechs_x" / "wiltechs_x_policy.py").read_text()
+    ns = {"torch": torch}
+    exec("class _P:\n" + src[src.index("    def _chunk_noise"):], ns)
+    Stub._chunk_noise = ns["_P"]._chunk_noise
+
+    off = Stub(False)
+    check("disabled -> model draws its own noise", off._chunk_noise(4) is None)
+
+    s = Stub(True)
+    n1 = s._chunk_noise(4)
+    check("enabled -> noise has (B, horizon, action_dim)", tuple(n1.shape) == (4, 16, 7))
+    n2 = s._chunk_noise(4)
+    check("every replan in the episode reuses ONE draw", torch.equal(n1, n2))
+    check("and it is the same object, not an equal copy", n1 is n2)
+
+    # reset() is what makes it per-episode. Emulate the two lines that matter.
+    s._episode_noise = None
+    n3 = s._chunk_noise(4)
+    check("reset -> a new episode gets a NEW branch", not torch.equal(n1, n3))
+
+    n4 = s._chunk_noise(8)
+    check("batch size change redraws rather than broadcasting",
+          tuple(n4.shape) == (8, 16, 7))
+
+    # The eval harness batches envs; two envs in one batch must not be handed
+    # the same branch, or 10 "independent" episodes are 1 episode 10 times.
+    n5 = s._chunk_noise(8)
+    check("envs within a batch get DIFFERENT branches",
+          not torch.allclose(n5[0], n5[1]))
+
+
+def test_attention_mass():
+    """The attention diagnostic patches F.scaled_dot_product_attention. Two
+    things must hold or it is worse than useless: the patch must not change
+    what the model computes, and the recorded probabilities must be the real
+    ones. Its segment table must also account for EVERY key -- a share that
+    silently sums to less than 1 would understate whatever is missing."""
+    print("\nattention_mass diagnostic")
+
+    src = (ROOT.parent / "attention_mass_wiltechs_x.py").read_text()
+    ns = {"torch": torch, "F": torch.nn.functional,
+          "contextmanager": __import__("contextlib").contextmanager}
+    exec(src[src.index("@contextmanager"):src.index("def main(")], ns)
+    record_attention, segment_ranges = ns["record_attention"], ns["segment_ranges"]
+
+    # ---- the patch must be transparent -----------------------------------
+    torch.manual_seed(0)
+    q = torch.randn(2, 4, 25, 16)
+    k = torch.randn(2, 4, 100, 16)
+    v = torch.randn(2, 4, 100, 16)
+    m = torch.zeros(2, 1, 25, 100)
+    m[:, :, :, 90:] = torch.finfo(torch.float32).min      # mask a tail
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=m)
+
+    store = []
+    with record_attention(store, 25):
+        got = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=m)
+    check("patched SDPA returns the unpatched result", torch.allclose(ref, got))
+    check("SDPA is restored on exit",
+          torch.nn.functional.scaled_dot_product_attention is not None
+          and torch.allclose(
+              torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=m),
+              ref))
+    check("one call recorded", len(store) == 1)
+    check("recorded probs are (B, Lq, Lk), head-averaged",
+          tuple(store[0].shape) == (2, 25, 100))
+    check("probabilities sum to 1 per query",
+          torch.allclose(store[0].sum(-1), torch.ones(2, 25), atol=1e-5))
+    check("masked keys get no mass",
+          float(store[0][:, :, 90:].abs().max()) < 1e-6)
+
+    # Only the expert's suffix queries should be captured, not the prefix-only
+    # VLM layers -- those have L_prefix queries and would swamp the average.
+    store2 = []
+    with record_attention(store2, 25):
+        torch.nn.functional.scaled_dot_product_attention(
+            torch.randn(2, 4, 100, 16), k, v)                # L_p queries
+        torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=m)
+    check("only matching query lengths are recorded", len(store2) == 1)
+
+    # ---- the segment table must tile the whole sequence -------------------
+    spans = {"lang": (5, 53), "vision": [(55, 119), (121, 185)],
+             "wrist": [(185, 441)], "motion": (441, 449), "readout": 451}
+    L_p, L_s = 452, 25
+    segs = segment_ranges(spans, L_p, L_s, 16)
+    covered = torch.zeros(L_p + L_s, dtype=torch.bool)
+    dup = False
+    for rs in segs.values():
+        for s, e in rs:
+            if covered[s:e].any():
+                dup = True
+            covered[s:e] = True
+    check("every key belongs to exactly one segment", bool(covered.all()) and not dup)
+    check("the chat template / vision brackets are not lost",
+          "template" in segs and sum(e - s for s, e in segs["template"]) == 452 - (
+              48 + 128 + 256 + 8 + 1))
+    check("suffix self-attention is its own segment",
+          segs["self(suffix)"] == [(452, 477)])
+
+    # A checkpoint without wrist or motion must not produce phantom segments.
+    lean = segment_ranges({"lang": (5, 53), "vision": [(55, 119)], "readout": 120},
+                          121, 25, 16)
+    check("absent segments are omitted, not zero-filled",
+          "wrist" not in lean and "motion" not in lean and "lang" in lean)
+
+
 if __name__ == "__main__":
     mask = test_mask()
     test_cached_equals_reference(*test_joint_layer(mask))
@@ -376,5 +506,7 @@ if __name__ == "__main__":
     test_long_horizon()
     test_motion_history_guard()
     test_hinge_negatives()
+    test_episode_noise()
+    test_attention_mass()
     print("\nRESULT:", "ALL PASS" if _ok else "FAILURES ABOVE")
     sys.exit(0 if _ok else 1)

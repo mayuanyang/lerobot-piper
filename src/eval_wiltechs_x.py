@@ -101,13 +101,24 @@ class StateHistory:
 # ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
-def load_policy(ckpt: Path, device: str, num_inference_steps: int | None):
+def load_policy(ckpt: Path, device: str, num_inference_steps: int | None,
+                n_action_steps: int | None = None,
+                fixed_episode_noise: bool = False):
     from lerobot.configs.policies import PreTrainedConfig
 
     cfg = PreTrainedConfig.from_pretrained(ckpt)
     cfg.device = str(device)
     if num_inference_steps:
         cfg.num_inference_steps = int(num_inference_steps)
+    if n_action_steps:
+        n = int(n_action_steps)
+        if n > int(cfg.horizon):
+            raise SystemExit(
+                f"--n_action_steps {n} exceeds the trained horizon "
+                f"{cfg.horizon}: the chunk has no steps past that to execute.")
+        cfg.n_action_steps = n
+    if fixed_episode_noise:
+        cfg.fixed_episode_noise = True
     policy = WiltechsXPolicy.from_pretrained(ckpt, config=cfg)
     policy.to(device)
     policy.eval()
@@ -415,6 +426,23 @@ def main():
     p.add_argument("--num_inference_steps", type=int, default=0,
                    help="0 = the checkpoint's config (4). Re-run at 16 to test "
                         "whether the shortcut term made few-step inference valid.")
+    p.add_argument("--n_action_steps", type=int, default=0,
+                   help="0 = the checkpoint's config (8). Steps of each chunk "
+                        "executed open-loop before replanning. At 10 Hz, 8 is "
+                        "0.8 s and ~35 replans per episode; wiltechs_vla and "
+                        "wiltechs_moe run 32 of a 64 horizon, so they "
+                        "re-decide 4x less often. Each replan redraws the "
+                        "noise, i.e. resamples WHICH plan to follow, so a high "
+                        "replan rate is a candidate cause of the stumbling "
+                        "approach. Cannot exceed the trained horizon.")
+    p.add_argument("--fixed_episode_noise", action="store_true",
+                   help="Draw x_1 once per episode and reuse it for every "
+                        "replan. The integration is deterministic given the "
+                        "noise, so this keeps the policy on ONE branch of a "
+                        "multimodal action distribution while staying fully "
+                        "reactive to the observation. A bad branch now costs "
+                        "the whole episode instead of 0.8 s, so read the "
+                        "success distribution, not only the mean.")
     p.add_argument("--stock_init", action="store_true",
                    help="Disable the init-state ordering fix. For an A/B against "
                         "the canonical 50 layouts; not for reportable numbers.")
@@ -453,14 +481,16 @@ def main():
     patch_lerobot_libero(enable=not a.stock_init)
     patch_control_freq(a.control_freq, a.render_gpu)
 
-    policy = load_policy(ckpt, device, a.num_inference_steps)
+    policy = load_policy(ckpt, device, a.num_inference_steps,
+                         a.n_action_steps, a.fixed_episode_noise)
     pre, post = load_processors(ckpt, device, a.dataset_id)
     cams = list(policy.config.cameras_for_vlm)
     print(f"[eval] {ckpt}  device={device}  cameras={cams}\n"
           f"[eval] horizon={policy.config.horizon} "
           f"n_action_steps={policy.config.n_action_steps} "
           f"NFE={policy.config.num_inference_steps} "
-          f"state_history={policy.config.n_obs_steps}")
+          f"state_history={policy.config.n_obs_steps} "
+          f"noise={'fixed/episode' if a.fixed_episode_noise else 'per-chunk'}")
 
     video_cb = make_video_writer(Path(a.video_dir) if a.video_dir else None,
                                  a.videos_per_task)
@@ -549,6 +579,8 @@ def main():
     payload = {"checkpoint": str(ckpt), "control_freq": a.control_freq,
                "fixed_init_states": not a.stock_init,
                "num_inference_steps": policy.config.num_inference_steps,
+               "n_action_steps": policy.config.n_action_steps,
+               "fixed_episode_noise": bool(a.fixed_episode_noise),
                "episodes_per_task": a.episodes, "ablate_lang": a.ablate_lang,
                "overall_avg": avg, "overall_min": mn, "gate_pass": gate,
                "suites": results}

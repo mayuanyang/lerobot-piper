@@ -221,6 +221,34 @@ class WiltechsXConfig(PreTrainedConfig):
     sample_noise_scale: float = 1.0
     # AR(1) correlation across the horizon when drawing noise. 0 = iid.
     noise_temporal_correlation: float = 0.0
+    # Draw the initial noise ONCE per episode and reuse it for every replan,
+    # instead of drawing fresh noise every n_action_steps.
+    #
+    # The Euler integration is deterministic given x_1, so the noise is not a
+    # perturbation on top of a mean action -- it INDEXES which sample of
+    # p(action | obs) comes out. p(action | obs) is genuinely multimodal in
+    # manipulation (approach the bowl from the left or from the right; grasp
+    # now or close the distance first), so a fresh draw every 0.8 s can hand
+    # back a different branch each replan. The arm then commits 0.8 s to one
+    # plan, re-decides, and commits to another: the observed stumbling, and
+    # the reason the siblings look decisive is partly that their 32-step
+    # chunks re-decide 4x less often (wiltechs_vla/moe: horizon 64, n_action_
+    # steps 32; here 16/8).
+    #
+    # With the noise held fixed the map obs -> action stays continuous, so the
+    # policy is still fully reactive to the new observation; only the branch
+    # selection stops flip-flopping.
+    #
+    # The trade is real and untested here: a draw that lands on a bad branch
+    # is now bad for the whole episode rather than for 0.8 s, so this can
+    # LOWER the mean while it raises within-episode consistency. Judge it on
+    # the success-rate distribution, not only the mean. Off by default.
+    #
+    # Not the same as annealing the noise to zero: x_1 = 0 is far outside the
+    # distribution the field was fit on (training sees ||x_1|| ~ sqrt(H*A)).
+    # Nor the same as averaging several samples -- the mean of two valid
+    # branches (left, right) is a path into the object.
+    fixed_episode_noise: bool = False
 
     # =====================================================================
     # Losses

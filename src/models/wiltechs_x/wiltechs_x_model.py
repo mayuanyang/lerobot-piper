@@ -1542,13 +1542,21 @@ class WiltechsXModel(nn.Module):
     # Sampling
     # =====================================================================
     @torch.no_grad()
-    def sample_actions(self, batch: dict, full_horizon: bool = True) -> torch.Tensor:
+    def sample_actions(self, batch: dict, full_horizon: bool = True,
+                       noise: torch.Tensor | None = None) -> torch.Tensor:
         """(B, horizon, action_dim). ONE prefix pass, then N expert passes.
 
         full_horizon defaults True so that measurement does not move when an
         inference knob moves -- the validation metrics integrate the chunk to a
         terminal position, and truncating here would change what they mean at
         every n_action_steps setting.
+
+        `noise` overrides the draw at x_1. The integration is deterministic
+        given it, so the noise is not a perturbation -- it is the INDEX of
+        which sample of p(action | obs) gets returned. Holding it fixed across
+        the replans of one episode keeps the policy on one branch of a
+        multimodal distribution instead of re-picking every chunk; see
+        WiltechsXPolicy.select_action.
         """
         cfg = self.config
         B = batch["observation.state"].shape[0]
@@ -1563,7 +1571,15 @@ class WiltechsXModel(nn.Module):
 
             N = max(1, int(cfg.num_inference_steps))
             state = batch["observation.state"]
-            x = self.sample_noise((B, cfg.horizon, cfg.action_dim), device)
+            shape = (B, cfg.horizon, cfg.action_dim)
+            if noise is None:
+                x = self.sample_noise(shape, device)
+            else:
+                if tuple(noise.shape) != shape:
+                    raise ValueError(
+                        f"noise {tuple(noise.shape)} does not match "
+                        f"(B, horizon, action_dim) = {shape}")
+                x = noise.to(device=device, dtype=torch.float32)
             step = 1.0 / N
             t = torch.ones(B, device=device)
             # Integrates t: 1 -> 0, matching x_t = t*noise + (1-t)*action.
