@@ -318,11 +318,15 @@ def log_gradient_analysis(model, step: int, knowledge_insulation: bool) -> None:
     """
     print(f"\n--- gradients at step {step} (raw, pre-clip) ---")
 
+    seen: dict = {}                 # label -> g/w, for the ratio line below
+
     def section(title, groups):
         tot = 0.0
         print(f"  {title}")
         for label, needle in groups:
             g, rms, gw, n, present = _grad_stats(model, needle)
+            if gw is not None:
+                seen[label.strip()] = gw
             if g is None:
                 if present:
                     print(f"    {label:<16s} *** {present:,} trainable params, "
@@ -335,13 +339,35 @@ def log_gradient_analysis(model, step: int, knowledge_insulation: bool) -> None:
                   f"{gw_s}  ({n / 1e6:.1f}M)")
         return tot
 
-    pre = section("PREFIX side — reachable ONLY via the discrete CE head:",
-                  PREFIX_GROUPS)
+    # The header states the GRADIENT PATH, which knowledge insulation changes.
+    # It used to read "reachable ONLY via the discrete CE head" unconditionally,
+    # so a --no_knowledge_insulation run printed a header denying the very
+    # thing it was there to measure.
+    pre = section(
+        "PREFIX side — reachable ONLY via the discrete CE head:"
+        if knowledge_insulation else
+        "PREFIX side — discrete CE head AND flow/shortcut/gripper/progress "
+        "(KI off):",
+        PREFIX_GROUPS)
     exp = section("EXPERT side — trained by flow / shortcut / gripper / progress:",
                   EXPERT_GROUPS)
 
     if pre > 0 and exp > 0:
         print(f"  prefix/expert gradient L2 = {pre / exp:.3f}")
+        # Comparing g/w across REPORTS is unsafe when the batch changed --
+        # raw gradient magnitude carries the batch's noise scale. Ratios taken
+        # inside one report do not, so print the two that matter. Measured
+        # across the KI switch at matched steps 14000/14050: wrist 0.025 ->
+        # 0.036 while motion went 1.43 -> 6.12, i.e. the gradient a segment
+        # gains is proportional to the attention it already had.
+        base = seen.get("expert layers")
+        if base:
+            parts = [f"{k}/expert {seen[k] / base:.4f}"
+                     for k in ("wrist encoder", "motion encoder", "LoRA (q/k/v/o)",
+                               "discrete head") if k in seen]
+            if parts:
+                print("  g/w relative to expert layers (batch-independent, so "
+                      "these compare across runs):\n    " + "   ".join(parts))
     if knowledge_insulation and pre == 0.0:
         print("  *** PREFIX SIDE IS DEAD ***\n"
               "  knowledge_insulation detaches the K/V cache, so the discrete "
