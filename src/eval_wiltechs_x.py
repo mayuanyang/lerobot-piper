@@ -42,6 +42,17 @@ import os
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
+# Same reason, one layer up: LIBERO's env_wrapper imports matplotlib.cm, and
+# matplotlib resolves MPLBACKEND at import time. A notebook exports
+# MPLBACKEND=module://matplotlib_inline.backend_inline, which is only importable
+# inside the notebook's OWN interpreter -- run this script from a Colab cell
+# against any other environment and matplotlib raises before LIBERO loads. This
+# is a headless eval that draws nothing, so agg is the right backend; a
+# deliberate non-inline choice is left alone.
+_mpl = os.environ.get("MPLBACKEND", "")
+if not _mpl or "inline" in _mpl:
+    os.environ["MPLBACKEND"] = "agg"
+
 import argparse
 import json
 import sys
