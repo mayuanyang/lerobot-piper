@@ -1486,8 +1486,22 @@ class WiltechsXModel(nn.Module):
             d0_sub = d0[idx] if d0 is not None else None
             v_wrong, _ = self._suffix_pass(state[idx], x_t[idx], t[idx], d0_sub,
                                            wrong_cache, sub_rope, sub_pad)
-            apart = F.mse_loss(v_wrong, v_t[idx].detach(),
-                               reduction="none").mean(dim=(1, 2))
+            # Weighted with the SAME cells as the flow loss, not a bare mean.
+            # A bare mean averages over padded steps and over the tail the
+            # flow loss was told to de-emphasise, so `apart` shrinks as the
+            # horizon grows even when language sensitivity is unchanged. At
+            # horizon 64 with loss_exec_steps=16 that diluted it ~4x and
+            # pinned `contrastive` at the margin: the language-induced
+            # divergence lives in the near steps, where the "which object"
+            # decision shows up, and the mean spread it over 48 steps the
+            # objective barely trains plus ~27% padding.
+            #
+            # Same normaliser as the flow term also makes `contrastive`
+            # comparable across horizons, so one margin works for all of them.
+            sub_cells = cells[idx]                          # (k, H, 1)
+            diff = F.mse_loss(v_wrong, v_t[idx].detach(), reduction="none")
+            wsum = sub_cells.expand_as(diff).sum(dim=(1, 2)).clamp(min=1e-6)
+            apart = (diff * sub_cells).sum(dim=(1, 2)) / wsum
             hinge = F.relu(float(cfg.contrastive_margin) - apart).mean()
             main = main + cw * hinge
             parts["contrastive"] = float(hinge.detach())
