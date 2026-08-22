@@ -568,6 +568,49 @@ def test_paraphrase():
     cov, under = P.coverage([SP, "turn on the stove"], 8, 5)
     check("coverage names the instructions below the minimum",
           under == ["turn on the stove"] and len(cov[SP]) >= 5)
+    check("coverage reports the WRITTEN table, not the templates",
+          cov[SP] == P.table_variants(SP))
+
+    # ---- the written table is what training samples from -----------------
+    print("  -- written table --")
+    tv = P.table_variants(SP)
+    check("table entry exists for a libero_spatial instruction", tv is not None)
+    check("accessor prepends the original", tv[0] == SP)
+    check("at least 5 variants", len(tv) >= 5)
+    check("unknown instruction returns None, not a guess",
+          P.table_variants("turn on the stove") is None)
+
+    bad = []
+    for key, alts in P._TABLE.items():
+        v = [key] + alts
+        if len(set(x.lower() for x in v)) != len(v):
+            bad.append((key, "duplicate variant"))
+        if len(v) < 5:
+            bad.append((key, f"only {len(v)} variants"))
+        if key in alts:
+            bad.append((key, "original repeated in alternates"))
+        # The destination and the object identify the task; a variant that
+        # moved either trains the wrong thing under the right reward.
+        for x in v:
+            if "black bowl" not in x:
+                bad.append((key, f"object lost: {x!r}"))
+            if "plate" not in x.rsplit(" ", 3)[-1] and not x.endswith("the plate"):
+                bad.append((key, f"destination lost: {x!r}"))
+    check(f"every written entry is well formed ({len(P._TABLE)} entries)",
+          not bad)
+    if bad:
+        for k, why in bad[:6]:
+            print(f"        {why}  <- {k}")
+
+    # A variant of one task must never equal a variant of another, or a sample
+    # would be handed a different task's instruction as if it were correct.
+    allv = {}
+    dup = []
+    for key in P._TABLE:
+        for x in P.table_variants(key):
+            if allv.setdefault(x.lower(), key) != key:
+                dup.append(x)
+    check("no variant is shared between two tasks", not dup)
 
     tbl = P.build_table([SP, SP, "pick up the black bowl on the ramekin "
                                  "and place it on the plate"])

@@ -42,6 +42,128 @@ import json
 import re
 from pathlib import Path
 
+# =========================================================================
+# The table. This is what training samples from.
+# =========================================================================
+# Written out rather than generated, so what the model is trained on can be
+# read and reviewed here instead of inferred from template code. Keys are the
+# dataset's instruction strings VERBATIM -- a key that differs by a word
+# matches nothing and that task trains unaugmented, which is what the trainer
+# preflight exists to catch.
+#
+# Values are ALTERNATES ONLY; the accessor prepends the key. That makes "the
+# original is always in the set" structural rather than a rule someone has to
+# remember, and eval is run on the original.
+#
+# Each alternate must preserve: the object, the relation that identifies WHICH
+# object, and the destination. The reward is the original task's, so a variant
+# that moves any of those trains the policy to do one thing while telling it
+# another -- and nothing raises. The variation to aim for is structural
+# ("move X to Y", "put X onto Y") and not only lexical, since a model can learn
+# a synonym table as easily as it learned the sentences.
+#
+# libero_spatial, verbatim from the suite. The other three suites still need
+# writing; the preflight refuses to start until they are here or in
+# --paraphrase_file.
+_TABLE: dict[str, list[str]] = {
+    "pick up the black bowl between the plate and the ramekin and place it on the plate": [
+        "pick up the black bowl that is between the plate and the ramekin and put it on the plate",
+        "grasp the black bowl in between the plate and the ramekin and set it on the plate",
+        "take the black bowl sitting between the plate and the ramekin and place it onto the plate",
+        "lift the black bowl between the plate and the ramekin and put it onto the plate",
+        "move the black bowl between the plate and the ramekin to the plate",
+        "put the black bowl that sits between the plate and the ramekin onto the plate",
+    ],
+    "pick up the black bowl next to the ramekin and place it on the plate": [
+        "pick up the black bowl that is next to the ramekin and put it on the plate",
+        "grasp the black bowl beside the ramekin and set it on the plate",
+        "take the black bowl adjacent to the ramekin and place it onto the plate",
+        "lift the black bowl next to the ramekin and put it onto the plate",
+        "move the black bowl next to the ramekin to the plate",
+        "put the black bowl beside the ramekin onto the plate",
+    ],
+    "pick up the black bowl from table center and place it on the plate": [
+        "pick up the black bowl at the center of the table and put it on the plate",
+        "grasp the black bowl in the middle of the table and set it on the plate",
+        "take the black bowl from the center of the table and place it onto the plate",
+        "lift the black bowl from table center and put it onto the plate",
+        "move the black bowl at the middle of the table to the plate",
+        "put the black bowl from the table center onto the plate",
+    ],
+    "pick up the black bowl on the cookie box and place it on the plate": [
+        "pick up the black bowl that is on the cookie box and put it on the plate",
+        "grasp the black bowl on top of the cookie box and set it on the plate",
+        "take the black bowl sitting on the cookie box and place it onto the plate",
+        "lift the black bowl resting on the cookie box and put it onto the plate",
+        "move the black bowl on the cookie box to the plate",
+        "put the black bowl that sits on the cookie box onto the plate",
+    ],
+    "pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate": [
+        "pick up the black bowl that is in the top drawer of the wooden cabinet and put it on the plate",
+        "grasp the black bowl inside the top drawer of the wooden cabinet and set it on the plate",
+        "take the black bowl from the top drawer of the wooden cabinet and place it onto the plate",
+        "lift the black bowl out of the top drawer of the wooden cabinet and put it onto the plate",
+        "move the black bowl in the top drawer of the wooden cabinet to the plate",
+        "put the black bowl inside the top drawer of the wooden cabinet onto the plate",
+    ],
+    "pick up the black bowl on the ramekin and place it on the plate": [
+        "pick up the black bowl that is on the ramekin and put it on the plate",
+        "grasp the black bowl on top of the ramekin and set it on the plate",
+        "take the black bowl sitting on the ramekin and place it onto the plate",
+        "lift the black bowl resting on the ramekin and put it onto the plate",
+        "move the black bowl on the ramekin to the plate",
+        "put the black bowl that sits on the ramekin onto the plate",
+    ],
+    "pick up the black bowl next to the cookie box and place it on the plate": [
+        "pick up the black bowl that is next to the cookie box and put it on the plate",
+        "grasp the black bowl beside the cookie box and set it on the plate",
+        "take the black bowl adjacent to the cookie box and place it onto the plate",
+        "lift the black bowl next to the cookie box and put it onto the plate",
+        "move the black bowl next to the cookie box to the plate",
+        "put the black bowl beside the cookie box onto the plate",
+    ],
+    "pick up the black bowl on the stove and place it on the plate": [
+        "pick up the black bowl that is on the stove and put it onto the plate",
+        "grasp the black bowl on top of the stove and set it on the plate",
+        "take the black bowl sitting on the stove and place it onto the plate",
+        "lift the black bowl resting on the stove and put it on the plate",
+        "move the black bowl on the stove to the plate",
+        "put the black bowl that sits on the stove onto the plate",
+    ],
+    "pick up the black bowl next to the plate and place it on the plate": [
+        "pick up the black bowl that is next to the plate and put it on the plate",
+        "grasp the black bowl beside the plate and set it on the plate",
+        "take the black bowl adjacent to the plate and place it onto the plate",
+        "lift the black bowl next to the plate and put it onto the plate",
+        "move the black bowl next to the plate onto the plate",
+        "put the black bowl beside the plate onto the plate",
+    ],
+    "pick up the black bowl on the wooden cabinet and place it on the plate": [
+        "pick up the black bowl that is on the wooden cabinet and put it on the plate",
+        "grasp the black bowl on top of the wooden cabinet and set it on the plate",
+        "take the black bowl sitting on the wooden cabinet and place it onto the plate",
+        "lift the black bowl resting on the wooden cabinet and put it onto the plate",
+        "move the black bowl on the wooden cabinet to the plate",
+        "put the black bowl that sits on the wooden cabinet onto the plate",
+    ],
+}
+
+
+def table_variants(instruction: str) -> list[str] | None:
+    """Written variants for `instruction`, original first, or None if absent."""
+    key = " ".join(str(instruction).split())
+    alts = _TABLE.get(key)
+    return None if alts is None else [key] + list(alts)
+
+
+# =========================================================================
+# Template drafting. NOT used during training -- see _sample_paraphrase.
+# =========================================================================
+# Kept to draft entries for instructions not yet in _TABLE: it emits candidates
+# a human then reviews and pastes above. Training reads only _TABLE and
+# --paraphrase_file, so a template that mangles a sentence cannot reach the
+# model without someone having looked at it.
+
 # Locative relations may take "that is"/"which is"; source/path ones may not
 # ("the bowl that is from table center" is not English). Ordered longest-first
 # so "next to the" cannot be matched by a shorter prefix.
@@ -170,7 +292,9 @@ def coverage(instructions, limit: int = 8, minimum: int = 5,
         key = " ".join(str(ins).split())
         if key in table:
             continue
-        table[key] = extra.get(key) or paraphrases(key, limit)
+        # Same precedence as training: file, then the written table. Templates
+        # are NOT consulted, so this reports what the model would actually see.
+        table[key] = extra.get(key) or table_variants(key) or [key]
         if len(table[key]) < minimum:
             under.append(key)
     return table, under

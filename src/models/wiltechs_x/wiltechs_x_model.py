@@ -882,14 +882,21 @@ class WiltechsXModel(nn.Module):
         key = " ".join(str(desc).split())
         variants = self._paraphrase_cache.get(key)
         if variants is None:
-            from .paraphrase import load_table, paraphrases
+            from .paraphrase import load_table, table_variants
             if self._paraphrase_file is None:
                 path = str(getattr(self.config, "paraphrase_file", "") or "")
                 self._paraphrase_file = load_table(path) if path else {}
-            # A supplied table WINS over the templates: it is there precisely
-            # for the sentences the templates decline to guess at.
-            variants = self._paraphrase_file.get(key) or paraphrases(
-                key, int(getattr(self.config, "paraphrase_limit", 8)))
+            # Written variants only -- the built-in table, or a file that
+            # overrides it. The template generator in paraphrase.py is for
+            # DRAFTING new entries and is deliberately not on this path: a
+            # template that mangles a sentence must not reach the model without
+            # a human having read it. An instruction in neither source trains
+            # unaugmented, which the trainer preflight refuses to start on.
+            variants = (self._paraphrase_file.get(key)
+                        or table_variants(key) or [key])
+            lim = int(getattr(self.config, "paraphrase_limit", 0) or 0)
+            if lim and len(variants) > lim:
+                variants = variants[:lim]
             self._paraphrase_cache[key] = variants
             self._once(f"para::{len(self._paraphrase_cache)}",
                        f"[wiltechs_x] paraphrase augmentation: "
