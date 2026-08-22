@@ -311,6 +311,12 @@ if __name__ == "__main__":
     ap.add_argument("--limit", type=int, default=8)
     ap.add_argument("--min_variants", type=int, default=5)
     ap.add_argument("--out", help="write the full table here (JSON)")
+    ap.add_argument("--emit", choices=("json", "python", "keys"), default="json",
+                    help="keys: just the instruction strings, one per line -- "
+                         "the thing to paste when asking someone to write "
+                         "entries. python: a _TABLE block ready to paste into "
+                         "this file, template drafts where they exist and an "
+                         "empty list where they do not.")
     a = ap.parse_args()
 
     if a.dataset_id:
@@ -334,7 +340,26 @@ if __name__ == "__main__":
           f"{len(under)} BELOW")
     for k in under:
         print(f"  UNDER: {k}")
+    if a.emit == "keys":
+        print("\n--- instruction strings, verbatim ---")
+        for k in table:
+            print(k)
+    elif a.emit == "python":
+        # Drafts come from the TEMPLATES here, unlike the coverage report
+        # above: this output is for a human to read and edit before it becomes
+        # code, which is the only path by which a template may reach training.
+        print("\n--- paste into _TABLE, review every line ---")
+        for k in table:
+            drafted = [x for x in paraphrases(k, a.limit) if x != k]
+            print(f"    {k!r}: [")
+            for x in drafted:
+                print(f"        {x!r},")
+            if not drafted:
+                print("        # TEMPLATES DECLINED THIS SENTENCE -- write >= "
+                      f"{a.min_variants - 1} by hand.")
+                print("        # Keep the object, the thing that identifies "
+                      "WHICH object, and the destination.")
+            print("    ],")
     if a.out:
         Path(a.out).write_text(json.dumps(table, indent=2, ensure_ascii=False))
-        print(f"\nwrote {a.out} -- hand-edit the UNDER entries, then pass it as "
-              f"--paraphrase_file")
+        print(f"\nwrote {a.out}")
