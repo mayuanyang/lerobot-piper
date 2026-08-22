@@ -542,6 +542,8 @@ def train(
     contrastive_margin: float = 0.05,
     contrastive_frac: float = 0.5,
     contrastive_suite_jaccard: float = 0.5,
+    paraphrase_augment: bool = False,
+    paraphrase_limit: int = 8,
     use_descriptive_objects: bool = False,
     preprocess_in_workers: bool = True,
     profile_steps: int = 20,
@@ -633,6 +635,8 @@ def train(
         contrastive_margin=contrastive_margin,
         contrastive_frac=contrastive_frac,
         contrastive_suite_jaccard=contrastive_suite_jaccard,
+        paraphrase_augment=paraphrase_augment,
+        paraphrase_limit=paraphrase_limit,
         optimizer_lr=lr, optimizer_weight_decay=weight_decay,
         scheduler_warmup_steps=warmup_steps,
         scheduler_decay_steps=training_steps,
@@ -938,6 +942,8 @@ def train(
          "contrastive_margin": contrastive_margin,
          "contrastive_frac": contrastive_frac,
          "contrastive_suite_jaccard": contrastive_suite_jaccard,
+         "paraphrase_augment": paraphrase_augment,
+         "paraphrase_limit": paraphrase_limit,
          "freeze_wrist_encoder": policy.config.freeze_wrist_encoder,
          "gradient_checkpointing": gradient_checkpointing}, indent=2))
     print("done")
@@ -1087,6 +1093,17 @@ def main():
                         "which would collapse to one fixed partner per task. "
                         "0 = uniform-random negatives (behaviour before "
                         "2026-08-18).")
+    p.add_argument("--paraphrase_augment", action="store_true",
+                   help="Train on several phrasings per instruction, resampled "
+                        "every step. Measured motivation: this model scores 60% "
+                        "on its own instruction and 0% on a PARAPHRASE of it, "
+                        "i.e. it keys on surface form, not content. Unlike "
+                        "--use_descriptive_objects (one fixed rewrite = a "
+                        "second table to memorise) the variant changes per "
+                        "sample, so surface form stops being a usable key. The "
+                        "original string is always in the set; eval uses it.")
+    p.add_argument("--paraphrase_limit", type=int, default=8,
+                   help="Variants per instruction, including the original.")
     p.add_argument("--use_descriptive_objects", action="store_true")
     p.add_argument("--no_preprocess_in_workers", dest="preprocess_in_workers",
                    action="store_false", default=True,

@@ -499,6 +499,77 @@ def test_attention_mass():
           "wrist" not in lean and "motion" not in lean and "lang" in lean)
 
 
+def test_paraphrase():
+    """The model scores 60% on an instruction and 0% on a paraphrase of it, so
+    it keys on surface form. These checks are about the augmentation being an
+    honest fix for that: the original must survive (eval uses it), the MEANING
+    must not move (a variant that renames the target trains the wrong task),
+    and a sentence the pattern does not understand must be left alone rather
+    than mangled."""
+    print("\nparaphrase augmentation")
+
+    P = _load("models.wiltechs_x.paraphrase", ROOT / "wiltechs_x" / "paraphrase.py")
+
+    SP = "pick up the black bowl on the stove and place it on the plate"
+    v = P.paraphrases(SP)
+    check("original is present and first", v[0] == SP)
+    check("produces several variants", len(v) >= 6)
+    check("all variants are distinct", len(set(v)) == len(v))
+    # The relation and the destination are the meaning. If either moves, the
+    # policy is being trained on a different task under the same reward.
+    check("every variant keeps the relation phrase",
+          all("on the stove" in x for x in v))
+    check("every variant keeps the destination",
+          all(x.rstrip(". ").endswith("the plate") for x in v))
+    check("every variant still names the object",
+          all("black bowl" in x for x in v))
+
+    # "the bowl that is from table center" is not English; the generator must
+    # not attach a qualifier to a source phrase.
+    fc = P.paraphrases("pick up the black bowl from table center and place it on the plate")
+    check("no qualifier on a non-locative relation",
+          not any("that is from" in x or "which is from" in x for x in fc))
+
+    # A multi-word relation containing "and" must not be split at the first one.
+    bt = P.paraphrases("pick up the black bowl between the plate and the ramekin "
+                       "and place it on the plate")
+    check("relation containing 'and' is parsed whole",
+          all("between the plate and the ramekin" in x for x in bt))
+
+    # Unknown structure -> leave it alone rather than guess.
+    other = P.paraphrases("open the top drawer of the cabinet")
+    check("unmatched sentence is returned unchanged, not mangled",
+          other == ["open the top drawer of the cabinet"])
+
+    check("limit is respected and keeps the original",
+          len(P.paraphrases(SP, limit=3)) == 3
+          and P.paraphrases(SP, limit=3)[0] == SP)
+    check("deterministic across calls", P.paraphrases(SP) == P.paraphrases(SP))
+
+    # Two different tasks must never generate a shared variant, or a sample of
+    # one task would be handed the other's instruction as if it were correct.
+    a = set(P.paraphrases(SP))
+    b = set(P.paraphrases("pick up the black bowl on the wooden cabinet "
+                          "and place it on the plate"))
+    check("variant sets of two tasks never collide", not (a & b))
+
+    tbl = P.build_table([SP, SP, "pick up the black bowl on the ramekin "
+                                 "and place it on the plate"])
+    check("build_table deduplicates instructions", len(tbl) == 2)
+
+    # A hand-edited table that drops the original would train on phrasings the
+    # model is never scored with.
+    import json, tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump({SP: ["grasp the black bowl on the stove and put it on the plate"]}, f)
+        bad = f.name
+    try:
+        P.load_table(bad)
+        check("load_table rejects a table missing the original", False)
+    except ValueError:
+        check("load_table rejects a table missing the original", True)
+
+
 if __name__ == "__main__":
     mask = test_mask()
     test_cached_equals_reference(*test_joint_layer(mask))
@@ -508,5 +579,6 @@ if __name__ == "__main__":
     test_hinge_negatives()
     test_episode_noise()
     test_attention_mass()
+    test_paraphrase()
     print("\nRESULT:", "ALL PASS" if _ok else "FAILURES ABOVE")
     sys.exit(0 if _ok else 1)

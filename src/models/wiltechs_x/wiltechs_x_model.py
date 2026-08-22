@@ -686,6 +686,7 @@ class WiltechsXModel(nn.Module):
         self._motion_grace = 0
         self._suite_tokens = {}       # instruction -> token set  (hinge buckets)
         self._suite_id = {}           # instruction -> suite representative
+        self._paraphrase_cache = {}   # instruction -> surface variants
         self.gradient_checkpointing = False
 
     # =====================================================================
@@ -845,14 +846,56 @@ class WiltechsXModel(nn.Module):
                                dtype=torch.bfloat16), []
         return torch.cat(all_vis, dim=1), grids
 
-    def _resolve_descs(self, batch: dict):
+    def _resolve_descs(self, batch: dict, augment: bool | None = None):
+        """Instructions for this batch.
+
+        `augment` defaults to "training, and paraphrase_augment is on". Pass
+        False for anything that needs the CANONICAL string: the hinge decides
+        "is this a different instruction" by string equality, and two
+        paraphrases of one task must not read as two tasks or the term
+        penalises the model for agreeing with its own instruction in other
+        words -- fighting exactly what the augmentation is for.
+        """
         v = batch.get("task_description", batch.get("task"))
         if v is None:
             return None
         descs = [v] if isinstance(v, str) else list(v)
         if self.config.use_descriptive_objects:
             descs = [rewrite_instruction(d) for d in descs]
+        if augment is None:
+            augment = self.training and bool(
+                getattr(self.config, "paraphrase_augment", False))
+        if augment:
+            descs = [self._sample_paraphrase(d) for d in descs]
         return descs
+
+    def _sample_paraphrase(self, desc: str) -> str:
+        """One surface variant of `desc`, drawn per sample per step.
+
+        The table is built lazily and cached, the same way suites are: LIBERO
+        has ~40 unique instructions, so after a few hundred steps nothing new
+        arrives. Sampling per call rather than per epoch is what stops surface
+        form from being a usable key -- a fixed rewrite would just be a second
+        table to memorise.
+        """
+        key = " ".join(str(desc).split())
+        variants = self._paraphrase_cache.get(key)
+        if variants is None:
+            from .paraphrase import paraphrases
+            variants = paraphrases(
+                key, int(getattr(self.config, "paraphrase_limit", 8)))
+            self._paraphrase_cache[key] = variants
+            self._once(f"para::{len(self._paraphrase_cache)}",
+                       f"[wiltechs_x] paraphrase augmentation: "
+                       f"{len(self._paraphrase_cache)} instruction(s) seen, "
+                       f"latest gets {len(variants)} variants"
+                       + ("  *** 1 variant = the pattern did not match, this "
+                          "instruction is NOT augmented ***" if len(variants) == 1
+                          else ""))
+        if len(variants) == 1:
+            return variants[0]
+        i = int(torch.randint(len(variants), (1,)).item())
+        return variants[i]
 
     def _suite_map(self, descs):
         """Group instructions into "suites" by token overlap.
@@ -1448,7 +1491,10 @@ class WiltechsXModel(nn.Module):
             # hard one. See contrastive_suite_jaccard in the config for why
             # a cross-suite negative teaches object presence, not relations.
             other = torch.roll(idx, 1)
-            descs = self._resolve_descs(batch)
+            # augment=False: identity and suite membership are decided by
+            # string equality, and paraphrases of one task must not read as
+            # two different tasks. See _resolve_descs.
+            descs = self._resolve_descs(batch, augment=False)
             if descs is not None and len(descs) == B:
                 # one draw per pair, taken up front so this stays O(k) on CPU
                 keep, oo, hard, dropped = self._hinge_pairs(

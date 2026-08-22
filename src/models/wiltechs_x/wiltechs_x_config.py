@@ -312,6 +312,27 @@ class WiltechsXConfig(PreTrainedConfig):
     # room on both sides. Set to 0.0 to restore uniform-random negatives.
     contrastive_suite_jaccard: float = 0.5
 
+    # Train on several phrasings of each instruction, drawn per sample per step.
+    #
+    # Measured on wiltechs-x-114k, libero_spatial task 7, identical harness:
+    # its own instruction scored 60%; ANOTHER TASK's instruction verbatim
+    # scored 0% with the arm going cleanly to that task's object; and a
+    # PARAPHRASE of its own instruction -- "that is on the stove", "put it onto
+    # the plate" -- also scored 0%. A model reading the sentence is untouched
+    # by that rewording. This one has memorised the ~40 strings in the dataset
+    # and maps each to a behaviour: hand it a table entry and it retrieves,
+    # hand it anything else and it does not.
+    #
+    # The language probe does not catch this. It substitutes OTHER TASKS'
+    # instructions, all table entries, so its d(lang) measures only whether the
+    # 40 known strings are told apart.
+    #
+    # Sampling per step is the point; a single fixed rewrite (see
+    # use_descriptive_objects) is just a second table to memorise. The original
+    # string is always among the variants because evaluation uses it.
+    paraphrase_augment: bool = False
+    paraphrase_limit: int = 8
+
     # =====================================================================
     # Optimizer / schedule
     # =====================================================================
