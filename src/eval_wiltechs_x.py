@@ -476,6 +476,18 @@ def main():
                         "no amount of further training changes that. Run it "
                         "against an identical non-ablated run -- same "
                         "checkpoint, seed, episodes and cap.")
+    p.add_argument("--instruction_override", default=None,
+                   help="Tell the policy this exact instruction instead of the "
+                        "task's own, while still scoring against the real task. "
+                        "For a SPECIFIC confusion, where --ablate_lang's fixed "
+                        "half-suite offset does not put the two tasks in "
+                        "question against each other. Also takes a rephrasing, "
+                        "to ask whether a more distinctive wording is followed.")
+    p.add_argument("--instruction_from_task", type=int, default=None,
+                   help="Same, but pulls the instruction off another task in "
+                        "this suite by id -- no chance of a typo silently "
+                        "testing a different sentence. Use with --task_ids to "
+                        "swap a pair: --task_ids 7 --instruction_from_task 9.")
     p.add_argument("--heartbeat", type=int, default=50,
                    help="Env steps between progress lines inside a rollout. A "
                         "batch that runs to the episode cap is minutes of "
@@ -486,6 +498,34 @@ def main():
 
     device = a.device or pick_device()
     from train_wiltechs_x import resolve_checkpoint
+
+    # --seed used to reach only env.reset(). The POLICY is stochastic -- flow
+    # matching draws x_1 fresh for every chunk, which at n_action_steps=2 is
+    # 140 draws per episode -- so two runs of the identical command walked
+    # different trajectories through identical layouts. That also made the
+    # --ablate_lang instruction to use "the same checkpoint, seed, episodes and
+    # cap" impossible to honour.
+    #
+    # Seeding does NOT shrink the error on a single estimate: at n=20 the
+    # binomial SE near p=0.85 is ~8 points, which is what an 80% and a 90% run
+    # of the same command actually differ by. What it buys is a PAIRED A/B --
+    # same layouts and same noise, only the setting under test moving.
+    #
+    # Pairing is exact only when the two arms draw the same number of samples.
+    # Comparing n_action_steps settings changes that count, so the noise
+    # streams diverge after the first chunk; --fixed_episode_noise draws once
+    # per episode and pairs across those too.
+    torch.manual_seed(a.seed)
+    np.random.seed(a.seed % (2 ** 32))
+
+    n_lang = sum(x is not None and x is not False
+                 for x in (a.ablate_lang or None, a.instruction_override,
+                           a.instruction_from_task))
+    if n_lang > 1:
+        raise SystemExit(
+            "--ablate_lang, --instruction_override and --instruction_from_task "
+            "all replace what the policy is told. Pick one; combining them "
+            "would report a number nobody could attribute.")
 
     ckpt = resolve_checkpoint(a.checkpoint, for_resume=False)
 
@@ -531,9 +571,38 @@ def main():
             # A random or out-of-scene string would test novelty instead.
             wrong = {t: all_desc[(t + max(n_tasks // 2, 1)) % n_tasks]
                      for t in task_ids}
+        elif a.instruction_override or a.instruction_from_task is not None:
+            # --ablate_lang's half-suite offset asks "does ANY wrong instruction
+            # change behaviour". That is the wrong question for a specific
+            # confusion: libero_spatial task 7 ("on the stove") is scored at 60%
+            # with its failures reaching for the cabinet, and task 9 ("on the
+            # wooden cabinet") at 50% -- a pair the offset never puts against
+            # each other. Naming the instruction directly is what tests whether
+            # the policy can tell those two apart.
+            if a.instruction_from_task is not None:
+                if not 0 <= a.instruction_from_task < n_tasks:
+                    raise SystemExit(
+                        f"--instruction_from_task {a.instruction_from_task} is "
+                        f"outside {suite_name}'s 0..{n_tasks - 1}")
+                text = suite.get_task(a.instruction_from_task).language
+            else:
+                text = a.instruction_override
+            for t in task_ids:
+                real = suite.get_task(t).language
+                if text.strip() == real.strip():
+                    # Silently scoring a task against its own instruction would
+                    # look like "language has no effect" when nothing was
+                    # actually swapped.
+                    raise SystemExit(
+                        f"task {t}'s own instruction is {real!r}, which is what "
+                        f"the override supplies. That is a null test, not a "
+                        f"result -- pick a different task or string.")
+            wrong = {t: text for t in task_ids}
 
+        tag = ("  [LANGUAGE ABLATED]" if a.ablate_lang
+               else "  [INSTRUCTION OVERRIDDEN]" if wrong else "")
         print(f"\n=== {suite_name}: {len(task_ids)} tasks x {a.episodes} episodes"
-              f"{'  [LANGUAGE ABLATED]' if a.ablate_lang else ''} ===")
+              f"{tag} ===")
         per_task = {}
         for k, tid in enumerate(task_ids):
             t_task = time.time()
@@ -593,11 +662,16 @@ def main():
                "n_action_steps": policy.config.n_action_steps,
                "fixed_episode_noise": bool(a.fixed_episode_noise),
                "episodes_per_task": a.episodes, "ablate_lang": a.ablate_lang,
+               "instruction_override": a.instruction_override,
+               "instruction_from_task": a.instruction_from_task,
                "overall_avg": avg, "overall_min": mn, "gate_pass": gate,
                "suites": results}
     # A separate filename: an ablation result overwriting the real one is a
     # mistake you only notice much later.
-    default_name = "eval_libero_ablated.json" if a.ablate_lang else "eval_libero.json"
+    default_name = ("eval_libero_ablated.json" if a.ablate_lang
+                    else "eval_libero_override.json"
+                    if (a.instruction_override or a.instruction_from_task is not None)
+                    else "eval_libero.json")
     out = Path(a.out) if a.out else ckpt / default_name
     out.write_text(json.dumps(payload, indent=2))
     print(f"wrote {out}")
