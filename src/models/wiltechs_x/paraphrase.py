@@ -483,6 +483,36 @@ def paraphrases(instruction: str, limit: int = 8) -> list[str]:
     return out
 
 
+def instruction_strings(raw) -> list[str]:
+    """Pull the instruction strings out of whatever `meta.tasks` happens to be.
+
+    lerobot 0.4.0 keeps them in the *index* of a one-column DataFrame whose
+    only column is `task_index` (see its `load_tasks`), so the obvious
+    `list(tasks)` yields the column NAME -- one bogus instruction called
+    "task_index". That is how this was found: the preflight reported
+    `1 instructions ... max 1` against a 40-task dataset, and would have gone
+    on to reject the run for a coverage gap that did not exist. Older releases
+    used a plain {index: task} dict, and a hand-built list is also plausible,
+    so all three are accepted.
+
+    Shape alone is ambiguous -- a DataFrame's strings could sit in a column, a
+    dict's in either half -- so candidates are ranked by looking like sentences
+    rather than trusted positionally.
+    """
+    if hasattr(raw, "columns"):                               # pandas DataFrame
+        cand = [list(raw.index)] + [list(raw[c]) for c in raw.columns]
+    elif isinstance(raw, dict):
+        cand = [list(raw.values()), list(raw.keys())]
+    elif hasattr(raw, "to_list") and hasattr(raw, "index"):   # pandas Series
+        cand = [raw.to_list(), list(raw.index)]
+    else:
+        cand = [list(raw)]
+    for c in cand:
+        if c and all(isinstance(x, str) for x in c) and any(" " in x for x in c):
+            return c
+    return [str(x) for x in cand[0]]
+
+
 def build_table(instructions, limit: int = 8) -> dict[str, list[str]]:
     """instruction -> its variants, for every unique instruction given."""
     table: dict[str, list[str]] = {}
@@ -566,8 +596,7 @@ if __name__ == "__main__":
     if a.dataset_id:
         from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
         meta = LeRobotDatasetMetadata(a.dataset_id, force_cache_sync=True)
-        raw = meta.tasks
-        ins = list(raw.values()) if isinstance(raw, dict) else list(raw)
+        ins = instruction_strings(meta.tasks)
     elif a.instructions:
         ins = [l for l in Path(a.instructions).read_text().splitlines() if l.strip()]
     else:

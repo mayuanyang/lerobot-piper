@@ -600,15 +600,27 @@ def train(
         # surface form as a usable key for exactly those tasks -- and the run
         # cannot answer whether augmentation works. Twenty hours is too long to
         # find that out from the eval.
-        from models.wiltechs_x.paraphrase import coverage, load_table
-        raw = getattr(D["meta"], "tasks", None) if "meta" in D else None
-        if raw is None:
+        from models.wiltechs_x.paraphrase import (
+            coverage, instruction_strings, load_table)
+        # Union over every dataset, not just the reference one: with several
+        # --dataset_ids the task lists differ, and an instruction that only
+        # appears in the second one still needs variants.
+        instructions, seen = [], set()
+        for m in D.get("metas") or ([D["meta"]] if "meta" in D else []):
+            raw = getattr(m, "tasks", None)
+            if raw is None:
+                continue
+            for ins in instruction_strings(raw):
+                key = " ".join(str(ins).split())
+                if key not in seen:
+                    seen.add(key)
+                    instructions.append(key)
+        if not instructions:
             print("[paraphrase] dataset metadata exposes no task list; coverage "
                   "cannot be checked here. Run\n"
                   "  python -m models.wiltechs_x.paraphrase --dataset_id <id> "
                   "--min_variants N\nbefore trusting this run.")
         else:
-            instructions = list(raw.values()) if isinstance(raw, dict) else list(raw)
             table, under = coverage(
                 instructions, paraphrase_limit, paraphrase_min_variants,
                 load_table(paraphrase_file) if paraphrase_file else None)

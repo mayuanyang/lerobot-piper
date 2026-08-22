@@ -565,6 +565,51 @@ def test_paraphrase():
     check("no 'set it into/inside' (not idiomatic)",
           not any("set it into" in x or "set it inside" in x for x in ob))
 
+    # ---- reading the instructions off dataset metadata --------------------
+    # The preflight is only as good as its enumeration. lerobot 0.4.0 stores
+    # the strings in the DataFrame INDEX with `task_index` as the sole column,
+    # so `list(meta.tasks)` returned ["task_index"] and the preflight rejected
+    # a fully covered 40-task dataset for a coverage gap of its own making.
+    print("  -- meta.tasks enumeration --")
+    THREE = [SP, "pick up the alphabet soup and place it in the basket",
+             "turn on the stove"]
+
+    class _FakeDF:
+        """Only the duck-typing that matters, so this runs without pandas.
+
+        `__iter__` yielding column names is not incidental -- it is the whole
+        bug, and a fake without it would pass while the real thing failed.
+        """
+        columns = ["task_index"]
+
+        def __init__(self, rows):
+            self.index = list(rows)
+
+        def __iter__(self):
+            return iter(self.columns)
+
+        def __getitem__(self, col):
+            return list(range(len(self.index)))
+
+    check("lerobot 0.4.0 shape: strings come from the index, not the column "
+          "name", P.instruction_strings(_FakeDF(THREE)) == THREE)
+    check("the naive list() is what this replaces", list(_FakeDF(THREE)) ==
+          ["task_index"])
+    try:
+        import pandas as pd
+        df = pd.DataFrame({"task_index": range(len(THREE))}, index=THREE)
+        check("real pandas DataFrame agrees with the fake",
+              P.instruction_strings(df) == THREE)
+        check("pandas Series is read too",
+              P.instruction_strings(pd.Series(THREE)) == THREE)
+    except ImportError:
+        print("        (pandas unavailable here -- the fake above still covers "
+              "the contract)")
+    check("legacy {index: task} dict",
+          P.instruction_strings({0: THREE[0], 1: THREE[1]}) == THREE[:2])
+    check("plain list passes through", P.instruction_strings(THREE) == THREE)
+    check("empty input does not raise", P.instruction_strings([]) == [])
+
     UNKNOWN = "fold the towel and hang it on the rail"
     cov, under = P.coverage([SP, UNKNOWN], 8, 5)
     check("coverage names the instructions below the minimum",
