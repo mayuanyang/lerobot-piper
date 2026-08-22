@@ -565,9 +565,10 @@ def test_paraphrase():
     check("no 'set it into/inside' (not idiomatic)",
           not any("set it into" in x or "set it inside" in x for x in ob))
 
-    cov, under = P.coverage([SP, "turn on the stove"], 8, 5)
+    UNKNOWN = "fold the towel and hang it on the rail"
+    cov, under = P.coverage([SP, UNKNOWN], 8, 5)
     check("coverage names the instructions below the minimum",
-          under == ["turn on the stove"] and len(cov[SP]) >= 5)
+          under == [UNKNOWN] and len(cov[SP]) >= 5)
     check("coverage reports the WRITTEN table, not the templates",
           cov[SP] == P.table_variants(SP))
 
@@ -578,7 +579,7 @@ def test_paraphrase():
     check("accessor prepends the original", tv[0] == SP)
     check("at least 5 variants", len(tv) >= 5)
     check("unknown instruction returns None, not a guess",
-          P.table_variants("turn on the stove") is None)
+          P.table_variants("fold the towel and hang it on the rail") is None)
 
     bad = []
     for key, alts in P._TABLE.items():
@@ -589,13 +590,25 @@ def test_paraphrase():
             bad.append((key, f"only {len(v)} variants"))
         if key in alts:
             bad.append((key, "original repeated in alternates"))
-        # The destination and the object identify the task; a variant that
-        # moved either trains the wrong thing under the right reward.
+        # Parts of the key that ARE the task. Dropping one trains the policy
+        # on something other than what the reward scores, and nothing raises.
+        low = key.lower()
         for x in v:
-            if "black bowl" not in x:
-                bad.append((key, f"object lost: {x!r}"))
-            if "plate" not in x.rsplit(" ", 3)[-1] and not x.endswith("the plate"):
-                bad.append((key, f"destination lost: {x!r}"))
+            xl = x.lower()
+            # libero_10's quantifier: "put BOTH X and Y" without "both" is a
+            # different, easier task.
+            if "both" in low and "both" not in xl:
+                bad.append((key, f"quantifier 'both' lost: {x!r}"))
+            # "... and close it" is a second subtask, not a flourish.
+            if ("close it" in low or "close the" in low) and not (
+                    "clos" in xl or "shut" in xl):
+                bad.append((key, f"closing action lost: {x!r}"))
+            # left/right and colours are what disambiguate the two mugs.
+            for w in ("left", "right", "white", "yellow", "black", "middle",
+                      "top", "bottom", "back", "front"):
+                if f" {w} " in f" {low} " and f" {w} " not in f" {xl} ":
+                    bad.append((key, f"'{w}' lost: {x!r}"))
+    check("all 40 LIBERO instructions are written", len(P._TABLE) == 40)
     check(f"every written entry is well formed ({len(P._TABLE)} entries)",
           not bad)
     if bad:
