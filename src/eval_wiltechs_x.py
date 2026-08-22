@@ -70,6 +70,19 @@ from models.wiltechs_x.wiltechs_x_config import WiltechsXConfig  # noqa: F401  (
 from models.wiltechs_x.wiltechs_x_policy import WiltechsXPolicy
 
 
+def _git_commit() -> str | None:
+    """Which build produced this JSON. Cheap, and the alternative is guessing
+    from which keys happen to be present in the file."""
+    import subprocess
+    try:
+        r = subprocess.run(["git", "-C", str(Path(__file__).resolve().parent),
+                            "rev-parse", "--short", "HEAD"],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() or None
+    except Exception:
+        return None
+
+
 def pick_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
@@ -656,8 +669,16 @@ def main():
               "success rate means the instruction is not driving the\npolicy, "
               "which no amount of further training changes.")
 
+    # Everything a later run must match to be comparable. `seed` and the eval
+    # commit were missing, and both bit: the seed only started reaching the
+    # policy in 92ec163, so a JSON written before it recorded a draw that
+    # cannot be reproduced -- and nothing in the file said which side it was
+    # on. A baseline you cannot re-run is not a baseline.
     payload = {"checkpoint": str(ckpt), "control_freq": a.control_freq,
                "fixed_init_states": not a.stock_init,
+               "seed": a.seed,
+               "max_episode_steps": a.max_episode_steps,
+               "eval_commit": _git_commit(),
                "num_inference_steps": policy.config.num_inference_steps,
                "n_action_steps": policy.config.n_action_steps,
                "fixed_episode_noise": bool(a.fixed_episode_noise),
