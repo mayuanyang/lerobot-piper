@@ -500,6 +500,7 @@ def test_attention_mass():
 
 
 def test_paraphrase():
+    import re
     """The model scores 60% on an instruction and 0% on a paraphrase of it, so
     it keys on surface form. These checks are about the augmentation being an
     honest fix for that: the original must survive (eval uses it), the MEANING
@@ -552,6 +553,21 @@ def test_paraphrase():
     b = set(P.paraphrases("pick up the black bowl on the wooden cabinet "
                           "and place it on the plate"))
     check("variant sets of two tasks never collide", not (a & b))
+
+    # A destination reached with "in" must never be rewritten to "on": the
+    # reward stays the original task's, so the policy would be trained to do
+    # one thing while told another. The first version substituted on/onto
+    # unconditionally and would have done this to every libero_object task.
+    ob = P.paraphrases("pick up the alphabet soup and place it in the basket")
+    check("libero_object form is augmented too (relation is optional)", len(ob) >= 5)
+    check("preposition stays inside its equivalence class",
+          all(re.search(r"\b(in|into|inside)\s+the basket$", x) for x in ob))
+    check("no 'set it into/inside' (not idiomatic)",
+          not any("set it into" in x or "set it inside" in x for x in ob))
+
+    cov, under = P.coverage([SP, "turn on the stove"], 8, 5)
+    check("coverage names the instructions below the minimum",
+          under == ["turn on the stove"] and len(cov[SP]) >= 5)
 
     tbl = P.build_table([SP, SP, "pick up the black bowl on the ramekin "
                                  "and place it on the plate"])

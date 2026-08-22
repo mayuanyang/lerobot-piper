@@ -332,6 +332,18 @@ class WiltechsXConfig(PreTrainedConfig):
     # string is always among the variants because evaluation uses it.
     paraphrase_augment: bool = False
     paraphrase_limit: int = 8
+    # Instructions the templates decline to restructure -- libero_goal's "turn
+    # on the stove", libero_10's "put both X and Y in the basket" -- need a
+    # hand-written table, or they train unaugmented while everything else
+    # varies. Partial augmentation is worse than none: the model keeps surface
+    # form as a usable key for exactly the tasks that were left alone, and the
+    # run cannot say whether augmentation works. A supplied entry overrides the
+    # templates. `python -m models.wiltechs_x.paraphrase --dataset_id ... --out`
+    # writes a starting table and names the entries that need editing.
+    paraphrase_file: str = ""
+    # Trainer preflight: refuse to start if any instruction has fewer variants
+    # than this. Failing at startup beats discovering it in the eval.
+    paraphrase_min_variants: int = 5
 
     # =====================================================================
     # Optimizer / schedule

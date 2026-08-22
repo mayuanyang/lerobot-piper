@@ -50,14 +50,26 @@ _LOCATIVE = ("between the", "next to the", "in the top drawer of the",
 _NON_LOCATIVE = ("from the", "from")
 
 _GRASP = ("pick up", "grasp", "take", "lift")
-_PLACE = (("place", "on"), ("put", "on"), ("place", "onto"), ("put", "onto"),
-          ("set", "on"))
+_PLACE_VERBS = ("place", "put", "set")
+# Prepositions may only be swapped INSIDE an equivalence class. "place it in
+# the basket" -> "place it on the basket" is a different instruction, and the
+# reward would still be the original task's -- the model would be trained to
+# do one thing while told another. The first version of this file substituted
+# on/onto unconditionally and would have done exactly that to libero_object.
+_PREP_CLASS = {"on": ("on", "onto"), "onto": ("onto", "on"),
+               "in": ("in", "into", "inside"), "into": ("into", "in"),
+               "inside": ("inside", "in")}
+# "set it into the basket" is not idiomatic; keep `set` on surfaces.
+_SET_OK = ("on", "onto")
 _QUALIFIER = ("", "that is ", "which is ")
 
+# The relation is OPTIONAL: libero_object is "pick up the alphabet soup and
+# place it in the basket", with nothing between object and "and".
 _PATTERN = re.compile(
-    r"^(?P<verb>pick up|grasp|take|lift)\s+(?P<obj>.+?)\s+"
-    r"(?P<rel>(?:%s)\s+.+?|(?:%s)\s+.+?)\s+"
-    r"and\s+(?P<pverb>place|put|set)\s+it\s+(?P<prep>onto|on|in|into)\s+(?P<dest>.+)$"
+    r"^(?P<verb>pick up|grasp|take|lift)\s+(?P<obj>.+?)"
+    r"(?:\s+(?P<rel>(?:%s)\s+.+?|(?:%s)\s+.+?))?\s+"
+    r"and\s+(?P<pverb>place|put|set)\s+it\s+"
+    r"(?P<prep>onto|on|into|inside|in)\s+(?P<dest>.+)$"
     % ("|".join(re.escape(r) for r in _LOCATIVE),
        "|".join(re.escape(r) for r in _NON_LOCATIVE)),
     re.IGNORECASE)
@@ -76,18 +88,25 @@ def paraphrases(instruction: str, limit: int = 8) -> list[str]:
     if not m:
         return [text]
 
-    obj, rel, dest = m["obj"], m["rel"], m["dest"]
-    locative = rel.lower().startswith(tuple(r.lower() for r in _LOCATIVE))
+    obj, dest = m["obj"], m["dest"]
+    rel = m["rel"] or ""
+    locative = bool(rel) and rel.lower().startswith(
+        tuple(r.lower() for r in _LOCATIVE))
+    preps = _PREP_CLASS.get(m["prep"].lower(), (m["prep"].lower(),))
 
     out, seen = [text], {text.lower()}
     for grasp in _GRASP:
         for qual in (_QUALIFIER if locative else ("",)):
-            for pverb, prep in _PLACE:
-                cand = f"{grasp} {obj} {qual}{rel} and {pverb} it {prep} {dest}"
-                key = cand.lower()
-                if key not in seen:
-                    seen.add(key)
-                    out.append(cand)
+            for pverb in _PLACE_VERBS:
+                for prep in preps:
+                    if pverb == "set" and prep not in _SET_OK:
+                        continue
+                    mid = f" {qual}{rel}" if rel else ""
+                    cand = f"{grasp} {obj}{mid} and {pverb} it {prep} {dest}"
+                    key = cand.lower()
+                    if key not in seen:
+                        seen.add(key)
+                        out.append(cand)
     # Deterministic order, and a stable subset when limit < len(out): the
     # nested loops already vary the grasp verb slowest, so a prefix would be
     # all "pick up". Stride instead, keeping the original at index 0.
@@ -129,16 +148,69 @@ def load_table(path: str | Path) -> dict[str, list[str]]:
     return table
 
 
-if __name__ == "__main__":  # quick look at what a suite would get
-    import sys
-    samples = sys.argv[1:] or [
-        "pick up the black bowl on the stove and place it on the plate",
-        "pick up the black bowl between the plate and the ramekin and place it on the plate",
-        "pick up the black bowl from table center and place it on the plate",
-        "open the top drawer of the cabinet",
-    ]
-    for s in samples:
-        v = paraphrases(s)
-        print(f"\n{s}\n  -> {len(v)} variants")
-        for x in v:
-            print(f"     {x}")
+def coverage(instructions, limit: int = 8, minimum: int = 5,
+             extra: dict[str, list[str]] | None = None):
+    """-> (table, under) where `under` lists instructions below `minimum`.
+
+    Templates cover the pick-and-place forms (libero_spatial, libero_object).
+    They deliberately do NOT guess at libero_goal's "turn on the stove" or
+    libero_10's "put both the alphabet soup and the tomato sauce in the
+    basket": inventing structure for those risks emitting a sentence that
+    means something else, which trains the wrong task under the right reward.
+    Those need a hand-written or LLM-written table, and `under` is the list to
+    write it for.
+
+    Partial augmentation is worse than none. Some tasks varied and others not
+    means the model can still key on surface form for the unvaried ones, and
+    the run tells you nothing about whether augmentation works.
+    """
+    extra = extra or {}
+    table, under = {}, []
+    for ins in instructions:
+        key = " ".join(str(ins).split())
+        if key in table:
+            continue
+        table[key] = extra.get(key) or paraphrases(key, limit)
+        if len(table[key]) < minimum:
+            under.append(key)
+    return table, under
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="Report how many variants each instruction would get. Run "
+                    "this BEFORE committing a training run to --paraphrase_augment.")
+    ap.add_argument("--instructions", help="file with one instruction per line")
+    ap.add_argument("--dataset_id", help="read the task strings off a LeRobot dataset")
+    ap.add_argument("--extra", help="existing paraphrase JSON to count as covered")
+    ap.add_argument("--limit", type=int, default=8)
+    ap.add_argument("--min_variants", type=int, default=5)
+    ap.add_argument("--out", help="write the full table here (JSON)")
+    a = ap.parse_args()
+
+    if a.dataset_id:
+        from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+        meta = LeRobotDatasetMetadata(a.dataset_id, force_cache_sync=True)
+        raw = meta.tasks
+        ins = list(raw.values()) if isinstance(raw, dict) else list(raw)
+    elif a.instructions:
+        ins = [l for l in Path(a.instructions).read_text().splitlines() if l.strip()]
+    else:
+        ins = ["pick up the black bowl on the stove and place it on the plate",
+               "pick up the alphabet soup and place it in the basket",
+               "turn on the stove"]
+
+    table, under = coverage(ins, a.limit, a.min_variants,
+                            load_table(a.extra) if a.extra else None)
+    for k, v in table.items():
+        print(f"{len(v):>3}  {k}")
+    print(f"\n{len(table)} instructions, "
+          f"{len(table) - len(under)} at >= {a.min_variants} variants, "
+          f"{len(under)} BELOW")
+    for k in under:
+        print(f"  UNDER: {k}")
+    if a.out:
+        Path(a.out).write_text(json.dumps(table, indent=2, ensure_ascii=False))
+        print(f"\nwrote {a.out} -- hand-edit the UNDER entries, then pass it as "
+              f"--paraphrase_file")

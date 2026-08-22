@@ -687,6 +687,7 @@ class WiltechsXModel(nn.Module):
         self._suite_tokens = {}       # instruction -> token set  (hinge buckets)
         self._suite_id = {}           # instruction -> suite representative
         self._paraphrase_cache = {}   # instruction -> surface variants
+        self._paraphrase_file = None  # lazily loaded --paraphrase_file
         self.gradient_checkpointing = False
 
     # =====================================================================
@@ -881,8 +882,13 @@ class WiltechsXModel(nn.Module):
         key = " ".join(str(desc).split())
         variants = self._paraphrase_cache.get(key)
         if variants is None:
-            from .paraphrase import paraphrases
-            variants = paraphrases(
+            from .paraphrase import load_table, paraphrases
+            if self._paraphrase_file is None:
+                path = str(getattr(self.config, "paraphrase_file", "") or "")
+                self._paraphrase_file = load_table(path) if path else {}
+            # A supplied table WINS over the templates: it is there precisely
+            # for the sentences the templates decline to guess at.
+            variants = self._paraphrase_file.get(key) or paraphrases(
                 key, int(getattr(self.config, "paraphrase_limit", 8)))
             self._paraphrase_cache[key] = variants
             self._once(f"para::{len(self._paraphrase_cache)}",

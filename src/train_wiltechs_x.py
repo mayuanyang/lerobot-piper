@@ -202,6 +202,9 @@ def build_datasets(dataset_ids, obs_steps, horizon, max_episode_index):
         "dataset": base, "ep_from": ep_from, "ep_to": ep_to, "cameras": cameras,
         "state_dim": state_dim, "action_dim": action_dim, "stats": stats,
         "fps": fps, "input_features": in_f, "output_features": out_f,
+        # Carried out so the paraphrase preflight can enumerate the instruction
+        # strings without re-fetching the metadata.
+        "meta": ref, "metas": metas,
     }
 
 
@@ -544,6 +547,8 @@ def train(
     contrastive_suite_jaccard: float = 0.5,
     paraphrase_augment: bool = False,
     paraphrase_limit: int = 8,
+    paraphrase_file: str = "",
+    paraphrase_min_variants: int = 5,
     use_descriptive_objects: bool = False,
     preprocess_in_workers: bool = True,
     profile_steps: int = 20,
@@ -588,6 +593,43 @@ def train(
                 f"explicitly or --no_wrist_encoder. The wrist path is worth ~34 "
                 f"points in this repo's own measurements — do not drop it silently.")
     print(f"wrist cameras: {wrist_keys}")
+
+    if paraphrase_augment:
+        # Preflight, not a runtime warning. A sentence the templates decline to
+        # restructure trains UNAUGMENTED while the rest vary, so the model keeps
+        # surface form as a usable key for exactly those tasks -- and the run
+        # cannot answer whether augmentation works. Twenty hours is too long to
+        # find that out from the eval.
+        from models.wiltechs_x.paraphrase import coverage, load_table
+        raw = getattr(D["meta"], "tasks", None) if "meta" in D else None
+        if raw is None:
+            print("[paraphrase] dataset metadata exposes no task list; coverage "
+                  "cannot be checked here. Run\n"
+                  "  python -m models.wiltechs_x.paraphrase --dataset_id <id> "
+                  "--min_variants N\nbefore trusting this run.")
+        else:
+            instructions = list(raw.values()) if isinstance(raw, dict) else list(raw)
+            table, under = coverage(
+                instructions, paraphrase_limit, paraphrase_min_variants,
+                load_table(paraphrase_file) if paraphrase_file else None)
+            sizes = sorted(len(v) for v in table.values())
+            print(f"[paraphrase] {len(table)} instructions, "
+                  f"{len(table) - len(under)} at >= {paraphrase_min_variants} "
+                  f"variants (min {sizes[0]}, median {sizes[len(sizes) // 2]}, "
+                  f"max {sizes[-1]})")
+            if under:
+                shown = "\n".join(f"    {len(table[k]):>2}  {k}" for k in under[:12])
+                raise SystemExit(
+                    f"[paraphrase] {len(under)} instruction(s) below "
+                    f"--paraphrase_min_variants {paraphrase_min_variants}:\n"
+                    f"{shown}\n"
+                    f"{'    ...' if len(under) > 12 else ''}\n"
+                    f"  Write a table for these and pass --paraphrase_file:\n"
+                    f"    python -m models.wiltechs_x.paraphrase "
+                    f"--dataset_id {dataset_ids[0]} --out para.json\n"
+                    f"  then hand-edit the entries listed as UNDER. Lower "
+                    f"--paraphrase_min_variants only if you accept that those "
+                    f"tasks train unaugmented.")
 
     gthr = calibrate_gripper_threshold(stats, gripper_action_dim)
 
@@ -637,6 +679,8 @@ def train(
         contrastive_suite_jaccard=contrastive_suite_jaccard,
         paraphrase_augment=paraphrase_augment,
         paraphrase_limit=paraphrase_limit,
+        paraphrase_file=paraphrase_file,
+        paraphrase_min_variants=paraphrase_min_variants,
         optimizer_lr=lr, optimizer_weight_decay=weight_decay,
         scheduler_warmup_steps=warmup_steps,
         scheduler_decay_steps=training_steps,
@@ -944,6 +988,8 @@ def train(
          "contrastive_suite_jaccard": contrastive_suite_jaccard,
          "paraphrase_augment": paraphrase_augment,
          "paraphrase_limit": paraphrase_limit,
+         "paraphrase_file": paraphrase_file,
+         "paraphrase_min_variants": paraphrase_min_variants,
          "freeze_wrist_encoder": policy.config.freeze_wrist_encoder,
          "gradient_checkpointing": gradient_checkpointing}, indent=2))
     print("done")
@@ -1104,6 +1150,17 @@ def main():
                         "original string is always in the set; eval uses it.")
     p.add_argument("--paraphrase_limit", type=int, default=8,
                    help="Variants per instruction, including the original.")
+    p.add_argument("--paraphrase_file", default="",
+                   help="JSON of instruction -> [variants], overriding the "
+                        "templates. For the sentences they decline to "
+                        "restructure (libero_goal, libero_10). Generate a "
+                        "starting table with: python -m "
+                        "models.wiltechs_x.paraphrase --dataset_id <id> --out f.json")
+    p.add_argument("--paraphrase_min_variants", type=int, default=5,
+                   help="Refuse to start if any instruction has fewer variants "
+                        "than this. Partial augmentation is worse than none: "
+                        "the untouched tasks keep surface form as a usable key "
+                        "and the run cannot say whether augmentation worked.")
     p.add_argument("--use_descriptive_objects", action="store_true")
     p.add_argument("--no_preprocess_in_workers", dest="preprocess_in_workers",
                    action="store_false", default=True,
