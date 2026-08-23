@@ -255,8 +255,43 @@ def state_scale(preprocessor):
     return None
 
 
+def blur_images(batch: dict, factor: int, cams=None) -> int:
+    """Destroy detail finer than `factor` pixels, keeping every shape identical.
+
+    Downsample then upsample back, so the ViT still sees the same resolution
+    and produces the same token count -- only the information below `factor`
+    pixels is gone. That is what makes this a clean test of whether the policy
+    USES fine visual detail: an image at a genuinely lower resolution would
+    also change the token grid, and then a drop could not be attributed.
+
+    Flat success rate under factor 2 means adding vision capacity (a finer
+    DINO path, a larger vision_input_size, LoRA on the tower) is buying
+    resolution the policy already declines to use.
+    """
+    n = 0
+    for k in list(batch):
+        if not k.startswith("observation.image"):
+            continue
+        if cams and not any(c in k for c in cams):
+            continue
+        v = batch[k]
+        if not torch.is_tensor(v) or v.dim() < 3:
+            continue
+        flat = v.reshape(-1, *v.shape[-3:]) if v.dim() > 4 else v
+        h, w = flat.shape[-2:]
+        small = torch.nn.functional.interpolate(
+            flat, size=(max(1, h // factor), max(1, w // factor)),
+            mode="area")
+        back = torch.nn.functional.interpolate(
+            small, size=(h, w), mode="bilinear", align_corners=False)
+        batch[k] = back.reshape(v.shape)
+        n += 1
+    return n
+
+
 def build_batch(obs_list, tasks, hist: StateHistory, preprocessor, device,
-                state_noise: float = 0.0, state_noise_dims=None):
+                state_noise: float = 0.0, state_noise_dims=None,
+                blur: int = 0, blur_cams=None):
     from lerobot.envs.utils import preprocess_observation
 
     stacked = {
@@ -270,6 +305,11 @@ def build_batch(obs_list, tasks, hist: StateHistory, preprocessor, device,
     # the state token, exactly as in training.
     batch["observation.state"] = torch.from_numpy(hist.stack()).float()
     batch["task"] = list(tasks)
+    # Before the preprocessor, on the raw [0, 1] frames: that is where "detail
+    # finer than N pixels" is a statement about the camera rather than about
+    # whatever affine the normalizer applies.
+    if blur > 1:
+        blur_images(batch, blur, blur_cams)
     batch = preprocessor(batch)
 
     if state_noise > 0.0:
@@ -300,7 +340,7 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
               max_episode_steps: int, seed: int, expected_cams: list[str],
               video_cb=None, videos_per_task: int = 0, heartbeat: int = 50,
               instruction: str | None = None, state_noise: float = 0.0,
-              state_noise_dims=None):
+              state_noise_dims=None, blur: int = 0, blur_cams=None):
     """-> (n_success, n_episodes, mean_success_steps, n_chunks, task_description,
     per_episode_success).
 
@@ -384,7 +424,8 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
                 # it mid-chunk would drop the actions the live envs still owe.
                 batch = build_batch(obs_list, [told] * num_envs, hist,
                                     preprocessor, device,
-                                    state_noise, state_noise_dims)
+                                    state_noise, state_noise_dims,
+                                    blur, blur_cams)
                 # An empty queue means this call will run the prefix. Counting
                 # it here rather than after the call keeps it correct at
                 # n_action_steps=1, where the queue is empty again on return.
@@ -565,6 +606,18 @@ def main():
                    help="Restrict --state_noise to these state indices, e.g. "
                         "0 1 2 for end-effector position only. Default: all "
                         "dims, matching the sibling trainers.")
+    p.add_argument("--image_blur", type=int, default=0,
+                   help="Downsample the camera frames by this factor and "
+                        "upsample back, destroying detail finer than N pixels "
+                        "while keeping the token grid identical. The mirror of "
+                        "--state_noise: flat SR under factor 2 means the policy "
+                        "does not use fine visual detail, so a finer DINO path, "
+                        "a larger --vision_input_size, or LoRA on the vision "
+                        "tower is buying resolution it declines to read.")
+    p.add_argument("--image_blur_cams", nargs="+", default=None,
+                   help="Restrict --image_blur to camera keys containing these "
+                        "substrings, e.g. image2 for the wrist view alone. "
+                        "Default: every camera.")
     p.add_argument("--heartbeat", type=int, default=50,
                    help="Env steps between progress lines inside a rollout. A "
                         "batch that runs to the episode cap is minutes of "
@@ -641,6 +694,13 @@ def main():
               f"unchanged. This is a DIAGNOSTIC: flat SR means state "
               f"augmentation buys nothing.")
 
+    if a.image_blur > 1:
+        print(f"[eval] IMAGE BLUR x{a.image_blur} on "
+              f"{a.image_blur_cams or 'every camera'} -- detail finer than "
+              f"~{a.image_blur} px is gone, token grid unchanged.\n"
+              f"       DIAGNOSTIC: flat SR means more vision resolution is not "
+              f"the missing ingredient.")
+
     video_cb = make_video_writer(Path(a.video_dir) if a.video_dir else None,
                                  a.videos_per_task)
 
@@ -708,7 +768,8 @@ def main():
                 policy, pre, post, suite, suite_name, tid, a.episodes,
                 a.num_envs, device, a.max_episode_steps, a.seed, cams, video_cb,
                 a.videos_per_task, a.heartbeat, wrong.get(tid),
-                a.state_noise, a.state_noise_dims)
+                a.state_noise, a.state_noise_dims,
+                a.image_blur, a.image_blur_cams)
             sr = 100.0 * n_ok / max(n_ep, 1)
             per_task[tid] = {"success_rate": sr, "n_success": n_ok,
                              "n_episodes": n_ep, "mean_success_steps": mean_steps,
@@ -773,6 +834,8 @@ def main():
                "fixed_episode_noise": bool(a.fixed_episode_noise),
                "state_noise": a.state_noise,
                "state_noise_dims": a.state_noise_dims,
+               "image_blur": a.image_blur,
+               "image_blur_cams": a.image_blur_cams,
                "episodes_per_task": a.episodes, "ablate_lang": a.ablate_lang,
                "instruction_override": a.instruction_override,
                "instruction_from_task": a.instruction_from_task,
@@ -785,6 +848,8 @@ def main():
                     if (a.instruction_override or a.instruction_from_task is not None)
                     else f"eval_libero_statenoise_{a.state_noise:g}.json"
                     if a.state_noise > 0.0
+                    else f"eval_libero_blur_{a.image_blur}.json"
+                    if a.image_blur > 1
                     else "eval_libero.json")
     out = Path(a.out) if a.out else ckpt / default_name
     out.write_text(json.dumps(payload, indent=2))
