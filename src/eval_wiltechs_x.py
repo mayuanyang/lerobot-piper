@@ -261,7 +261,15 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
               max_episode_steps: int, seed: int, expected_cams: list[str],
               video_cb=None, videos_per_task: int = 0, heartbeat: int = 50,
               instruction: str | None = None):
-    """-> (n_success, n_episodes, mean_success_steps, n_chunks, task_description)."""
+    """-> (n_success, n_episodes, mean_success_steps, n_chunks, task_description,
+    per_episode_success).
+
+    The per-episode vector is what makes two checkpoints COMPARABLE. Episode i
+    starts from the same canonical init state in every run (fixed_init_states),
+    so two evals are a PAIRED sample and McNemar applies. Comparing only the
+    two rates throws that away and leaves ~15pp of unpaired noise at n=20 --
+    enough to invent a 20-point "regression" between adjacent checkpoints.
+    """
     from lerobot.envs.libero import LiberoEnv
 
     # Building an OffScreenRenderEnv takes seconds and there are num_envs of
@@ -394,7 +402,8 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
                     video_cb(task_id, start + i, frames[i])
 
         mean_steps = float(np.mean(steps_to_success)) if steps_to_success else float("nan")
-        return sum(successes), len(successes), mean_steps, n_chunks, task_desc
+        return (sum(successes), len(successes), mean_steps, n_chunks, task_desc,
+                [int(s) for s in successes])
     finally:
         for e in envs:
             try:
@@ -619,14 +628,17 @@ def main():
         per_task = {}
         for k, tid in enumerate(task_ids):
             t_task = time.time()
-            n_ok, n_ep, mean_steps, n_chunks, desc = eval_task(
+            n_ok, n_ep, mean_steps, n_chunks, desc, ep_ok = eval_task(
                 policy, pre, post, suite, suite_name, tid, a.episodes,
                 a.num_envs, device, a.max_episode_steps, a.seed, cams, video_cb,
                 a.videos_per_task, a.heartbeat, wrong.get(tid))
             sr = 100.0 * n_ok / max(n_ep, 1)
             per_task[tid] = {"success_rate": sr, "n_success": n_ok,
                              "n_episodes": n_ep, "mean_success_steps": mean_steps,
-                             "policy_chunks": n_chunks, "task": desc}
+                             "policy_chunks": n_chunks, "task": desc,
+                             # Ordered by episode index == canonical init state,
+                             # so two runs of this line are paired. See eval_task.
+                             "episode_success": ep_ok}
             done_n, total_n = k + 1, len(task_ids)
             eta = (time.time() - t0) / done_n * (total_n - done_n) / 60
             print(f"  task {tid:2d}  SR {sr:5.1f}%  ({n_ok}/{n_ep})  "
