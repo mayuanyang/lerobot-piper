@@ -238,7 +238,25 @@ def patch_control_freq(control_freq: int, render_gpu: int):
 # ---------------------------------------------------------------------------
 # Rollout
 # ---------------------------------------------------------------------------
-def build_batch(obs_list, tasks, hist: StateHistory, preprocessor, device):
+def state_scale(preprocessor):
+    """Per-dimension std of observation.state, for printing sigma in real units.
+
+    Best effort: the pipeline's shape is lerobot's, not ours. Returns None
+    rather than guessing, and the banner then reports normalized units only.
+    """
+    for step in getattr(preprocessor, "steps", []) or []:
+        stats = getattr(step, "stats", None)
+        if isinstance(stats, dict) and "observation.state" in stats:
+            s = stats["observation.state"]
+            for key in ("std", "max"):
+                v = s.get(key) if isinstance(s, dict) else getattr(s, key, None)
+                if v is not None:
+                    return np.asarray(v, dtype=float), key
+    return None
+
+
+def build_batch(obs_list, tasks, hist: StateHistory, preprocessor, device,
+                state_noise: float = 0.0, state_noise_dims=None):
     from lerobot.envs.utils import preprocess_observation
 
     stacked = {
@@ -252,7 +270,28 @@ def build_batch(obs_list, tasks, hist: StateHistory, preprocessor, device):
     # the state token, exactly as in training.
     batch["observation.state"] = torch.from_numpy(hist.stack()).float()
     batch["task"] = list(tasks)
-    return preprocessor(batch)
+    batch = preprocessor(batch)
+
+    if state_noise > 0.0:
+        # AFTER the preprocessor, so sigma is in the same normalized units the
+        # sibling trainers use (apply_joint_augmentations: randn * 0.02). That
+        # makes this measurement directly answer "what sigma should training
+        # use", instead of needing a unit conversion to be trusted.
+        #
+        # ONE offset for the whole (B, T, D) window, not per frame: the motion
+        # encoder reads differences, so independent per-frame noise would inject
+        # a velocity spike that the real failure mode -- being a few millimetres
+        # off -- does not produce. A constant offset leaves every difference
+        # unchanged and moves only the position.
+        s = batch["observation.state"]
+        off = torch.randn(s.shape[0], 1, s.shape[-1], device=s.device,
+                          dtype=s.dtype) * state_noise
+        if state_noise_dims is not None:
+            keep = torch.zeros(s.shape[-1], device=s.device, dtype=s.dtype)
+            keep[list(state_noise_dims)] = 1.0
+            off = off * keep
+        batch["observation.state"] = s + off.expand_as(s)
+    return batch
 
 
 @torch.no_grad()
@@ -260,7 +299,8 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
               task_id: int, episodes: int, num_envs: int, device: str,
               max_episode_steps: int, seed: int, expected_cams: list[str],
               video_cb=None, videos_per_task: int = 0, heartbeat: int = 50,
-              instruction: str | None = None):
+              instruction: str | None = None, state_noise: float = 0.0,
+              state_noise_dims=None):
     """-> (n_success, n_episodes, mean_success_steps, n_chunks, task_description,
     per_episode_success).
 
@@ -343,7 +383,8 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
                 # queue inside select_action is keyed on batch size, and resizing
                 # it mid-chunk would drop the actions the live envs still owe.
                 batch = build_batch(obs_list, [told] * num_envs, hist,
-                                    preprocessor, device)
+                                    preprocessor, device,
+                                    state_noise, state_noise_dims)
                 # An empty queue means this call will run the prefix. Counting
                 # it here rather than after the call keeps it correct at
                 # n_action_steps=1, where the queue is empty again on return.
@@ -510,6 +551,20 @@ def main():
                         "this suite by id -- no chance of a typo silently "
                         "testing a different sentence. Use with --task_ids to "
                         "swap a pair: --task_ids 7 --instruction_from_task 9.")
+    p.add_argument("--state_noise", type=float, default=0.0,
+                   help="Gaussian offset added to observation.state, sigma in "
+                        "NORMALIZED units -- the same units the sibling trainers "
+                        "augment in (train_wiltechs_moe uses 0.02). Sweep it to "
+                        "find out whether the policy is brittle to being a few "
+                        "millimetres off, which is what a fumbled grasp is. Flat "
+                        "SR means state augmentation buys nothing; a collapse "
+                        "means it does, and the collapse point is the sigma to "
+                        "train at. One offset per episode-window, so the motion "
+                        "differences are untouched.")
+    p.add_argument("--state_noise_dims", nargs="+", type=int, default=None,
+                   help="Restrict --state_noise to these state indices, e.g. "
+                        "0 1 2 for end-effector position only. Default: all "
+                        "dims, matching the sibling trainers.")
     p.add_argument("--heartbeat", type=int, default=50,
                    help="Env steps between progress lines inside a rollout. A "
                         "batch that runs to the episode cap is minutes of "
@@ -564,6 +619,27 @@ def main():
           f"NFE={policy.config.num_inference_steps} "
           f"state_history={policy.config.n_obs_steps} "
           f"noise={'fixed/episode' if a.fixed_episode_noise else 'per-chunk'}")
+
+    if a.state_noise > 0.0:
+        # Report the physical size too. A sigma the arm cannot actually be off
+        # by measures nothing, and one large enough to contradict the camera is
+        # measuring a broken observation rather than a brittle policy.
+        sc = state_scale(pre)
+        dims = a.state_noise_dims if a.state_noise_dims is not None else "all"
+        phys = ""
+        if sc is not None:
+            scale, kind = sc
+            idx = (a.state_noise_dims if a.state_noise_dims is not None
+                   else range(min(3, len(scale))))
+            vals = [a.state_noise * float(scale[i]) for i in idx if i < len(scale)]
+            if vals:
+                phys = (f"  ~= {min(vals) * 1000:.1f}-{max(vals) * 1000:.1f} mm "
+                        f"on dims {list(idx)} (from dataset {kind})")
+        print(f"[eval] STATE NOISE sigma={a.state_noise} normalized on dims "
+              f"{dims}{phys}\n"
+              f"       One offset per window, so motion differences are "
+              f"unchanged. This is a DIAGNOSTIC: flat SR means state "
+              f"augmentation buys nothing.")
 
     video_cb = make_video_writer(Path(a.video_dir) if a.video_dir else None,
                                  a.videos_per_task)
@@ -631,7 +707,8 @@ def main():
             n_ok, n_ep, mean_steps, n_chunks, desc, ep_ok = eval_task(
                 policy, pre, post, suite, suite_name, tid, a.episodes,
                 a.num_envs, device, a.max_episode_steps, a.seed, cams, video_cb,
-                a.videos_per_task, a.heartbeat, wrong.get(tid))
+                a.videos_per_task, a.heartbeat, wrong.get(tid),
+                a.state_noise, a.state_noise_dims)
             sr = 100.0 * n_ok / max(n_ep, 1)
             per_task[tid] = {"success_rate": sr, "n_success": n_ok,
                              "n_episodes": n_ep, "mean_success_steps": mean_steps,
@@ -694,6 +771,8 @@ def main():
                "num_inference_steps": policy.config.num_inference_steps,
                "n_action_steps": policy.config.n_action_steps,
                "fixed_episode_noise": bool(a.fixed_episode_noise),
+               "state_noise": a.state_noise,
+               "state_noise_dims": a.state_noise_dims,
                "episodes_per_task": a.episodes, "ablate_lang": a.ablate_lang,
                "instruction_override": a.instruction_override,
                "instruction_from_task": a.instruction_from_task,
@@ -704,6 +783,8 @@ def main():
     default_name = ("eval_libero_ablated.json" if a.ablate_lang
                     else "eval_libero_override.json"
                     if (a.instruction_override or a.instruction_from_task is not None)
+                    else f"eval_libero_statenoise_{a.state_noise:g}.json"
+                    if a.state_noise > 0.0
                     else "eval_libero.json")
     out = Path(a.out) if a.out else ckpt / default_name
     out.write_text(json.dumps(payload, indent=2))
