@@ -971,7 +971,7 @@ def train(
     # Subset the OUTERMOST wrapper: ProgressDataset and VlmPixelDataset are
     # both index-preserving maps, so a positional Subset over either reaches
     # the same frames as one over the base.
-    val_loader, train_ds, n_val_frames = None, dataset, 0
+    val_loader, fit_loader, train_ds, n_val_frames = None, None, dataset, 0
     if val_episodes > 0:
         tr_ep, va_ep, alloc = split_episodes(D["ep_task"], val_episodes, seed)
         frames = lambda eps: [i for e in eps
@@ -992,10 +992,22 @@ def train(
         # val loader alone would leave them in the training stream and the
         # split would measure nothing.
         train_ds = torch.utils.data.Subset(dataset, tr_idx)
-        val_loader = torch.utils.data.DataLoader(
-            torch.utils.data.Subset(dataset, va_idx), batch_size=batch_size,
+        mk = lambda idx: torch.utils.data.DataLoader(
+            torch.utils.data.Subset(dataset, idx), batch_size=batch_size,
             shuffle=False, num_workers=max(num_workers // 2, 1),
             pin_memory=(device == "cuda"), drop_last=True)
+        val_loader = mk(va_idx)
+        # A same-sized sample of TRAINING episodes, scored the same way. The
+        # step log's train loss is NOT comparable to the val loss: it is
+        # measured under paraphrase augmentation and on fresh flow draws, both
+        # of which make it larger for reasons that have nothing to do with
+        # generalisation. Comparing them directly would flatter the val number
+        # and hide over-fitting. This pass removes both differences, so
+        # fit - val is the gap and nothing else.
+        rng = np.random.default_rng(seed + 1)
+        fit_ep = rng.choice(tr_ep, size=min(len(va_ep), len(tr_ep)),
+                            replace=False)
+        fit_loader = mk(frames(sorted(int(e) for e in fit_ep)))
     else:
         print("Validation: DISABLED (--val_episodes 0). Training loss alone "
               "cannot separate a better model from a better-memorised one.")
@@ -1171,10 +1183,23 @@ def train(
                                            or step >= training_steps):
                 vp, nb = run_validation(policy, val_loader, prepare, device,
                                         val_max_batches, seed)
-                vmsg = "  ".join(f"{k}={v:.4f}" for k, v in sorted(vp.items()))
-                print(f"  VAL @ {step}  {vmsg}  "
-                      f"({nb} batches of {batch_size} over {n_val_frames} "
-                      f"held-out frames)")
+                fp, _ = run_validation(policy, fit_loader, prepare, device,
+                                       val_max_batches, seed)
+                keys = sorted(set(vp) | set(fp))
+                gap = "  ".join(
+                    f"{k}={fp.get(k, float('nan')):.4f}/{vp.get(k, float('nan')):.4f}"
+                    for k in keys)
+                fv, vv = fp.get("flow"), vp.get("flow")
+                verdict = ""
+                if fv and vv:
+                    verdict = (f"   flow gap {100 * (vv / fv - 1):+.1f}%"
+                               f"  ({'held-out is WORSE — over-fitting' if vv > fv * 1.10
+                                    else 'no gap — under-fitting or under-trained'
+                                    if vv < fv * 1.03 else 'mild gap'})")
+                print(f"  VAL @ {step}  fit/heldout  {gap}{verdict}\n"
+                      f"       ({nb} batches of {batch_size} each, {n_val_frames} "
+                      f"held-out frames; both passes canonical instruction, "
+                      f"pinned draws)")
 
             if step % save_every == 0 or step >= training_steps:
                 ck = out / f"checkpoint-{step}"
