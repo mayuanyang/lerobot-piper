@@ -167,6 +167,21 @@ def build_datasets(dataset_ids, obs_steps, horizon, max_episode_index):
            or i["observation.state"].shape[-1] != state_dim \
            or next(iter(o.values())).shape[-1] != action_dim:
             raise ValueError(f"dataset {d!r} schema differs from {dataset_ids[0]!r}")
+        # fps is NOT cosmetic here. `delta` below is derived once from the FIRST
+        # dataset's fps and then applied to every dataset, so a mismatch changes
+        # the STRIDE of the action chunk and state history in the others: a set
+        # stamped at 20 Hz mixed under a 10 Hz reference gets every second frame,
+        # i.e. a 64-step chunk covering 128 real steps, and nothing raises. The
+        # opposite order lands between frames and fails the tolerance instead.
+        # `train_rft.py --rft.collect_only` defaults --rft.save_fps to 20 while
+        # LIBERO runs at 10, so this is the expected way to get bitten.
+        if abs(float(metas[d].fps) - float(ref.fps)) > 1e-6:
+            raise ValueError(
+                f"dataset {d!r} is {metas[d].fps} fps but {dataset_ids[0]!r} is "
+                f"{ref.fps}. Mixing them would silently re-stride one of the two. "
+                f"Re-stamp the collected set (its frames are unchanged -- only "
+                f"info.json's fps is wrong) or collect again with "
+                f"--rft.save_fps={ref.fps}.")
 
     stats = ref.stats if len(dataset_ids) == 1 else (
         aggregate_stats([metas[d].stats for d in dataset_ids]) if aggregate_stats
