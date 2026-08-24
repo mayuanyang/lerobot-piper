@@ -1198,10 +1198,13 @@ def train(
                 fv, vv = fp.get("flow"), vp.get("flow")
                 verdict = ""
                 if fv and vv:
-                    verdict = (f"   flow gap {100 * (vv / fv - 1):+.1f}%"
-                               f"  ({'held-out is WORSE — over-fitting' if vv > fv * 1.10
-                                    else 'no gap — under-fitting or under-trained'
-                                    if vv < fv * 1.03 else 'mild gap'})")
+                    # Built outside the f-string on purpose: a newline inside
+                    # the braces of an f-string is 3.12+ grammar, and this
+                    # trains on Colab's 3.10. Same trap as the KI banner.
+                    call = ("held-out is WORSE — over-fitting" if vv > fv * 1.10
+                            else "no gap — under-fitting or under-trained"
+                            if vv < fv * 1.03 else "mild gap")
+                    verdict = f"   flow gap {100 * (vv / fv - 1):+.1f}%  ({call})"
                 print(f"  VAL @ {step}  fit/heldout  {gap}{verdict}\n"
                       f"       ({nb} batches of {batch_size} each, {n_val_frames} "
                       f"held-out frames; both passes canonical instruction, "
