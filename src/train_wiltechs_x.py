@@ -435,7 +435,62 @@ def resolve_checkpoint(path_or_repo: str, *, for_resume: bool = True) -> Path:
     return local
 
 
-def load_resume_state(policy, ck: Path, device: str):
+def _report_key_diff(policy, missing, unexpected, allow_new: bool, src: str):
+    """Account for every parameter the checkpoint did not supply.
+
+    Adding a module to a resumed run (the wrist encoder is the case this was
+    written for) is legitimate, but it means part of the model starts from
+    random init inside a converged one. Both load paths used to be STRICT, so
+    it raised; making them lenient without saying what got initialised would be
+    worse -- half a model silently freshly-initialised is a 25-hour mistake
+    that looks like a training failure.
+
+    `unexpected` is the opposite case: the checkpoint has parameters this model
+    does not. That means something was REMOVED, which is almost never intended
+    on a resume, so it is always reported.
+    """
+    if unexpected:
+        by = {}
+        for k in unexpected:
+            by[k.split(".")[0]] = by.get(k.split(".")[0], 0) + 1
+        print(f"*** {len(unexpected)} tensor(s) in {src} have NO home in this "
+              f"model — something was removed since it was written: "
+              f"{dict(sorted(by.items(), key=lambda x: -x[1])[:6])}")
+    if not missing:
+        return
+    shapes = dict(policy.named_parameters())
+    shapes.update(dict(policy.named_buffers()))
+    by_mod, n_fresh = {}, 0
+    for k in missing:
+        n = shapes[k].numel() if k in shapes else 0
+        n_fresh += n
+        # Group at the module that owns it, not the leaf.
+        pre = ".".join(k.split(".")[:2]) if "." in k else k
+        by_mod[pre] = by_mod.get(pre, 0) + n
+    total = sum(p.numel() for p in policy.parameters())
+    lines = "\n".join(f"      {m:<44} {n / 1e6:>8.1f}M"
+                      for m, n in sorted(by_mod.items(), key=lambda x: -x[1])[:12])
+    msg = (f"{len(missing)} tensor(s) / {n_fresh / 1e6:.1f}M parameters "
+           f"({100 * n_fresh / max(total, 1):.1f}% of the model) are NOT in "
+           f"{src} and would start from RANDOM INIT:\n{lines}")
+    if not allow_new:
+        raise SystemExit(
+            f"*** {msg}\n"
+            f"  If that is the point -- adding a module to a resumed run -- pass "
+            f"--allow_new_modules.\n"
+            f"  If it is not, the config does not match the checkpoint: check "
+            f"--expert_hidden_size / --expert_intermediate_size / "
+            f"--expert_num_layers / --horizon, which change parameter SHAPES "
+            f"and cannot be resumed into.")
+    print(f"*** --allow_new_modules: {msg}\n"
+          f"    A freshly-initialised module inside a converged model starts at "
+          f"a disadvantage: attention has already learned to route around\n"
+          f"    tokens that were not there, and this repo has measured that\n"
+          f"    throttle to be self-reinforcing. Give it warmup and read the\n"
+          f"    per-component gradient report before trusting the eval.")
+
+
+def load_resume_state(policy, ck: Path, device: str, allow_new: bool = False):
     """-> (resume_state | None, start_step | None).
 
     Two kinds of checkpoint reach this. `training_state.pth` is what this
@@ -446,6 +501,9 @@ def load_resume_state(policy, ck: Path, device: str):
     start_step 0 restarts the LR schedule from warmup on a model that is
     thousands of steps in, so it is reported loudly and --start_step exists to
     repair it.
+
+    Loading is non-strict so a module can be ADDED on resume, but every tensor
+    the checkpoint did not supply is accounted for; see _report_key_diff.
     """
     state_file = ck / "training_state.pth"
     if state_file.exists():
@@ -453,11 +511,13 @@ def load_resume_state(policy, ck: Path, device: str):
         # moments (~9.5 + 2.6 GiB here), and mapping it straight onto the GPU
         # doubles the weights for as long as the dict is alive.
         st = torch.load(state_file, map_location="cpu")
-        policy.load_state_dict(st["model"])
+        r = policy.load_state_dict(st["model"], strict=False)
+        _report_key_diff(policy, r.missing_keys, r.unexpected_keys, allow_new,
+                         "training_state.pth")
         return st, st.get("step", 0)
 
     from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
-    from safetensors.torch import load_model as load_model_as_safetensor
+    from safetensors.torch import load_file as load_safetensor_file
 
     weights = ck / SAFETENSORS_SINGLE_FILE
     if not weights.exists():
@@ -465,7 +525,10 @@ def load_resume_state(policy, ck: Path, device: str):
         raise SystemExit(
             f"{ck} has neither training_state.pth nor {SAFETENSORS_SINGLE_FILE}.\n"
             f"  contents: {found}")
-    load_model_as_safetensor(policy, str(weights))
+    sd = load_safetensor_file(str(weights), device="cpu")
+    r = policy.load_state_dict(sd, strict=False)
+    _report_key_diff(policy, r.missing_keys, r.unexpected_keys, allow_new,
+                     SAFETENSORS_SINGLE_FILE)
     print(f"*** WEIGHTS-ONLY resume from {weights.name}.\n"
           f"    No optimizer state: the Adam moments restart at zero, which is "
           f"a transient of ~20 steps at betas=(0.9, 0.95).\n"
@@ -560,6 +623,7 @@ def train(
     contrastive_margin: float = 0.05,
     contrastive_frac: float = 0.5,
     contrastive_suite_jaccard: float = 0.5,
+    allow_new_modules: bool = False,
     paraphrase_augment: bool = False,
     paraphrase_limit: int = 8,
     paraphrase_file: str = "",
@@ -724,7 +788,8 @@ def train(
     if resume_from_checkpoint:
         ck = resolve_checkpoint(resume_from_checkpoint)
         print(f"resuming from {ck}")
-        resume_state, ckpt_step = load_resume_state(policy, ck, device)
+        resume_state, ckpt_step = load_resume_state(policy, ck, device,
+                                                    allow_new_modules)
         start_step = ckpt_step if ckpt_step is not None else 0
         if start_step_override >= 0:
             print(f"start_step: {start_step} -> {start_step_override} (--start_step)")
@@ -1013,6 +1078,7 @@ def train(
          "contrastive_margin": contrastive_margin,
          "contrastive_frac": contrastive_frac,
          "contrastive_suite_jaccard": contrastive_suite_jaccard,
+         "allow_new_modules": allow_new_modules,
          "paraphrase_augment": paraphrase_augment,
          "paraphrase_limit": paraphrase_limit,
          "paraphrase_file": paraphrase_file,
@@ -1166,6 +1232,13 @@ def main():
                         "which would collapse to one fixed partner per task. "
                         "0 = uniform-random negatives (behaviour before "
                         "2026-08-18).")
+    p.add_argument("--allow_new_modules", action="store_true",
+                   help="Permit --resume_from_checkpoint to leave parameters "
+                        "randomly initialised because the checkpoint has no "
+                        "entry for them -- i.e. you are ADDING a module (the "
+                        "wrist encoder) to a resumed run. Without it a resume "
+                        "that would silently initialise part of the model "
+                        "refuses to start and prints which part.")
     p.add_argument("--paraphrase_augment", action="store_true",
                    help="Train on several phrasings per instruction, resampled "
                         "every step. Measured motivation: this model scores 60% "
