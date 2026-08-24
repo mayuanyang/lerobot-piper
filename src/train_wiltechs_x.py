@@ -196,11 +196,17 @@ def build_datasets(dataset_ids, obs_steps, horizon, max_episode_index):
         **{c: [0.0] for c in cameras},
     }
 
-    subs, ep_from, ep_to, offset = [], [], [], 0
+    subs, ep_from, ep_to, ep_task, offset = [], [], [], [], 0
     for d in dataset_ids:
         ds = LeRobotDataset(d, delta_timestamps=delta, force_cache_sync=True,
                             revision="main", tolerance_s=max(0.005, ft / 2))
         ep = np.array(ds.hf_dataset["episode_index"])
+        # Per-episode task label, for stratifying the validation holdout. Keyed
+        # by dataset too: the same task_index means different things in two
+        # datasets, and a holdout that took every episode of one task would
+        # measure generalisation to an unseen TASK, not to unseen episodes.
+        cols = getattr(ds.hf_dataset, "column_names", [])
+        ti = np.array(ds.hf_dataset["task_index"]) if "task_index" in cols else None
         cuts = np.where(np.diff(ep) != 0)[0] + 1
         starts = np.concatenate([[0], cuts])
         ends = np.concatenate([cuts, [len(ep)]])
@@ -209,18 +215,100 @@ def build_datasets(dataset_ids, obs_steps, horizon, max_episode_index):
                 continue
             ep_from.append(offset + int(s))
             ep_to.append(offset + int(e))
+            ep_task.append(f"{d}#{int(ti[s])}" if ti is not None else d)
         subs.append(ds)
         offset += len(ds)
 
     base = subs[0] if len(subs) == 1 else torch.utils.data.ConcatDataset(subs)
     return {
-        "dataset": base, "ep_from": ep_from, "ep_to": ep_to, "cameras": cameras,
+        "dataset": base, "ep_from": ep_from, "ep_to": ep_to,
+        "ep_task": ep_task, "cameras": cameras,
         "state_dim": state_dim, "action_dim": action_dim, "stats": stats,
         "fps": fps, "input_features": in_f, "output_features": out_f,
         # Carried out so the paraphrase preflight can enumerate the instruction
         # strings without re-fetching the metadata.
         "meta": ref, "metas": metas,
     }
+
+
+def split_episodes(ep_task, n_val: int, seed: int):
+    """-> (train_ep, val_ep, alloc) holding out whole EPISODES, stratified.
+
+    Episode-level, never frame-level. Neighbouring frames of one episode share
+    almost all of their pixels and an action chunk overlapping by horizon-1
+    steps, so a frame split leaks the answer and the val loss then measures
+    nothing but memorisation of the same episode.
+
+    Stratified over `ep_task`, and never takes a whole group: a task left with
+    no training episodes would be scored on something the model was never
+    shown, which is generalisation to an unseen TASK -- a different question
+    than the one this is here to answer.
+    """
+    rng = np.random.default_rng(seed)
+    groups: dict[str, list[int]] = {}
+    for i, t in enumerate(ep_task):
+        groups.setdefault(t, []).append(i)
+    keys = sorted(groups)
+    alloc = {k: 0 for k in keys}
+    left = int(n_val)
+    while left > 0:                       # round-robin, so small groups are not
+        moved = False                     # squeezed out by large ones
+        for k in keys:
+            if left and alloc[k] < len(groups[k]) - 1:
+                alloc[k] += 1
+                left -= 1
+                moved = True
+        if not moved:
+            break
+    val: list[int] = []
+    for k in keys:
+        if alloc[k]:
+            val += [int(i) for i in rng.choice(groups[k], size=alloc[k],
+                                               replace=False)]
+    vs = set(val)
+    train = [i for i in range(len(ep_task)) if i not in vs]
+    return train, sorted(val), alloc
+
+
+@torch.no_grad()
+def run_validation(policy, loader, prepare, device, max_batches: int, seed: int):
+    """-> (mean loss parts over held-out episodes, n_batches).
+
+    Two things make the number comparable across steps rather than just
+    smaller-looking:
+
+      * The flow draws are PINNED. compute_loss samples `t` and the noise fresh
+        every call, so two passes over identical data differ by the sampling
+        alone -- at n=20 batches that is easily the size of the effect being
+        looked for. The RNG state is saved and restored, so measuring does not
+        perturb the training stream.
+      * policy.eval() disables paraphrase augmentation, because
+        _resolve_descs gates on self.training. The val loss is therefore always
+        against the CANONICAL instruction; a random paraphrase per pass would
+        move the target between measurements.
+    """
+    was_training = policy.training
+    policy.eval()
+    cpu_state = torch.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state_all() if device == "cuda" else None
+    torch.manual_seed(seed)
+    acc: dict[str, float] = {}
+    n = 0
+    for i, batch in enumerate(loader):
+        if i >= max_batches:
+            break
+        batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
+                 for k, v in batch.items()}
+        _, parts = policy.model.compute_loss(prepare(batch), return_parts=True)
+        for k, v in parts.items():
+            acc[k] = acc.get(k, 0.0) + float(v)
+        n += 1
+    torch.set_rng_state(cpu_state)
+    if cuda_state is not None:
+        torch.cuda.set_rng_state_all(cuda_state)
+    if was_training:
+        policy.train()
+    return {k: v / max(n, 1) for k, v in acc.items()}, n
 
 
 def report_memory_budget(model, counts, device) -> None:
@@ -634,6 +722,9 @@ def train(
     profile_steps: int = 20,
     grad_log_every: int = 1000,
     num_workers: int = 4,
+    val_episodes: int = 0,
+    val_every: int = 500,
+    val_max_batches: int = 20,
     save_every: int = 5000,
     log_every: int = 20,
     max_episode_index: int | None = None,
@@ -877,8 +968,40 @@ def train(
         print("Qwen image preprocessing runs INLINE in _encode_images, on the "
               "critical path. --profile_steps will show what that costs.")
 
+    # Subset the OUTERMOST wrapper: ProgressDataset and VlmPixelDataset are
+    # both index-preserving maps, so a positional Subset over either reaches
+    # the same frames as one over the base.
+    val_loader, train_ds, n_val_frames = None, dataset, 0
+    if val_episodes > 0:
+        tr_ep, va_ep, alloc = split_episodes(D["ep_task"], val_episodes, seed)
+        frames = lambda eps: [i for e in eps
+                              for i in range(D["ep_from"][e], D["ep_to"][e])]
+        tr_idx, va_idx = frames(tr_ep), frames(va_ep)
+        n_val_frames = len(va_idx)
+        empty = [k for k, v in alloc.items() if v == 0]
+        print(f"Validation: {len(va_ep)} episodes / {n_val_frames} frames held "
+              f"out over {len(alloc)} group(s) (dataset#task), "
+              f"{min(alloc.values())}-{max(alloc.values())} each"
+              + (f"  *** {len(empty)} group(s) got NONE — raise "
+                 f"--val_episodes to at least {len(alloc)} ***" if empty else ""))
+        if n_val_frames < batch_size:
+            raise SystemExit(
+                f"--val_episodes {val_episodes} holds out {n_val_frames} "
+                f"frames, fewer than one batch ({batch_size}). Raise it.")
+        # The TRAIN sampler must not see them. Dropping the val frames from the
+        # val loader alone would leave them in the training stream and the
+        # split would measure nothing.
+        train_ds = torch.utils.data.Subset(dataset, tr_idx)
+        val_loader = torch.utils.data.DataLoader(
+            torch.utils.data.Subset(dataset, va_idx), batch_size=batch_size,
+            shuffle=False, num_workers=max(num_workers // 2, 1),
+            pin_memory=(device == "cuda"), drop_last=True)
+    else:
+        print("Validation: DISABLED (--val_episodes 0). Training loss alone "
+              "cannot separate a better model from a better-memorised one.")
+
     loader = torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+        train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
         pin_memory=(device == "cuda"), drop_last=True,
         persistent_workers=num_workers > 0)
     steps_per_epoch = max(len(loader) // max(grad_accum, 1), 1)
@@ -1044,6 +1167,15 @@ def train(
                 acc, n_acc, t0 = {}, 0, time.time()
                 gn_sum, gn_clipped, gn_n = 0.0, 0, 0
 
+            if val_loader is not None and (step % val_every == 0
+                                           or step >= training_steps):
+                vp, nb = run_validation(policy, val_loader, prepare, device,
+                                        val_max_batches, seed)
+                vmsg = "  ".join(f"{k}={v:.4f}" for k, v in sorted(vp.items()))
+                print(f"  VAL @ {step}  {vmsg}  "
+                      f"({nb} batches of {batch_size} over {n_val_frames} "
+                      f"held-out frames)")
+
             if step % save_every == 0 or step >= training_steps:
                 ck = out / f"checkpoint-{step}"
                 ck.mkdir(parents=True, exist_ok=True)
@@ -1081,6 +1213,8 @@ def train(
          "contrastive_frac": contrastive_frac,
          "contrastive_suite_jaccard": contrastive_suite_jaccard,
          "allow_new_modules": allow_new_modules,
+         "val_episodes": val_episodes, "val_every": val_every,
+         "val_max_batches": val_max_batches,
          "paraphrase_augment": paraphrase_augment,
          "paraphrase_limit": paraphrase_limit,
          "paraphrase_file": paraphrase_file,
@@ -1291,6 +1425,18 @@ def main():
                         "a cuda synchronize, so the steady state must not pay "
                         "for it. 0 = off.")
     p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--val_episodes", type=int, default=0,
+                   help="Hold out this many whole EPISODES, stratified over "
+                        "dataset#task, and report the loss on them every "
+                        "--val_every steps. 0 = off. Training loss alone cannot "
+                        "tell an under-capacity model from an under-trained one "
+                        "from an over-fitting one, which is the question every "
+                        "'should I make the model bigger' decision needs "
+                        "answered. 40 gives one episode per LIBERO task.")
+    p.add_argument("--val_every", type=int, default=500)
+    p.add_argument("--val_max_batches", type=int, default=20,
+                   help="Batches per validation pass. Capped so a pass stays a "
+                        "rounding error against --val_every training steps.")
     p.add_argument("--save_every", type=int, default=1000)
     p.add_argument("--log_every", type=int, default=20)
     p.add_argument("--max_episode_index", type=int, default=None)
