@@ -54,6 +54,42 @@ def _mcnemar(a: list[int], b: list[int]):
     return b01, b10, min(1.0, 2 * tail)
 
 
+# The commit that stopped task ORDER from reaching the policy noise. Anything
+# written before it used a noise stream that depended on which tasks ran first,
+# which is how the same checkpoint scored task 0 at 45% and 85%. Such a file can
+# still be read as a level estimate; it cannot be one arm of an A/B.
+SEED_FIX = "bc86296"
+
+
+def _predates(commit: str) -> bool | None:
+    """True if `commit` is an ancestor of SEED_FIX (i.e. older). None if unknown."""
+    import subprocess
+    from pathlib import Path as _P
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(_P(__file__).resolve().parent), "merge-base",
+             "--is-ancestor", commit, SEED_FIX],
+            capture_output=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return None
+
+
+def _warn_build(ca, cb):
+    for name, c in (("before", ca), ("after", cb)):
+        if not c:
+            print(f"  [WARN] the {name} file records no eval_commit -- it "
+                  f"predates {SEED_FIX}, so its policy noise depended on task "
+                  f"ORDER. Not usable as an A/B arm; re-run it.")
+        elif _predates(c) and c != SEED_FIX:
+            print(f"  [WARN] the {name} file was written by {c}, which predates "
+                  f"the {SEED_FIX} seeding fix: task ORDER reached the policy "
+                  f"noise there. Re-run it before trusting any delta below.")
+    if ca and cb and ca != cb:
+        print(f"  [note] different builds ({ca} vs {cb}); fine if neither "
+              f"predates {SEED_FIX} and nothing in the eval path changed")
+
+
 def _unpaired_z(n1, k1, n2, k2):
     p1, p2 = k1 / n1, k2 / n2
     se = math.sqrt(p1 * (1 - p1) / n1 + p2 * (1 - p2) / n2)
@@ -85,6 +121,7 @@ def main():
     if A.get("seed", "<absent>") == "<absent>" or B.get("seed", "<absent>") == "<absent>":
         print("  [WARN] a file predates seed recording; if it also predates "
               "92ec163 the policy noise was unseeded there")
+    _warn_build(A.get("eval_commit"), B.get("eval_commit"))
 
     ta, tb = _tasks(A), _tasks(B)
     shared = sorted(set(ta) & set(tb))
