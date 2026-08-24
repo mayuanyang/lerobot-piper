@@ -338,6 +338,7 @@ def build_batch(obs_list, tasks, hist: StateHistory, preprocessor, device,
 def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
               task_id: int, episodes: int, num_envs: int, device: str,
               max_episode_steps: int, seed: int, expected_cams: list[str],
+              policy_seed: int | None = None,
               video_cb=None, videos_per_task: int = 0, heartbeat: int = 50,
               instruction: str | None = None, state_noise: float = 0.0,
               state_noise_dims=None, blur: int = 0, blur_cams=None):
@@ -364,8 +365,17 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
     # cannot reach the noise. Two runs are then paired on BOTH the layout and
     # the noise: episode i sees the same x_1 sequence in both, and diverges
     # only where the policy itself does.
-    torch.manual_seed(seed + task_id)
-    np.random.seed((seed + task_id) % (2 ** 32))
+    #
+    # `policy_seed` is separate from `seed` on purpose: `seed` picks the
+    # LAYOUTS (env.reset below) and policy_seed picks the flow noise. Holding
+    # the first and moving the second is the null control for every A/B run
+    # through this script -- how many episodes change outcome when NOTHING
+    # about the policy or its inputs changed, only the sampled x_1. Without
+    # that number, "state noise flipped 31 of 60 episodes" cannot be told
+    # apart from "this policy flips 31 of 60 episodes on its own".
+    ps = seed if policy_seed is None else policy_seed
+    torch.manual_seed(ps + task_id)
+    np.random.seed((ps + task_id) % (2 ** 32))
 
     # Building an OffScreenRenderEnv takes seconds and there are num_envs of
     # them PER TASK (LiberoEnv binds its bddl file at construction, so they
@@ -581,6 +591,13 @@ def main():
     p.add_argument("--device", default=None)
     p.add_argument("--render_gpu", type=int, default=0)
     p.add_argument("--seed", type=int, default=10000)
+    p.add_argument("--policy_seed", type=int, default=None,
+                   help="Seed for the POLICY's flow noise, separate from "
+                        "--seed which picks the layouts. Defaults to --seed. "
+                        "Re-running with only this changed is the null control: "
+                        "same checkpoint, same layouts, same inputs, different "
+                        "x_1. However many episodes flip is the floor that any "
+                        "--state_noise or --image_blur delta has to clear.")
     p.add_argument("--video_dir", default=None,
                    help="Write up to --videos_per_task FAILED episodes per task. "
                         "This repo's grasp-vs-selection diagnoses came from "
@@ -784,7 +801,8 @@ def main():
             t_task = time.time()
             n_ok, n_ep, mean_steps, n_chunks, desc, ep_ok = eval_task(
                 policy, pre, post, suite, suite_name, tid, a.episodes,
-                a.num_envs, device, a.max_episode_steps, a.seed, cams, video_cb,
+                a.num_envs, device, a.max_episode_steps, a.seed, cams,
+                a.policy_seed, video_cb,
                 a.videos_per_task, a.heartbeat, wrong.get(tid),
                 a.state_noise, a.state_noise_dims,
                 a.image_blur, a.image_blur_cams)
@@ -845,6 +863,7 @@ def main():
     payload = {"checkpoint": str(ckpt), "control_freq": a.control_freq,
                "fixed_init_states": not a.stock_init,
                "seed": a.seed,
+               "policy_seed": a.policy_seed,
                "max_episode_steps": a.max_episode_steps,
                "eval_commit": _git_commit(),
                "num_inference_steps": policy.config.num_inference_steps,
@@ -868,6 +887,8 @@ def main():
                     if a.state_noise > 0.0
                     else f"eval_libero_blur_{a.image_blur}.json"
                     if a.image_blur > 1
+                    else f"eval_libero_pseed_{a.policy_seed}.json"
+                    if a.policy_seed is not None and a.policy_seed != a.seed
                     else "eval_libero.json")
     out = Path(a.out) if a.out else ckpt / default_name
     out.write_text(json.dumps(payload, indent=2))
