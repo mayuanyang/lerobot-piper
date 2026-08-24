@@ -179,6 +179,14 @@ class WiltechsXConfig(PreTrainedConfig):
     # expert layer attends to.
     wrist_tokens: int = 256
     freeze_wrist_encoder: bool = False
+    # Initial value of the wrist tokenizer's output RMSNorm gain -- the only
+    # thing that sets how loud these tokens are, because the norm renormalises
+    # whatever `proj` produces. 1.0 is right for a fresh run. On a RESUME that
+    # ADDS the module, use ~1e-3: the tokens then start inert and grow in,
+    # instead of dropping n_tokens of full-magnitude noise into a converged
+    # prefix. Measured at gate 1.0 on a 236k resume: flow 0.25 -> 0.42,
+    # discrete 3.05 -> 3.68, grad norm 0.8 -> 84.8 with the clip at 100%.
+    wrist_gate_init: float = 1.0
 
     # =====================================================================
     # Long horizon: motion vectors + progress

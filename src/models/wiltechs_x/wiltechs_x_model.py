@@ -408,7 +408,7 @@ class WristTokenizer(nn.Module):
     STD = (0.229, 0.224, 0.225)
 
     def __init__(self, model_id: str, n_tokens: int, d_out: int, freeze: bool,
-                 input_size: int = 256):
+                 input_size: int = 256, gate_init: float = 1.0):
         super().__init__()
         from transformers import AutoModel
 
@@ -418,6 +418,23 @@ class WristTokenizer(nn.Module):
         self.input_size = input_size
         self.proj = nn.Linear(self.backbone.config.hidden_size, d_out)
         self.norm = RMSNorm(d_out)
+        # `gate_init` is the knob that controls this module's output
+        # magnitude. Shrinking `proj` is NOT a substitute: RMSNorm renormalises
+        # to unit RMS, so the tokens leave at unit scale however small proj is
+        # -- measured, scaling proj by 1e-3 moves the output RMS only 1.00 ->
+        # 0.18, and that much only because eps starts to dominate the
+        # denominator. The gain is applied AFTER the normalisation, so it is
+        # the one that reaches zero.
+        #
+        # That matters when the module is ADDED to a converged checkpoint. At
+        # gate 1.0 the prefix suddenly carries n_tokens of full-magnitude noise
+        # -- measured on a 236k-step resume: flow 0.25 -> 0.42, discrete
+        # 3.05 -> 3.68, grad norm 0.8 -> 84.8 with the clip at 100%. Small but
+        # NONZERO keeps the module inert at step 0 while leaving gradient on
+        # both this gain and `proj`; exact zero would cut proj's gradient for
+        # one step, the same trap DiscreteActionHead's init documents.
+        if gate_init != 1.0:
+            nn.init.constant_(self.norm.weight, float(gate_init))
         self.register_buffer("mean", torch.tensor(self.MEAN).view(1, 3, 1, 1), False)
         self.register_buffer("std", torch.tensor(self.STD).view(1, 3, 1, 1), False)
         self.frozen = freeze
@@ -619,11 +636,16 @@ class WiltechsXModel(nn.Module):
         if config.use_wrist_encoder:
             self.wrist_encoder = WristTokenizer(
                 config.wrist_encoder_id, config.wrist_tokens, self.hidden_size,
-                config.freeze_wrist_encoder, config.wrist_input_size)
+                config.freeze_wrist_encoder, config.wrist_input_size,
+                float(getattr(config, "wrist_gate_init", 1.0)))
             g = int(round(config.wrist_tokens ** 0.5))
+            _wg = float(getattr(config, "wrist_gate_init", 1.0))
             print(f"[wiltechs_x] wrist: {config.wrist_encoder_id}, "
                   f"{config.wrist_tokens} tok = {g}x{g} grid @ "
-                  f"{config.wrist_input_size}px input")
+                  f"{config.wrist_input_size}px input, output gate {_wg:g}"
+                  + ("  (starts INERT — grows in)" if _wg < 0.1 else
+                     "  (full magnitude from step 0; on a RESUME this dumps "
+                     "noise into a converged prefix — see --wrist_gate_init)"))
             # The verdict needs the VLM's own per-camera grid, which is only
             # known once an image has been through the processor. Printed by
             # _build_prefix instead.

@@ -599,6 +599,7 @@ def train(
     wrist_tokens: int = 256,
     wrist_input_size: int = 256,
     freeze_wrist_encoder: bool = False,
+    wrist_gate_init: float = 1.0,
     motion_vectors: bool = True,
     motion_history_len: int = 8,
     motion_vector_tokens: int = 8,
@@ -748,6 +749,7 @@ def train(
         wrist_cameras=wrist_keys, wrist_tokens=wrist_tokens,
         wrist_input_size=wrist_input_size,
         freeze_wrist_encoder=freeze_wrist_encoder,
+        wrist_gate_init=wrist_gate_init,
         use_motion_vectors=motion_vectors, motion_history_len=motion_history_len,
         motion_vector_tokens=motion_vector_tokens,
         progress_head=progress_head, progress_loss_weight=progress_loss_weight,
@@ -1084,6 +1086,7 @@ def train(
          "paraphrase_file": paraphrase_file,
          "paraphrase_min_variants": paraphrase_min_variants,
          "freeze_wrist_encoder": policy.config.freeze_wrist_encoder,
+         "wrist_gate_init": policy.config.wrist_gate_init,
          "gradient_checkpointing": gradient_checkpointing}, indent=2))
     print("done")
 
@@ -1165,6 +1168,12 @@ def main():
                         "a sqrt(wrist_tokens) grid, so a larger input is averaged "
                         "away rather than resolved. Raise it to give DINO more to "
                         "look at, not to buy token resolution.")
+    p.add_argument("--wrist_gate_init", type=float, default=1.0,
+                   help="Initial gain on the wrist tokenizer's output. 1.0 for "
+                        "a fresh run. Use 1e-3 when ADDING the wrist encoder to "
+                        "a resumed checkpoint, so its tokens start inert and "
+                        "grow in rather than dumping full-magnitude noise into "
+                        "a converged prefix.")
     p.add_argument("--freeze_wrist_encoder", action="store_true",
                    help="Skips the DINO backward. Saves memory, but this is the "
                         "path this repo measured at 34 points — freeze it only "
