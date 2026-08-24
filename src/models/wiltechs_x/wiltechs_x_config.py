@@ -218,6 +218,29 @@ class WiltechsXConfig(PreTrainedConfig):
     #
     # Few-step decoding is here for the RL ROLLOUT BUDGET, not for a headline
     # Hz number. At 5 Euler steps stage B costs 5x per env step.
+    # Flow-matching TIME sampling, the axis orthogonal to loss_exec_steps.
+    # x_t = t*noise + (1-t)*action, so t~0 is nearly the action -- where the
+    # fine detail that sets PLACEMENT PRECISION is denoised -- and t~1 is
+    # nearly pure noise, where the answer is little more than "head for the
+    # middle". "uniform" spends 30% of its capacity above t=0.7 on that.
+    # "lognormal" is SD3's logit-normal t = sigmoid(N(mean, std)); a negative
+    # mean shifts mass toward 0. Ported from wilro, the only sibling that has
+    # it, and untested here.
+    #
+    # Two things it costs, both measured, both arguing for a MILD mean:
+    #
+    #   * The shortcut term clamps its step size to t/2, so biasing t downward
+    #     biases `d` downward too and under-trains the LARGE-d consistency that
+    #     makes 2-4 NFE valid. Share of samples at t >= 0.5, which is what
+    #     keeps d = 1/4 unclamped: uniform 50.1%, mean -0.5 30.8%, mean -1.0
+    #     16.0%. Re-check NFE 4 against NFE 16 after changing this.
+    #   * Inference INTEGRATES FROM t = 1. Share above t = 0.7: uniform 30.0%,
+    #     mean -0.5 8.9%, mean -1.0 3.2% -- so the region where every rollout
+    #     starts gets 3.4x less training at -0.5 and 9x less at -1.0.
+    time_sampling: str = "uniform"          # "uniform" | "lognormal"
+    time_lognormal_mean: float = -0.5       # < 0 biases toward low t
+    time_lognormal_std: float = 1.0
+
     flow_objective: str = "shortcut"
     num_inference_steps: int = 4
     # Fraction of each batch that trains the shortcut self-consistency term

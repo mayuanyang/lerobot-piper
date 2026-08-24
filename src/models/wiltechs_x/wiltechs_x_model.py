@@ -1396,6 +1396,12 @@ class WiltechsXModel(nn.Module):
         return noise
 
     def sample_time(self, B, device):
+        """Where along the noise axis this batch trains. See time_sampling."""
+        if getattr(self.config, "time_sampling", "uniform") == "lognormal":
+            z = (torch.randn(B, device=device)
+                 * float(self.config.time_lognormal_std)
+                 + float(self.config.time_lognormal_mean))
+            return torch.sigmoid(z).clamp(0.001, 0.999)
         return torch.rand(B, device=device) * 0.998 + 0.001
 
     # =====================================================================

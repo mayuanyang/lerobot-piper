@@ -694,6 +694,9 @@ def train(
     progress_head: bool = True,
     progress_loss_weight: float = 0.1,
     flow_objective: str = "shortcut",
+    time_sampling: str = "uniform",
+    time_lognormal_mean: float = -0.5,
+    time_lognormal_std: float = 1.0,
     shortcut_consistency_frac: float = 0.25,
     num_inference_steps: int = 4,
     sample_noise_scale: float = 1.0,
@@ -845,6 +848,9 @@ def train(
         motion_vector_tokens=motion_vector_tokens,
         progress_head=progress_head, progress_loss_weight=progress_loss_weight,
         flow_objective=flow_objective,
+        time_sampling=time_sampling,
+        time_lognormal_mean=time_lognormal_mean,
+        time_lognormal_std=time_lognormal_std,
         shortcut_consistency_frac=shortcut_consistency_frac,
         num_inference_steps=num_inference_steps,
         sample_noise_scale=sample_noise_scale,
@@ -1238,6 +1244,9 @@ def train(
          "contrastive_frac": contrastive_frac,
          "contrastive_suite_jaccard": contrastive_suite_jaccard,
          "allow_new_modules": allow_new_modules,
+         "time_sampling": time_sampling,
+         "time_lognormal_mean": time_lognormal_mean,
+         "time_lognormal_std": time_lognormal_std,
          "val_episodes": val_episodes, "val_every": val_every,
          "val_max_batches": val_max_batches,
          "paraphrase_augment": paraphrase_augment,
@@ -1450,6 +1459,18 @@ def main():
                         "a cuda synchronize, so the steady state must not pay "
                         "for it. 0 = off.")
     p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--time_sampling", choices=("uniform", "lognormal"),
+                   default="uniform",
+                   help="Where along the NOISE axis training spends its "
+                        "capacity. uniform puts 30%% above t=0.7, where the "
+                        "answer is barely more than 'head for the middle'; "
+                        "lognormal (SD3 logit-normal) shifts mass toward t~0, "
+                        "the fine detail that sets placement precision. "
+                        "Orthogonal to --loss_exec_steps, which weights the "
+                        "HORIZON axis. Changes no parameter shapes, so it can "
+                        "be resumed into.")
+    p.add_argument("--time_lognormal_mean", type=float, default=-0.5)
+    p.add_argument("--time_lognormal_std", type=float, default=1.0)
     p.add_argument("--val_episodes", type=int, default=0,
                    help="Hold out this many whole EPISODES, stratified over "
                         "dataset#task, and report the loss on them every "
