@@ -127,7 +127,8 @@ class StateHistory:
 # ---------------------------------------------------------------------------
 def load_policy(ckpt: Path, device: str, num_inference_steps: int | None,
                 n_action_steps: int | None = None,
-                fixed_episode_noise: bool = False):
+                fixed_episode_noise: bool = False,
+                sample_noise_scale: float | None = None):
     from lerobot.configs.policies import PreTrainedConfig
 
     cfg = PreTrainedConfig.from_pretrained(ckpt)
@@ -143,6 +144,14 @@ def load_policy(ckpt: Path, device: str, num_inference_steps: int | None,
         cfg.n_action_steps = n
     if fixed_episode_noise:
         cfg.fixed_episode_noise = True
+    if sample_noise_scale is not None:
+        # Temperature on x_1. NOT the same experiment as
+        # --fixed_episode_noise: that commits to one RANDOM draw, this moves
+        # every draw toward the centre of the policy's distribution. Fixing
+        # the noise cost 25 points here, which says the per-chunk lottery is
+        # rescuing episodes -- but a lottery only helps when the distribution
+        # is too broad, and shrinking it is the other way to answer that.
+        cfg.sample_noise_scale = float(sample_noise_scale)
     policy = WiltechsXPolicy.from_pretrained(ckpt, config=cfg)
     policy.to(device)
     policy.eval()
@@ -591,6 +600,13 @@ def main():
     p.add_argument("--device", default=None)
     p.add_argument("--render_gpu", type=int, default=0)
     p.add_argument("--seed", type=int, default=10000)
+    p.add_argument("--sample_noise_scale", type=float, default=None,
+                   help="Temperature on the initial flow noise x_1 (trained "
+                        "value 1.0). Below 1 pulls every sample toward the "
+                        "centre of the action distribution; 0 makes the policy "
+                        "deterministic. Distinct from --fixed_episode_noise, "
+                        "which commits to one RANDOM draw rather than moving "
+                        "toward the middle.")
     p.add_argument("--policy_seed", type=int, default=None,
                    help="Seed for the POLICY's flow noise, separate from "
                         "--seed which picks the layouts. Defaults to --seed. "
@@ -698,7 +714,8 @@ def main():
     patch_control_freq(a.control_freq, a.render_gpu)
 
     policy = load_policy(ckpt, device, a.num_inference_steps,
-                         a.n_action_steps, a.fixed_episode_noise)
+                         a.n_action_steps, a.fixed_episode_noise,
+                         a.sample_noise_scale)
     pre, post = load_processors(ckpt, device, a.dataset_id)
     cams = list(policy.config.cameras_for_vlm)
     print(f"[eval] {ckpt}  device={device}  cameras={cams}\n"
@@ -873,6 +890,7 @@ def main():
                "num_inference_steps": policy.config.num_inference_steps,
                "n_action_steps": policy.config.n_action_steps,
                "fixed_episode_noise": bool(a.fixed_episode_noise),
+               "sample_noise_scale": policy.config.sample_noise_scale,
                "state_noise": a.state_noise,
                "state_noise_dims": a.state_noise_dims,
                "image_blur": a.image_blur,
@@ -891,6 +909,8 @@ def main():
                     if a.state_noise > 0.0
                     else f"eval_libero_blur_{a.image_blur}.json"
                     if a.image_blur > 1
+                    else f"eval_libero_temp_{a.sample_noise_scale:g}.json"
+                    if a.sample_noise_scale is not None
                     else f"eval_libero_pseed_{a.policy_seed}.json"
                     if a.policy_seed is not None and a.policy_seed != a.seed
                     else "eval_libero.json")
