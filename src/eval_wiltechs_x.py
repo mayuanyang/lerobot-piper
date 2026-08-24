@@ -864,6 +864,10 @@ def main():
                "fixed_init_states": not a.stock_init,
                "seed": a.seed,
                "policy_seed": a.policy_seed,
+               # Not cosmetic: the policy draws one noise tensor of shape
+               # (num_envs, ...) per chunk, so changing num_envs changes the
+               # RNG stream and silently unpairs two runs.
+               "num_envs": a.num_envs,
                "max_episode_steps": a.max_episode_steps,
                "eval_commit": _git_commit(),
                "num_inference_steps": policy.config.num_inference_steps,

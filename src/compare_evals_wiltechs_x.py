@@ -113,6 +113,9 @@ def main():
 
     for key in ("n_action_steps", "num_inference_steps", "control_freq",
                 "episodes_per_task", "fixed_init_states", "seed",
+                # num_envs sizes the per-chunk noise tensor, so it moves the
+                # RNG stream as surely as the seed does.
+                "num_envs", "max_episode_steps",
                 "ablate_lang", "instruction_override"):
         va, vb = A.get(key, "<absent>"), B.get(key, "<absent>")
         if va != vb:
