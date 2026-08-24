@@ -352,6 +352,21 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
     """
     from lerobot.envs.libero import LiberoEnv
 
+    # Re-seed PER TASK, not once per process. The policy draws its flow noise
+    # from the global torch RNG, which advances with every chunk, so a run of
+    # `--task_ids 4 0 5` reached task 0 with thousands of draws already spent
+    # and gave it a different noise stream than a run of `--task_ids 0 ...`.
+    # That is not a subtle effect: it produced task 0 at 45% in one ordering
+    # and 85% in another, on the SAME checkpoint -- a 40-point artefact that
+    # reads as a result.
+    #
+    # Keyed on task_id so ordering, and which tasks are in the run at all,
+    # cannot reach the noise. Two runs are then paired on BOTH the layout and
+    # the noise: episode i sees the same x_1 sequence in both, and diverges
+    # only where the policy itself does.
+    torch.manual_seed(seed + task_id)
+    np.random.seed((seed + task_id) % (2 ** 32))
+
     # Building an OffScreenRenderEnv takes seconds and there are num_envs of
     # them PER TASK (LiberoEnv binds its bddl file at construction, so they
     # cannot be reused across tasks). Say so: this is minutes of silence
@@ -645,6 +660,9 @@ def main():
     # Comparing n_action_steps settings changes that count, so the noise
     # streams diverge after the first chunk; --fixed_episode_noise draws once
     # per episode and pairs across those too.
+    #
+    # This seeds the setup; eval_task re-seeds per task so that TASK ORDER
+    # cannot reach the noise. See the comment there.
     torch.manual_seed(a.seed)
     np.random.seed(a.seed % (2 ** 32))
 
