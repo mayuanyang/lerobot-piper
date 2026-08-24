@@ -42,15 +42,24 @@ def load_meta(spec: str):
 
 
 def describe(meta, label: str) -> dict:
+    from lerobot.datasets.utils import dataset_to_policy_features
     from models.wiltechs_x.paraphrase import instruction_strings
 
     feats = meta.features
     cams = sorted(k for k in feats if "image" in k)
     state = next((k for k in feats if "state" in k), None)
+    # The POLICY shape, not the raw metadata shape. dataset_to_policy_features
+    # rewrites (h, w, c) -> (c, h, w) when names[2] is "channel"/"channels", so
+    # a set declaring (256, 256, 3) and one declaring (3, 256, 256) can be the
+    # same thing downstream -- and build_datasets only ever sees this side.
+    # Comparing the raw shapes reports a conflict that does not exist.
+    pol = dataset_to_policy_features(feats)
     info = {
         "fps": getattr(meta, "fps", None),
         "cams": cams,
-        "cam_shape": {c: tuple(feats[c]["shape"]) for c in cams},
+        "raw_shape": {c: tuple(feats[c]["shape"]) for c in cams},
+        "names": {c: list(feats[c].get("names") or []) for c in cams},
+        "cam_shape": {c: tuple(pol[c].shape) for c in cams if c in pol},
         "state_dim": int(np.prod(feats[state]["shape"])) if state else None,
         "action_dim": int(np.prod(feats["action"]["shape"])) if "action" in feats else None,
         "episodes": int(getattr(meta, "total_episodes", 0) or 0),
@@ -64,7 +73,8 @@ def describe(meta, label: str) -> dict:
         print(f"  mean length    {info['frames'] / info['episodes']:.0f} frames")
     print(f"  cameras        {cams}")
     for c in cams:
-        print(f"                 {c}  {info['cam_shape'][c]}")
+        print(f"                 {c}  declared {info['raw_shape'][c]} "
+              f"names={info['names'][c]}  ->  policy {info['cam_shape'].get(c)}")
     print(f"  state '{state}' dim {info['state_dim']}")
     print(f"  action dim     {info['action_dim']}")
     print(f"  tasks          {len(info['tasks'])}")
@@ -72,20 +82,25 @@ def describe(meta, label: str) -> dict:
 
 
 def episode_lengths(meta) -> np.ndarray | None:
-    """Per-episode frame counts, if the metadata exposes them."""
-    for attr in ("episodes",):
-        d = getattr(meta, attr, None)
-        if d is None:
-            continue
-        try:
-            if hasattr(d, "columns") and "length" in d.columns:
-                return np.asarray(d["length"], dtype=float)
-            if isinstance(d, dict):
-                vals = [e.get("length") for e in d.values() if isinstance(e, dict)]
-                if vals and all(v is not None for v in vals):
-                    return np.asarray(vals, dtype=float)
-        except Exception:
-            pass
+    """Per-episode frame counts, if the metadata exposes them.
+
+    lerobot 0.4.0's `meta.episodes` is an HF `datasets.Dataset` with a "length"
+    column (and dataset_from_index/dataset_to_index). It is neither a DataFrame
+    nor a dict, which is how the first version of this returned None and printed
+    nothing.
+    """
+    d = getattr(meta, "episodes", None)
+    if d is None:
+        return None
+    cols = set(getattr(d, "column_names", None) or getattr(d, "columns", []) or [])
+    try:
+        if "length" in cols:
+            return np.asarray(d["length"], dtype=float)
+        if {"dataset_from_index", "dataset_to_index"} <= cols:
+            return (np.asarray(d["dataset_to_index"], dtype=float)
+                    - np.asarray(d["dataset_from_index"], dtype=float))
+    except Exception:
+        pass
     return None
 
 
@@ -132,7 +147,13 @@ def main():
 
     for c in got["cams"]:
         if c in want["cam_shape"] and got["cam_shape"][c] != want["cam_shape"][c]:
-            bad.append(f"{c} shape {got['cam_shape'][c]} vs {want['cam_shape'][c]}")
+            bad.append(f"{c} POLICY shape {got['cam_shape'][c]} vs "
+                       f"{want['cam_shape'][c]} (declared {got['raw_shape'][c]} vs "
+                       f"{want['raw_shape'][c]})")
+        elif c in want["raw_shape"] and got["raw_shape"][c] != want["raw_shape"][c]:
+            print(f"  [ok] {c} declared differently ({got['raw_shape'][c]} vs "
+                  f"{want['raw_shape'][c]}) but both resolve to "
+                  f"{got['cam_shape'][c]} -- not a conflict")
 
     unknown = [t for t in got["tasks"] if t not in set(want["tasks"])]
     if unknown:
