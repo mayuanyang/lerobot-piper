@@ -595,7 +595,12 @@ if __name__ == "__main__":
 
     if a.dataset_id:
         from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-        meta = LeRobotDatasetMetadata(a.dataset_id, force_cache_sync=True)
+        # revision="main" for the same reason build_datasets uses it: a dataset
+        # without lerobot's codebase version tag otherwise raises
+        # RevisionNotFoundError, which current huggingface_hub cannot even
+        # construct -- the real cause surfaces as an unrelated TypeError.
+        meta = LeRobotDatasetMetadata(a.dataset_id, force_cache_sync=True,
+                                      revision="main")
         ins = instruction_strings(meta.tasks)
     elif a.instructions:
         ins = [l for l in Path(a.instructions).read_text().splitlines() if l.strip()]

@@ -27,11 +27,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 def load_meta(spec: str):
+    """revision="main" is not optional. lerobot defaults the revision to its own
+    codebase version tag, which a dataset written by `--rft.collect_only` does
+    not carry; the lookup then raises RevisionNotFoundError, and on current
+    huggingface_hub that raise ITSELF fails with "missing keyword-only argument
+    'response'" -- so the real cause is buried under a TypeError. Same value
+    train_wiltechs_x.build_datasets uses.
+    """
     from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
     p = Path(spec)
     if p.exists():
         return LeRobotDatasetMetadata("local/inspect", root=str(p))
-    return LeRobotDatasetMetadata(spec)
+    return LeRobotDatasetMetadata(spec, force_cache_sync=True, revision="main")
 
 
 def describe(meta, label: str) -> dict:
