@@ -1434,6 +1434,27 @@ class WiltechsXModel(nn.Module):
 
         noise = self.sample_noise((B, H, A), device)
         t = self.sample_time(B, device)
+        # Prove the knob took, from the DRAWS rather than from the config: a
+        # flag that silently failed to reach sample_time looks identical in the
+        # loss curve, and the loss is not a check either -- see below.
+        self._once(
+            "tsample",
+            f"[wiltechs_x] flow time sampling: "
+            f"{getattr(self.config, 'time_sampling', 'uniform')}"
+            + (f"(mean {self.config.time_lognormal_mean:g}, "
+               f"std {self.config.time_lognormal_std:g})"
+               if getattr(self.config, "time_sampling", "uniform") == "lognormal"
+               else "")
+            + f" — first batch t: median {float(t.median()):.3f}, "
+              f"t<0.3 {float((t < 0.3).float().mean()):.0%}, "
+              f"t>0.7 {float((t > 0.7).float().mean()):.0%}"
+              f"  (uniform is 0.500 / 30% / 30%)"
+            + ("\n[wiltechs_x]   `flow` is NOT comparable across time_sampling "
+               "settings: its residual is ~Var(noise) at t->0 and ~Var(action|obs) "
+               "at t->1, so moving the t distribution moves the number without "
+               "the model changing. Judge this run on eval, not on the curve."
+               if getattr(self.config, "time_sampling", "uniform") != "uniform"
+               else ""))
         t_e = t[:, None, None]
         x_t = t_e * noise + (1.0 - t_e) * actions
         u_t = noise - actions                                  # velocity target
