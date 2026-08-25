@@ -105,9 +105,16 @@ class StateHistory:
     without relying on the encoder's fallback.
     """
 
-    def __init__(self, n_envs: int, history_len: int):
+    MODES = ("real", "frozen", "shuffled")
+
+    def __init__(self, n_envs: int, history_len: int, mode: str = "real",
+                 seed: int = 0):
         self.t = max(1, int(history_len))
         self.buf = [deque(maxlen=self.t) for _ in range(n_envs)]
+        if mode not in self.MODES:
+            raise SystemExit(f"--history_mode must be one of {self.MODES}")
+        self.mode = mode
+        self.rng = np.random.default_rng(seed)
 
     def reset(self, i: int, state: np.ndarray):
         self.buf[i].clear()
@@ -118,8 +125,35 @@ class StateHistory:
         self.buf[i].append(np.asarray(state, dtype=np.float32))
 
     def stack(self) -> np.ndarray:
-        """-> (n_envs, T, D)."""
-        return np.stack([np.stack(list(b)) for b in self.buf])
+        """-> (n_envs, T, D), after whatever ablation `mode` asks for.
+
+        The one place the window is assembled, so the one place to intervene.
+        See ARCHITECTURE.md 8.2: the model can form `s_t - s_{t-1}` from this
+        window, and under a position controller that difference IS the
+        previously executed action. Demos are smooth, so extrapolating it
+        explains the near horizon without reading the image -- and at
+        `n_action_steps=2` the near horizon is the ONLY part ever executed.
+
+          real      untouched.
+          frozen    newest frame repeated. Velocity is identically zero. This
+                    is NOT out of distribution: `reset` builds exactly this,
+                    so every episode's first inference call already sees it.
+          shuffled  same T frames, order permuted per call. The CONTROL, and
+                    the one that carries the argument: it leaves every
+                    marginal intact and destroys only the temporal ordering,
+                    so a drop here cannot be blamed on unfamiliar values.
+
+        `frozen` alone is ambiguous -- a policy could fail on it because zero
+        velocity is rare mid-episode rather than because it needed the signal.
+        Run both, and read `shuffled`.
+        """
+        out = np.stack([np.stack(list(b)) for b in self.buf])
+        if self.mode == "frozen":
+            out[:] = out[:, -1:, :]
+        elif self.mode == "shuffled":
+            for i in range(len(out)):
+                out[i] = out[i][self.rng.permutation(self.t)]
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +384,8 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
               policy_seed: int | None = None,
               video_cb=None, videos_per_task: int = 0, heartbeat: int = 50,
               instruction: str | None = None, state_noise: float = 0.0,
-              state_noise_dims=None, blur: int = 0, blur_cams=None):
+              state_noise_dims=None, blur: int = 0, blur_cams=None,
+              history_mode: str = "real"):
     """-> (n_success, n_episodes, mean_success_steps, n_chunks, task_description,
     per_episode_success).
 
@@ -414,7 +449,10 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
         n_states = len(envs[0]._init_states)
         horizon_cap = min(envs[0]._max_episode_steps, max_episode_steps) \
             if max_episode_steps else envs[0]._max_episode_steps
-        hist = StateHistory(num_envs, policy.config.n_obs_steps)
+        # Seeded off the task, like the policy noise, so `shuffled` is a
+        # reproducible intervention rather than a fresh coin every run.
+        hist = StateHistory(num_envs, policy.config.n_obs_steps,
+                            mode=history_mode, seed=ps + task_id)
 
         autocast = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                     if device == "cuda"
@@ -640,6 +678,18 @@ def main():
                         "this suite by id -- no chance of a typo silently "
                         "testing a different sentence. Use with --task_ids to "
                         "swap a pair: --task_ids 7 --instruction_from_task 9.")
+    p.add_argument("--history_mode", default="real",
+                   choices=("real", "frozen", "shuffled"),
+                   help="Ablate the observation.state WINDOW the motion-vector "
+                        "encoder reads. 'shuffled' permutes the T frames per "
+                        "call: every marginal is preserved and only the "
+                        "temporal order dies, so a drop cannot be blamed on "
+                        "unfamiliar values -- it is the control for "
+                        "ARCHITECTURE.md 8.2 (does this policy ride the "
+                        "demonstrator's momentum instead of the image?). "
+                        "'frozen' repeats the newest frame, which is what "
+                        "every episode's first step already looks like. "
+                        "Read 'shuffled'; 'frozen' alone is ambiguous.")
     p.add_argument("--state_noise", type=float, default=0.0,
                    help="Gaussian offset added to observation.state, sigma in "
                         "NORMALIZED units -- the same units the sibling trainers "
@@ -822,7 +872,7 @@ def main():
                 a.policy_seed, video_cb,
                 a.videos_per_task, a.heartbeat, wrong.get(tid),
                 a.state_noise, a.state_noise_dims,
-                a.image_blur, a.image_blur_cams)
+                a.image_blur, a.image_blur_cams, a.history_mode)
             sr = 100.0 * n_ok / max(n_ep, 1)
             per_task[tid] = {"success_rate": sr, "n_success": n_ok,
                              "n_episodes": n_ep, "mean_success_steps": mean_steps,
@@ -892,6 +942,7 @@ def main():
                "fixed_episode_noise": bool(a.fixed_episode_noise),
                "sample_noise_scale": policy.config.sample_noise_scale,
                "state_noise": a.state_noise,
+               "history_mode": a.history_mode,
                "state_noise_dims": a.state_noise_dims,
                "image_blur": a.image_blur,
                "image_blur_cams": a.image_blur_cams,
