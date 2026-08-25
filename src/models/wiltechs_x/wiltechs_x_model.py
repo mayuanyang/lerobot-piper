@@ -1567,11 +1567,31 @@ class WiltechsXModel(nn.Module):
                 # agreeing with itself. Skipping is the only sound option.
                 if not keep:
                     run_hinge = False
-                    self._once("contrastive_skip",
-                               "[wiltechs_x] contrastive hinge SKIPPED: the "
-                               "batch holds a single instruction, so it has no "
-                               "valid negative. Expected only if the sampler "
-                               "groups by task -- check it if this repeats.")
+                    # Counted, NOT _once. The old banner's own advice was
+                    # "check it if this repeats", which is the one thing a
+                    # fire-once banner cannot tell you -- and the answer
+                    # decides whether the val `contrastive` column means
+                    # anything. Powers of ten, so a persistent problem keeps
+                    # reporting itself without flooding a 25k-step run.
+                    n = getattr(self, "_hinge_skips", 0) + 1
+                    self._hinge_skips = n
+                    if n in (1, 3, 10, 30, 100, 300) or n % 1000 == 0:
+                        where = "TRAINING" if self.training else "validation"
+                        print(f"[wiltechs_x] contrastive hinge SKIPPED "
+                              f"({n}x so far; this one in {where}): no pair in "
+                              f"the batch has a DISTINCT same-suite "
+                              f"instruction, so every available negative would "
+                              f"be a correct one.\n"
+                              f"    In validation this is expected and benign "
+                              f"for the objective -- the val loader is "
+                              f"sequential, so a batch is one or two whole "
+                              f"episodes -- but it means the val "
+                              f"`contrastive` column is measured on whatever "
+                              f"few batches DID straddle a usable boundary. "
+                              f"Do not read it as a language-binding "
+                              f"trend.\n"
+                              f"    In TRAINING it means the sampler is "
+                              f"grouping by task, which would be a real bug.")
                 else:
                     idx = torch.tensor(keep, device=device)
                     other = torch.tensor(oo, device=device)
