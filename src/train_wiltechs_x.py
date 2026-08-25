@@ -1012,13 +1012,14 @@ def train(
     # Subset the OUTERMOST wrapper: ProgressDataset and VlmPixelDataset are
     # both index-preserving maps, so a positional Subset over either reaches
     # the same frames as one over the base.
-    val_loader, fit_loader, train_ds, n_val_frames = None, None, dataset, 0
+    val_loader, fit_loader, train_ds = None, None, dataset
+    n_val_frames, n_val_eps = 0, 0
     if val_episodes > 0:
         tr_ep, va_ep, alloc = split_episodes(D["ep_task"], val_episodes, seed)
         frames = lambda eps: [i for e in eps
                               for i in range(D["ep_from"][e], D["ep_to"][e])]
         tr_idx, va_idx = frames(tr_ep), frames(va_ep)
-        n_val_frames = len(va_idx)
+        n_val_frames, n_val_eps = len(va_idx), len(va_ep)
         empty = [k for k, v in alloc.items() if v == 0]
         print(f"Validation: {len(va_ep)} episodes / {n_val_frames} frames held "
               f"out over {len(alloc)} group(s) (dataset#task), "
@@ -1226,24 +1227,42 @@ def train(
                                         val_max_batches, seed)
                 fp, _ = run_validation(policy, fit_loader, prepare, device,
                                        val_max_batches, seed)
-                keys = sorted(set(vp) | set(fp))
-                gap = "  ".join(
-                    f"{k}={fp.get(k, float('nan')):.4f}/{vp.get(k, float('nan')):.4f}"
-                    for k in keys)
-                fv, vv = fp.get("flow"), vp.get("flow")
-                verdict = ""
-                if fv and vv:
-                    # Built outside the f-string on purpose: a newline inside
-                    # the braces of an f-string is 3.12+ grammar, and this
-                    # trains on Colab's 3.10. Same trap as the KI banner.
-                    call = ("held-out is WORSE — over-fitting" if vv > fv * 1.10
-                            else "no gap — under-fitting or under-trained"
-                            if vv < fv * 1.03 else "mild gap")
-                    verdict = f"   flow gap {100 * (vv / fv - 1):+.1f}%  ({call})"
-                print(f"  VAL @ {step}  fit/heldout  {gap}{verdict}\n"
-                      f"       ({nb} batches of {batch_size} each, {n_val_frames} "
-                      f"held-out frames; both passes canonical instruction, "
-                      f"pinned draws)")
+                # One row per term, both columns labelled. The previous
+                # `fit/heldout  a=x/y  b=x/y ...` made the reader carry the
+                # column order across six pairs, and said nothing about how
+                # either column relates to the `flow=` on the step line -- which
+                # is a THIRD number, larger than both for reasons that are not
+                # generalisation. That was read as the train loss going up.
+                allk = set(vp) | set(fp)
+                # flow leads: it is what the verdict is computed on and the term
+                # the capacity question is asked about. The rest alphabetical.
+                keys = (["flow"] if "flow" in allk else []) + sorted(allk - {"flow"})
+                rows = [f"      {'':<12s}{'TRAIN eps':>10s}{'HELD-OUT':>12s}"
+                        f"{'gap':>11s}"]
+                for k in keys:
+                    f_, v_ = fp.get(k, float("nan")), vp.get(k, float("nan"))
+                    ok = f_ and f_ == f_ and v_ == v_           # non-zero, non-NaN
+                    d = f"{100 * (v_ / f_ - 1):+.1f}%" if ok else "--"
+                    # The verdict hangs off flow alone. The other five move for
+                    # their own reasons and a gap in `progress` means nothing.
+                    note = ""
+                    if k == "flow" and ok:
+                        note = ("   <- held-out WORSE: OVER-FITTING"
+                                if v_ > f_ * 1.10 else
+                                "   <- no gap: under-fitting or under-trained"
+                                if v_ < f_ * 1.03 else "   <- mild gap")
+                    rows.append(f"      {k:<12s}{f_:>10.4f}{v_:>12.4f}"
+                                f"{d:>11s}{note}")
+                body = "\n".join(rows)
+                print(f"  VAL @ {step}   {n_val_eps} held-out episodes / "
+                      f"{n_val_frames} frames, {nb} batches x {batch_size}\n"
+                      f"{body}\n"
+                      f"    Both columns are eval mode / canonical instruction / "
+                      f"pinned draws, so NEITHER is\n"
+                      f"    the flow= on the step line (train mode, paraphrase "
+                      f"augmentation, fresh draws).\n"
+                      f"    Read the two COLUMNS against each other, never a "
+                      f"column against the step line.")
 
             if step % save_every == 0 or step >= training_steps:
                 ck = out / f"checkpoint-{step}"
