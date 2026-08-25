@@ -8,8 +8,13 @@ ARCHITECTURE.md 8.2 lists this as a known risk and names the control:
   > Check that a motion-vector-only model does *not* score above chance.
 
 That control has never been run. This is its cheap form: no VLM, no GPU, no
-images -- just least squares from the state window to the action chunk, which
-upper-bounds what ANY architecture could extract from that channel alone.
+images -- just least squares from the state window to the action chunk.
+
+It is a FLOOR on what that channel yields, not a ceiling: ridge is linear and
+MotionVectorEncoder is an MLP, so a real encoder can only do better. The floor
+is still the useful number, because the shortcut being tested -- copy the last
+executed delta forward -- is itself close to linear, and a floor that already
+sits far above the model's residual settles the question on its own.
 
 THE MECHANISM. Training requests `obs_steps = motion_history_len` frames of
 `observation.state` (train_wiltechs_x.build_datasets), so the model can form
