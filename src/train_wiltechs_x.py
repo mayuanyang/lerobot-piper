@@ -937,6 +937,10 @@ def train(
     # and is not.
     if resume_state is not None:
         if "opt" in resume_state:
+            # Everything about the groups EXCEPT the moments belongs to this
+            # run, so snapshot it before the restore can overwrite it.
+            live = [{k: v for k, v in g.items() if k != "params"}
+                    for g in opt.param_groups]
             try:
                 opt.load_state_dict(resume_state["opt"])
                 print("optimizer state restored (Adam moments continue)")
@@ -948,6 +952,30 @@ def train(
                       f"    The parameter set differs from the checkpoint's, so "
                       f"a flag affecting which modules train was changed. "
                       f"Expect a transient for ~20 steps.")
+            # load_state_dict replaces param_groups WHOLESALE: it keeps only
+            # `params` from the live optimizer and takes every hyperparameter
+            # from the file. So the checkpoint's lr/betas/eps/weight_decay win
+            # over this run's -- and because LambdaLR is built below with
+            # setdefault("initial_lr", ...), the restored `initial_lr` becomes
+            # the peak the whole schedule scales, not --lr.
+            #
+            # Measured: `--lr 6e-5` resuming a checkpoint saved at 1.7e-4 ran
+            # the entire warmup at 1.7e-4 (2.8x requested) and the flag looked
+            # like it had no effect whatsoever. Re-warming an annealed model
+            # to its ORIGINAL peak is the destructive case load_resume_state
+            # already warns about, arrived at by accident.
+            #
+            # This also silently undid the "read betas/eps/weight_decay off the
+            # config" fix above, on every resume.
+            stale = {k: v for k, v in opt.param_groups[0].items()
+                     if k in live[0] and live[0][k] != v}
+            for g, keep in zip(opt.param_groups, live):
+                g.update(keep)
+                g.pop("initial_lr", None)      # let LambdaLR re-derive it
+            if stale:
+                now = {k: live[0][k] for k in stale}
+                print(f"*** optimizer hyperparameters come from THIS run, not "
+                      f"the checkpoint:\n    {stale}  ->  {now}")
         else:
             print("*** checkpoint has no optimizer state; Adam restarts cold")
         resume_state = None                    # free the CPU copy
@@ -961,6 +989,13 @@ def train(
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_at)
     for _ in range(start_step):
         sched.step()
+    # Read the peak back OUT of the scheduler rather than echoing --lr. That is
+    # the whole lesson of the block above: the flag was applied and then thrown
+    # away, and nothing in the log said so -- the step line prints the CURRENT
+    # lr, which during warmup is small enough to look plausible at any peak.
+    peak = opt.param_groups[0]["initial_lr"]
+    print(f"LR peak {peak:.3e} (--lr {lr:.3e})"
+          + ("" if abs(peak - lr) < 1e-12 else "   *** THESE DISAGREE ***"))
 
     if preprocess_in_workers:
         dataset = VlmPixelDataset(dataset, policy.model.processor.image_processor,
