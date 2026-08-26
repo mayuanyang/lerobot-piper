@@ -665,6 +665,7 @@ def train(
     lr: float = 1e-4,
     weight_decay: float = 1e-6,
     warmup_steps: int = 1000,
+    train_state_noise: float = 0.0,
     horizon: int = 16,
     n_action_steps: int = 8,
     expert_hidden_size: int = 1024,
@@ -1087,6 +1088,31 @@ def train(
         out = preprocessor(batch)
         for k, v in batch.items():
             out.setdefault(k, v)
+        if train_state_noise > 0.0 and policy.training:
+            # ONE offset per sample, broadcast over the whole window -- NOT
+            # independent noise per frame.
+            #
+            # `observation.state` is the highest-resolution identifier the
+            # expert receives: 8 floats that pin down which frame of which
+            # demonstration this is. When the val gap localised the memorising
+            # to the expert (flow +42%, gripper +45%, progress +258%, against
+            # discrete +0.7% off the SAME prefix), this became the thing to
+            # blur.
+            #
+            # Per-frame noise would also destroy the first differences
+            # MotionVectorEncoder takes, and section 10 of the ablation ledger
+            # measured that signal as load-bearing -- a monotone dose-response
+            # across four inference conditions, trend z = 4.77, p = 1.8e-06.
+            # A constant offset leaves every difference in the window exactly
+            # intact and only moves the absolute position, so it attacks the
+            # memorisation key without touching the motion signal.
+            #
+            # Applied AFTER the preprocessor, so sigma is in the same
+            # normalized units the loss and `--state_noise` use.
+            st = out["observation.state"]
+            shape = (st.shape[0], 1, st.shape[-1]) if st.dim() == 3 else st.shape
+            out["observation.state"] = st + torch.randn(
+                shape, device=st.device, dtype=st.dtype) * train_state_noise
         return out
 
     # `step` counts OPTIMIZER steps, not dataloader iterations. The scheduler
@@ -1329,7 +1355,23 @@ def main():
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--grad_accum", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--weight_decay", type=float, default=1e-6)
+    p.add_argument("--weight_decay", type=float, default=1e-6,
+                   help="1e-6 is effectively OFF -- four orders below the "
+                        "0.01-0.1 that transformer training conventionally "
+                        "uses. Worth raising first when the val gap says the "
+                        "model is memorising: it costs nothing and needs no "
+                        "new code.")
+    p.add_argument("--train_state_noise", type=float, default=0.0,
+                   help="Augment observation.state during TRAINING: one "
+                        "Gaussian offset per sample, broadcast over the whole "
+                        "history window, sigma in NORMALIZED units. Distinct "
+                        "from eval_wiltechs_x.py's --state_noise, which "
+                        "perturbs a trained policy at inference. Aimed: the "
+                        "state is the expert's sharpest key for 'which frame "
+                        "of which demo', and a constant offset blurs that key "
+                        "while leaving every first difference -- the motion "
+                        "signal -- exactly intact. train_wiltechs_moe uses "
+                        "0.02; try 0.02-0.05.")
     p.add_argument("--warmup_steps", type=int, default=1000)
     p.add_argument("--horizon", type=int, default=16)
     p.add_argument("--n_action_steps", type=int, default=8,
