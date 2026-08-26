@@ -128,6 +128,15 @@ def load_columns(dataset_id: str, max_episodes: int | None):
     if max_episodes:
         keep = ep < (np.unique(ep)[:max_episodes].max() + 1)
         state, action, ep = state[keep], action[keep], ep[keep]
+    # Settle end-effector-pose vs joint-angles from the schema rather than
+    # from correlations. It decides whether a null-space augmentation ("many
+    # joint configurations, one end-effector pose, one action") is even
+    # expressible in this vector: on an EE pose the alternatives collapse to
+    # the SAME state and there is no redundancy left to sample.
+    for key in ("observation.state", "action"):
+        f = meta.features.get(key, {})
+        print(f"  {key:20s} dim {int(np.prod(f.get('shape', (0,))))}  "
+              f"names={list(f.get('names') or []) or 'UNDECLARED'}")
     st = meta.stats
     return state, action, ep, st
 
@@ -268,10 +277,19 @@ def state_geometry(state, ep, args):
         L2 = sg * math.sqrt(D)
         print(f"  {sg:7.2f}{L2:10.3f}{L2/max(st_med,1e-9):11.1f}"
               f"{100*L2/max(nn_med,1e-9):25.0f}%")
-    print(f"\n  Blurring demo identity needs the last column near 100%. Read it")
-    print(f"  against the ceiling: the action distribution this policy has to")
-    print(f"  resolve is sigma ~ 0.099 in ACTION units, and the state token is")
-    print(f"  what the expert reads to place the gripper.")
+    print(f"\n  The 'N steps' column reads TWO ways, and they pull opposite ways:")
+    print(f"    to blur which demo this is, you want it LARGE;")
+    print(f"    but the current augmentation moves the state and leaves the")
+    print(f"    ACTION unchanged, so it also says 'ignore a position error worth")
+    print(f"    N steps' -- and correcting an error of exactly that size is what")
+    print(f"    the policy is for. Same error moe removed from image aug:")
+    print(f"    translating without translating the label teaches 'position does")
+    print(f"    not change the action'.")
+    print(f"  If no sigma is both large enough for the last column and small")
+    print(f"  enough for this one, an uncorrected offset is the wrong tool. The")
+    print(f"  fix is to offset the state AND subtract the same displacement from")
+    print(f"  the action, which is well defined here: the state-diff to action")
+    print(f"  map above is near-identity on the position dims.")
 
 
 def self_test(args):
