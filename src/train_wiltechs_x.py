@@ -99,6 +99,29 @@ class ProgressDataset(torch.utils.data.Dataset):
         return item
 
 
+def get_image_augmentations():
+    """PHOTOMETRIC ONLY. No RandomAffine, deliberately.
+
+    train_wiltechs_vla still ships `translate=0.03`; train_wiltechs_moe turned
+    the same thing OFF and wrote down why, and that reasoning applies here
+    verbatim:
+
+      > Geometric augmentation moves the objects in the frame but NOT the
+      > action label, so it teaches "position does not change the action" --
+      > the exact invariance a spatial-referring task must not have. On a 256px
+      > LIBERO frame translate=0.03 was +-7.7px against a ~19px
+      > ramekin-to-bowl separation: 40% of the distance the policy is being
+      > asked to resolve.
+
+    Colour and blur move nothing, so they stay. Matches moe's strengths.
+    """
+    from torchvision.transforms import v2
+    return v2.Compose([
+        v2.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.08),
+        v2.RandomApply([v2.GaussianBlur(kernel_size=5, sigma=(0.1, 1.0))], p=0.3),
+    ])
+
+
 class VlmPixelDataset(torch.utils.data.Dataset):
     """Runs the Qwen image processor in the DataLoader worker rather than on
     the training loop's critical path.
@@ -117,10 +140,14 @@ class VlmPixelDataset(torch.utils.data.Dataset):
     augmentation this trainer does not do.
     """
 
-    def __init__(self, base, image_processor, camera_keys, target_size=0):
+    def __init__(self, base, image_processor, camera_keys, target_size=0,
+                 augment=None):
         self.base = base
         self.image_processor = image_processor
         self.camera_keys = list(camera_keys)
+        # None for the validation wrapper. Augmenting a held-out batch would
+        # measure the augmentation, not generalisation.
+        self.augment = augment
         # Must match what _encode_images would have passed inline, or the two
         # paths build different vision grids for the same frame.
         self.target_size = int(target_size or 0)
@@ -130,13 +157,29 @@ class VlmPixelDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, i):
         s = self.base[i]
+        # delta_timestamps gives cameras a leading T=1; the inline path takes
+        # [:, -1] for the same reason.
+        imgs = {k: (v[-1] if v.dim() == 4 else v)
+                for k in self.camera_keys
+                if isinstance(v := s.get(k), torch.Tensor)}
+        if self.augment is not None and imgs:
+            # ONE draw for every camera of the sample. Jittering agentview and
+            # wrist independently would hand the model two views of a scene
+            # under different lighting, which is not a scene it can ever
+            # observe. Both siblings share the draw the same way.
+            keys = list(imgs)
+            shapes = {imgs[k].shape for k in keys}
+            if len(shapes) == 1:
+                stacked = self.augment(torch.stack([imgs[k] for k in keys]))
+                imgs = {k: stacked[j] for j, k in enumerate(keys)}
+            else:                                  # cameras differ in size
+                imgs = {k: self.augment(imgs[k]) for k in keys}
+            for k in keys:                         # the wrist encoder reads these
+                s[k] = imgs[k].unsqueeze(0) if s[k].dim() == 4 else imgs[k]
         for k in self.camera_keys:
-            v = s.get(k)
-            if not isinstance(v, torch.Tensor):
+            if k not in imgs:
                 continue
-            # delta_timestamps gives cameras a leading T=1; the inline path
-            # takes [:, -1] for the same reason.
-            img = v[-1] if v.dim() == 4 else v
+            img = imgs[k]
             pv, thw = preprocess_camera_to_pixels(self.image_processor, img,
                                                   target_size=self.target_size)
             s[vlm_pixels_key(k)] = pv                          # (P, dim)
@@ -666,6 +709,7 @@ def train(
     weight_decay: float = 1e-6,
     warmup_steps: int = 1000,
     train_state_noise: float = 0.0,
+    image_aug: bool = False,
     horizon: int = 16,
     n_action_steps: int = 8,
     expert_hidden_size: int = 1024,
@@ -998,9 +1042,29 @@ def train(
     print(f"LR peak {peak:.3e} (--lr {lr:.3e})"
           + ("" if abs(peak - lr) < 1e-12 else "   *** THESE DISAGREE ***"))
 
+    # Two wrappers over the same base, not one with a toggle: with
+    # num_workers > 0 the dataset is pickled into each worker, so flipping an
+    # attribute in the main process before a validation pass would reach
+    # nothing. The val and fit loaders are built from `dataset_eval` below.
+    if image_aug and not preprocess_in_workers:
+        raise SystemExit(
+            "--image_aug needs the worker preprocessing path; you passed "
+            "--no_preprocess_in_workers.\n"
+            "    Augmentation has to be PER SAMPLE. The inline path only sees "
+            "an assembled batch, so one draw would cover all 96 frames at "
+            "once -- a weaker and different thing wearing the same flag "
+            "name.\n"
+            "    Drop --no_preprocess_in_workers (and keep --num_workers > 0).")
+    dataset_eval = dataset
     if preprocess_in_workers:
-        dataset = VlmPixelDataset(dataset, policy.model.processor.image_processor,
-                                  cameras, target_size=vision_input_size)
+        _mkwrap = lambda aug: VlmPixelDataset(
+            dataset, policy.model.processor.image_processor, cameras,
+            target_size=vision_input_size, augment=aug)
+        dataset_eval = _mkwrap(None)
+        dataset = _mkwrap(get_image_augmentations() if image_aug else None)
+        if image_aug:
+            print("image augmentation ON (photometric only: ColorJitter + "
+                  "GaussianBlur p=0.3). Validation batches are NOT augmented.")
         where = (f"{num_workers} DataLoader workers (parallel, overlapped with "
                  f"GPU)" if num_workers > 0
                  else "the MAIN process — --num_workers is 0, so this buys "
@@ -1036,7 +1100,7 @@ def train(
         # split would measure nothing.
         train_ds = torch.utils.data.Subset(dataset, tr_idx)
         mk = lambda idx: torch.utils.data.DataLoader(
-            torch.utils.data.Subset(dataset, idx), batch_size=batch_size,
+            torch.utils.data.Subset(dataset_eval, idx), batch_size=batch_size,
             shuffle=False, num_workers=max(num_workers // 2, 1),
             pin_memory=(device == "cuda"), drop_last=True)
         val_loader = mk(va_idx)
@@ -1361,6 +1425,16 @@ def main():
                         "uses. Worth raising first when the val gap says the "
                         "model is memorising: it costs nothing and needs no "
                         "new code.")
+    p.add_argument("--image_aug", action="store_true",
+                   help="Photometric image augmentation (ColorJitter + "
+                        "GaussianBlur), one draw shared across a sample's "
+                        "cameras. All three sibling trainers do this and "
+                        "WiltechsX did not. NO geometric component: moe "
+                        "removed RandomAffine because translating the frame "
+                        "without translating the action label teaches "
+                        "'position does not change the action', which is the "
+                        "one invariance a spatial-referring task must not "
+                        "have. Requires the worker preprocessing path.")
     p.add_argument("--train_state_noise", type=float, default=0.0,
                    help="Augment observation.state during TRAINING: one "
                         "Gaussian offset per sample, broadcast over the whole "
