@@ -105,7 +105,7 @@ class StateHistory:
     without relying on the encoder's fallback.
     """
 
-    MODES = ("real", "frozen", "shuffled")
+    MODES = ("real", "frozen", "shuffled", "noise")
 
     def __init__(self, n_envs: int, history_len: int, mode: str = "real",
                  seed: int = 0):
@@ -138,21 +138,39 @@ class StateHistory:
           frozen    newest frame repeated. Velocity is identically zero. This
                     is NOT out of distribution: `reset` builds exactly this,
                     so every episode's first inference call already sees it.
-          shuffled  same T frames, order permuted per call. The CONTROL, and
-                    the one that carries the argument: it leaves every
-                    marginal intact and destroys only the temporal ordering,
-                    so a drop here cannot be blamed on unfamiliar values.
+          shuffled  the OLDER T-1 frames permuted; ordering dies, every
+                    marginal survives.
+          noise     the older T-1 frames replaced by the newest plus Gaussian
+                    noise at the real window's own per-dim std. Motion
+                    MAGNITUDE is preserved, direction is gone, and -- unlike
+                    `frozen` -- the window makes no coherent claim.
 
-        `frozen` alone is ambiguous -- a policy could fail on it because zero
-        velocity is rare mid-episode rather than because it needed the signal.
-        Run both, and read `shuffled`.
+        EVERY mode leaves frame -1 untouched, because the state token is
+        `st[:, -1]` (wiltechs_x_model, _suffix_pass). A permutation over all T
+        moves an older frame into that slot and displaces the CURRENT
+        proprioceptive reading by up to T-1 frames, which is a second
+        intervention on top of the intended one. Results taken before this was
+        fixed under-state nothing -- they destroyed ordering AND the state
+        token -- but they cannot be read against `frozen`, which never had the
+        defect.
+
+        Why three: `frozen` alone is ambiguous. It does not merely remove the
+        signal, it asserts a self-consistent falsehood ("this arm has been
+        still for T frames") that a phase detector can lock onto, so a
+        collapse under it can mean either "the signal was needed" or "the lie
+        selected the wrong mode". `noise` carries variance without either a
+        true velocity or that assertion, and separates the two.
         """
         out = np.stack([np.stack(list(b)) for b in self.buf])
         if self.mode == "frozen":
             out[:] = out[:, -1:, :]
-        elif self.mode == "shuffled":
+        elif self.mode == "shuffled" and self.t > 1:
             for i in range(len(out)):
-                out[i] = out[i][self.rng.permutation(self.t)]
+                out[i, :-1] = out[i][self.rng.permutation(self.t - 1)]
+        elif self.mode == "noise" and self.t > 1:
+            sd = out.std(axis=1, keepdims=True)
+            jitter = self.rng.normal(0.0, 1.0, out.shape) * sd
+            out[:, :-1] = (out[:, -1:, :] + jitter[:, :-1]).astype(out.dtype)
         return out
 
 
@@ -679,7 +697,7 @@ def main():
                         "testing a different sentence. Use with --task_ids to "
                         "swap a pair: --task_ids 7 --instruction_from_task 9.")
     p.add_argument("--history_mode", default="real",
-                   choices=("real", "frozen", "shuffled"),
+                   choices=("real", "frozen", "shuffled", "noise"),
                    help="Ablate the observation.state WINDOW the motion-vector "
                         "encoder reads. 'shuffled' permutes the T frames per "
                         "call: every marginal is preserved and only the "
