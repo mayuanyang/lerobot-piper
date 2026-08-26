@@ -43,6 +43,7 @@ k=0..1 the back door is real and load-bearing on the executed steps.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -217,6 +218,62 @@ def report(S, A, M, E, args):
               "     path the shortcut takes.)")
 
 
+def state_geometry(state, ep, args):
+    """How large must --train_state_noise be to blur "which frame of which demo"?
+
+    Two scales decide it, both in NORMALIZED state units (per-dim std = 1):
+
+      one-step motion   ||s_t - s_{t-1}||   how far a single action moves you
+      nearest OTHER     min ||s - s'|| over frames of a DIFFERENT episode
+
+    The second is the memorisation key's actual resolution: if the noise cannot
+    reach a frame from another demonstration, the state still identifies this
+    one and the augmentation buys nothing.
+
+    The factor that is easy to drop: the offset is drawn per-dim, so its L2
+    displacement is sigma * sqrt(D) -- 2.83x at D=8, not 1x.
+
+    And there is a ceiling. The state token is what the expert reads to know
+    where the arm IS, and grasp precision is the confirmed bottleneck, so a
+    sigma large enough to blur demo identity may already be large enough to
+    cost the thing it is meant to protect. If the two scales do not separate,
+    state noise is the wrong tool and the report should say so rather than
+    leaving a number to be tuned blindly.
+    """
+    rng = np.random.default_rng(args.seed)
+    D = state.shape[1]
+    step = np.linalg.norm(np.diff(state, axis=0)[ep[1:] == ep[:-1]], axis=1)
+
+    q_i = rng.choice(len(state), size=min(4000, len(state)), replace=False)
+    pool_i = rng.choice(len(state), size=min(40000, len(state)), replace=False)
+    Q, P, Qe, Pe = state[q_i], state[pool_i], ep[q_i], ep[pool_i]
+    nn = np.full(len(Q), np.inf)
+    for a in range(0, len(P), 4000):                       # chunked, ~O(1) RAM
+        blk, blk_e = P[a:a + 4000], Pe[a:a + 4000]
+        d = np.linalg.norm(Q[:, None, :] - blk[None, :, :], axis=2)
+        d[Qe[:, None] == blk_e[None, :]] = np.inf          # same episode: not a key
+        nn = np.minimum(nn, d.min(axis=1))
+    nn = nn[np.isfinite(nn)]
+
+    st_med, nn_med = float(np.median(step)), float(np.median(nn))
+    print(f"\n=== state geometry ({D}d, normalized; per-dim std = 1) ===")
+    print(f"  one-step motion  ||s_t - s_t-1||   median {st_med:.4f}"
+          f"   p10 {np.percentile(step,10):.4f}  p90 {np.percentile(step,90):.4f}")
+    print(f"  nearest frame, DIFFERENT episode   median {nn_med:.4f}"
+          f"   p10 {np.percentile(nn,10):.4f}  p90 {np.percentile(nn,90):.4f}")
+    print(f"\n  a per-dim sigma displaces by sigma*sqrt({D}) = {math.sqrt(D):.2f}x sigma\n")
+    print(f"  {'sigma':>7s}{'L2 shift':>10s}{'= N steps':>11s}"
+          f"{'% of gap to another demo':>26s}")
+    for sg in (0.01, 0.02, 0.05, 0.1, 0.2):
+        L2 = sg * math.sqrt(D)
+        print(f"  {sg:7.2f}{L2:10.3f}{L2/max(st_med,1e-9):11.1f}"
+              f"{100*L2/max(nn_med,1e-9):25.0f}%")
+    print(f"\n  Blurring demo identity needs the last column near 100%. Read it")
+    print(f"  against the ceiling: the action distribution this policy has to")
+    print(f"  resolve is sigma ~ 0.099 in ACTION units, and the state token is")
+    print(f"  what the expert reads to place the gripper.")
+
+
 def self_test(args):
     """Synthetic data where the answer is known, so the probe can be trusted.
 
@@ -257,6 +314,7 @@ def main():
                     help="subsample windows; 1 is every frame")
     ap.add_argument("--ridge", type=float, default=1e-3)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--skip_geometry", action="store_true")
     ap.add_argument("--self_test", action="store_true")
     a = ap.parse_args()
 
@@ -270,6 +328,8 @@ def main():
     action = normalize(action, st, "action")
     S, A, M, E = build_windows(state, action, ep, a.obs_steps, a.horizon, a.stride)
     report(S, A, M, E, a)
+    if not a.skip_geometry:
+        state_geometry(state, ep, a)
 
 
 if __name__ == "__main__":
