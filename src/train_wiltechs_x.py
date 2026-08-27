@@ -1343,6 +1343,21 @@ def train(
                                 if v_ < f_ * 1.03 else "   <- mild gap")
                     rows.append(f"      {k:<12s}{f_:>10.4f}{v_:>12.4f}"
                                 f"{d:>11s}{note}")
+                # Append to disk as well as printing. Twice now a val row
+                # needed for a cross-run comparison existed only in a Colab
+                # scrollback that was gone by the time it was asked for, and
+                # the comparison had to fall back on interpolating between the
+                # points that survived. One line per pass, in the output dir,
+                # so it outlives the session and two runs can be read against
+                # each other directly.
+                try:
+                    with open(Path(out) / "val_log.jsonl", "a") as fh:
+                        fh.write(json.dumps({"step": step, "lr": sched.get_last_lr()[0],
+                                             "train_eps": fp, "held_out": vp,
+                                             "n_val_eps": n_val_eps,
+                                             "n_val_frames": n_val_frames}) + "\n")
+                except OSError as e:                      # never kill a run for a log
+                    print(f"  (val_log.jsonl not written: {e})")
                 body = "\n".join(rows)
                 print(f"  VAL @ {step}   {n_val_eps} held-out episodes / "
                       f"{n_val_frames} frames, {nb} batches x {batch_size}\n"
