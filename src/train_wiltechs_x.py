@@ -31,6 +31,7 @@ at startup is printed from whichever one ran.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import sys
@@ -97,6 +98,68 @@ class ProgressDataset(torch.utils.data.Dataset):
         item = self.base[i]
         item["progress"] = torch.tensor(self.prog[i], dtype=torch.float32)
         return item
+
+
+class WeightEMA:
+    """Shadow copy of the trainable weights, pulled toward them each step.
+
+    Aimed at a specific thing the val log shows. Held-out `flow` bounces
+    0.4442-0.4648 inside 400 steps while the train column falls monotonically,
+    and the validation pass is deterministic -- pinned draws, fixed episodes,
+    eval mode -- so that bounce is the WEIGHTS oscillating, not measurement
+    noise. Every checkpoint is therefore one arbitrary sample of that
+    oscillation. Memorisation is the high-frequency part of it; the
+    generalising structure is the low-frequency part. An average keeps the
+    second and drops the first, which is why flow and diffusion policies
+    (Diffusion Policy, pi-0) treat EMA as standard rather than optional.
+
+    It is also the only regulariser here that pays for its own evaluation: raw
+    and averaged weights come out of ONE run, so `HELD-OUT(EMA)` sits next to
+    `HELD-OUT` in the same table. Everything else -- dropout, weight decay, a
+    capacity change -- needs a second run before it can be read.
+    """
+
+    def __init__(self, params, decay: float):
+        self.decay = float(decay)
+        self.params = [p for p in params if p.requires_grad]
+        self.shadow = [p.detach().clone().float() for p in self.params]
+        self.n = 0
+
+    @torch.no_grad()
+    def update(self):
+        self.n += 1
+        # Warm the decay in. At step 0 the shadow is the initialisation, and a
+        # flat 0.999 would still be carrying 37% of it 1000 steps later.
+        d = min(self.decay, (1.0 + self.n) / (10.0 + self.n))
+        for sh, p in zip(self.shadow, self.params):
+            sh.mul_(d).add_(p.detach().float(), alpha=1.0 - d)
+
+    @contextlib.contextmanager
+    def applied(self):
+        """Install the averaged weights for the duration of the block."""
+        backup = [p.detach().clone() for p in self.params]
+        try:
+            with torch.no_grad():
+                for p, sh in zip(self.params, self.shadow):
+                    p.copy_(sh.to(p.dtype))
+            yield
+        finally:
+            with torch.no_grad():
+                for p, b in zip(self.params, backup):
+                    p.copy_(b)
+
+    def state_dict(self):
+        return {"decay": self.decay, "n": self.n, "shadow": self.shadow}
+
+    def load_state_dict(self, sd):
+        if len(sd.get("shadow", [])) != len(self.shadow):
+            print("*** EMA state not restored: the parameter set differs from "
+                  "the checkpoint's. The average restarts from the current "
+                  "weights.")
+            return
+        self.n = int(sd.get("n", 0))
+        for sh, src in zip(self.shadow, sd["shadow"]):
+            sh.copy_(src.to(sh.device))
 
 
 def get_image_augmentations():
@@ -709,6 +772,7 @@ def train(
     weight_decay: float = 1e-6,
     warmup_steps: int = 1000,
     train_state_noise: float = 0.0,
+    ema_decay: float = 0.0,
     image_aug: bool = False,
     horizon: int = 16,
     n_action_steps: int = 8,
@@ -980,6 +1044,7 @@ def train(
     # rebuilt over ~20 steps, and until it is the updates are effectively
     # unnormalised -- a loss spike on resume that looks like a real regression
     # and is not.
+    ema_state = None
     if resume_state is not None:
         if "opt" in resume_state:
             # Everything about the groups EXCEPT the moments belongs to this
@@ -1023,6 +1088,7 @@ def train(
                       f"the checkpoint:\n    {stale}  ->  {now}")
         else:
             print("*** checkpoint has no optimizer state; Adam restarts cold")
+        ema_state = resume_state.get("ema")    # before the dict is dropped
         resume_state = None                    # free the CPU copy
 
     def lr_at(step):
@@ -1038,6 +1104,16 @@ def train(
     # the whole lesson of the block above: the flag was applied and then thrown
     # away, and nothing in the log said so -- the step line prints the CURRENT
     # lr, which during warmup is small enough to look plausible at any peak.
+    ema = None
+    if ema_decay > 0:
+        ema = WeightEMA(params, ema_decay)
+        n_sh = sum(x.numel() for x in ema.shadow)
+        print(f"EMA on, decay {ema_decay} (time constant ~{1/(1-ema_decay):.0f} "
+              f"steps) over {n_sh/1e6:.0f}M params, +{n_sh*4/2**30:.1f} GiB")
+        if ema_state is not None:
+            ema.load_state_dict(ema_state)
+            print("  EMA state restored")
+
     peak = opt.param_groups[0]["initial_lr"]
     print(f"LR peak {peak:.3e} (--lr {lr:.3e})"
           + ("" if abs(peak - lr) < 1e-12 else "   *** THESE DISAGREE ***"))
@@ -1281,6 +1357,8 @@ def train(
             opt.step()
             opt.zero_grad(set_to_none=True)
             sched.step()
+            if ema is not None:
+                ema.update()
             step += 1
 
             if profiling:
@@ -1317,6 +1395,15 @@ def train(
                                         val_max_batches, seed)
                 fp, _ = run_validation(policy, fit_loader, prepare, device,
                                        val_max_batches, seed)
+                # One extra pass, on the HELD-OUT set only: that is the number
+                # the averaging is meant to move, and a fit column for the EMA
+                # answers nothing. This is what makes EMA self-attributing --
+                # both weight sets are scored in the same table, from one run.
+                ep_ = None
+                if ema is not None:
+                    with ema.applied():
+                        ep_, _ = run_validation(policy, val_loader, prepare,
+                                                device, val_max_batches, seed)
                 # One row per term, both columns labelled. The previous
                 # `fit/heldout  a=x/y  b=x/y ...` made the reader carry the
                 # column order across six pairs, and said nothing about how
@@ -1327,8 +1414,9 @@ def train(
                 # flow leads: it is what the verdict is computed on and the term
                 # the capacity question is asked about. The rest alphabetical.
                 keys = (["flow"] if "flow" in allk else []) + sorted(allk - {"flow"})
+                emah = f"{'HELD-OUT(EMA)':>15s}" if ep_ is not None else ""
                 rows = [f"      {'':<12s}{'TRAIN eps':>10s}{'HELD-OUT':>12s}"
-                        f"{'gap':>11s}"]
+                        f"{emah}{'gap':>11s}"]
                 for k in keys:
                     f_, v_ = fp.get(k, float("nan")), vp.get(k, float("nan"))
                     ok = f_ and f_ == f_ and v_ == v_           # non-zero, non-NaN
@@ -1341,8 +1429,10 @@ def train(
                                 if v_ > f_ * 1.10 else
                                 "   <- no gap: under-fitting or under-trained"
                                 if v_ < f_ * 1.03 else "   <- mild gap")
+                    e_ = "" if ep_ is None else (
+                        f"{ep_[k]:>15.4f}" if k in ep_ else f"{'--':>15s}")
                     rows.append(f"      {k:<12s}{f_:>10.4f}{v_:>12.4f}"
-                                f"{d:>11s}{note}")
+                                f"{e_}{d:>11s}{note}")
                 # Append to disk as well as printing. Twice now a val row
                 # needed for a cross-run comparison existed only in a Colab
                 # scrollback that was gone by the time it was asked for, and
@@ -1354,6 +1444,7 @@ def train(
                     with open(Path(out) / "val_log.jsonl", "a") as fh:
                         fh.write(json.dumps({"step": step, "lr": sched.get_last_lr()[0],
                                              "train_eps": fp, "held_out": vp,
+                                             "held_out_ema": ep_,
                                              "n_val_eps": n_val_eps,
                                              "n_val_frames": n_val_frames}) + "\n")
                 except OSError as e:                      # never kill a run for a log
@@ -1376,8 +1467,18 @@ def train(
                 policy.save_pretrained(ck)
                 preprocessor.save_pretrained(ck)
                 postprocessor.save_pretrained(ck)
-                torch.save({"model": policy.state_dict(), "opt": opt.state_dict(),
-                            "step": step}, ck / "training_state.pth")
+                blob = {"model": policy.state_dict(), "opt": opt.state_dict(),
+                        "step": step}
+                if ema is not None:
+                    blob["ema"] = ema.state_dict()
+                    # ALSO write the averaged weights as a loadable policy, so
+                    # eval_wiltechs_x.py can point at them without knowing
+                    # anything about EMA.
+                    with ema.applied():
+                        policy.save_pretrained(ck / "ema")
+                        preprocessor.save_pretrained(ck / "ema")
+                        postprocessor.save_pretrained(ck / "ema")
+                torch.save(blob, ck / "training_state.pth")
                 print(f"saved {ck}")
 
             # LAST, so logging and checkpoint writes are not charged to the
@@ -1440,6 +1541,22 @@ def main():
                         "uses. Worth raising first when the val gap says the "
                         "model is memorising: it costs nothing and needs no "
                         "new code.")
+    p.add_argument("--ema_decay", type=float, default=0.0,
+                   help="Exponential moving average of the trainable weights; "
+                        "0 = off, 0.999 is a ~1000-step time constant. The val "
+                        "table gains a HELD-OUT(EMA) column and each checkpoint "
+                        "gains an ema/ subdirectory that eval_wiltechs_x.py can "
+                        "be pointed at directly. This is the only regulariser "
+                        "here that does not need a second run to be read: the "
+                        "raw and averaged weights are scored side by side. "
+                        "Costs one fp32 copy of the trainable parameters.")
+    p.add_argument("--expert_dropout", type=float, default=0.0,
+                   help="Dropout on the action expert's sublayer outputs. "
+                        "--lora_dropout only reaches the prefix, and the "
+                        "prefix is not what memorises: at step 8200 the "
+                        "held-out gap was +24.8% on flow and +188% on "
+                        "progress, both expert-side, against +0.5% on the "
+                        "discrete head reading the SAME cache. Try 0.1.")
     p.add_argument("--image_aug", action="store_true",
                    help="Photometric image augmentation (ColorJitter + "
                         "GaussianBlur), one draw shared across a sample's "

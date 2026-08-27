@@ -192,8 +192,15 @@ class JointExpertLayer(nn.Module):
 
     def __init__(self, expert_hidden: int, expert_intermediate: int,
                  num_heads: int, num_kv_heads: int, head_dim: int,
-                 rms_norm_eps: float = 1e-6, ada_rank: int = 64):
+                 rms_norm_eps: float = 1e-6, ada_rank: int = 64,
+                 dropout: float = 0.0):
         super().__init__()
+        # On the SUFFIX sublayer outputs, before the residual add -- standard
+        # transformer placement. Nothing in this model had dropout anywhere
+        # except LoRA, which sits in the prefix, and the val split localised
+        # the memorising to the expert: flow +24.8%, progress +188%, against
+        # discrete +0.5% off the SAME cache.
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -256,9 +263,11 @@ class JointExpertLayer(nn.Module):
         # may be fp32. Reconcile on the way back into the residual stream.
         s_attn = s_attn.transpose(1, 2).contiguous().view(B, L_s, -1)
         s_attn = s_attn.to(self.o_proj.weight.dtype)
-        suffix = suffix + gate_a.unsqueeze(1) * self.o_proj(s_attn).to(suffix.dtype)
+        suffix = suffix + gate_a.unsqueeze(1) * self.dropout(
+            self.o_proj(s_attn).to(suffix.dtype))
         s_ff = self._modulate(self.ffn_norm(suffix), shift_f, scale_f)
-        return suffix + gate_f.unsqueeze(1) * self.ffn(s_ff).to(suffix.dtype)
+        return suffix + gate_f.unsqueeze(1) * self.dropout(
+            self.ffn(s_ff).to(suffix.dtype))
 
     def forward(self, prefix, suffix, vlm_layer, attn_mask, rope, t_emb,
                 stop_grad_to_prefix):
@@ -596,7 +605,8 @@ class WiltechsXModel(nn.Module):
         self.expert_layers = nn.ModuleList([
             JointExpertLayer(self.d_exp, d_ffn, self.num_heads, self.num_kv_heads,
                              self.head_dim, self.rms_norm_eps,
-                             ada_rank=int(config.ada_rank))
+                             ada_rank=int(config.ada_rank),
+                             dropout=float(getattr(config, "expert_dropout", 0.0)))
             for _ in range(n_exp)
         ])
         n_e = sum(p.numel() for p in self.expert_layers.parameters())

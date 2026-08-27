@@ -68,6 +68,11 @@ class WiltechsXConfig(PreTrainedConfig):
     lora_rank: int = 32
     lora_alpha: int = 64
     lora_dropout: float = 0.0
+    # Dropout inside the ACTION EXPERT, which is where the val split localised
+    # the memorising. lora_dropout above only reaches the prefix, and the
+    # prefix is not what memorises (discrete, reading the same cache, shows
+    # +0.5% while flow shows +24.8%).
+    expert_dropout: float = 0.0
     lora_target_modules: list[str] = field(
         default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"]
     )
