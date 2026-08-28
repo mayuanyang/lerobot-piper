@@ -66,8 +66,6 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from libero_env_fixed import patch_lerobot_libero
-from models.wiltechs_x.wiltechs_x_config import WiltechsXConfig  # noqa: F401  (registers "wiltechs_x")
-from models.wiltechs_x.wiltechs_x_policy import WiltechsXPolicy
 
 # One harness, several policies -- deliberately NOT a second script.
 #
@@ -90,9 +88,13 @@ POLICIES = {
 def _register_configs():
     """Importing a config module is what registers its `type` string, and
     PreTrainedConfig.from_pretrained resolves the checkpoint by that string.
-    Failures are per-model and non-fatal: a missing sibling must not stop an
-    eval of the one that is present."""
-    for mod in ("models.wiltechs_moe.wiltechs_moe_config",
+    Failures are per-model and non-fatal, WiltechsX included: this harness is
+    routinely run from a git worktree pinned to an older commit, to score a
+    checkpoint against the code of its own era, and in such a tree the other
+    models simply do not exist yet. A top-level import of any one of them makes
+    the harness unusable exactly where it is most needed."""
+    for mod in ("models.wiltechs_x.wiltechs_x_config",
+                "models.wiltechs_moe.wiltechs_moe_config",
                 "models.wiltechs_vla.wiltechs_vla_config",
                 "models.wilro.wilro_config"):
         try:
@@ -466,6 +468,7 @@ def load_processors(ckpt: Path, device: str, dataset_id: str | None):
     print(f"[eval] WARNING: no saved processors in {ckpt}; rebuilding from "
           f"{dataset_id}. Valid only if that dataset is byte-identical to the "
           f"one trained on.")
+    from models.wiltechs_x.wiltechs_x_config import WiltechsXConfig
     cfg = WiltechsXConfig.from_pretrained(ckpt)
     cfg.device = str(device)
     stats = LeRobotDatasetMetadata(dataset_id, revision="main").stats
