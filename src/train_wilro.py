@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import torch
 import pandas as pd
@@ -185,7 +186,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           paraphrase_limit: int = 8,
           paraphrase_file: str = "",
           paraphrase_min_variants: int = 5,
-          training_steps: int | None = None):
+          training_steps: int | None = None,
+          n_obs_steps: int | None = None,
+          val_episodes: int = 0,
+          val_every: int = 500,
+          val_max_batches: int = 20):
     """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model.
 
     `dataset_id` may be a single id or a list. Multiple datasets are concatenated
@@ -286,7 +291,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         print(f"Aggregated normalization stats across {len(dataset_ids)} datasets.")
 
     # Training parameters — match train_transformer.py for like-for-like comparison
-    obs = 2
+    obs = 2 if n_obs_steps is None else max(1, int(n_obs_steps))
     horizon = 64
     n_action_steps = 64
 
@@ -410,7 +415,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                 raise FileNotFoundError(f"No .safetensors file found in {local_ckpt_path}")
             model_file = candidates[0]
 
-        import json
         step, epoch = 0, 0
         saved_cfg_json = {}
         for config_name in ("config.json", "pretrained_config.json"):
@@ -591,6 +595,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     sub_datasets = []
     ep_from: list[int] = []
     ep_to: list[int] = []
+    ep_ds: list[str] = []          # which dataset each episode came from
     offset = 0
     first_root = None
     for did in dataset_ids:
@@ -637,6 +642,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                 continue
             ep_from.append(offset + int(s))
             ep_to.append(offset + int(e))
+            ep_ds.append(did)
             kept += 1
         suffix = f" (<= ep {max_episode_index})" if max_episode_index is not None else ""
         print(f"  {did}: {len(ds)} frames, {kept} episodes{suffix}")
@@ -680,23 +686,95 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         print(f"Norm stats action:")
         print(f"  mean={s.get('mean', 'N/A')}")
         print(f"  std ={s.get('std',  'N/A')}")
-    sampler = EpisodeAwareSampler(
-        dataset_from_indices=ep_from,
-        dataset_to_indices=ep_to,
-        drop_n_first_frames=0,
-        drop_n_last_frames=0,
-        shuffle=True,
-    )
-    print(f"EpisodeAwareSampler: {len(sampler)} frames")
+    # ---- held-out split, by EPISODE ----
+    # Splitting by frame would put frames from one episode on both sides: the
+    # neighbouring frame is nearly the same image with nearly the same action,
+    # so a held-out loss built that way measures interpolation and reports a
+    # gap of roughly zero no matter how badly the model has memorised.
+    val_ep_idx: list = []
+    if val_episodes > 0:
+        rng = np.random.default_rng(seed=42)
+        by_ds: dict = {}
+        for i, d in enumerate(ep_ds):
+            by_ds.setdefault(d, []).append(i)
+        # Proportional per dataset, so a mixed run does not hold out only the
+        # big one and then report a number about the wrong domain.
+        total = len(ep_ds)
+        for d, idxs in by_ds.items():
+            k = max(1, round(val_episodes * len(idxs) / total))
+            k = min(k, max(0, len(idxs) - 1))
+            if k:
+                val_ep_idx += list(rng.choice(idxs, size=k, replace=False))
+    val_set = set(val_ep_idx)
+    tr_idx = [i for i in range(len(ep_ds)) if i not in val_set]
 
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        num_workers=8,
-        batch_size=batch_size,
-        sampler=sampler,
-        pin_memory=device.type != "cpu",
-        drop_last=True,
-    )
+    def mk_sampler(idxs, shuffle):
+        return EpisodeAwareSampler(
+            dataset_from_indices=[ep_from[i] for i in idxs],
+            dataset_to_indices=[ep_to[i] for i in idxs],
+            drop_n_first_frames=0, drop_n_last_frames=0, shuffle=shuffle)
+
+    def mk_loader(idxs, shuffle, workers):
+        return torch.utils.data.DataLoader(
+            dataset, num_workers=workers, batch_size=batch_size,
+            sampler=mk_sampler(idxs, shuffle),
+            pin_memory=device.type != "cpu", drop_last=True)
+
+    sampler = mk_sampler(tr_idx, True)
+    print(f"EpisodeAwareSampler: {len(sampler)} frames "
+          f"over {len(tr_idx)} episodes")
+    dataloader = mk_loader(tr_idx, True, 8)
+
+    val_loader = fit_loader = None
+    if val_ep_idx:
+        val_loader = mk_loader(val_ep_idx, False, 2)
+        # A same-sized slice of TRAINING episodes, scored the SAME way (eval
+        # mode, no augmentation). Without it the only comparison available is
+        # held-out against the running train loss, and those two differ by
+        # dropout, image/state augmentation, paraphrase sampling AND the
+        # contrastive term -- which is train-only here -- so their difference
+        # is not a generalisation gap. fit vs held-out is.
+        fit_loader = mk_loader(tr_idx[:len(val_ep_idx)], False, 2)
+        n_val_frames = sum(ep_to[i] - ep_from[i] for i in val_ep_idx)
+        per_ds = {}
+        for i in val_ep_idx:
+            per_ds[ep_ds[i]] = per_ds.get(ep_ds[i], 0) + 1
+        print(f"Validation: {len(val_ep_idx)} episodes held out "
+              f"({n_val_frames} frames, {100 * n_val_frames / max(1, sum(ep_to[i] - ep_from[i] for i in range(len(ep_ds)))):.1f}%), "
+              f"every {val_every} steps, <= {val_max_batches} batches\n"
+              f"  per dataset: {per_ds}")
+    else:
+        print("Validation: DISABLED (--val_episodes 0). Training loss alone "
+              "cannot tell fitting from memorising.")
+
+    @torch.no_grad()
+    def run_eval_loss(loader):
+        """Mean loss in EVAL mode with no augmentation.
+
+        policy.eval() is what turns paraphrase sampling off (the model gates it
+        on self.training), and it is also what drops the contrastive term, so
+        both columns below are the same quantity measured on different
+        episodes."""
+        was_training = policy.training
+        policy.eval()
+        tot, n = 0.0, 0
+        for i, b in enumerate(loader):
+            if i >= val_max_batches:
+                break
+            for k in b:
+                if isinstance(b[k], torch.Tensor):
+                    b[k] = b[k].to(device, non_blocking=True)
+            if "task" in b and isinstance(b["task"], (list, tuple)):
+                b["task_description"] = b["task"]
+            b = preprocessor(b)
+            with (torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+                  if device.type == "cuda"
+                  else torch.autocast(device_type="cpu", enabled=False)):
+                loss, _ = policy.forward(b)
+            tot += float(loss.detach()); n += 1
+        if was_training:
+            policy.train()
+        return tot / max(1, n)
 
     # Training loop
     print("Starting training loop...")
@@ -788,6 +866,18 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                     "grad_norm": f"{grad_norm:.2f}"
                 })
 
+            if val_loader is not None and step > 0 and step % val_every == 0:
+                v = run_eval_loss(val_loader)
+                f = run_eval_loss(fit_loader)
+                gap = 100.0 * (v - f) / max(abs(f), 1e-9)
+                print(f"\n  VAL @ {step}   "
+                      f"fit(train eps) {f:.4f}   held-out {v:.4f}   "
+                      f"gap {gap:+.1f}%"
+                      f"   [both eval mode, no augmentation]")
+                with open(output_directory / "val_log.jsonl", "a") as fh:
+                    fh.write(json.dumps({"step": step, "fit": f, "heldout": v,
+                                         "gap_pct": gap}) + "\n")
+
             if step > 0 and step % checkpoint_freq == 0:
                 checkpoint_dir = output_directory / f"checkpoint-{step}"
                 checkpoint_dir.mkdir(exist_ok=True)
@@ -841,6 +931,24 @@ if __name__ == "__main__":
                              "(piper_arm holdout convention; omit for full dataset).")
     parser.add_argument("--batch_size", type=int, default=64,
                         help="DataLoader batch size (default: 64).")
+    parser.add_argument("--n_obs_steps", type=int, default=None,
+                        help="Frames of observation.state history fed to the "
+                             "model (default: 2). 1 means the current frame "
+                             "only -- the model always reads images from the "
+                             "last frame regardless, so this controls the "
+                             "proprioceptive window alone.")
+    parser.add_argument("--val_episodes", type=int, default=0,
+                        help="Hold out this many EPISODES for validation, "
+                             "allocated proportionally across --dataset_id so a "
+                             "mixed run does not measure only the larger set. "
+                             "0 disables. Splitting by frame instead would put "
+                             "neighbouring frames of one episode on both sides "
+                             "and report a gap near zero however badly the "
+                             "model memorised.")
+    parser.add_argument("--val_every", type=int, default=500,
+                        help="Steps between validation passes (default: 500).")
+    parser.add_argument("--val_max_batches", type=int, default=20,
+                        help="Batches per validation pass (default: 20).")
     parser.add_argument("--training_steps", type=int, default=None,
                         help="Total optimizer steps (default: 200000). The "
                              "cosine LR schedule spans this, so it is not a "
