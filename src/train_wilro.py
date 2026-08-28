@@ -242,6 +242,18 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     print(f"State dim: {state_dim}, Action dim: {action_dim}")
 
     # Validate the other datasets share the same schema.
+    # Image RESOLUTION is tracked separately from the schema check below. It is
+    # not a schema conflict -- the model pads to square and interpolates every
+    # frame to vision_input_size regardless -- but ConcatDataset collates raw
+    # tensors, so two sets at 480 and 256 pass every check here and then die in
+    # torch.stack, inside a worker if num_workers > 0:
+    #   "stack expects each tensor to be equal size, but got [3, 256, 256] at
+    #    entry 0 and [3, 480, 480] at entry 3"
+    # Resolved by resizing at LOAD time instead (see resize_to below), which is
+    # the same operation the model would do later and therefore lossless.
+    vis_shapes = {dataset_ids[0]: {k: tuple(ft.shape)
+                                   for k, ft in input_features.items()
+                                   if ft.type is FeatureType.VISUAL}}
     for did in dataset_ids[1:]:
         f = dataset_to_policy_features(metas[did].features)
         out_f = {k: ft for k, ft in f.items() if ft.type is FeatureType.ACTION}
@@ -249,6 +261,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         cks = sorted(k for k, ft in in_f.items() if ft.type is FeatureType.VISUAL)
         sd = in_f["observation.state"].shape[-1] if "observation.state" in in_f else 7
         ad = next(iter(out_f.values())).shape[-1]
+        vis_shapes[did] = {k: tuple(ft.shape) for k, ft in in_f.items()
+                           if ft.type is FeatureType.VISUAL}
         if cks != camera_keys or sd != state_dim or ad != action_dim:
             raise ValueError(
                 f"Dataset '{did}' schema differs from '{dataset_ids[0]}':\n"
@@ -537,6 +551,28 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
 
     # Build each dataset, concatenate, and accumulate episode boundaries in the
     # concatenated index space (optionally filtered per-dataset by --max_episode_index).
+    # One resize for every dataset, or none at all. Applying it to only the
+    # odd one out would leave two different preprocessing paths feeding one
+    # model, and the difference would be invisible in the loss.
+    all_shapes = {sh for d in vis_shapes.values() for sh in d.values()}
+    resize_to = None
+    if len(all_shapes) > 1:
+        non_square = [sh for sh in all_shapes if sh[-1] != sh[-2]]
+        if non_square:
+            raise ValueError(
+                f"cameras differ in resolution AND some are not square "
+                f"({sorted(all_shapes)}). The model pads non-square frames to "
+                f"square before resizing, so resizing them here would change "
+                f"the aspect handling. Convert them to a common size first.")
+        resize_to = int(cfg.vision_input_size)
+        print(f"\nCamera resolutions differ across datasets: "
+              f"{ {d: sorted(set(v.values())) for d, v in vis_shapes.items()} }\n"
+              f"  -> resizing every frame to {resize_to}x{resize_to} at LOAD "
+              f"time. ConcatDataset stacks raw tensors, so mixed resolutions "
+              f"would fail in collate; the model resizes to vision_input_size "
+              f"anyway, so doing it here changes nothing but the timing.")
+    img_tf = v2.Resize((resize_to, resize_to), antialias=True) if resize_to else None
+
     sub_datasets = []
     ep_from: list[int] = []
     ep_to: list[int] = []
@@ -546,6 +582,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         ds = LeRobotDataset(
             did, delta_timestamps=delta_timestamps,
             force_cache_sync=True, revision="main", tolerance_s=tolerance_s,
+            image_transforms=img_tf,
         )
         if first_root is None:
             first_root = ds.root
