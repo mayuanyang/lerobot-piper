@@ -294,21 +294,35 @@ def load_policy(ckpt: Path, device: str, num_inference_steps: int | None,
 
 
 def report_missing_weights(policy, ckpt: Path, allow: bool):
-    """Account for every tensor the checkpoint did not supply.
+    """Account for the tensors the checkpoint did not supply -- by requires_grad.
 
-    lerobot logs these as one `WARNING:root:Missing key(s)` line and carries
-    on, which is how an eval can silently score a DIFFERENT model than the one
-    that was trained: a missing tensor keeps its INITIALISATION, and whether
-    that is harmless depends entirely on what the initialisation is.
+    lerobot logs these as one `WARNING:root:Missing key(s)` line and carries on,
+    which can mean an eval silently scores a DIFFERENT model than the one that
+    was trained. But "missing" alone is not the signal, and the first version of
+    this function got that wrong: it flagged all 714 frozen Qwen3-VL tensors of
+    a WiltechsMoE checkpoint and would have refused to run.
 
-    Real case that motivated this: MoE's `model.robot_pos_gate` was added in
-    4c06db6 (2026-08-08), after the checkpoint that scored 92% (2026-08-04).
-    It is nn.Parameter(torch.zeros(1)) multiplying an additive term, so at 0 it
-    contributes exactly nothing and the loaded model is numerically identical
-    to the trained one. A norm weight initialised to 1.0, or a projection,
-    would not have been -- and would have looked exactly the same in the log.
+    Those are missing BY DESIGN. train_wiltechs_moe strips `model.vlm_model.*`
+    at save time, and says why: "the encoder is always loaded by
+    from_pretrained(model_id) before this point, so the checkpoint's copy is
+    redundant either way". Their values in state_dict() are the correct
+    pretrained weights, not an initialisation.
 
-    So: print each one WITH its current magnitude, and let zero decide.
+    So the discriminator is requires_grad, not presence:
+
+      frozen and missing     expected -- the value came from the pretrained
+                             source at construction. Summarised, not listed.
+      TRAINABLE and missing  a learned weight sitting at its init. THAT is the
+                             alarm, and whether it matters depends on what the
+                             init is: zero contributes nothing, anything else
+                             changes the model.
+
+    The case that prompted the whole check is the benign end of that:
+    `model.robot_pos_gate` is trainable, arrived in 4c06db6 (2026-08-08) after
+    the checkpoint that scored 92% (2026-08-04), and is
+    nn.Parameter(torch.zeros(1)) multiplying an additive term -- so at 0 it is
+    exactly the model that was trained. A norm weight initialised to 1.0 would
+    have looked identical in the log and would not have been.
     """
     try:
         from safetensors import safe_open
@@ -322,27 +336,39 @@ def report_missing_weights(policy, ckpt: Path, allow: bool):
         with safe_open(f, framework="pt") as fh:
             have |= set(fh.keys())
     sd = policy.state_dict()
-    if len(have & set(sd)) < 0.5 * len(sd):
+    if len(have & set(sd)) < 0.2 * len(sd):
         print(f"[weights] key naming does not line up with the checkpoint "
               f"({len(have & set(sd))}/{len(sd)} matched); skipping the audit.")
         return
+    grads = {k: p.requires_grad for k, p in policy.named_parameters()}
     missing = sorted(k for k in sd if k not in have)
     if not missing:
         return
-    live = [(k, float(sd[k].detach().abs().max())) for k in missing]
-    inert = [k for k, m in live if m == 0.0]
-    print(f"[weights] {len(missing)} tensor(s) not in the checkpoint "
+    # Buffers are not parameters; grads.get(...) is False for them, which puts
+    # them on the expected side. That is right -- they are constants or caches.
+    frozen = [k for k in missing if not grads.get(k, False)]
+    live = [(k, float(sd[k].detach().abs().max()))
+            for k in missing if grads.get(k, False)]
+
+    if frozen:
+        n = sum(sd[k].numel() for k in frozen)
+        print(f"[weights] {len(frozen)} FROZEN tensor(s) / {n/1e6:.0f}M params not "
+              f"in the checkpoint -- expected: a frozen backbone is loaded at "
+              f"construction, so the checkpoint does not carry a second copy.")
+    if not live:
+        print("[weights] every TRAINABLE tensor was supplied. Good.")
+        return
+    print(f"[weights] {len(live)} TRAINABLE tensor(s) not in the checkpoint "
           f"-- each keeps its INITIALISATION:")
     for k, m in live:
-        n = sd[k].numel()
-        print(f"    {k:<50s} {n:>10,} el   |max| {m:.3e}"
+        print(f"    {k:<50s} {sd[k].numel():>10,} el   |max| {m:.3e}"
               + ("   inert (exactly 0)" if m == 0.0 else "   *** NONZERO ***"))
-    if len(inert) == len(missing):
+    if all(m == 0.0 for _, m in live):
         print("  All zero, so they contribute nothing: this is numerically the "
               "model the checkpoint was trained as.")
         return
-    msg = ("Some are NONZERO, so this is not the model that was trained and "
-           "the number below would not be comparable to anything.")
+    msg = ("Some are NONZERO, so this is not the model that was trained and the "
+           "number below would not be comparable to anything.")
     if not allow:
         raise SystemExit(f"  {msg}\n  Pass --allow_missing_weights to score it "
                          f"anyway, knowing that.")
