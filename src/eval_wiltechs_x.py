@@ -121,13 +121,20 @@ def _policy_class(kind: str):
 def _policy_cameras(cfg) -> list[str]:
     """Camera keys the checkpoint expects, from the checkpoint itself.
 
-    `cameras_for_vlm` is WiltechsX's name for it. Every lerobot policy config
-    also carries input_features, so fall back to the VISUAL ones there rather
-    than hard-coding a per-model attribute name.
+    Each model names this differently, and the name matters because the
+    ENCODER iterates its own field and SKIPS keys the batch does not carry
+    (wilro_model `_encode_images`: `if cam_key not in batch: continue`). Read
+    input_features instead and the guard below checks a list the encoder never
+    consults -- a checkpoint whose camera field still held another robot's keys
+    would pass the guard and then encode ZERO cameras, scoring a blind policy.
+    So ask each model for ITS field first, in the order they were added, and
+    fall back to input_features only when a config declares none of them.
     """
-    cams = list(getattr(cfg, "cameras_for_vlm", None) or [])
-    if cams:
-        return cams
+    for attr in ("cameras_for_vlm",                    # wiltechs_x / moe / vla
+                 "cameras_for_vision_state_concat"):   # wilro
+        cams = list(getattr(cfg, attr, None) or [])
+        if cams:
+            return cams
     feats = getattr(cfg, "input_features", None) or {}
     cams = [k for k, v in feats.items()
             if getattr(getattr(v, "type", None), "name", "") == "VISUAL"]
@@ -670,7 +677,8 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
         if missing:
             raise SystemExit(
                 f"LIBERO provides cameras {got}; the policy expects {want} "
-                f"(from cameras_for_vlm={expected_cams}). _encode_images drops "
+                f"(the config's own camera list: {expected_cams}). "
+                f"_encode_images drops "
                 f"missing cameras SILENTLY, so this would score a "
                 f"differently-conditioned model. Pass a camera_name_mapping to "
                 f"LiberoEnv for this lerobot version.")
