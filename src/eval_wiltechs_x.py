@@ -293,6 +293,62 @@ def load_policy(ckpt: Path, device: str, num_inference_steps: int | None,
     return policy
 
 
+def report_missing_weights(policy, ckpt: Path, allow: bool):
+    """Account for every tensor the checkpoint did not supply.
+
+    lerobot logs these as one `WARNING:root:Missing key(s)` line and carries
+    on, which is how an eval can silently score a DIFFERENT model than the one
+    that was trained: a missing tensor keeps its INITIALISATION, and whether
+    that is harmless depends entirely on what the initialisation is.
+
+    Real case that motivated this: MoE's `model.robot_pos_gate` was added in
+    4c06db6 (2026-08-08), after the checkpoint that scored 92% (2026-08-04).
+    It is nn.Parameter(torch.zeros(1)) multiplying an additive term, so at 0 it
+    contributes exactly nothing and the loaded model is numerically identical
+    to the trained one. A norm weight initialised to 1.0, or a projection,
+    would not have been -- and would have looked exactly the same in the log.
+
+    So: print each one WITH its current magnitude, and let zero decide.
+    """
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        return
+    files = sorted(ckpt.glob("*.safetensors"))
+    if not files:
+        return
+    have = set()
+    for f in files:
+        with safe_open(f, framework="pt") as fh:
+            have |= set(fh.keys())
+    sd = policy.state_dict()
+    if len(have & set(sd)) < 0.5 * len(sd):
+        print(f"[weights] key naming does not line up with the checkpoint "
+              f"({len(have & set(sd))}/{len(sd)} matched); skipping the audit.")
+        return
+    missing = sorted(k for k in sd if k not in have)
+    if not missing:
+        return
+    live = [(k, float(sd[k].detach().abs().max())) for k in missing]
+    inert = [k for k, m in live if m == 0.0]
+    print(f"[weights] {len(missing)} tensor(s) not in the checkpoint "
+          f"-- each keeps its INITIALISATION:")
+    for k, m in live:
+        n = sd[k].numel()
+        print(f"    {k:<50s} {n:>10,} el   |max| {m:.3e}"
+              + ("   inert (exactly 0)" if m == 0.0 else "   *** NONZERO ***"))
+    if len(inert) == len(missing):
+        print("  All zero, so they contribute nothing: this is numerically the "
+              "model the checkpoint was trained as.")
+        return
+    msg = ("Some are NONZERO, so this is not the model that was trained and "
+           "the number below would not be comparable to anything.")
+    if not allow:
+        raise SystemExit(f"  {msg}\n  Pass --allow_missing_weights to score it "
+                         f"anyway, knowing that.")
+    print(f"  {msg}  --allow_missing_weights was passed; continuing.")
+
+
 def load_processors(ckpt: Path, device: str, dataset_id: str | None):
     """Prefer the pipelines saved next to the weights.
 
@@ -776,6 +832,13 @@ def main():
                         "this suite by id -- no chance of a typo silently "
                         "testing a different sentence. Use with --task_ids to "
                         "swap a pair: --task_ids 7 --instruction_from_task 9.")
+    p.add_argument("--allow_missing_weights", action="store_true",
+                   help="Score a checkpoint that does not supply every tensor "
+                        "the current code declares. Refused by default when any "
+                        "of them initialises NONZERO, because then the loaded "
+                        "model is not the one that was trained and the number "
+                        "compares to nothing. Zero-init tensors contribute "
+                        "nothing and are allowed without this.")
     p.add_argument("--history_mode", default="real",
                    choices=("real", "frozen", "shuffled", "noise"),
                    help="Ablate the observation.state WINDOW the motion-vector "
@@ -864,6 +927,7 @@ def main():
     policy = load_policy(ckpt, device, a.num_inference_steps,
                          a.n_action_steps, a.fixed_episode_noise,
                          a.sample_noise_scale)
+    report_missing_weights(policy, ckpt, a.allow_missing_weights)
     pre, post = load_processors(ckpt, device, a.dataset_id)
     cams = _policy_cameras(policy.config)
     print(f"[eval] {ckpt}  device={device}  cameras={cams}\n"
