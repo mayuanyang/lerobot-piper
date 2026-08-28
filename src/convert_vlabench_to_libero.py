@@ -287,10 +287,35 @@ def convert(src: str, out: str, reference: str, scale_t=None, scale_r=None,
         root = Path(src_root)
         if not root.exists():
             raise SystemExit(f"--src_root {root} does not exist")
+        print(f"[src] {root}  (--src_root)")
     else:
-        print(f"[src] downloading {src} (videos included; this is the slow part)")
-        root = Path(snapshot_download(src, repo_type="dataset"))
-    print(f"[src] {root}")
+        # Try the cache first. snapshot_download would otherwise stat all
+        # ~19k files against the hub before deciding it has everything, and
+        # this dataset is normally already on disk by the time anyone converts
+        # it. local_files_only never touches the network.
+        try:
+            root = Path(snapshot_download(src, repo_type="dataset",
+                                          local_files_only=True))
+            print(f"[src] {root}  (cache, no download)")
+        except Exception:
+            print(f"[src] not fully cached; downloading {src} "
+                  f"(videos included; this is the slow part)")
+            root = Path(snapshot_download(src, repo_type="dataset"))
+            print(f"[src] {root}")
+
+    # A cache can be complete enough to open and still be missing files. Say so
+    # here rather than letting the episode count quietly come out short.
+    _info = json.load(open(root / "meta" / "info.json"))
+    n_data = len(_data_files(root))
+    n_vid = {k: len(list((root / "videos" / k).rglob("*.mp4")))
+             for k in CAMERA_MAP if (root / "videos" / k).exists()}
+    print(f"[src] {n_data} data file(s), videos {n_vid}, "
+          f"info.json declares {_info.get('total_episodes')} episodes / "
+          f"{_info.get('total_frames')} frames")
+    if any(v < _info.get("total_episodes", 0) for v in n_vid.values()):
+        print("      NOTE: fewer videos than episodes -- the cache is partial. "
+              "Episodes without data are dropped and any kept episode with a "
+              "missing video aborts the run below.")
     out_root = Path(out)
     out_root.mkdir(parents=True, exist_ok=True)
 
