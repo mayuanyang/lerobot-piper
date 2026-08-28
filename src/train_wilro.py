@@ -180,7 +180,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           gripper_phase_weight: float = 1.0,
           time_sampling: str = "uniform",
           time_lognormal_mean: float = -0.5,
-          time_lognormal_std: float = 1.0):
+          time_lognormal_std: float = 1.0,
+          paraphrase_augment: bool = False,
+          paraphrase_limit: int = 8,
+          paraphrase_file: str = "",
+          paraphrase_min_variants: int = 5):
     """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model.
 
     `dataset_id` may be a single id or a list. Multiple datasets are concatenated
@@ -287,6 +291,54 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     # eye-in-hand view) to actually activate it.
     gripper_camera = gripper_camera if gripper_camera is not None else WilroConfig.gripper_camera
 
+    if paraphrase_augment:
+        # Preflight, not a runtime warning. A sentence with no written variants
+        # trains UNAUGMENTED while the rest vary, so the model keeps surface
+        # form as a usable key for exactly those tasks -- and the run cannot
+        # answer whether augmentation works. Too long a run to find that out
+        # from the eval.
+        from libero_paraphrase import coverage, instruction_strings, load_table
+        # Union over every dataset: with several --dataset_id the task lists
+        # differ, and an instruction that only appears in the second one still
+        # needs variants.
+        instructions, seen = [], set()
+        for did in dataset_ids:
+            raw = getattr(metas[did], "tasks", None)
+            if raw is None:
+                continue
+            for ins in instruction_strings(raw):
+                key = " ".join(str(ins).split())
+                if key not in seen:
+                    seen.add(key)
+                    instructions.append(key)
+        if not instructions:
+            print("[paraphrase] dataset metadata exposes no task list; coverage "
+                  "cannot be checked here. Run\n"
+                  "  python -m libero_paraphrase --dataset_id <id> --min_variants N\n"
+                  "before trusting this run.")
+        else:
+            table, under = coverage(
+                instructions, paraphrase_limit, paraphrase_min_variants,
+                load_table(paraphrase_file) if paraphrase_file else None)
+            sizes = sorted(len(v) for v in table.values())
+            print(f"[paraphrase] {len(table)} instructions, "
+                  f"{len(table) - len(under)} at >= {paraphrase_min_variants} "
+                  f"variants (min {sizes[0]}, median {sizes[len(sizes) // 2]}, "
+                  f"max {sizes[-1]})")
+            if under:
+                shown = "\n".join(f"    {len(table[k]):>2}  {k}" for k in under[:12])
+                raise SystemExit(
+                    f"[paraphrase] {len(under)} instruction(s) below "
+                    f"--paraphrase_min_variants {paraphrase_min_variants}:\n"
+                    f"{shown}\n"
+                    f"{'    ...' if len(under) > 12 else ''}\n"
+                    f"  Write a table for these and pass --paraphrase_file:\n"
+                    f"    python -m libero_paraphrase --dataset_id "
+                    f"{dataset_ids[0]} --out para.json\n"
+                    f"  then hand-edit the entries listed as UNDER. Lower "
+                    f"--paraphrase_min_variants only if you accept that those "
+                    f"tasks train unaugmented.")
+
     # Build wilro config
     cfg = WilroConfig(
         input_features=input_features,
@@ -313,6 +365,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         time_sampling=time_sampling,
         time_lognormal_mean=time_lognormal_mean,
         time_lognormal_std=time_lognormal_std,
+        paraphrase_augment=paraphrase_augment,
+        paraphrase_limit=paraphrase_limit,
+        paraphrase_file=paraphrase_file,
+        paraphrase_min_variants=paraphrase_min_variants,
     )
 
     # Model + checkpoint loading
@@ -722,6 +778,29 @@ if __name__ == "__main__":
                              "confusable minimal pairs that fail at eval) rather than trivially-"
                              "different tasks. Expect the reported contrastive value to spike "
                              "when first enabled, then decline. Off = legacy random pairing.")
+    parser.add_argument("--paraphrase_augment", action="store_true",
+                        help="Draw a different phrasing of the same instruction "
+                             "per sample per step, so the surface string stops "
+                             "being a usable key. Measured on the sibling "
+                             "(wiltechs-x-114k, libero_spatial T7): 60%% on its "
+                             "own instruction, 0%% on a PARAPHRASE of that same "
+                             "instruction -- it had memorised the ~40 strings "
+                             "and was retrieving, not reading. Table in "
+                             "src/libero_paraphrase.py; the original string is "
+                             "always among the variants, since eval uses it.")
+    parser.add_argument("--paraphrase_limit", type=int, default=8,
+                        help="Cap on variants per instruction (0 = all).")
+    parser.add_argument("--paraphrase_file", default="",
+                        help="JSON table overriding the built-in one, for "
+                             "instructions it does not cover. Draft it with "
+                             "python -m libero_paraphrase --dataset_id <id> "
+                             "--out f.json, then hand-edit -- templates never "
+                             "reach the model unread.")
+    parser.add_argument("--paraphrase_min_variants", type=int, default=5,
+                        help="Refuse to start when any instruction has fewer "
+                             "variants than this. Partial augmentation is worse "
+                             "than none: the unvaried tasks keep surface form as "
+                             "a key and the run answers nothing.")
     parser.add_argument("--lock_joint_index", type=int, default=3,
                         help="Action dim with weight 0 (piper_arm joint 4 = "
                              "index 3 is mechanically locked). Pass -1 to "

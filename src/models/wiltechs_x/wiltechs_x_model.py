@@ -914,7 +914,7 @@ class WiltechsXModel(nn.Module):
         key = " ".join(str(desc).split())
         variants = self._paraphrase_cache.get(key)
         if variants is None:
-            from .paraphrase import load_table, table_variants
+            from libero_paraphrase import load_table, table_variants
             if self._paraphrase_file is None:
                 path = str(getattr(self.config, "paraphrase_file", "") or "")
                 self._paraphrase_file = load_table(path) if path else {}

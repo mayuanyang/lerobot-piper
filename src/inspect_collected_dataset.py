@@ -43,7 +43,7 @@ def load_meta(spec: str):
 
 def describe(meta, label: str) -> dict:
     from lerobot.datasets.utils import dataset_to_policy_features
-    from models.wiltechs_x.paraphrase import instruction_strings
+    from libero_paraphrase import instruction_strings
 
     feats = meta.features
     cams = sorted(k for k in feats if "image" in k)

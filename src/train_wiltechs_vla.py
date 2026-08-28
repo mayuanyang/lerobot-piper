@@ -1610,7 +1610,7 @@ if __name__ == "__main__":
                              "cross-attends to, one per DiT layer. 36 = every layer, the same "
                              "LAYER COUNT as WiltechsMoE (4 experts x 9 layers, all of which run "
                              "every forward) but as one sequential stack -- to match its "
-                             "PARAMETERS too you also need --dit_hidden_size 1280 (its 92% run's "
+                             "PARAMETERS too you also need --dit_hidden_size 1280 (its 92%% run's "
                              "width; 36L at 640 is only 1/3 the params). Biggest memory lever; "
                              "pair with --dit_hidden_size to control per-layer width. Must be <= 36.")
     parser.add_argument("--vlm_capture_mode", type=str, default="last",
@@ -1620,8 +1620,8 @@ if __name__ == "__main__":
                              "spaces them over the full depth. A real trade: the VLM runs all 36 "
                              "either way, so 'last' discards the shallow layers' KV for free, but "
                              "gives every DiT layer a fully fused representation. Measured on the "
-                             "MoE variant, cross-attn language share is ~44% at VLM layer 8 vs "
-                             "~91% at layer 35, and under text_first the language K/V never sees "
+                             "MoE variant, cross-attn language share is ~44%% at VLM layer 8 vs "
+                             "~91%% at layer 35, and under text_first the language K/V never sees "
                              "the image -- so 'last' reads the least visually grounded band.")
     parser.add_argument("--vlm_capture_layers", type=int, nargs="+", default=[],
                         help="Explicit VLM layer indices for the DiT to read, overriding "
@@ -1665,7 +1665,7 @@ if __name__ == "__main__":
                         help="Drop the VLM's causal mask over the prompt so language attends "
                              "to the images and vice versa (key padding still enforced). "
                              "--text_first only buys image<-text; the language positions "
-                             "precede every patch and stay vision-BLIND, which is where ~88% "
+                             "precede every patch and stay vision-BLIND, which is where ~88%% "
                              "of the DiT's cross-attn mass lands. This restores text<-image "
                              "without growing L_vlm (a text|image|text sandwich would). OOD "
                              "for Qwen3-VL, but the VLM is frozen and never decodes, so only "

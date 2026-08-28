@@ -883,7 +883,7 @@ def train(
         # surface form as a usable key for exactly those tasks -- and the run
         # cannot answer whether augmentation works. Twenty hours is too long to
         # find that out from the eval.
-        from models.wiltechs_x.paraphrase import (
+        from libero_paraphrase import (
             coverage, instruction_strings, load_table)
         # Union over every dataset, not just the reference one: with several
         # --dataset_ids the task lists differ, and an instruction that only
@@ -901,7 +901,7 @@ def train(
         if not instructions:
             print("[paraphrase] dataset metadata exposes no task list; coverage "
                   "cannot be checked here. Run\n"
-                  "  python -m models.wiltechs_x.paraphrase --dataset_id <id> "
+                  "  python -m libero_paraphrase --dataset_id <id> "
                   "--min_variants N\nbefore trusting this run.")
         else:
             table, under = coverage(
@@ -920,7 +920,7 @@ def train(
                     f"{shown}\n"
                     f"{'    ...' if len(under) > 12 else ''}\n"
                     f"  Write a table for these and pass --paraphrase_file:\n"
-                    f"    python -m models.wiltechs_x.paraphrase "
+                    f"    python -m libero_paraphrase "
                     f"--dataset_id {dataset_ids[0]} --out para.json\n"
                     f"  then hand-edit the entries listed as UNDER. Lower "
                     f"--paraphrase_min_variants only if you accept that those "
@@ -1554,8 +1554,8 @@ def main():
                    help="Dropout on the action expert's sublayer outputs. "
                         "--lora_dropout only reaches the prefix, and the "
                         "prefix is not what memorises: at step 8200 the "
-                        "held-out gap was +24.8% on flow and +188% on "
-                        "progress, both expert-side, against +0.5% on the "
+                        "held-out gap was +24.8%% on flow and +188%% on "
+                        "progress, both expert-side, against +0.5%% on the "
                         "discrete head reading the SAME cache. Try 0.1.")
     p.add_argument("--image_aug", action="store_true",
                    help="Photometric image augmentation (ColorJitter + "
@@ -1590,7 +1590,7 @@ def main():
                         "expert attached to the deepest N layers only.")
     p.add_argument("--ada_rank", type=int, default=64,
                    help="Rank of the adaLN modulation factorisation. A full "
-                        "Linear(d,6d) is 32%% of the expert (226M at 36L/1024) "
+                        "Linear(d,6d) is 32%%%% of the expert (226M at 36L/1024) "
                         "and OOM'd a 22 GiB card. 0 = full rank.")
     p.add_argument("--num_register_tokens", type=int, default=8)
     p.add_argument("--lora_rank", type=int, default=32)
@@ -1687,7 +1687,7 @@ def main():
     p.add_argument("--gripper_bce_temp", type=float, default=0.25)
     p.add_argument("--no_gripper_class_balance", action="store_true",
                    help="Without balancing this term sits in the majority-class "
-                        "optimum (~89% open) and transition-time agreement stays "
+                        "optimum (~89%% open) and transition-time agreement stays "
                         "at chance. Ablation only.")
     p.add_argument("--contrastive_loss_weight", type=float, default=0.0,
                    help="Hinge forcing the action to DEPEND on the instruction: "
@@ -1723,8 +1723,8 @@ def main():
                         "refuses to start and prints which part.")
     p.add_argument("--paraphrase_augment", action="store_true",
                    help="Train on several phrasings per instruction, resampled "
-                        "every step. Measured motivation: this model scores 60% "
-                        "on its own instruction and 0% on a PARAPHRASE of it, "
+                        "every step. Measured motivation: this model scores 60%% "
+                        "on its own instruction and 0%% on a PARAPHRASE of it, "
                         "i.e. it keys on surface form, not content. Unlike "
                         "--use_descriptive_objects (one fixed rewrite = a "
                         "second table to memorise) the variant changes per "
@@ -1737,7 +1737,7 @@ def main():
                         "templates. For the sentences they decline to "
                         "restructure (libero_goal, libero_10). Generate a "
                         "starting table with: python -m "
-                        "models.wiltechs_x.paraphrase --dataset_id <id> --out f.json")
+                        "libero_paraphrase --dataset_id <id> --out f.json")
     p.add_argument("--paraphrase_min_variants", type=int, default=5,
                    help="Refuse to start if any instruction has fewer variants "
                         "than this. Partial augmentation is worse than none: "
@@ -1767,7 +1767,7 @@ def main():
     p.add_argument("--time_sampling", choices=("uniform", "lognormal"),
                    default="uniform",
                    help="Where along the NOISE axis training spends its "
-                        "capacity. uniform puts 30%% above t=0.7, where the "
+                        "capacity. uniform puts 30%%%% above t=0.7, where the "
                         "answer is barely more than 'head for the middle'; "
                         "lognormal (SD3 logit-normal) shifts mass toward t~0, "
                         "the fine detail that sets placement precision. "

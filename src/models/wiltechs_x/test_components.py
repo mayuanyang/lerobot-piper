@@ -509,7 +509,7 @@ def test_paraphrase():
     than mangled."""
     print("\nparaphrase augmentation")
 
-    P = _load("models.wiltechs_x.paraphrase", ROOT / "wiltechs_x" / "paraphrase.py")
+    P = _load("libero_paraphrase", ROOT.parent / "libero_paraphrase.py")
 
     SP = "pick up the black bowl on the stove and place it on the plate"
     v = P.paraphrases(SP)

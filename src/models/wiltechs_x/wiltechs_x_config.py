@@ -374,7 +374,7 @@ class WiltechsXConfig(PreTrainedConfig):
     # varies. Partial augmentation is worse than none: the model keeps surface
     # form as a usable key for exactly the tasks that were left alone, and the
     # run cannot say whether augmentation works. A supplied entry overrides the
-    # templates. `python -m models.wiltechs_x.paraphrase --dataset_id ... --out`
+    # templates. `python -m libero_paraphrase --dataset_id ... --out`
     # writes a starting table and names the entries that need editing.
     paraphrase_file: str = ""
     # Trainer preflight: refuse to start if any instruction has fewer variants

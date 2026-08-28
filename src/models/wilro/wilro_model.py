@@ -427,6 +427,9 @@ class WilroTransformer(nn.Module):
     def __init__(self, config: WilroConfig):
         super().__init__()
         self.config = config
+        self._paraphrase_cache: dict = {}   # instruction -> surface variants
+        self._paraphrase_file = None        # lazily loaded --paraphrase_file
+        self._paraphrase_announced = False
 
         # ─────────────────────────────────────────────────────────────
         # 1. Load SmolVLM2 (frozen, ALL layers kept)
@@ -783,12 +786,62 @@ class WilroTransformer(nn.Module):
         intermediate_features = torch.cat(all_intermediate, dim=1) if all_intermediate else None
         return vis_tokens, intermediate_features
 
+    def _sample_paraphrase(self, desc: str) -> str:
+        """One surface variant of `desc`, drawn per sample per step.
+
+        Built lazily and cached: LIBERO has ~40 unique instructions, so after a
+        few hundred steps nothing new arrives. Sampling per CALL rather than
+        per epoch is what stops surface form from being a usable key -- a fixed
+        rewrite would just be a second table to memorise.
+
+        Written variants only -- the built-in table, or a file that overrides
+        it. paraphrase.py's template generator is for DRAFTING new entries and
+        is deliberately not on this path: a template that mangles a sentence
+        must not reach the model without a human having read it. An instruction
+        in neither source trains unaugmented, which the trainer preflight
+        refuses to start on.
+        """
+        key = " ".join(str(desc).split())
+        variants = self._paraphrase_cache.get(key)
+        if variants is None:
+            from libero_paraphrase import load_table, table_variants
+            if self._paraphrase_file is None:
+                path = str(getattr(self.config, "paraphrase_file", "") or "")
+                self._paraphrase_file = load_table(path) if path else {}
+            variants = (self._paraphrase_file.get(key)
+                        or table_variants(key) or [key])
+            lim = int(getattr(self.config, "paraphrase_limit", 0) or 0)
+            if lim and len(variants) > lim:
+                variants = variants[:lim]
+            self._paraphrase_cache[key] = variants
+            if len(variants) == 1:
+                print(f"[wilro] paraphrase: NO variants for {key!r} -- this "
+                      f"instruction trains UNAUGMENTED while the rest vary")
+            elif not self._paraphrase_announced:
+                self._paraphrase_announced = True
+                print(f"[wilro] paraphrase augmentation ON; first instruction "
+                      f"gets {len(variants)} variants")
+        if len(variants) == 1:
+            return variants[0]
+        return variants[int(torch.randint(len(variants), (1,)).item())]
+
     def _encode_language(self, batch: dict, device: torch.device) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         descs = batch.get("task_description")
         if not descs:
             descs = batch.get("task")
         if not descs or not any(descs):
             return None
+        # Only the ENCODER sees the variant. compute_loss reads the canonical
+        # strings straight off `batch` for the contrastive hinge and for
+        # _hard_negative_perm, both of which decide "same instruction?" by
+        # exact string equality -- paraphrasing before that point would make
+        # two phrasings of one task read as two tasks. Eval always passes the
+        # original string, and `self.training` keeps this off there.
+        if self.training and getattr(self.config, "paraphrase_augment", False):
+            if isinstance(descs, str):
+                descs = self._sample_paraphrase(descs)
+            else:
+                descs = [self._sample_paraphrase(d) for d in descs]
         inputs = self.processor.tokenizer(
             descs, return_tensors="pt", padding=True, truncation=True,
             max_length=self._lang_max_len, add_special_tokens=True,

@@ -167,6 +167,31 @@ class WilroConfig(PreTrainedConfig):
     contrastive_margin: float = 0.05
     contrastive_hard_negatives: bool = False
 
+    # -------- Instruction surface-form augmentation --------
+    # Draw a different phrasing of the same instruction per sample per step, so
+    # the surface string stops being a usable key. Measured on the sibling
+    # (wiltechs-x-114k, libero_spatial T7): 60% on its own instruction, 0% on a
+    # PARAPHRASE of that same instruction -- it had memorised the ~40 strings
+    # and was retrieving, not reading. The table lives in src/libero_paraphrase.py.
+    #
+    # The draw happens in `_encode_language` only, so the contrastive hinge
+    # still sees the CANONICAL strings from the batch and keeps deciding "same
+    # instruction or not" by exact equality. Paraphrasing before that check
+    # would make two phrasings of one task read as two tasks, and the hinge
+    # would penalise the model for agreeing with itself in other words --
+    # fighting precisely what this is for.
+    paraphrase_augment: bool = False
+    # Cap on variants per instruction (0 = all). The table has 5-7 each.
+    paraphrase_limit: int = 8
+    # JSON table overriding the built-in one, for instructions it does not
+    # cover. `python -m libero_paraphrase --dataset_id ... --out f.json`, then
+    # hand-edit. Templates are NOT consulted at training time.
+    paraphrase_file: str = ""
+    # The trainer preflight refuses to start when any instruction has fewer
+    # variants than this. Partial augmentation is worse than none: the unvaried
+    # tasks keep surface form as a key, and the run answers nothing.
+    paraphrase_min_variants: int = 5
+
     # -------- Action prefix for async execution (paper Sec 2.2.2) --------
     # Max number of clean action prefix steps to condition on. During training,
     # Δt_c is sampled from {0, 1, ..., max_action_prefix_steps}. When > 0,
