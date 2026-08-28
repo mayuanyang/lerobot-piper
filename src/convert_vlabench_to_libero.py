@@ -101,7 +101,15 @@ def convert_frame_block(state, actions, scale_t, scale_r, clip=1.0):
 
 
 def _data_files(root: Path):
-    return sorted((root / "data").rglob("*.parquet"))
+    """Sorted the way lerobot concatenates them: by (chunk_index, file_index).
+
+    Lexicographic path order agrees only while the indices stay zero-padded to
+    the same width. Sorting on the integers removes that dependency, and the
+    row offsets computed below are only correct in lerobot's own order.
+    """
+    def key(p: Path):
+        return (int(p.parent.name.split("-")[-1]), int(p.stem.split("-")[-1]))
+    return sorted((root / "data").rglob("*.parquet"), key=key)
 
 
 def fit_scale(root: Path, ref_std, max_files: int = 40):
@@ -193,9 +201,81 @@ def acceptance(out_root: Path, n_files: int = 3):
           f"median {np.median(ca_sn):+.3f}   n={len(ca_sn)}")
     print(f"  gripper action values: {sorted(gvals)}   (LIBERO: [-1.0, 1.0])")
     ok = np.median(ca_ds) > 0.85 and abs(np.median(ca_sn)) < 0.35
-    print(f"  => {'PASS' if ok else 'FAIL -- output is NOT in LIBERO action space'}")
+    print(f"  action space: {'PASS' if ok else 'FAIL -- NOT in LIBERO action space'}")
+    ok = _load_with_deltas(out_root) and ok
     print("=" * 68)
     return ok
+
+
+def _load_with_deltas(out_root: Path, horizon: int = 16, obs: int = 8):
+    """Open the output the way the TRAINER does, with delta_timestamps.
+
+    Not the same test as loading it plainly. _get_query_indices is only reached
+    when deltas are configured, and it is the sole consumer of
+    dataset_from_index / dataset_to_index -- so a dataset with broken episode
+    spans loads, indexes and prints perfectly right up until a trainer asks for
+    an action chunk. That is exactly how the source's bad offsets reached a
+    training run here.
+    """
+    try:
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    except Exception as e:
+        print(f"  span check: SKIPPED (lerobot not importable: {e})")
+        return True
+    info = json.load(open(out_root / "meta" / "info.json"))
+    ft = 1.0 / float(info["fps"])
+    dt = {"observation.state": [-i * ft for i in range(obs)][::-1],
+          "action": [i * ft for i in range(horizon)],
+          **{k: [0.0] for k in info["features"] if k.startswith("observation.images")}}
+    try:
+        ds = LeRobotDataset("local/acceptance", root=str(out_root),
+                            delta_timestamps=dt, tolerance_s=max(0.005, ft / 2))
+        n = len(ds)
+        # STRUCTURAL, not sampled. Sampling a few frames does not detect this:
+        # on a small subset `length * episode_index` stays inside the table and
+        # every probe loads fine, so the first version of this check passed on
+        # deliberately corrupted metadata. The spans must TILE the table.
+        E = ds.meta.episodes
+        fr = np.asarray(E["dataset_from_index"], dtype=np.int64)
+        to = np.asarray(E["dataset_to_index"], dtype=np.int64)
+        ln = np.asarray(E["length"], dtype=np.int64)
+        order = np.argsort(np.asarray(E["episode_index"], dtype=np.int64))
+        fr, to, ln = fr[order], to[order], ln[order]
+        bad = []
+        if fr[0] != 0:
+            bad.append(f"first episode starts at {fr[0]}, not 0")
+        if not (to[:-1] == fr[1:]).all():
+            k = int((to[:-1] != fr[1:]).sum())
+            bad.append(f"{k} of {len(fr) - 1} episode boundaries leave a gap or overlap")
+        if to[-1] != n:
+            bad.append(f"last episode ends at {to[-1]}, table has {n} rows")
+        if not (to - fr == ln).all():
+            bad.append("length disagrees with to - from")
+        if not bad:
+            # And the spans must hold the rows they claim. Metadata can tile
+            # perfectly while pointing at the wrong rows.
+            for i in list(range(min(3, len(fr)))) + [len(fr) - 1]:
+                eis = ds.hf_dataset.select(range(int(fr[i]), int(to[i])))["episode_index"]
+                if len(set(int(x) for x in eis)) != 1:
+                    bad.append(f"span {i} spills across episodes")
+                    break
+        if bad:
+            print("  span check: FAIL -- " + "; ".join(bad) + "\n"
+                  "    _get_query_indices clamps to [from, to-1], so this "
+                  "kills the trainer on its first batch with an IndexError "
+                  "from a DataLoader worker.")
+            return False
+        # Cheap smoke test on top of the structural one.
+        for i in (0, n // 2, n - 1):
+            item = ds[int(i)]
+            assert item["action"].shape[0] == horizon, item["action"].shape
+            assert item["observation.state"].shape[0] == obs
+        print(f"  span check: PASS -- {len(fr)} episode spans tile "
+              f"[0, {n}) and load with delta_timestamps")
+        return True
+    except Exception as e:
+        print(f"  span check: FAIL -- {type(e).__name__}: {str(e)[:180]}")
+        return False
 
 
 def convert(src: str, out: str, reference: str, scale_t=None, scale_r=None,
@@ -235,6 +315,13 @@ def convert(src: str, out: str, reference: str, scale_t=None, scale_r=None,
         files = files[:limit_files]
     n_rows = n_clip = 0
     covered: set = set()          # episode_index values actually written
+    # TRUE row count per episode, in lerobot's concatenation order. The source
+    # ships dataset_from_index = length * episode_index instead of a running
+    # sum -- see the repair below -- so nothing downstream may trust the
+    # published offsets, and counting the rows here is the only authority.
+    ep_rows: dict = {}
+    ep_order: list = []
+    last_ep = -1
     acc = {"observation.state": [], "action": []}
     for i, f in enumerate(files):
         df = pd.read_parquet(f)
@@ -250,7 +337,19 @@ def convert(src: str, out: str, reference: str, scale_t=None, scale_r=None,
         n_rows += len(df); n_clip += nc
         acc["observation.state"].append(s_out)
         acc["action"].append(a_out)
-        covered.update(int(x) for x in df["episode_index"].unique())
+        for e, c in df["episode_index"].value_counts().sort_index().items():
+            e = int(e)
+            if e not in ep_rows:
+                ep_rows[e] = 0
+                ep_order.append(e)
+                if e < last_ep:
+                    raise SystemExit(
+                        f"episode {e} appears after {last_ep} in the data "
+                        f"concatenation; row offsets cannot be derived from "
+                        f"file order for this source.")
+                last_ep = e
+            ep_rows[e] += int(c)
+        covered.update(ep_rows)
         if i % 200 == 0 or i == len(files) - 1:
             print(f"  data {i + 1}/{len(files)}  rows={n_rows}", flush=True)
     pct = 100.0 * n_clip / max(n_rows * 6, 1)
@@ -262,13 +361,40 @@ def convert(src: str, out: str, reference: str, scale_t=None, scale_r=None,
     # whose metadata promises 5000 episodes over data that covers a handful,
     # and the failure surfaces later as a missing-file error during training
     # rather than here.
+    #
+    # It ALSO rebuilds dataset_from_index / dataset_to_index, because the
+    # source's are wrong. Published VLABench ships
+    #     dataset_from_index = length * episode_index
+    # instead of a running sum, so the spans do not tile the table: 4945 of
+    # 4999 boundaries have gaps and the maximum reaches 947551 against 575101
+    # actual rows. _get_query_indices clamps to [from, to-1], so training dies
+    # on the first batch with
+    #     IndexError: Invalid key: 863104 is out of bounds for size 575101
+    # -- and ONLY when delta_timestamps are in play. A plain
+    # LeRobotDataset[i] never consults the span, which is why this survived an
+    # end-to-end load test and surfaced in the trainer instead.
+    #
+    # The lengths themselves are correct and the rows are in episode order, so
+    # the true offsets are the prefix sums of the counts observed above.
+    starts, n = {}, 0
+    for e in ep_order:
+        starts[e] = n
+        n += ep_rows[e]
     keep_videos: set = set()
-    n_ep_in = n_ep_out = 0
+    n_ep_in = n_ep_out = n_span_fixed = n_len_fixed = 0
     for f in sorted((root / "meta" / "episodes").rglob("*.parquet")):
         df = pd.read_parquet(f)
         n_ep_in += len(df)
         df = df[df["episode_index"].isin(covered)].copy()
         n_ep_out += len(df)
+        ei = df["episode_index"].astype(int)
+        new_from = ei.map(starts)
+        new_len = ei.map(ep_rows)
+        n_span_fixed += int((df["dataset_from_index"].to_numpy() != new_from.to_numpy()).sum())
+        n_len_fixed += int((df["length"].to_numpy() != new_len.to_numpy()).sum())
+        df["dataset_from_index"] = new_from.to_numpy()
+        df["length"] = new_len.to_numpy()
+        df["dataset_to_index"] = (new_from + new_len).to_numpy()
         for dst_key, src_key in ((d, s) for s, d in CAMERA_MAP.items()):
             ci, fi = f"videos/{src_key}/chunk_index", f"videos/{src_key}/file_index"
             if ci in df.columns:
@@ -283,7 +409,13 @@ def convert(src: str, out: str, reference: str, scale_t=None, scale_r=None,
         (out_root / rel).parent.mkdir(parents=True, exist_ok=True)
         df.to_parquet(out_root / rel, index=False)
     print(f"[meta] episodes {n_ep_out}/{n_ep_in} kept "
-          f"(those whose data was converted)")
+          f"(those whose data was converted); "
+          f"{n_span_fixed} row-offset(s) and {n_len_fixed} length(s) rebuilt "
+          f"from the actual data")
+    if n != n_rows:
+        raise SystemExit(
+            f"internal: episode row counts sum to {n} but {n_rows} rows were "
+            f"written. The rebuilt offsets would not match the table.")
     shutil.copy2(root / "meta" / "tasks.parquet", out_root / "meta" / "tasks.parquet")
 
     # ---- videos: rename the directory, do not touch the bytes ----

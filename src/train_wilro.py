@@ -586,6 +586,32 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         )
         if first_root is None:
             first_root = ds.root
+        # Episode spans must tile the table. delta_timestamps make
+        # _get_query_indices clamp every lookup to [dataset_from_index,
+        # dataset_to_index - 1], and it is the ONLY consumer of those columns:
+        # a set whose offsets are wrong loads, indexes and prints correctly,
+        # then raises from inside a DataLoader worker on the first batch --
+        #   IndexError: Invalid key: 863104 is out of bounds for size 575101
+        # Published VLABench ships dataset_from_index = length * episode_index
+        # instead of a running sum, so this is not hypothetical.
+        E = ds.meta.episodes
+        fr = np.asarray(E["dataset_from_index"], dtype=np.int64)
+        to = np.asarray(E["dataset_to_index"], dtype=np.int64)
+        o = np.argsort(np.asarray(E["episode_index"], dtype=np.int64))
+        fr, to = fr[o], to[o]
+        n_rows_ds = len(ds.hf_dataset)
+        if fr[0] != 0 or to[-1] != n_rows_ds or not (to[:-1] == fr[1:]).all():
+            raise ValueError(
+                f"Dataset '{did}': meta/episodes row offsets do not tile the "
+                f"table.\n"
+                f"  spans cover [{fr[0]}, {to[-1]}), table has {n_rows_ds} rows; "
+                f"{int((to[:-1] != fr[1:]).sum())} of {len(fr) - 1} boundaries "
+                f"gap or overlap.\n"
+                f"  Training would fail on its first batch inside a DataLoader "
+                f"worker with an out-of-bounds IndexError, which does not name "
+                f"this as the cause.\n"
+                f"  For VLABench, src/convert_vlabench_to_libero.py rebuilds "
+                f"these from the data.")
         ep_ids = np.array(ds.hf_dataset["episode_index"])
         changes = np.where(np.diff(ep_ids) != 0)[0] + 1
         starts = np.concatenate([[0], changes])
