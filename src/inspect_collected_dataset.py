@@ -48,12 +48,24 @@ def describe(meta, label: str) -> dict:
     feats = meta.features
     cams = sorted(k for k in feats if "image" in k)
     state = next((k for k in feats if "state" in k), None)
+    # NOT just feats["action"]. A dataset exported outside lerobot's own
+    # conventions may call it `actions`, and the old code silently reported
+    # action_dim None for one and a number for the other, which reads as
+    # "incompatible dims" when the real problem is the key NAME.
+    act = next((k for k in ("action", "actions") if k in feats), None)
     # The POLICY shape, not the raw metadata shape. dataset_to_policy_features
     # rewrites (h, w, c) -> (c, h, w) when names[2] is "channel"/"channels", so
     # a set declaring (256, 256, 3) and one declaring (3, 256, 256) can be the
     # same thing downstream -- and build_datasets only ever sees this side.
     # Comparing the raw shapes reports a conflict that does not exist.
-    pol = dataset_to_policy_features(feats)
+    # Non-standard key names can make this raise instead of returning. That
+    # is itself the finding, so catch it and keep going rather than dying
+    # halfway through the report.
+    try:
+        pol = dataset_to_policy_features(feats)
+        pol_err = None
+    except Exception as e:
+        pol, pol_err = {}, f"{type(e).__name__}: {e}"
     info = {
         "fps": getattr(meta, "fps", None),
         "cams": cams,
@@ -61,7 +73,10 @@ def describe(meta, label: str) -> dict:
         "names": {c: list(feats[c].get("names") or []) for c in cams},
         "cam_shape": {c: tuple(pol[c].shape) for c in cams if c in pol},
         "state_dim": int(np.prod(feats[state]["shape"])) if state else None,
-        "action_dim": int(np.prod(feats["action"]["shape"])) if "action" in feats else None,
+        "action_key": act,
+        "state_key": state,
+        "pol_err": pol_err,
+        "action_dim": int(np.prod(feats[act]["shape"])) if act else None,
         "episodes": int(getattr(meta, "total_episodes", 0) or 0),
         "frames": int(getattr(meta, "total_frames", 0) or 0),
         "tasks": instruction_strings(meta.tasks) if getattr(meta, "tasks", None) is not None else [],
@@ -75,8 +90,14 @@ def describe(meta, label: str) -> dict:
     for c in cams:
         print(f"                 {c}  declared {info['raw_shape'][c]} "
               f"names={info['names'][c]}  ->  policy {info['cam_shape'].get(c)}")
-    print(f"  state '{state}' dim {info['state_dim']}")
-    print(f"  action dim     {info['action_dim']}")
+    print(f"  state  key '{state}'  dim {info['state_dim']}  "
+          f"names={list(feats[state].get('names') or []) if state else '--'}")
+    print(f"  action key '{act}'  dim {info['action_dim']}  "
+          f"names={list(feats[act].get('names') or []) if act else '--'}")
+    if pol_err:
+        print(f"  [WARN] dataset_to_policy_features FAILED: {pol_err}\n"
+              f"         build_datasets calls the same function, so this "
+              f"dataset cannot be loaded by the trainer as-is.")
     print(f"  tasks          {len(info['tasks'])}")
     return info
 
@@ -137,6 +158,14 @@ def main():
             f"      delta_timestamps from a reference fps, so mixing these gives one of\n"
             f"      them the wrong stride for its action chunk and state history. This is\n"
             f"      the --rft.save_fps default (20) not matching LIBERO's 10.")
+    if got["state_key"] != want["state_key"] or got["action_key"] != want["action_key"]:
+        bad.append(
+            f"KEY NAMES: state '{got['state_key']}' vs '{want['state_key']}', "
+            f"action '{got['action_key']}' vs '{want['action_key']}'.\n"
+            f"      build_datasets and dataset_to_policy_features both key off "
+            f"lerobot's names ('observation.state', 'action',\n"
+            f"      'observation.images.*'). This is a re-export, not a "
+            f"training-code change -- but it is a blocker until done.")
     if got["cams"] != want["cams"]:
         bad.append(f"camera keys {got['cams']} vs {want['cams']} -- build_datasets "
                    f"raises on a mismatch")
