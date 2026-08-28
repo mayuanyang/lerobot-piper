@@ -184,7 +184,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           paraphrase_augment: bool = False,
           paraphrase_limit: int = 8,
           paraphrase_file: str = "",
-          paraphrase_min_variants: int = 5):
+          paraphrase_min_variants: int = 5,
+          training_steps: int | None = None):
     """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model.
 
     `dataset_id` may be a single id or a list. Multiple datasets are concatenated
@@ -198,7 +199,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
 
-    training_steps = 200000
+    # The cosine schedule spans this, so it is not a "stop whenever" ceiling:
+    # interrupting a 200k run at 30k leaves the LR mid-cosine and the model
+    # never annealed. Pick the number you intend to finish.
+    steps_cli = training_steps                       # None unless asked for
+    training_steps = 200000 if steps_cli is None else int(steps_cli)
     progress_update_freq = 200
     checkpoint_freq = 1000
     image_transforms = get_augmentations()
@@ -416,7 +421,17 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                 step = saved_cfg_json.get("training_step", 0)
                 epoch = saved_cfg_json.get("training_epoch", 0)
                 saved_total = saved_cfg_json.get("training_steps_total", 0)
-                if saved_total > 0:
+                # An explicit --training_steps wins over the checkpoint's. The
+                # opposite order is how --lr was silently thrown away on every
+                # resume in this repo (4caed2d); the schedule is worth even
+                # more than the peak LR, since it decides whether the run
+                # anneals at all.
+                if steps_cli is not None and saved_total > 0 and saved_total != steps_cli:
+                    print(f"--training_steps {steps_cli} OVERRIDES the "
+                          f"checkpoint's {saved_total}; the cosine schedule is "
+                          f"rebuilt over {steps_cli} and the LR at step {step} "
+                          f"will differ from the original run's.")
+                elif saved_total > 0:
                     training_steps = saved_total
                 print(f"Read config from {config_file.name}: step={step}, epoch={epoch}, training_steps_total={training_steps}")
                 break
@@ -826,6 +841,14 @@ if __name__ == "__main__":
                              "(piper_arm holdout convention; omit for full dataset).")
     parser.add_argument("--batch_size", type=int, default=64,
                         help="DataLoader batch size (default: 64).")
+    parser.add_argument("--training_steps", type=int, default=None,
+                        help="Total optimizer steps (default: 200000). The "
+                             "cosine LR schedule spans this, so it is not a "
+                             "stop-whenever ceiling -- interrupting a 200k run "
+                             "early leaves the LR mid-cosine and the model "
+                             "never annealed. On resume an explicit value "
+                             "overrides the checkpoint's and rebuilds the "
+                             "schedule.")
     parser.add_argument("--contrastive_loss_weight", type=float, default=0.1,
                         help="Weight for the language-permute contrastive loss "
                              "(default: 0.1). Bump to ~0.5 for LIBERO / datasets "
