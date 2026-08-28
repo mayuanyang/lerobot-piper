@@ -190,7 +190,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           n_obs_steps: int | None = None,
           val_episodes: int = 0,
           val_every: int = 500,
-          val_max_batches: int = 20):
+          val_max_batches: int = 20,
+          progress_update_freq: int = 200):
     """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model.
 
     `dataset_id` may be a single id or a list. Multiple datasets are concatenated
@@ -209,7 +210,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     # never annealed. Pick the number you intend to finish.
     steps_cli = training_steps                       # None unless asked for
     training_steps = 200000 if steps_cli is None else int(steps_cli)
-    progress_update_freq = 200
+    progress_update_freq = max(1, int(progress_update_freq))
     checkpoint_freq = 1000
     image_transforms = get_augmentations()
 
@@ -797,9 +798,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                 batch["task_description"] = [task_idx_to_description.get(int(ti), "") for ti in task_indices]
 
             # Apply instruction rewriting if enabled (for LIBERO spatial grounding)
-            if args.rewrite_instructions and "task_description" in batch:
+            if rewrite_instructions and "task_description" in batch:
                 batch["task_description"] = [
-                    rewrite_instruction(t, random_augment=args.rewrite_augment)
+                    rewrite_instruction(t, random_augment=rewrite_augment)
                     for t in batch["task_description"]
                 ]
 
@@ -945,6 +946,15 @@ if __name__ == "__main__":
                              "neighbouring frames of one episode on both sides "
                              "and report a gap near zero however badly the "
                              "model memorised.")
+    parser.add_argument("--progress_update_freq", type=int, default=200,
+                        help="Steps between the gradient/attention diagnostic "
+                             "and the progress-bar refresh (default: 200). The "
+                             "attention capture re-runs the last DiT layer's "
+                             "softmax at (B, H, L, L) in fp32 under no_grad -- "
+                             "transient, but the largest single allocation in "
+                             "the step. Raise it to move that cost, which is "
+                             "also how to test whether it is what is killing a "
+                             "run at a multiple of this number.")
     parser.add_argument("--val_every", type=int, default=500,
                         help="Steps between validation passes (default: 500).")
     parser.add_argument("--val_max_batches", type=int, default=20,
