@@ -69,6 +69,72 @@ from libero_env_fixed import patch_lerobot_libero
 from models.wiltechs_x.wiltechs_x_config import WiltechsXConfig  # noqa: F401  (registers "wiltechs_x")
 from models.wiltechs_x.wiltechs_x_policy import WiltechsXPolicy
 
+# One harness, several policies -- deliberately NOT a second script.
+#
+# Everything that makes two numbers comparable lives in this file: the
+# canonical-50 init states (patch_lerobot_libero), control_freq=10, per-task
+# policy seeding, the paired per-episode vectors. A copy for another model
+# would be a second place for those to drift, and this repo has already paid
+# for exactly that -- the sibling's 92% was produced by a script that is no
+# longer in the tree, so it cannot be re-run against the current fixes at all.
+#
+# Adding a model here is two lines and it inherits every fix.
+POLICIES = {
+    "wiltechs_x":   ("models.wiltechs_x.wiltechs_x_policy", "WiltechsXPolicy"),
+    "wiltechs_moe": ("models.wiltechs_moe.wiltechs_moe_policy", "WiltechsMoEPolicy"),
+    "wiltechs_vla": ("models.wiltechs_vla.wiltechs_vla_policy", "WiltechsVLAPolicy"),
+    "wilro":        ("models.wilro.wilro_policy", "WilroPolicy"),
+}
+
+
+def _register_configs():
+    """Importing a config module is what registers its `type` string, and
+    PreTrainedConfig.from_pretrained resolves the checkpoint by that string.
+    Failures are per-model and non-fatal: a missing sibling must not stop an
+    eval of the one that is present."""
+    for mod in ("models.wiltechs_moe.wiltechs_moe_config",
+                "models.wiltechs_vla.wiltechs_vla_config",
+                "models.wilro.wilro_config"):
+        try:
+            __import__(mod)
+        except Exception:
+            pass
+
+
+_register_configs()
+
+
+def _policy_class(kind: str):
+    import importlib
+    if kind not in POLICIES:
+        raise SystemExit(
+            f"checkpoint declares policy type {kind!r}, which this harness does "
+            f"not know.\n    Known: {', '.join(sorted(POLICIES))}\n"
+            f"    Add it to POLICIES in {Path(__file__).name} -- two lines, and "
+            f"it inherits every eval fix.")
+    mod, cls = POLICIES[kind]
+    return getattr(importlib.import_module(mod), cls)
+
+
+def _policy_cameras(cfg) -> list[str]:
+    """Camera keys the checkpoint expects, from the checkpoint itself.
+
+    `cameras_for_vlm` is WiltechsX's name for it. Every lerobot policy config
+    also carries input_features, so fall back to the VISUAL ones there rather
+    than hard-coding a per-model attribute name.
+    """
+    cams = list(getattr(cfg, "cameras_for_vlm", None) or [])
+    if cams:
+        return cams
+    feats = getattr(cfg, "input_features", None) or {}
+    cams = [k for k, v in feats.items()
+            if getattr(getattr(v, "type", None), "name", "") == "VISUAL"]
+    if cams:
+        return sorted(cams)
+    raise SystemExit(
+        "cannot tell which cameras this checkpoint expects: its config has "
+        "neither cameras_for_vlm nor VISUAL input_features.")
+
 
 def _git_commit() -> str | None:
     """Which build produced this JSON. Cheap, and the alternative is guessing
@@ -185,8 +251,19 @@ def load_policy(ckpt: Path, device: str, num_inference_steps: int | None,
 
     cfg = PreTrainedConfig.from_pretrained(ckpt)
     cfg.device = str(device)
+    # Guarded: these are flow-policy knobs and not every sibling has them.
+    # Setting an attribute a config does not declare would silently do nothing
+    # on a dataclass with slots, or silently invent a field on one without.
+    def _set(name, value, flag):
+        if not hasattr(cfg, name):
+            raise SystemExit(
+                f"{flag} was passed, but {type(cfg).__name__} has no "
+                f"'{name}'. That knob does not exist for this policy.")
+        setattr(cfg, name, value)
+
     if num_inference_steps:
-        cfg.num_inference_steps = int(num_inference_steps)
+        _set("num_inference_steps", int(num_inference_steps),
+             "--num_inference_steps")
     if n_action_steps:
         n = int(n_action_steps)
         if n > int(cfg.horizon):
@@ -195,7 +272,7 @@ def load_policy(ckpt: Path, device: str, num_inference_steps: int | None,
                 f"{cfg.horizon}: the chunk has no steps past that to execute.")
         cfg.n_action_steps = n
     if fixed_episode_noise:
-        cfg.fixed_episode_noise = True
+        _set("fixed_episode_noise", True, "--fixed_episode_noise")
     if sample_noise_scale is not None:
         # Temperature on x_1. NOT the same experiment as
         # --fixed_episode_noise: that commits to one RANDOM draw, this moves
@@ -203,8 +280,11 @@ def load_policy(ckpt: Path, device: str, num_inference_steps: int | None,
         # the noise cost 25 points here, which says the per-chunk lottery is
         # rescuing episodes -- but a lottery only helps when the distribution
         # is too broad, and shrinking it is the other way to answer that.
-        cfg.sample_noise_scale = float(sample_noise_scale)
-    policy = WiltechsXPolicy.from_pretrained(ckpt, config=cfg)
+        _set("sample_noise_scale", float(sample_noise_scale),
+             "--sample_noise_scale")
+    kind = getattr(cfg, "type", None) or getattr(cfg, "name", "")
+    print(f"policy type: {kind}")
+    policy = _policy_class(kind).from_pretrained(ckpt, config=cfg)
     policy.to(device)
     policy.eval()
     for m in policy.model.modules():                      # deterministic rollout
@@ -785,7 +865,7 @@ def main():
                          a.n_action_steps, a.fixed_episode_noise,
                          a.sample_noise_scale)
     pre, post = load_processors(ckpt, device, a.dataset_id)
-    cams = list(policy.config.cameras_for_vlm)
+    cams = _policy_cameras(policy.config)
     print(f"[eval] {ckpt}  device={device}  cameras={cams}\n"
           f"[eval] horizon={policy.config.horizon} "
           f"n_action_steps={policy.config.n_action_steps} "
@@ -955,10 +1035,12 @@ def main():
                "num_envs": a.num_envs,
                "max_episode_steps": a.max_episode_steps,
                "eval_commit": _git_commit(),
-               "num_inference_steps": policy.config.num_inference_steps,
+               "num_inference_steps": getattr(policy.config, "num_inference_steps", None),
                "n_action_steps": policy.config.n_action_steps,
                "fixed_episode_noise": bool(a.fixed_episode_noise),
-               "sample_noise_scale": policy.config.sample_noise_scale,
+               "policy_type": getattr(policy.config, "type", None),
+               "sample_noise_scale": getattr(
+                   policy.config, "sample_noise_scale", None),
                "state_noise": a.state_noise,
                "history_mode": a.history_mode,
                "state_noise_dims": a.state_noise_dims,
