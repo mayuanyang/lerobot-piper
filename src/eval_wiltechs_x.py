@@ -293,6 +293,53 @@ def load_policy(ckpt: Path, device: str, num_inference_steps: int | None,
     return policy
 
 
+def report_new_config_fields(cfg, ckpt: Path):
+    """Fields the CODE declares that the checkpoint's config.json never set.
+
+    The weight audit's exact analogue, and the more dangerous half: a config
+    field added after a checkpoint was written gets its dataclass DEFAULT with
+    no warning anywhere, and if that default is non-empty the model computes
+    something different from what was trained.
+
+    Real case: WiltechsMoE's `instruction_template` landed 2026-08-11 with
+    `= STARVLA_COT_TEMPLATE`, a week after the checkpoint that scored 92%. That
+    checkpoint's config.json has no such key, so loading it silently switched
+    the model's text input to a bounding-box CoT prompt it was never trained
+    on. No missing key, no shape mismatch, no warning -- just a different
+    model wearing the same number.
+
+    Values are printed so a non-empty default is visible as such; deciding
+    which ones matter needs the git log, which is why this reports rather than
+    refuses.
+    """
+    f = ckpt / "config.json"
+    if not f.exists():
+        return
+    try:
+        saved = set(json.loads(f.read_text()))
+    except Exception:
+        return
+    import dataclasses
+    if not dataclasses.is_dataclass(cfg):
+        return
+    new = [fl.name for fl in dataclasses.fields(cfg)
+           if fl.name not in saved and not fl.name.startswith("_")]
+    if not new:
+        return
+    print(f"[config] {len(new)} field(s) declared by the code but absent from "
+          f"this checkpoint's config.json -- each took its DEFAULT:")
+    for n in sorted(new):
+        v = getattr(cfg, n, None)
+        empty = v in (None, "", 0, 0.0, False) or (isinstance(v, (list, dict, tuple)) and not v)
+        r = repr(v)
+        print(f"    {n:<34s} = {r[:80] + ('...' if len(r) > 80 else '')}"
+              + ("" if empty else "   <- NON-EMPTY, changes behaviour"))
+    print("  Anything marked NON-EMPTY postdates this checkpoint and is active "
+          "now but was not during training.\n"
+          "  Override it, or evaluate against the code of that era -- see "
+          "`git log -- <model dir>`.")
+
+
 def report_missing_weights(policy, ckpt: Path, allow: bool):
     """Account for the tensors the checkpoint did not supply -- by requires_grad.
 
@@ -953,6 +1000,7 @@ def main():
     policy = load_policy(ckpt, device, a.num_inference_steps,
                          a.n_action_steps, a.fixed_episode_noise,
                          a.sample_noise_scale)
+    report_new_config_fields(policy.config, ckpt)
     report_missing_weights(policy, ckpt, a.allow_missing_weights)
     pre, post = load_processors(ckpt, device, a.dataset_id)
     cams = _policy_cameras(policy.config)
