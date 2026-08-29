@@ -82,6 +82,15 @@ POLICIES = {
     "wiltechs_moe": ("models.wiltechs_moe.wiltechs_moe_policy", "WiltechsMoEPolicy"),
     "wiltechs_vla": ("models.wiltechs_vla.wiltechs_vla_policy", "WiltechsVLAPolicy"),
     "wilro":        ("models.wilro.wilro_policy", "WilroPolicy"),
+    # Off-the-shelf policies, so a CANDIDATE TEACHER can be scored on the same
+    # harness before anyone distils from it. Published LIBERO numbers are not
+    # comparable to this repo's: everything measured before 2026-08-03 used
+    # lerobot's reset ordering, which serves layouts far wider than the
+    # canonical 50 (see the module docstring). A teacher that does not clearly
+    # beat the student HERE is not a teacher.
+    "pi0":          ("lerobot.policies.pi0.modeling_pi0", "PI0Policy"),
+    "pi05":         ("lerobot.policies.pi05.modeling_pi05", "PI05Policy"),
+    "groot":        ("lerobot.policies.groot.modeling_groot", "GrootPolicy"),
 }
 
 
@@ -96,7 +105,10 @@ def _register_configs():
     for mod in ("models.wiltechs_x.wiltechs_x_config",
                 "models.wiltechs_moe.wiltechs_moe_config",
                 "models.wiltechs_vla.wiltechs_vla_config",
-                "models.wilro.wilro_config"):
+                "models.wilro.wilro_config",
+                "lerobot.policies.pi0.configuration_pi0",
+                "lerobot.policies.pi05.configuration_pi05",
+                "lerobot.policies.groot.configuration_groot"):
         try:
             __import__(mod)
         except Exception:
