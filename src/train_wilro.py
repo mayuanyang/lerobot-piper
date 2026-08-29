@@ -876,6 +876,18 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         episodes."""
         was_training = policy.training
         policy.eval()
+        # Same t and same noise on every pass, and on BOTH loaders.
+        # compute_loss draws a fresh flow timestep per sample and a fresh
+        # source noise; without pinning them, two consecutive validations
+        # differ by the draw as much as by the model. Measured on a real run:
+        # the fit/held-out gap swung 8.3 -> 7.5 -> 22.2 -> 12.9 -> 21.8 -> 12.9
+        # across adjacent passes while held-out itself moved by under 0.01.
+        # Pinning also means `fit` and `held-out` are scored at the SAME
+        # timesteps, so their difference is about the episodes and nothing else.
+        cpu_state = torch.get_rng_state()
+        cuda_state = (torch.cuda.get_rng_state_all()
+                      if torch.cuda.is_available() else None)
+        torch.manual_seed(20260829)
         tot, n = 0.0, 0
         for i, b in enumerate(loader):
             if i >= val_max_batches:
@@ -891,6 +903,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                   else torch.autocast(device_type="cpu", enabled=False)):
                 loss, _ = policy.forward(b)
             tot += float(loss.detach()); n += 1
+        torch.set_rng_state(cpu_state)
+        if cuda_state is not None:
+            torch.cuda.set_rng_state_all(cuda_state)
         if was_training:
             policy.train()
         return tot / max(1, n)
