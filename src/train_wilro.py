@@ -94,8 +94,38 @@ def apply_image_augmentations(batch, camera_keys, transform):
 # ---------------------------------------------------------------------------
 # Gradient analysis tailored to wilro components
 # ---------------------------------------------------------------------------
+def _rss_gb():
+    """Resident set of this process AND its dataloader workers, in GB.
+
+    Workers are separate processes, so the parent's own RSS misses most of
+    the growth that ends these runs."""
+    try:
+        import os
+        def rss(pid):
+            with open(f"/proc/{pid}/status") as f:
+                for ln in f:
+                    if ln.startswith("VmRSS:"):
+                        return int(ln.split()[1]) / 1048576.0
+            return 0.0
+        me = os.getpid()
+        try:
+            with open(f"/proc/{me}/task/{me}/children") as f:
+                kids = [int(x) for x in f.read().split()]
+        except Exception:
+            kids = []
+        return rss(me) + sum(rss(k) for k in kids), len(kids)
+    except Exception:
+        return None, 0
+
+
 def _log_gradient_analysis(policy, step: int) -> None:
     print(f"\n--- Gradient Analysis at Step {step} ---")
+    tot, nk = _rss_gb()
+    if tot is not None:
+        print(f"  Host RAM (self + {nk} worker(s)): {tot:.1f} GB"
+              + ("   <-- climbing across steps means the dataloader workers "
+                 "are un-sharing the dataset; lower --num_workers"
+                 if tot > 8 else ""))
 
     def _grad_stats(prefix: str):
         total, count = 0.0, 0
@@ -191,7 +221,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           val_episodes: int = 0,
           val_every: int = 500,
           val_max_batches: int = 20,
-          progress_update_freq: int = 200):
+          progress_update_freq: int = 200,
+          num_workers: int = 8):
     """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model.
 
     `dataset_id` may be a single id or a list. Multiple datasets are concatenated
@@ -724,18 +755,26 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     sampler = mk_sampler(tr_idx, True)
     print(f"EpisodeAwareSampler: {len(sampler)} frames "
           f"over {len(tr_idx)} episodes")
-    dataloader = mk_loader(tr_idx, True, 8)
+    dataloader = mk_loader(tr_idx, True, num_workers)
+    # Each worker forks a copy of the dataset, and Python refcounting
+    # gradually un-shares the copy-on-write pages holding the Arrow table --
+    # so host RAM climbs for hundreds of steps and then the runtime SIGINTs
+    # the process. It reads as "^C" with no traceback, which looks nothing
+    # like a memory error. _rss_gb below is there to make it visible.
+    print(f"DataLoader workers: {num_workers} train"
+          + (f" + {min(2, num_workers)} x2 validation" if val_episodes > 0 else "")
+          + f", prefetch 2 x batch {batch_size}")
 
     val_loader = fit_loader = None
     if val_ep_idx:
-        val_loader = mk_loader(val_ep_idx, False, 2)
+        val_loader = mk_loader(val_ep_idx, False, min(2, num_workers))
         # A same-sized slice of TRAINING episodes, scored the SAME way (eval
         # mode, no augmentation). Without it the only comparison available is
         # held-out against the running train loss, and those two differ by
         # dropout, image/state augmentation, paraphrase sampling AND the
         # contrastive term -- which is train-only here -- so their difference
         # is not a generalisation gap. fit vs held-out is.
-        fit_loader = mk_loader(tr_idx[:len(val_ep_idx)], False, 2)
+        fit_loader = mk_loader(tr_idx[:len(val_ep_idx)], False, min(2, num_workers))
         n_val_frames = sum(ep_to[i] - ep_from[i] for i in val_ep_idx)
         per_ds = {}
         for i in val_ep_idx:
@@ -946,6 +985,14 @@ if __name__ == "__main__":
                              "neighbouring frames of one episode on both sides "
                              "and report a gap near zero however badly the "
                              "model memorised.")
+    parser.add_argument("--num_workers", type=int, default=8,
+                        help="DataLoader worker processes (default: 8). Each "
+                             "forks a copy of the dataset; Python refcounting "
+                             "then un-shares the copy-on-write pages holding "
+                             "the Arrow table, so host RAM climbs for hundreds "
+                             "of steps until the runtime SIGINTs the process -- "
+                             "which prints a bare ^C and no traceback. On Colab "
+                             "with a 575k-row set, 2-4 is the safe range.")
     parser.add_argument("--progress_update_freq", type=int, default=200,
                         help="Steps between the gradient/attention diagnostic "
                              "and the progress-bar refresh (default: 200). The "
