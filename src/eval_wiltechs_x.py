@@ -982,7 +982,7 @@ def main():
     a = p.parse_args()
 
     device = a.device or pick_device()
-    from train_wiltechs_x import resolve_checkpoint
+    from checkpoint_utils import resolve_checkpoint
 
     # --seed used to reach only env.reset(). The POLICY is stochastic -- flow
     # matching draws x_1 fresh for every chunk, which at n_action_steps=2 is
