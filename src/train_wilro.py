@@ -237,6 +237,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           val_max_batches: int = 20,
           progress_update_freq: int = 200,
           num_workers: int = 8,
+          start_step_override: int = -1,
           download_progress: bool = False,
           cache_sync: bool = False,
           load_image_size: int = 0,
@@ -515,6 +516,18 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                 break
         if step == 0 and local_ckpt_path.name.startswith("checkpoint-"):
             step = int(local_ckpt_path.name.split("-")[1])
+        if start_step_override >= 0:
+            # Loading weights from a run on a DIFFERENT dataset is not a
+            # resume, and inheriting its step counter silently does three
+            # things nobody asked for: the cosine is fast-forwarded, so the
+            # new run starts mid-decay with no warmup; the step budget is
+            # short by however far the old run got; and the progress bar
+            # reports a number that belongs to another dataset.
+            print(f"--start_step_override {start_step_override}: taking the "
+                  f"WEIGHTS from step {step} but restarting the counter, so "
+                  f"the schedule is rebuilt from scratch (warmup included) "
+                  f"over {training_steps} steps.")
+            step = int(start_step_override)
         print(f"Resuming from step {step}, epoch {epoch}")
 
         print(f"Loading weights from: {model_file}")
@@ -1105,6 +1118,15 @@ if __name__ == "__main__":
                              "~14k requests for a converted VLABench before the "
                              "first step; only needed when the remote may have "
                              "changed under an existing cache.")
+    parser.add_argument("--start_step_override", type=int, default=-1,
+                        help="Restart the step counter at this value when "
+                             "loading a checkpoint (-1 = keep the checkpoint's, "
+                             "the default). Pass 0 to fine-tune on a DIFFERENT "
+                             "dataset: without it the checkpoint's step is "
+                             "inherited, the cosine is fast-forwarded to it, "
+                             "and the run starts mid-decay with no warmup and "
+                             "a step budget short by however far the previous "
+                             "run got.")
     parser.add_argument("--num_workers", type=int, default=8,
                         help="DataLoader worker processes (default: 8). Each "
                              "forks a copy of the dataset; Python refcounting "
