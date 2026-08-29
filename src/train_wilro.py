@@ -119,14 +119,27 @@ def _rss_gb():
         return None, 0
 
 
+_RSS_PREV: list = []
+
+
 def _log_gradient_analysis(policy, step: int) -> None:
     print(f"\n--- Gradient Analysis at Step {step} ---")
     tot, nk = _rss_gb()
     if tot is not None:
-        print(f"  Host RAM (self + {nk} worker(s)): {tot:.1f} GB"
-              + ("   <-- climbing across steps means the dataloader workers "
-                 "are un-sharing the dataset; lower --num_workers"
-                 if tot > 8 else ""))
+        # The DELTA is the diagnostic, not the level. A large constant baseline
+        # is just the model, the CUDA context and the Arrow table; what kills
+        # the run is growth, and the OOM killer takes a WORKER, which surfaces
+        # as "DataLoader worker (pid ...) is killed by signal: Killed" raised
+        # from wherever the main process happened to be -- never from the loader.
+        d = f"{tot - _RSS_PREV[-1]:+.2f} GB since step {_RSS_PREV[0]:.0f}" \
+            if _RSS_PREV else "baseline"
+        note = ""
+        if _RSS_PREV and tot - _RSS_PREV[-1] > 0.3:
+            note = ("   <-- GROWING; the workers are un-sharing the dataset. "
+                    "Lower --num_workers / --prefetch_factor before it is "
+                    "killed.")
+        print(f"  Host RAM (self + {nk} worker(s)): {tot:.1f} GB  ({d}){note}")
+        _RSS_PREV[:] = [step, tot]
 
     def _grad_stats(prefix: str):
         total, count = 0.0, 0

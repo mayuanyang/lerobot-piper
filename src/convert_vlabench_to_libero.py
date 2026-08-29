@@ -71,7 +71,43 @@ def wrap(x):
     return (np.asarray(x) + np.pi) % (2 * np.pi) - np.pi
 
 
-def convert_frame_block(state, actions, scale_t, scale_r, clip=1.0):
+def rotation_offsets(root: Path, max_files: int = 40):
+    """Circular mean of each rpy dim, for re-cutting the angle branch.
+
+    The source stores rpy in (-pi, pi] and its roll sits AT the seam, so a
+    trajectory flips +3.141 -> -3.142 -- the same angle -- mid-episode.
+    Measured over 892 frames of the source: roll std 2.937 with 32 such flips.
+    After MEAN_STD normalisation the model receives a channel whose spread is
+    almost entirely a coordinate convention, and whose sign flips at random.
+
+    Re-cutting the branch at the antipode of the circular mean puts the seam
+    where the fewest samples are. On the same frames: roll 2.937 -> 0.197 std
+    and 32 -> 0 flips; pitch is left untouched (0.328, already clean); yaw
+    1.542 -> 1.492. A fixed `mod 2*pi` fixes roll just as well but WRECKS
+    pitch (0.328 -> 2.571, 0 -> 13 flips), which is why the offset is measured
+    per dimension rather than chosen once.
+
+    It also lands roll near pi, which is where LIBERO's already is (mean 2.972,
+    and its range reaches 3.671, so LIBERO is not wrapped to (-pi, pi] at all).
+
+    ACTIONS are unaffected: they are built from wrap(a_rpy - s_rpy), and a
+    difference of wrapped angles does not depend on where the branch is cut.
+    """
+    import pandas as pd
+    files = _data_files(root)[:max_files]
+    ang = np.concatenate([
+        np.stack(pd.read_parquet(f, columns=["state"])["state"].to_numpy())[:, 3:6]
+        for f in files]).astype(np.float64)
+    mu = np.arctan2(np.sin(ang).mean(0), np.cos(ang).mean(0))
+    before = ang.std(0)
+    after = (mu + wrap(ang - mu)).std(0)
+    print(f"[rotation] circular means (rad): {np.round(mu, 3)}\n"
+          f"           state rpy std  {np.round(before, 3)} -> {np.round(after, 3)}")
+    return mu
+
+
+def convert_frame_block(state, actions, scale_t, scale_r, clip=1.0,
+                        rot_offset=None):
     """(N,7) VLABench state+action -> (N,8) LIBERO state, (N,7) LIBERO action.
 
     The action is `a_t - s_t`, NOT `s_{t+1} - s_t`: the commanded delta is what
@@ -96,7 +132,13 @@ def convert_frame_block(state, actions, scale_t, scale_r, clip=1.0):
     # state gripper: 0 = open, 1 = closed -> two fingers, LIBERO's convention.
     sg = state[:, 6:7]
     f1 = FINGER_OPEN * (1.0 - sg)
-    out_s = np.concatenate([state[:, 0:6], f1, -f1], axis=1)
+    s_rpy = state[:, 3:6]
+    if rot_offset is not None:
+        # Applied AFTER d_r is computed above, which is why the actions are
+        # untouched: they depend only on the difference of two angles.
+        mu = np.asarray(rot_offset, dtype=np.float64)[None, :]
+        s_rpy = mu + wrap(s_rpy - mu)
+    out_s = np.concatenate([state[:, 0:3], s_rpy, f1, -f1], axis=1)
     return out_s.astype(np.float32), out_a.astype(np.float32), n_clipped
 
 
@@ -279,7 +321,8 @@ def _load_with_deltas(out_root: Path, horizon: int = 16, obs: int = 8):
 
 
 def convert(src: str, out: str, reference: str, scale_t=None, scale_r=None,
-            clip: float = 1.0, src_root: str = "", limit_files: int = 0):
+            clip: float = 1.0, src_root: str = "", limit_files: int = 0,
+            recenter_rotation: bool = True):
     import pandas as pd
     from huggingface_hub import snapshot_download
 
@@ -333,6 +376,7 @@ def convert(src: str, out: str, reference: str, scale_t=None, scale_r=None,
         scale_t = ft if scale_t is None else scale_t
         scale_r = fr if scale_r is None else scale_r
     print(f"[scale] using translation x{scale_t:.1f}, rotation x{scale_r:.1f}")
+    rot_offset = rotation_offsets(root) if recenter_rotation else None
 
     # ---- data parquet ----
     files = _data_files(root)
@@ -352,7 +396,8 @@ def convert(src: str, out: str, reference: str, scale_t=None, scale_r=None,
         df = pd.read_parquet(f)
         S = np.stack(df["state"].to_numpy())
         A = np.stack(df["actions"].to_numpy())
-        s_out, a_out, nc = convert_frame_block(S, A, scale_t, scale_r, clip)
+        s_out, a_out, nc = convert_frame_block(S, A, scale_t, scale_r,
+                                               clip, rot_offset)
         df = df.drop(columns=["state", "actions"])
         df["observation.state"] = list(s_out)
         df["action"] = list(a_out)
@@ -488,8 +533,11 @@ def convert(src: str, out: str, reference: str, scale_t=None, scale_r=None,
     info["conversion"] = {
         "source": src, "action_scale_translation": scale_t,
         "action_scale_rotation": scale_r, "clip": clip,
+        "rotation_branch_offsets": (None if rot_offset is None
+                                   else [float(x) for x in rot_offset]),
         "note": "absolute EEF pose -> LIBERO-style delta; rpy pi-wrapped; "
-                "gripper 1-2g; state 7 -> 8 fingers; second_image dropped",
+                "gripper 1-2g; state 7 -> 8 fingers; second_image dropped; "
+                "state rpy branch re-cut at the circular mean",
     }
     json.dump(info, open(out_root / "meta" / "info.json", "w"), indent=2)
 
@@ -544,6 +592,19 @@ def self_test():
     A = np.concatenate([a_xyz, a_rpy, 1.0 - g], axis=1)
 
     s_out, a_out, nc = convert_frame_block(S, A, 80.0, 5.0)
+    # The branch offset must move the STATE and leave the ACTION alone --
+    # actions are differences of angles and cannot depend on where the cut is.
+    off = np.array([np.pi, 0.0, 0.0])
+    s_off, a_off, _ = convert_frame_block(S, A, 80.0, 5.0, rot_offset=off)
+    check("rot_offset leaves the action untouched",
+          np.allclose(a_out, a_off, atol=1e-6))
+    check("rot_offset moves the state rpy", not np.allclose(s_out[:, 3:6], s_off[:, 3:6]))
+    check("rot_offset leaves xyz and fingers untouched",
+          np.allclose(s_out[:, 0:3], s_off[:, 0:3])
+          and np.allclose(s_out[:, 6:8], s_off[:, 6:8]))
+    check("re-cut angles still represent the SAME rotation",
+          np.allclose(np.cos(s_out[:, 3:6]), np.cos(s_off[:, 3:6]), atol=1e-6)
+          and np.allclose(np.sin(s_out[:, 3:6]), np.sin(s_off[:, 3:6]), atol=1e-6))
     check("state widens 7 -> 8", s_out.shape[1] == 8)
     check("action stays 7", a_out.shape[1] == 7)
     check("fingers open when state gripper is 0",
@@ -590,6 +651,14 @@ def main():
                     help="Convert only the first N data parquet files -- for a "
                          "small feasibility run before committing to all 5000 "
                          "episodes.")
+    ap.add_argument("--no_recenter_rotation", action="store_true",
+                    help="Keep the source's (-pi, pi] branch for state rpy. "
+                         "By default the branch is re-cut at each dim's "
+                         "circular mean, because the source's roll sits ON the "
+                         "seam: std 2.937 with 32 mid-episode sign flips over "
+                         "892 frames, against 0.197 and 0 after. Actions are "
+                         "unaffected either way -- they are differences of "
+                         "angles.")
     ap.add_argument("--self_test", action="store_true")
     a = ap.parse_args()
 
@@ -598,7 +667,8 @@ def main():
     if not a.out:
         ap.error("--out is required (or pass --self_test)")
     ok = convert(a.src, a.out, a.reference, a.action_scale, a.rotation_scale,
-                 a.clip, a.src_root, a.limit_files)
+                 a.clip, a.src_root, a.limit_files,
+                 recenter_rotation=not a.no_recenter_rotation)
     sys.exit(0 if ok else 1)
 
 
