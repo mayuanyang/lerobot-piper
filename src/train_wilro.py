@@ -225,7 +225,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           progress_update_freq: int = 200,
           num_workers: int = 8,
           download_progress: bool = False,
-          cache_sync: bool = False):
+          cache_sync: bool = False,
+          load_image_size: int = 0,
+          prefetch_factor: int = 2):
     """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model.
 
     `dataset_id` may be a single id or a list. Multiple datasets are concatenated
@@ -649,6 +651,21 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
               f"time. ConcatDataset stacks raw tensors, so mixed resolutions "
               f"would fail in collate; the model resizes to vision_input_size "
               f"anyway, so doing it here changes nothing but the timing.")
+    if load_image_size:
+        # The model pads to square and interpolates every frame to
+        # vision_input_size anyway, so doing it in the workers costs nothing at
+        # the model and cuts what the loader must hold, pin and copy by
+        # (size/native)^2. A 480 source at 384 is 0.64x. This is the difference
+        # between a batch of 64 costing 354 MB and 226 MB, per in-flight batch,
+        # per worker.
+        #
+        # Opt-in rather than automatic: v2.Resize antialiases and the model's
+        # F.interpolate does not, so enabling it changes the pixels slightly
+        # and a run started with it is not bit-comparable to one without.
+        if resize_to and resize_to != int(load_image_size):
+            print(f"  --load_image_size {load_image_size} overrides the "
+                  f"{resize_to} chosen to reconcile mixed resolutions.")
+        resize_to = int(load_image_size)
     img_tf = v2.Resize((resize_to, resize_to), antialias=True) if resize_to else None
 
     sub_datasets = []
@@ -780,10 +797,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
             drop_n_first_frames=0, drop_n_last_frames=0, shuffle=shuffle)
 
     def mk_loader(idxs, shuffle, workers):
+        kw = {} if workers == 0 else {"prefetch_factor": max(1, int(prefetch_factor))}
         return torch.utils.data.DataLoader(
             dataset, num_workers=workers, batch_size=batch_size,
             sampler=mk_sampler(idxs, shuffle),
-            pin_memory=device.type != "cpu", drop_last=True)
+            pin_memory=device.type != "cpu", drop_last=True, **kw)
 
     sampler = mk_sampler(tr_idx, True)
     print(f"EpisodeAwareSampler: {len(sampler)} frames "
@@ -794,9 +812,24 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     # so host RAM climbs for hundreds of steps and then the runtime SIGINTs
     # the process. It reads as "^C" with no traceback, which looks nothing
     # like a memory error. _rss_gb below is there to make it visible.
-    print(f"DataLoader workers: {num_workers} train"
-          + (f" + {min(2, num_workers)} x2 validation" if val_episodes > 0 else "")
-          + f", prefetch 2 x batch {batch_size}")
+    # Predict the in-flight cost instead of discovering it as a SIGKILL a few
+    # hundred steps in. A killed worker surfaces as
+    #   RuntimeError: DataLoader worker (pid ...) is killed by signal: Killed
+    # raised from wherever the main process happened to be -- the traceback
+    # points at the model, never at the loader.
+    px = resize_to if resize_to else max(
+        (sh[-1] for d in vis_shapes.values() for sh in d.values()), default=0)
+    per_sample_mb = len(camera_keys) * 3 * px * px * 4 / 1048576.0
+    inflight = per_sample_mb * batch_size * max(1, num_workers) * \
+        max(1, int(prefetch_factor))
+    print(f"DataLoader: {num_workers} worker(s), prefetch "
+          f"{prefetch_factor}, batch {batch_size}, "
+          f"{len(camera_keys)} cam @ {px or '?'}px\n"
+          f"  ~{per_sample_mb:.1f} MB/sample -> ~{inflight / 1024:.1f} GB of "
+          f"decoded frames in flight, plus an equal pinned copy"
+          + ("   <-- large; lower --batch_size / --num_workers / "
+             "--prefetch_factor, or pass --load_image_size 384"
+             if inflight / 1024 > 3 else ""))
 
     val_loader = fit_loader = None
     if val_ep_idx:
@@ -1018,6 +1051,20 @@ if __name__ == "__main__":
                              "neighbouring frames of one episode on both sides "
                              "and report a gap near zero however badly the "
                              "model memorised.")
+    parser.add_argument("--load_image_size", type=int, default=0,
+                        help="Resize frames to NxN in the DATALOADER (0 = keep "
+                             "native, the default). The model pads to square "
+                             "and interpolates to vision_input_size anyway, so "
+                             "this costs nothing there and cuts what every "
+                             "worker must decode, hold, pin and copy by "
+                             "(N/native)^2 -- 480 -> 384 is 0.64x. Opt-in "
+                             "because v2.Resize antialiases and the model's "
+                             "interpolate does not, so a run using it is not "
+                             "bit-comparable to one without.")
+    parser.add_argument("--prefetch_factor", type=int, default=2,
+                        help="Batches each worker keeps queued (default: 2). "
+                             "Total decoded frames held is batch_size x "
+                             "num_workers x this; 1 halves it.")
     parser.add_argument("--download_progress", action="store_true",
                         help="Keep huggingface_hub's per-file progress bars. "
                              "Off by default: at ~14k files they redraw "
