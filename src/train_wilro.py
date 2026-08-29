@@ -1,4 +1,5 @@
 import json
+import time
 from pathlib import Path
 import torch
 import pandas as pd
@@ -222,7 +223,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           val_every: int = 500,
           val_max_batches: int = 20,
           progress_update_freq: int = 200,
-          num_workers: int = 8):
+          num_workers: int = 8,
+          download_progress: bool = False,
+          cache_sync: bool = False):
     """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model.
 
     `dataset_id` may be a single id or a list. Multiple datasets are concatenated
@@ -233,6 +236,19 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     dataset_ids = [dataset_id] if isinstance(dataset_id, str) else list(dataset_id)
     if not dataset_ids:
         raise ValueError("At least one dataset_id is required.")
+
+    # huggingface_hub draws a per-file tqdm for every repo it touches, and this
+    # trainer touches each dataset twice (metadata, then the dataset itself).
+    # At ~14k files that is thousands of redrawn lines before the first step,
+    # which buries the schema and normalisation output that actually needs
+    # reading. One status line each instead; --download_progress restores the
+    # bars for a genuinely first-time pull.
+    if not download_progress:
+        try:
+            from huggingface_hub.utils import disable_progress_bars
+            disable_progress_bars()
+        except Exception:
+            pass
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
 
@@ -247,8 +263,19 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
 
     # Load metadata for all datasets. Schema is taken from the first and the rest
     # are validated against it (homogeneous assumption).
-    metas = {did: LeRobotDatasetMetadata(did, force_cache_sync=True, revision="main")
-             for did in dataset_ids}
+    # force_cache_sync re-verifies every file in the repo against the hub on
+    # each launch -- ~14k HEAD requests for a converted VLABench, before a
+    # single step. It only matters when the remote may have changed under a
+    # cache that already exists, so it is opt-in via --cache_sync.
+    metas = {}
+    for did in dataset_ids:
+        _t = time.time()
+        print(f"[data] reading metadata for {did}"
+              + ("  (--cache_sync: re-verifying every file against the hub)"
+                 if cache_sync else ""), flush=True)
+        metas[did] = LeRobotDatasetMetadata(did, force_cache_sync=cache_sync,
+                                            revision="main")
+        print(f"[data]   ...{time.time() - _t:.0f}s", flush=True)
     ref_meta = metas[dataset_ids[0]]
     features = dataset_to_policy_features(ref_meta.features)
     output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
@@ -631,11 +658,17 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     offset = 0
     first_root = None
     for did in dataset_ids:
+        _t = time.time()
+        print(f"[data] opening {did}"
+              + ("  (syncing cache; first pull can take a long time and is "
+                 "silent unless --download_progress)" if cache_sync else ""),
+              flush=True)
         ds = LeRobotDataset(
             did, delta_timestamps=delta_timestamps,
-            force_cache_sync=True, revision="main", tolerance_s=tolerance_s,
+            force_cache_sync=cache_sync, revision="main", tolerance_s=tolerance_s,
             image_transforms=img_tf,
         )
+        print(f"[data]   ...{time.time() - _t:.0f}s", flush=True)
         if first_root is None:
             first_root = ds.root
         # Episode spans must tile the table. delta_timestamps make
@@ -985,6 +1018,18 @@ if __name__ == "__main__":
                              "neighbouring frames of one episode on both sides "
                              "and report a gap near zero however badly the "
                              "model memorised.")
+    parser.add_argument("--download_progress", action="store_true",
+                        help="Keep huggingface_hub's per-file progress bars. "
+                             "Off by default: at ~14k files they redraw "
+                             "thousands of lines and bury the schema and "
+                             "normalisation output printed before training. "
+                             "Turn on for a genuinely first-time pull.")
+    parser.add_argument("--cache_sync", action="store_true",
+                        help="Re-verify every file of every dataset against the "
+                             "hub at launch (the old always-on behaviour). "
+                             "~14k requests for a converted VLABench before the "
+                             "first step; only needed when the remote may have "
+                             "changed under an existing cache.")
     parser.add_argument("--num_workers", type=int, default=8,
                         help="DataLoader worker processes (default: 8). Each "
                              "forks a copy of the dataset; Python refcounting "
