@@ -648,6 +648,16 @@ def main():
     print(f"[rl] trainable params: {sum(p.numel() for p in trainable):,}")
     optimizer = make_optimizer(trainable, args.lr, args.use_8bit_adam)
 
+    # Canonical LIBERO init states, before any env is built. reset_group() gives
+    # every member of a GRPO group the same _init_state_id and a different seed,
+    # on the premise that a group shares one initial state. Without this patch
+    # robosuite re-samples the placement initializer and the seed drives it, so
+    # the members get DIFFERENT layouts and the group-mean baseline cancels
+    # layout difficulty rather than action quality. See src/libero_env_fixed.py.
+    from libero_env_fixed import patch_lerobot_libero
+    patch_lerobot_libero()
+    print("[rl] canonical LIBERO init states: ON")
+
     from lerobot.envs.libero import _get_suite
     suite = _get_suite(args.env_task)
     task_ids = args.task_ids if args.task_ids else list(range(len(suite.tasks)))

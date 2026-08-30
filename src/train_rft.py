@@ -251,6 +251,7 @@ class RFTParams:
     save_dataset_repo_id: str = "rft/collected"  # local repo_id label (no hub push)
     save_fps: int = 20                # fps stamped into the dataset (set to match your demo set)
     control_freq: int = 10            # LIBERO sim control Hz (demos are 10; stock env default is 20). 0 = leave stock.
+    stock_init: bool = False          # True = lerobot's reset ordering (layouts 3-10x wider than canonical). For A/B only.
     init_states_per_task: int = 0     # >0: sweep this many LIBERO init states across batches (50 = full set), so a small batch_size still covers them all. 0 = legacy (only init states 0..batch_size-1).
     task_ids: str = ""                # comma-separated task indices within the suite to collect (e.g. "0,3,7"). Empty = all tasks.
 
@@ -790,6 +791,19 @@ def main(cfg: RFTConfig):
         if cfg.rft.headless:
             _start_virtual_display()
         _apply_robosuite_patches()
+        # Canonical LIBERO init states. lerobot's LiberoEnv.reset() writes the
+        # init state and THEN lets robosuite re-sample the placement
+        # initializer over it, serving layouts 3-10x wider than the 50 the
+        # demos were recorded on. Without this the rollouts here are collected
+        # on a DIFFERENT distribution from the one eval_wiltechs_x.py scores,
+        # so the rolling success rate printed below is not comparable to any
+        # eval number -- and `init_states_per_task` is largely inert, since
+        # cycling _init_state_id cannot pin a layout the sampler then
+        # overwrites. See src/libero_env_fixed.py.
+        from libero_env_fixed import patch_lerobot_libero
+        patch_lerobot_libero(enable=not cfg.rft.stock_init)
+        print(f"[train_rft] canonical init states: "
+              f"{'OFF (--rft.stock_init)' if cfg.rft.stock_init else 'ON'}")
         if cfg.rft.control_freq and cfg.rft.control_freq > 0:
             _patch_libero_control_freq(cfg.rft.control_freq)
             print(f"[train_rft] LIBERO control_freq patched to {cfg.rft.control_freq} Hz "

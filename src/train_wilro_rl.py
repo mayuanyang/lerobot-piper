@@ -231,6 +231,20 @@ def _env_worker(conn, suite_name: str, task_id: int, max_episode_steps: int,
     import numpy as _np
     from lerobot.envs.libero import LiberoEnv, _get_suite
 
+    # Canonical LIBERO init states, in the WORKER: each rollout process builds
+    # its own envs, so patching only in the parent leaves them unpatched.
+    # Without it robosuite re-samples the placement initializer over the state
+    # LiberoEnv.reset() just wrote, and a GRPO group whose members share one
+    # _init_state_id but differ by seed gets DIFFERENT layouts -- so the
+    # group-mean baseline absorbs layout difficulty instead of action quality,
+    # which is the one thing it exists to cancel. See src/libero_env_fixed.py.
+    try:
+        from libero_env_fixed import patch_lerobot_libero
+        patch_lerobot_libero()
+    except Exception as _e:
+        print(f"[worker] WARNING: canonical init states NOT applied ({_e}); "
+              f"group baselines will absorb layout difficulty")
+
     if control_freq and control_freq > 0:
         _patch_libero_control_freq(control_freq)
 
