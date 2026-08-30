@@ -41,10 +41,24 @@ Notes / things to VERIFY on the first run (printed at startup):
     as uint8 to keep buffer memory sane.
   - The frozen SmolVLM stays frozen (only requires_grad params are optimized).
 
-Known limitation (intentional, to keep the scaffold runnable):
-  - Demo anchoring is NOT wired yet. Collapse is mitigated by (a) a persistent
-    success buffer across iterations, (b) low LR, (c) limited updates/iter.
-    See _train_on_buffer() for the hook to mix in demo batches / add a KL anchor.
+Drift, and what holds it back. The policy is updated IN PLACE across
+iterations -- iteration 1 fine-tunes the SFT weights, iteration 2 fine-tunes
+iteration 1's, and it never returns to the SFT checkpoint. So each round's
+data comes from a policy the previous round already narrowed, which is a
+feedback loop straight into mode collapse. Four things push back:
+
+  (a) --rft.demo_dataset + --rft.demo_fraction: each update trains on an
+      EXPERT-demo batch with that probability instead of an RFT-success one.
+      Use it from the start, not as a rescue -- this repo has already
+      measured 25 points riding on distributional breadth (removing the
+      per-chunk noise re-draw cost that much).
+  (b) a persistent success buffer across iterations, so old modes keep being
+      replayed rather than being forgotten the moment they stop being sampled.
+  (c) low LR.
+  (d) limited updates/iter.
+
+A KL anchor to the SFT policy is still not implemented; demo anchoring is the
+substitute.
 """
 
 # NOTE: do NOT add `from __future__ import annotations` here. lerobot's
