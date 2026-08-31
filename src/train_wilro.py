@@ -238,6 +238,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           progress_update_freq: int = 200,
           num_workers: int = 8,
           start_step_override: int = -1,
+          lr: float | None = None,
+          warmup_steps: int | None = None,
           download_progress: bool = False,
           cache_sync: bool = False,
           load_image_size: int = 0,
@@ -464,6 +466,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         time_sampling=time_sampling,
         time_lognormal_mean=time_lognormal_mean,
         time_lognormal_std=time_lognormal_std,
+        **({} if lr is None else {"optimizer_lr": float(lr)}),
+        **({} if warmup_steps is None else {"scheduler_warmup_steps": int(warmup_steps)}),
         paraphrase_augment=paraphrase_augment,
         paraphrase_limit=paraphrase_limit,
         paraphrase_file=paraphrase_file,
@@ -1121,6 +1125,19 @@ if __name__ == "__main__":
                              "~14k requests for a converted VLABench before the "
                              "first step; only needed when the remote may have "
                              "changed under an existing cache.")
+    parser.add_argument("--lr", type=float, default=None,
+                        help="Peak learning rate (default: the config's 1e-4). "
+                             "The cosine is built around this, and the resume "
+                             "path rebuilds param_groups from it, so an "
+                             "explicit value survives --resume_from_checkpoint "
+                             "-- unlike the sibling trainer before 4caed2d. "
+                             "Refining an already-trained policy on collected "
+                             "rollouts wants ~1e-5; train_rft.py's own default "
+                             "is 1e-5.")
+    parser.add_argument("--warmup_steps", type=int, default=None,
+                        help="Linear warmup steps before the cosine (default: "
+                             "1500). Lower it for short refinement runs, where "
+                             "1500 can be most of the budget.")
     parser.add_argument("--start_step_override", type=int, default=-1,
                         help="Restart the step counter at this value when "
                              "loading a checkpoint (-1 = keep the checkpoint's, "
