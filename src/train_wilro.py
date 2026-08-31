@@ -1079,11 +1079,14 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=64,
                         help="DataLoader batch size (default: 64).")
     parser.add_argument("--n_obs_steps", type=int, default=None,
-                        help="Frames of observation.state history fed to the "
-                             "model (default: 2). 1 means the current frame "
-                             "only -- the model always reads images from the "
-                             "last frame regardless, so this controls the "
-                             "proprioceptive window alone.")
+                        help="Frames of observation.state FETCHED per sample "
+                             "(default: 2). Note that wilro then keeps only the "
+                             "last one: wilro_model slices state_tok[:, -1:], so "
+                             "anything above 1 is fetched, encoded and thrown "
+                             "away. It changes what the dataloader carries, not "
+                             "what the model sees -- 1 is strictly cheaper and "
+                             "numerically identical. The model has NO velocity "
+                             "input either way.")
     parser.add_argument("--val_episodes", type=int, default=0,
                         help="Hold out this many EPISODES for validation, "
                              "allocated proportionally across --dataset_id so a "
