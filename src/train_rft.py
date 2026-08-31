@@ -249,7 +249,7 @@ class RFTParams:
     collect_only: bool = False
     save_dataset_dir: str = ""        # output dataset root (default: <output_dir>/collected_dataset)
     save_dataset_repo_id: str = "rft/collected"  # local repo_id label (no hub push)
-    save_fps: int = 20                # fps stamped into the dataset (set to match your demo set)
+    save_fps: int = 0                 # fps stamped into the dataset. 0 = follow control_freq, which is the rate the frames are ACTUALLY produced at. Any other value is a lie the loader cannot detect.
     control_freq: int = 10            # LIBERO sim control Hz (demos are 10; stock env default is 20). 0 = leave stock.
     stock_init: bool = False          # True = lerobot's reset ordering (layouts 3-10x wider than canonical). For A/B only.
     init_states_per_task: int = 0     # >0: sweep this many LIBERO init states across batches (50 = full set), so a small batch_size still covers them all. 0 = legacy (only init states 0..batch_size-1).
@@ -511,10 +511,19 @@ def _write_episode(ds, episode_frames: list[dict], cam_keys: list[str], state_ke
 def _run_collect_only(cfg, task_envs, policy, preprocessor, postprocessor, device, action_dim):
     """Roll out, keep successes, stream them into a LeRobot v3 dataset. No training."""
     save_dir = cfg.rft.save_dataset_dir or str(Path(cfg.rft.output_dir) / "collected_dataset")
+    # The frames come out of the sim at control_freq Hz. Stamping any other fps
+    # is undetectable downstream and silently rescales time: train_wilro builds
+    # delta_timestamps as 1/fps, so a set claiming 20 Hz over 10 Hz frames gives
+    # every action chunk half the real duration it should cover.
+    save_fps = int(cfg.rft.save_fps) or int(cfg.rft.control_freq) or 10
+    if cfg.rft.save_fps and cfg.rft.control_freq and save_fps != int(cfg.rft.control_freq):
+        print(f"  *** --rft.save_fps={save_fps} but frames are produced at "
+              f"{cfg.rft.control_freq} Hz. The dataset will misreport time and "
+              f"nothing downstream can tell. ***")
     _obs0, _ = task_envs[0][1].reset()
     _obs0 = preprocess_observation(_obs0)
     ds, cam_keys, state_key = _create_collect_dataset(
-        save_dir, cfg.rft.save_dataset_repo_id, cfg.rft.save_fps, _obs0, action_dim,
+        save_dir, cfg.rft.save_dataset_repo_id, save_fps, _obs0, action_dim,
     )
 
     print("\n" + "=" * 64)
@@ -528,7 +537,8 @@ def _run_collect_only(cfg, task_envs, policy, preprocessor, postprocessor, devic
         print(f"  init states: cycling 0..{int(cfg.rft.init_states_per_task) - 1} across batches "
               f"(batch_size={cfg.eval.batch_size}) — full sweep per pass")
     print(f"  max_steps  : {cfg.rft.max_steps if cfg.rft.max_steps > 0 else 'env default per suite'}")
-    print(f"  dataset    : {save_dir}  (fps={cfg.rft.save_fps})")
+    print(f"  dataset    : {save_dir}  (fps={save_fps}"
+          + ("" if cfg.rft.save_fps else f", from control_freq") + ")")
     print("=" * 64 + "\n")
 
     cycle = int(cfg.rft.init_states_per_task)
