@@ -410,6 +410,9 @@ def _rft_collect_episodes(env, policy, preprocessor, postprocessor, device,
 
     episodes: list[list[dict]] = []
     n_success = 0
+    # Per-env, not just the count: the caller pins a different init state on each
+    # env, so this is what says WHICH states the policy can already solve.
+    succ_flags = np.zeros(B, dtype=bool)
     step = 0
     pbar = tqdm(total=max_steps, desc=desc, leave=False, dynamic_ncols=True)
     while not np.all(done) and step < max_steps:
@@ -447,6 +450,7 @@ def _rft_collect_episodes(env, policy, preprocessor, postprocessor, device,
                 if bool(successes[i]):
                     episodes.append(frames[i])
                     n_success += 1
+                    succ_flags[i] = True
                 frames[i] = []                          # free either way
         done = terminated | truncated | done
         step += 1
@@ -454,7 +458,7 @@ def _rft_collect_episodes(env, policy, preprocessor, postprocessor, device,
         pbar.set_postfix(done=f"{int(done.sum())}/{B}", success=n_success)
 
     pbar.close()
-    return episodes, n_success, B
+    return episodes, n_success, B, succ_flags
 
 
 def _create_collect_dataset(save_dir: str, repo_id: str, fps: int,
@@ -543,6 +547,12 @@ def _run_collect_only(cfg, task_envs, policy, preprocessor, postprocessor, devic
 
     cycle = int(cfg.rft.init_states_per_task)
     total_ep, total_succ, saved = 0, 0, 0
+    # (task, init_state_id) -> attempts / successes. RFT can only learn from a
+    # state it has SOLVED at least once, so the states with zero wins are the
+    # ones no amount of further collection will help -- they need demos or a
+    # dense reward, not more rollouts. The aggregate success rate hides them.
+    attempts: dict = {}
+    wins: dict = {}
     interrupted = False
     try:
         for it in range(1, cfg.rft.iterations + 1):
@@ -568,10 +578,15 @@ def _run_collect_only(cfg, task_envs, policy, preprocessor, postprocessor, devic
                         ids = [(b * num_envs + i) % n_init for i in range(num_envs)]
                         env.set_attr("_init_state_id", ids)
                     desc = f"pass{it} collect {label} [{t_idx+1}/{len(task_envs)}] b{b+1}/{n_batches}"
-                    episodes, n_succ, B = _rft_collect_episodes(
+                    episodes, n_succ, B, succ_flags = _rft_collect_episodes(
                         env, policy, preprocessor, postprocessor, device,
                         desc=desc, max_steps_cap=cfg.rft.max_steps,
                     )
+                    if cycle > 0:
+                        for i in range(min(B, len(ids))):
+                            key = (label, ids[i])
+                            attempts[key] = attempts.get(key, 0) + 1
+                            wins[key] = wins.get(key, 0) + int(succ_flags[i])
                     for ep in episodes:
                         _write_episode(ds, ep, cam_keys, state_key)
                         saved += 1
@@ -593,6 +608,35 @@ def _run_collect_only(cfg, task_envs, policy, preprocessor, postprocessor, devic
     status = "INTERRUPTED" if interrupted else "done"
     print(f"\n[collect] {status}: {total_succ}/{total_ep} successful episodes "
           f"({100.0 * total_succ / max(1, total_ep):.1f}%) → {saved} written to {save_dir}")
+
+    if attempts:
+        # The aggregate rate above averages over states and hides the ones that
+        # never work. RFT learns only from states it has solved, so a state at
+        # 0/n is not "collect more" -- it is outside what more rollouts can fix.
+        by_task: dict = {}
+        for (label, sid), n in attempts.items():
+            w = wins.get((label, sid), 0)
+            t = by_task.setdefault(label, {"n": 0, "zero": 0, "won": 0, "att": 0})
+            t["n"] += 1
+            t["att"] += n
+            t["won"] += w
+            if w == 0:
+                t["zero"] += 1
+        tot_states = sum(t["n"] for t in by_task.values())
+        tot_zero = sum(t["zero"] for t in by_task.values())
+        print(f"\n[coverage] per INIT STATE, over {sum(t['att'] for t in by_task.values())} "
+              f"attempt(s) on {tot_states} state(s):")
+        for label in sorted(by_task):
+            t = by_task[label]
+            print(f"  {label:28s} {t['n'] - t['zero']:3d}/{t['n']:3d} states solved "
+                  f"at least once   ({t['won']}/{t['att']} attempts won)"
+                  + ("   <-- has never-solved states" if t["zero"] else ""))
+        print(f"  TOTAL: {tot_states - tot_zero}/{tot_states} states solved at least once; "
+              f"{tot_zero} never solved.")
+        if tot_zero:
+            print(f"  Those {tot_zero} contribute NOTHING to RFT no matter how many "
+                  f"more iterations you run. More rollouts raise the sample COUNT "
+                  f"on states that already work; they do not open new ones.")
     print("\nNext — ordinary SFT on the collected dataset (no sim in the loop):")
     print(f"  python src/train_finetune.py \\")
     print(f"    --output_dir outputs/train/rft_sft \\")
