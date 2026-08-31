@@ -820,6 +820,27 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     val_set = set(val_ep_idx)
     tr_idx = [i for i in range(len(ep_ds)) if i not in val_set]
 
+    # The `fit` slice must be drawn the SAME way the held-out set was, from the
+    # same rng, or the two columns are not measuring the same thing. Taking
+    # tr_idx[:n] instead looks harmless and is not: lerobot/libero is ordered by
+    # SUITE, so the first n training episodes are all one suite while the
+    # held-out set spans all forty tasks. The difference then reports
+    # "suite A vs everything" on top of "trained vs held out", and on a real run
+    # that produced a gap of +400% while held-out itself was flat.
+    fit_ep_idx: list = []
+    if val_ep_idx:
+        by_ds_tr: dict = {}
+        for i in tr_idx:
+            by_ds_tr.setdefault(ep_ds[i], []).append(i)
+        want: dict = {}
+        for i in val_ep_idx:
+            want[ep_ds[i]] = want.get(ep_ds[i], 0) + 1
+        for d, k in want.items():
+            pool = by_ds_tr.get(d, [])
+            if pool:
+                fit_ep_idx += list(rng.choice(pool, size=min(k, len(pool)),
+                                              replace=False))
+
     def mk_sampler(idxs, shuffle):
         return EpisodeAwareSampler(
             dataset_from_indices=[ep_from[i] for i in idxs],
@@ -870,7 +891,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         # dropout, image/state augmentation, paraphrase sampling AND the
         # contrastive term -- which is train-only here -- so their difference
         # is not a generalisation gap. fit vs held-out is.
-        fit_loader = mk_loader(tr_idx[:len(val_ep_idx)], False, min(2, num_workers))
+        fit_loader = mk_loader(fit_ep_idx, False, min(2, num_workers))
         n_val_frames = sum(ep_to[i] - ep_from[i] for i in val_ep_idx)
         per_ds = {}
         for i in val_ep_idx:
