@@ -695,11 +695,30 @@ class WilroTransformer(nn.Module):
         return self
 
     def gradient_checkpointing_enable(self):
-        """Recompute DiT layer activations during backward instead of storing
-        them. Frozen VLM runs in no_grad and is unaffected."""
+        """Recompute activations during backward instead of storing them.
+
+        Covers the DiT, and the SigLIP ViT whenever vision LoRA is on. The
+        second half is not optional bookkeeping: a LoRA'd ViT layer requires
+        grad, so its activations ARE stored, and the old claim that "the frozen
+        VLM runs in no_grad and is unaffected" stopped being true the moment
+        any adapter was attached. Going from 8 adapted layers to 16 doubles
+        that cost and is what forces the batch size down -- the extra 0.8M
+        parameters are nothing next to the activations behind them.
+        """
         self.gradient_checkpointing = True
         print(f"[wilro] DiT gradient checkpointing ENABLED "
               f"({self.num_dit_layers} layers will be recomputed in backward)")
+        n_vis = int(getattr(self.config, "vision_lora_num_layers", 0) or 0)
+        if n_vis > 0:
+            try:
+                self.vision_model.gradient_checkpointing_enable()
+                print(f"[wilro] SigLIP ViT gradient checkpointing ENABLED "
+                      f"({n_vis} LoRA layers store activations without it)")
+            except Exception as e:
+                print(f"[wilro] SigLIP ViT gradient checkpointing NOT available "
+                      f"({type(e).__name__}: {e}); the {n_vis} adapted layers "
+                      f"will keep their activations and the batch size has to "
+                      f"absorb it")
 
     def gradient_checkpointing_disable(self):
         self.gradient_checkpointing = False
