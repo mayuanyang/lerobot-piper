@@ -909,14 +909,23 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
 
     val_loader = fit_loader = None
     if val_ep_idx:
-        val_loader = mk_loader(val_ep_idx, False, min(2, num_workers))
+        # shuffle=True on BOTH. val_max_batches x batch_size is far short of the
+        # held-out set -- 20 x 60 = 1200 frames against ~6500 -- so an unshuffled
+        # sampler scored the same arbitrary first ~7 episodes every pass and
+        # called it the held-out loss. Whether those seven happened to be easy or
+        # hard then set the absolute level for the whole run, which is how three
+        # runs of the same model family came back with held-out at 0.25, 1.02 and
+        # 1.30 while all three scored ~68% on the same held-out init states.
+        # Shuffling spreads the same budget over all 40 episodes; run_eval_loss
+        # pins the RNG, so successive passes still draw the SAME spread.
+        val_loader = mk_loader(val_ep_idx, True, min(2, num_workers))
         # A same-sized slice of TRAINING episodes, scored the SAME way (eval
         # mode, no augmentation). Without it the only comparison available is
         # held-out against the running train loss, and those two differ by
         # dropout, image/state augmentation, paraphrase sampling AND the
         # contrastive term -- which is train-only here -- so their difference
         # is not a generalisation gap. fit vs held-out is.
-        fit_loader = mk_loader(fit_ep_idx, False, min(2, num_workers))
+        fit_loader = mk_loader(fit_ep_idx, True, min(2, num_workers))
         n_val_frames = sum(ep_to[i] - ep_from[i] for i in val_ep_idx)
         per_ds = {}
         for i in val_ep_idx:
@@ -924,7 +933,12 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         print(f"Validation: {len(val_ep_idx)} episodes held out "
               f"({n_val_frames} frames, {100 * n_val_frames / max(1, sum(ep_to[i] - ep_from[i] for i in range(len(ep_ds)))):.1f}%), "
               f"every {val_every} steps, <= {val_max_batches} batches\n"
-              f"  per dataset: {per_ds}")
+              f"  per dataset: {per_ds}\n"
+              f"  each pass scores {val_max_batches * batch_size} frames of "
+              f"{n_val_frames} ({100 * val_max_batches * batch_size / max(1, n_val_frames):.0f}%), "
+              f"sampled across all {len(val_ep_idx)} episodes"
+              + ("  -- raise --val_max_batches for a steadier number"
+                 if val_max_batches * batch_size < 0.5 * n_val_frames else ""))
     else:
         print("Validation: DISABLED (--val_episodes 0). Training loss alone "
               "cannot tell fitting from memorising.")
