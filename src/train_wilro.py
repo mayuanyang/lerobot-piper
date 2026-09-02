@@ -240,6 +240,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           start_step_override: int = -1,
           lr: float | None = None,
           warmup_steps: int | None = None,
+          lora_rank: int | None = None,
+          lora_alpha: float | None = None,
+          vision_lora_num_layers: int | None = None,
           download_progress: bool = False,
           cache_sync: bool = False,
           load_image_size: int = 0,
@@ -440,6 +443,27 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                     f"--paraphrase_min_variants only if you accept that those "
                     f"tasks train unaugmented.")
 
+    # LoRA sizing. alpha defaults to 2x rank because LoRALinear scales by
+    # alpha/rank, and the shipped pair is 32/16 = 2.0 -- holding alpha fixed
+    # while raising rank would quietly HALVE the adapter's effective strength,
+    # moving two variables when only one was asked for.
+    lora_kw: dict = {}
+    if lora_rank is not None:
+        lora_kw["lora_rank"] = int(lora_rank)
+        lora_kw["lora_alpha"] = float(lora_alpha if lora_alpha is not None
+                                      else 2.0 * int(lora_rank))
+    elif lora_alpha is not None:
+        lora_kw["lora_alpha"] = float(lora_alpha)
+    if vision_lora_num_layers is not None:
+        lora_kw["vision_lora_num_layers"] = int(vision_lora_num_layers)
+    if lora_kw and resume_from_checkpoint is not None:
+        print(f"\n*** LoRA geometry changed ({lora_kw}) while resuming. The "
+              f"checkpoint's adapters have different shapes, so they will be "
+              f"SKIPPED and the vision adapter restarts at zero -- which means "
+              f"the frozen base SigLIP, i.e. every bit of visual adaptation the "
+              f"checkpoint had learned is discarded. Check the 'Skipped N "
+              f"checkpoint keys' line below. ***\n")
+
     # Build wilro config
     cfg = WilroConfig(
         input_features=input_features,
@@ -468,6 +492,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         time_lognormal_std=time_lognormal_std,
         **({} if lr is None else {"optimizer_lr": float(lr)}),
         **({} if warmup_steps is None else {"scheduler_warmup_steps": int(warmup_steps)}),
+        **lora_kw,
         paraphrase_augment=paraphrase_augment,
         paraphrase_limit=paraphrase_limit,
         paraphrase_file=paraphrase_file,
@@ -1146,6 +1171,26 @@ if __name__ == "__main__":
                              "~14k requests for a converted VLABench before the "
                              "first step; only needed when the remote may have "
                              "changed under an existing cache.")
+    parser.add_argument("--lora_rank", type=int, default=None,
+                        help="LoRA rank on the SigLIP ViT (default: 16). The "
+                             "vision adapter is ~0.1%% of this model's trainable "
+                             "parameters -- the DiT is 99.3%% -- so this is not "
+                             "a lever on OVERALL capacity, and the model already "
+                             "overfits. It is a lever on where adaptation is "
+                             "ALLOWED: grounding lives in the encoder, and the "
+                             "encoder is where almost nothing trains.")
+    parser.add_argument("--lora_alpha", type=float, default=None,
+                        help="LoRA alpha (default: 2 x rank). LoRALinear scales "
+                             "by alpha/rank, so leaving alpha fixed while "
+                             "raising rank halves the adapter's strength. The "
+                             "default tracks rank to keep that ratio at the "
+                             "shipped 32/16 = 2.0.")
+    parser.add_argument("--vision_lora_num_layers", type=int, default=None,
+                        help="How many trailing SigLIP ViT layers get adapters "
+                             "(default: 8; SmolVLM2-500M's ViT has 27). Text "
+                             "LoRA stays at 0 and should: the encoder-decoder "
+                             "detaches the VLM KV cache, so no gradient reaches "
+                             "the text tower to train an adapter with.")
     parser.add_argument("--lr", type=float, default=None,
                         help="Peak learning rate (default: the config's 1e-4). "
                              "The cosine is built around this, and the resume "
