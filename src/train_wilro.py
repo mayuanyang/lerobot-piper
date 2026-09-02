@@ -216,8 +216,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           contrastive_hard_negatives=False,
           lock_joint_index: int | None = 3, kv_capture_strategy: str = "last",
           kv_capture_layers: list | None = None,
-          robot_encoder_tokens: int = 49, gripper_encoder_tokens: int = 100,
-          gripper_camera: str | None = None,
           cameras: list | None = None,
           rewrite_instructions: bool = False,
           rewrite_augment: bool = False,
@@ -387,13 +385,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     else:
         print(f"All {action_dim} action dims weighted equally; "
               f"action_dim_weights={action_dim_weights}")
-
-    # The camera that gets the dense gripper_encoder_tokens grid (the rest get
-    # robot_encoder_tokens). The config default is "observation.images.gripper",
-    # which matches NO camera on LIBERO (image/image2) — leaving the dense grid
-    # silently inert. Pass --gripper_camera observation.images.image2 (the wrist /
-    # eye-in-hand view) to actually activate it.
-    gripper_camera = gripper_camera if gripper_camera is not None else WilroConfig.gripper_camera
 
     if paraphrase_augment:
         # Preflight, not a runtime warning. A sentence with no written variants
@@ -1311,24 +1302,6 @@ if __name__ == "__main__":
                         help="Comma-separated 0-based VLM layer indices for "
                              "--kv_capture_strategy custom, e.g. '3,7,11,15,19,"
                              "23,27,31'. Ignored for last/stride2.")
-    parser.add_argument("--robot_encoder_tokens", type=int, default=49,
-                        help="Robot CNN tokens per non-gripper camera. Must be a "
-                             "perfect square (grid side = sqrt). Spatial ceiling "
-                             "is the 14x14 layer3 map (=196); 49 (7x7) or 100 "
-                             "(10x10) buy real localisation resolution over the "
-                             "default 16 (4x4 ~25%% of frame per token).")
-    parser.add_argument("--gripper_encoder_tokens", type=int, default=100,
-                        help="Robot CNN tokens for the gripper/wrist camera "
-                             "(close-range placement precision). Perfect square; "
-                             "set equal to --robot_encoder_tokens to disable the "
-                             "per-camera difference.")
-    parser.add_argument("--gripper_camera", type=str, default=None,
-                        help="Which camera key gets the dense --gripper_encoder_tokens "
-                             "grid (all others get --robot_encoder_tokens). Default is "
-                             "the config's 'observation.images.gripper', which matches "
-                             "NO camera on LIBERO (image/image2) and silently disables "
-                             "the dense grid. For LIBERO pass the wrist / eye-in-hand "
-                             "view, e.g. --gripper_camera observation.images.image2.")
     parser.add_argument("--cameras", type=str, nargs="+", default=None,
                         help="Subset of cameras to use from the dataset. If not specified, "
                              "all available cameras are used. Example: "
@@ -1364,10 +1337,6 @@ if __name__ == "__main__":
                              "original and rewritten instruction (50/50) for each sample. "
                              "This trains the model to understand BOTH phrasings.")
     args = parser.parse_args()
-    for _name in ("robot_encoder_tokens", "gripper_encoder_tokens"):
-        _v = getattr(args, _name)
-        if int(_v ** 0.5) ** 2 != _v:
-            parser.error(f"--{_name} must be a perfect square, got {_v}")
     # Argparse can't express None for an int, so use -1 sentinel.
     if args.lock_joint_index is not None and args.lock_joint_index < 0:
         args.lock_joint_index = None
