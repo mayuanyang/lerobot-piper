@@ -802,8 +802,8 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
                 successes.append(succ[i])
                 if succ[i]:
                     steps_to_success.append(steps[i])
-                elif video_cb is not None:
-                    video_cb(task_id, start + i, frames[i])
+                if video_cb is not None:
+                    video_cb(task_id, start + i, frames[i], success=bool(succ[i]))
 
         mean_steps = float(np.mean(steps_to_success)) if steps_to_success else float("nan")
         return (sum(successes), len(successes), mean_steps, n_chunks, task_desc,
@@ -817,7 +817,15 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
 
 
 # ---------------------------------------------------------------------------
-def make_video_writer(video_dir: Path | None, max_per_task: int):
+def make_video_writer(video_dir: Path | None, max_per_task: int,
+                      which: str = "fail"):
+    """Record rollouts. `which` selects fail / success / both.
+
+    Failures alone answer "is it broken"; telling WHY usually needs the pair,
+    because the question is what the successful runs do differently. The
+    per-outcome caps are separate so asking for both does not let whichever
+    outcome is more common crowd the other out of the quota.
+    """
     if video_dir is None:
         return None
     try:
@@ -826,13 +834,21 @@ def make_video_writer(video_dir: Path | None, max_per_task: int):
         print("[eval] --video_dir set but imageio is not installed; skipping video.")
         return None
     video_dir.mkdir(parents=True, exist_ok=True)
-    written: dict[int, int] = {}
+    written: dict = {}
 
-    def cb(task_id, episode, frames):
-        if not frames or written.get(task_id, 0) >= max_per_task:
+    def cb(task_id, episode, frames, success=False):
+        if not frames:
             return
-        written[task_id] = written.get(task_id, 0) + 1
-        path = video_dir / f"task{task_id:02d}_ep{episode:03d}_FAIL.mp4"
+        if which == "fail" and success:
+            return
+        if which == "success" and not success:
+            return
+        key = (task_id, bool(success))
+        if written.get(key, 0) >= max_per_task:
+            return
+        written[key] = written.get(key, 0) + 1
+        tag = "OK" if success else "FAIL"
+        path = video_dir / f"task{task_id:02d}_ep{episode:03d}_{tag}.mp4"
         imageio.mimwrite(path, [np.asarray(f) for f in frames], fps=10)
 
     return cb
@@ -906,7 +922,16 @@ def main():
                    help="Write up to --videos_per_task FAILED episodes per task. "
                         "This repo's grasp-vs-selection diagnoses came from "
                         "watching these, not from the success rate.")
-    p.add_argument("--videos_per_task", type=int, default=2)
+    p.add_argument("--videos_per_task", type=int, default=2,
+                   help="Cap per task AND per outcome, so --videos_of both "
+                        "gives up to this many of each rather than letting the "
+                        "commoner outcome take the whole quota.")
+    p.add_argument("--videos_of", choices=("fail", "success", "both"),
+                   default="fail",
+                   help="Which rollouts to record (default: fail). Failures "
+                        "alone answer 'is it broken'; saying WHY usually needs "
+                        "'both', since the question is what the successful runs "
+                        "do differently.")
     p.add_argument("--ablate_lang", action="store_true",
                    help="Tell the policy ANOTHER task's instruction while "
                         "scoring against the real one. The bridge between "
@@ -1063,7 +1088,7 @@ def main():
               f"the missing ingredient.")
 
     video_cb = make_video_writer(Path(a.video_dir) if a.video_dir else None,
-                                 a.videos_per_task)
+                                 a.videos_per_task, a.videos_of)
 
     from lerobot.envs.libero import _get_suite
 
