@@ -447,13 +447,6 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         lora_kw["lora_alpha"] = float(lora_alpha)
     if vision_lora_num_layers is not None:
         lora_kw["vision_lora_num_layers"] = int(vision_lora_num_layers)
-    if lora_kw and resume_from_checkpoint is not None:
-        print(f"\n*** LoRA geometry changed ({lora_kw}) while resuming. The "
-              f"checkpoint's adapters have different shapes, so they will be "
-              f"SKIPPED and the vision adapter restarts at zero -- which means "
-              f"the frozen base SigLIP, i.e. every bit of visual adaptation the "
-              f"checkpoint had learned is discarded. Check the 'Skipped N "
-              f"checkpoint keys' line below. ***\n")
 
     # Build wilro config
     cfg = WilroConfig(
@@ -533,6 +526,26 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                 elif saved_total > 0:
                     training_steps = saved_total
                 print(f"Read config from {config_file.name}: step={step}, epoch={epoch}, training_steps_total={training_steps}")
+                # Warn only on an ACTUAL geometry change. Passing --lora_rank 64
+                # to continue a run that already trained at 64 is the normal way
+                # to resume, and a warning there says the adapters are being
+                # discarded when they load fine -- which is worth aborting over
+                # if believed.
+                changed = {k: (saved_cfg_json.get(k), v) for k, v in lora_kw.items()
+                           if k in saved_cfg_json and saved_cfg_json[k] != v}
+                if changed:
+                    detail = ", ".join(f"{k}: {a} -> {b}" for k, (a, b) in changed.items())
+                    print(f"\n*** LoRA geometry CHANGED ({detail}). The "
+                          f"checkpoint's adapters have different shapes, so they "
+                          f"will be SKIPPED and the vision adapter restarts at "
+                          f"zero -- the frozen base SigLIP, i.e. every bit of "
+                          f"visual adaptation this checkpoint learned is "
+                          f"discarded. Check 'Skipped N checkpoint keys' below. "
+                          f"***\n")
+                elif lora_kw:
+                    print(f"LoRA geometry matches the checkpoint "
+                          f"({', '.join(f'{k}={v}' for k, v in lora_kw.items())}); "
+                          f"adapters will load.")
                 break
         if step == 0 and local_ckpt_path.name.startswith("checkpoint-"):
             step = int(local_ckpt_path.name.split("-")[1])
