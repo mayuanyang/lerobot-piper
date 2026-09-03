@@ -963,6 +963,14 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                       if torch.cuda.is_available() else None)
         torch.manual_seed(20260829)
         tot, n = 0.0, 0
+        # Magnitude probe. The flow loss says how far the predicted velocity
+        # field is from the demo actions; it does not say in WHICH direction,
+        # so a policy that has drifted toward larger, faster actions and one
+        # that has simply got worse produce the same rising number. Sampling a
+        # chunk on the first batch and comparing |a| against the target's
+        # separates them: drift shows as a ratio moving away from 1.0 while the
+        # loss rises, degradation shows as the loss rising with the ratio flat.
+        amp_pred = amp_tgt = 0.0
         for i, b in enumerate(loader):
             if i >= val_max_batches:
                 break
@@ -977,12 +985,30 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                   else torch.autocast(device_type="cpu", enabled=False)):
                 loss, _ = policy.forward(b)
             tot += float(loss.detach()); n += 1
+            if i == 0 and hasattr(policy, "predict_action_chunk"):
+                try:
+                    policy.reset()
+                    pred = policy.predict_action_chunk(b).float()
+                    tgt = b["action"].float()
+                    h = min(pred.shape[1], tgt.shape[1])
+                    m = tgt.new_ones(tgt.shape[:2])
+                    pad = b.get("action_is_pad")
+                    if pad is not None:
+                        m = (~pad.bool()).to(tgt.dtype)
+                    m = m[:, :h].unsqueeze(-1)
+                    d = tgt.shape[-1] - 1        # drop the gripper channel
+                    amp_pred = float((pred[:, :h, :d].abs() * m).sum()
+                                     / m.sum().clamp(min=1) / d)
+                    amp_tgt = float((tgt[:, :h, :d].abs() * m).sum()
+                                    / m.sum().clamp(min=1) / d)
+                except Exception:
+                    amp_pred = amp_tgt = 0.0
         torch.set_rng_state(cpu_state)
         if cuda_state is not None:
             torch.cuda.set_rng_state_all(cuda_state)
         if was_training:
             policy.train()
-        return tot / max(1, n)
+        return tot / max(1, n), amp_pred, amp_tgt
 
     # Training loop
     print("Starting training loop...")
@@ -1075,16 +1101,21 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                 })
 
             if val_loader is not None and step > 0 and step % val_every == 0:
-                v = run_eval_loss(val_loader)
-                f = run_eval_loss(fit_loader)
+                v, ap, at = run_eval_loss(val_loader)
+                f, _, _ = run_eval_loss(fit_loader)
                 gap = 100.0 * (v - f) / max(abs(f), 1e-9)
+                ratio = ap / at if at > 0 else float("nan")
                 print(f"\n  VAL @ {step}   "
                       f"fit(train eps) {f:.4f}   held-out {v:.4f}   "
                       f"gap {gap:+.1f}%"
-                      f"   [both eval mode, no augmentation]")
+                      f"   [both eval mode, no augmentation]\n"
+                      f"      |action| predicted {ap:.4f} vs target {at:.4f}"
+                      f"   ratio {ratio:.3f}"
+                      f"   (>1 = the policy is taking BIGGER steps than the demos)")
                 with open(output_directory / "val_log.jsonl", "a") as fh:
                     fh.write(json.dumps({"step": step, "fit": f, "heldout": v,
-                                         "gap_pct": gap}) + "\n")
+                                         "gap_pct": gap, "amp_pred": ap,
+                                         "amp_target": at, "amp_ratio": ratio}) + "\n")
 
             if step > 0 and step % checkpoint_freq == 0:
                 checkpoint_dir = output_directory / f"checkpoint-{step}"
