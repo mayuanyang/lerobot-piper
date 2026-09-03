@@ -546,8 +546,14 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
             print(f"--start_step_override {start_step_override}: taking the "
                   f"WEIGHTS from step {step} but restarting the counter, so "
                   f"the schedule is rebuilt from scratch (warmup included) "
-                  f"over {training_steps} steps.")
+                  f"over {training_steps} steps. Epoch resets too "
+                  f"(checkpoint said {epoch}) -- it counts passes over THIS "
+                  f"dataset, and carrying the previous run's total over makes "
+                  f"the saved training_epoch unreadable: a 7-epoch run on a "
+                  f"new set was saved as 21 and read back as heavy "
+                  f"overtraining that never happened.")
             step = int(start_step_override)
+            epoch = 0
         print(f"Resuming from step {step}, epoch {epoch}")
 
         print(f"Loading weights from: {model_file}")
