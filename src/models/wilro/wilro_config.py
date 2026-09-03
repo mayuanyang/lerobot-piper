@@ -213,7 +213,13 @@ class WilroConfig(PreTrainedConfig):
     # robot-specific instructions and spatial grounding.
     # Base weights stay frozen; only LoRA params are trainable.
     lora_rank: int = 16
-    lora_alpha: int = 32
+    # float, not int: LoRALinear uses it only as the ratio alpha/rank, and
+    # the trainer's default of 2 x rank is written out as e.g. 128.0. Declared
+    # as int, draccus refused to load any checkpoint carrying such a value --
+    #   DecodingError: `lora_alpha`: Couldn't parse '128.0' into an int
+    # so a run trained fine and then could not be evaluated. Widening also
+    # reads the older checkpoints, whose value is a plain 32.
+    lora_alpha: float = 32.0
     lora_dropout: float = 0.05
     lora_target_modules: list = field(default_factory=lambda: ["q_proj", "v_proj"])
     vision_lora_num_layers: int = 8  # Last 8 layers of SigLIP ViT get LoRA
