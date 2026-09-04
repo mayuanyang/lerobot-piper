@@ -40,6 +40,7 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 
 from .wilro_config import WilroConfig
 from ..interleaved_flow_matching.expert_layer import RMSNorm, SwiGLU
+from ..transformer_flow_matching.robot_visual_encoder import RobotVisualEncoder
 
 
 # ---------------------------------------------------------------------------
@@ -637,9 +638,76 @@ class WilroTransformer(nn.Module):
         # forward pass, with natural language-vision alignment from SigLIP's
         # contrastive pretraining.
         self.robot_vlm_layer_offset = getattr(config, "robot_vlm_layer_offset", -3)
-        if self.use_robot_ca:
+        self.robot_ca_source = getattr(config, "robot_ca_source", "vlm_intermediate")
+        if self.robot_ca_source not in ("vlm_intermediate", "resnet"):
+            raise ValueError(
+                f"robot_ca_source must be 'vlm_intermediate' or 'resnet', "
+                f"got {self.robot_ca_source!r}")
+        self.robot_visual_encoder = None
+        self.robot_motion_gate = None
+        self.robot_motion_tokens = 0
+
+        # Guard here as well as in the trainer. The trainer's preflight cannot
+        # see a config that arrives from a checkpoint, and this combination
+        # fails silently rather than loudly: the motion tokens are simply never
+        # produced, so an eval reports on a model that has no motion path while
+        # its config says it does.
+        if (int(getattr(config, "robot_cnn_motion_tokens", 0) or 0) > 0
+                and self.robot_ca_source != "resnet"):
+            raise ValueError(
+                f"robot_cnn_motion_tokens="
+                f"{getattr(config, 'robot_cnn_motion_tokens')} requires "
+                f"robot_ca_source='resnet'; got {self.robot_ca_source!r}. The motion "
+                f"tokens come from differencing the ResNet's own feature maps.")
+
+        if self.use_robot_ca and self.robot_ca_source == "resnet":
+            # out_dim is hidden_size, not some CNN width: robot_ca_k_proj /
+            # v_proj are built at hidden_size and are SHARED across DiT layers,
+            # so the encoder must land in that space directly.
+            self.robot_visual_encoder = RobotVisualEncoder(
+                input_size=int(config.robot_encoder_input_size),
+                out_tokens=int(config.robot_encoder_tokens),
+                out_dim=self.hidden_size,
+                pool=str(getattr(config, "robot_encoder_pool", "avg")),
+            )
+            self.robot_motion_tokens = int(getattr(config, "robot_cnn_motion_tokens", 0) or 0)
+            if self.robot_motion_tokens > 0 and getattr(config, "robot_encoder_pool", "avg") == "attn":
+                raise ValueError(
+                    "robot_cnn_motion_tokens needs a second pooling grid from the same "
+                    "backbone, and AttentionPool2d's queries are parameters fixed at "
+                    "construction. Use robot_encoder_pool='avg' for the motion path.")
+            if self.robot_motion_tokens > 0:
+                # Zero-init scalar, exactly like moe's robot_pos_gate. Two jobs:
+                # the motion path starts as a no-op so Stage C cannot break
+                # Stage A's initialisation, and the gate's magnitude is the
+                # instrument that catches suppression -- the sibling's wrist
+                # encoder was only caught because its gate was logged.
+                self.robot_motion_gate = nn.Parameter(torch.zeros(1))
+            cams = list(getattr(config, "robot_cnn_cameras", None) or [])
+            self.robot_cnn_cameras = cams or list(config.cameras_for_vision_state_concat)
+            n_cam = len(self.robot_cnn_cameras)
+            px = config.robot_encoder_input_size / max(int(config.robot_encoder_tokens) ** 0.5, 1)
+            print(f"[wilro] Robot CA: ResNet-18 (trainable) — "
+                  f"{config.robot_encoder_tokens} tok x {n_cam} cam "
+                  f"@ {config.robot_encoder_input_size}px = {px:.0f} px/token, "
+                  f"pool={getattr(config, 'robot_encoder_pool', 'avg')!r}")
+            if self.robot_motion_tokens > 0:
+                print(f"[wilro] Robot CA motion: +{self.robot_motion_tokens} tok/cam from "
+                      f"feature-map diff at stride {config.robot_cnn_motion_stride} "
+                      f"(zero-init gate; VLM still sees ONE frame)")
+        elif self.use_robot_ca:
+            self.robot_cnn_cameras = []
             print(f"[wilro] Robot CA: SigLIP ViT intermediate layer "
                   f"(offset={self.robot_vlm_layer_offset}, LoRA-adapted, language-aligned)")
+        else:
+            self.robot_cnn_cameras = []
+
+        # Stage B. The slice this guards has meant --n_obs_steps changed nothing
+        # the model sees; see the config comment for the leak control.
+        self.use_state_history = bool(getattr(config, "use_state_history", False))
+        if self.use_state_history:
+            print(f"[wilro] state history ENABLED — all {config.n_obs_steps} state "
+                  f"frames enter the DiT (was: sliced to the last one)")
 
         # ─────────────────────────────────────────────────────────────
         # 5. Latent "thought" tokens — task-conditional, zero-init output
@@ -900,7 +968,9 @@ class WilroTransformer(nn.Module):
         device = batch["observation.state"].device
 
         # Extract intermediate features for Robot CA (SigLIP ViT intermediate layers)
-        need_intermediate = self.use_robot_ca
+        # Under the ResNet source the VLM intermediate is never read, so do not
+        # pay for output_hidden_states + a second connector pass to build it.
+        need_intermediate = self.use_robot_ca and self.robot_ca_source != "resnet"
         vis_tokens, intermediate_features = self._encode_images(batch, B, return_intermediate=need_intermediate)
         L_vis = vis_tokens.shape[1]
 
@@ -1022,22 +1092,86 @@ class WilroTransformer(nn.Module):
     # =========================================================================
     # DiT-side helpers: robot CNN, latents, time, input assembly
     # =========================================================================
+    def _resnet_robot_tokens(self, batch: dict) -> Optional[torch.Tensor]:
+        """Robot tokens from the trainable ResNet-18, one grid per camera.
+
+        Layout per camera: [ pool_N(f_t) , gate * pool_M(f_t - f_{t-k}) ], the
+        motion half present only when `robot_cnn_motion_tokens > 0`. Both halves
+        come from ONE shared backbone -- proj/norm are per-token, so the second
+        grid costs no parameters, and the ImageNet stem stays intact (stacking
+        the two frames into a 6-channel conv1 would destroy it).
+        """
+        enc = self.robot_visual_encoder
+        if enc is None:
+            return None
+        stride = int(getattr(self.config, "robot_cnn_motion_stride", 1) or 1)
+        out: list[torch.Tensor] = []
+        for cam_key in self.robot_cnn_cameras:
+            if cam_key not in batch:
+                continue
+            imgs = batch[cam_key]
+            if imgs.dim() == 5:
+                cur = imgs[:, -1]
+                # The trainer requests exactly [-stride*dt, 0.0], so the older
+                # frame is index 0. Anything else means the window and the
+                # config disagree, and silently differencing the wrong pair
+                # would look like a weak-but-present motion signal rather than
+                # a bug.
+                older = imgs[:, 0] if imgs.shape[1] >= 2 else None
+            else:
+                cur, older = imgs, None
+
+            if self.robot_motion_tokens > 0:
+                if older is None:
+                    raise ValueError(
+                        f"robot_cnn_motion_tokens={self.robot_motion_tokens} needs two "
+                        f"camera frames, but '{cam_key}' arrived with "
+                        f"{tuple(imgs.shape)}. The trainer must request "
+                        f"[-{stride}*frame_time, 0.0] for the cameras; check that "
+                        f"--robot_cnn_motion_tokens reached build_datasets too.")
+                fm_cur = enc.trunk(cur.float())
+                fm_old = enc.trunk(older.float())
+                toks = enc.tokens_from_map(fm_cur, out_tokens=enc.out_tokens)
+                mot = enc.tokens_from_map(fm_cur - fm_old,
+                                          out_tokens=self.robot_motion_tokens)
+                mot = self.robot_motion_gate.to(mot.dtype) * mot
+                out.append(torch.cat([toks, mot], dim=1))
+            else:
+                out.append(enc(cur.float()))
+
+        if not out:
+            return None
+        return torch.cat(out, dim=1)
+
     def _compute_robot_tokens(
         self,
+        batch: dict,
         vlm_robot_features: Optional[torch.Tensor],
     ) -> Optional[torch.Tensor]:
-        """Compute robot visual tokens from SigLIP ViT intermediate features.
+        """Compute robot visual tokens for Robot CA.
+
+        Source is `config.robot_ca_source`: either the VLM's own SigLIP ViT
+        intermediate layer (frozen base + LoRA) or a separate trainable
+        ResNet-18. Exactly one of them -- see the config for why this replaces
+        rather than adds.
 
         Args:
+            batch: input batch (ResNet source reads the camera tensors)
             vlm_robot_features: pre-extracted VLM vision intermediate features
-                from SigLIP ViT (with LoRA adaptation)
+                from SigLIP ViT (with LoRA adaptation); None under the ResNet
+                source, where it is never computed.
 
         Returns:
             robot_tokens: (B, R, hidden_size) — robot visual tokens
         """
-        if vlm_robot_features is None:
+        if self.robot_ca_source == "resnet":
+            toks = self._resnet_robot_tokens(batch)
+            if toks is None:
+                return None
+        elif vlm_robot_features is None:
             return None
-        toks = vlm_robot_features
+        else:
+            toks = vlm_robot_features
         vp = float(getattr(self.config, "vision_dropout_prob", 0.0)) if self.training else 0.0
         if vp > 0:
             B, R, _ = toks.shape
@@ -1102,7 +1236,7 @@ class WilroTransformer(nn.Module):
             state = state.unsqueeze(1)
         state = state.nan_to_num(0.0).clamp(-10.0, 10.0)
         state_tok = self.state_encoder(state).to(dtype)
-        if state_tok.shape[1] > 1:
+        if state_tok.shape[1] > 1 and not self.use_state_history:
             state_tok = state_tok[:, -1:]
 
         action_emb = self.action_in_proj(noisy_actions) + self.action_pos_emb[:, :H]
@@ -1433,7 +1567,7 @@ class WilroTransformer(nn.Module):
          lang_embeddings, robot_features) = self._run_vlm_and_cache_kv(batch)
 
         # ── DiT-side conditioning that does NOT depend on noise ─────
-        robot_tokens = self._compute_robot_tokens(robot_features)
+        robot_tokens = self._compute_robot_tokens(batch, robot_features)
         latents = self._generate_latents(batch, B, device, torch.bfloat16)
 
         # ── Action prefix for async execution training ──────────────
@@ -1616,7 +1750,7 @@ class WilroTransformer(nn.Module):
         with autocast_ctx:
             (kv_cache, vlm_kv_pad_mask, L_vis, L_lang,
              lang_embeddings, robot_features) = self._run_vlm_and_cache_kv(batch)
-            robot_tokens = self._compute_robot_tokens(robot_features)
+            robot_tokens = self._compute_robot_tokens(batch, robot_features)
             latents = self._generate_latents(batch, B, device, torch.bfloat16)
 
             N = int(getattr(self.config, "num_inference_steps", 10))
@@ -1646,7 +1780,7 @@ class WilroTransformer(nn.Module):
         with autocast_ctx:
             (kv_cache, vlm_kv_pad_mask, L_vis, L_lang,
              lang_embeddings, robot_features) = self._run_vlm_and_cache_kv(batch)
-            robot_tokens = self._compute_robot_tokens(robot_features)
+            robot_tokens = self._compute_robot_tokens(batch, robot_features)
             latents = self._generate_latents(batch, B, device, torch.bfloat16)
 
             N = int(getattr(self.config, "num_inference_steps", 10))

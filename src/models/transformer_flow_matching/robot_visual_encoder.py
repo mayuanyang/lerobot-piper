@@ -10,7 +10,10 @@ Fine-tuning on robot data adapts these to gripper aperture, object
 distance, contact state — features SigLIP misses because its patch
 size is too coarse and its pretraining domain is internet images.
 
-~11M params (ResNet-18 backbone), negligible vs VLM.
+~3.0M params. NOT the 11.7M of a full ResNet-18: layer4 is 72% of that and is
+excluded here, so quoting the stock figure overstates this module ~4x. The
+number appears as "~11M" in interleaved's ARCHITECTURE.md and in the wilro
+notes; both are the stock ResNet, not what is built.
 """
 
 import math
@@ -144,7 +147,8 @@ class RobotVisualEncoder(nn.Module):
     """
     Pretrained ResNet-18 backbone producing spatial feature tokens.
 
-    Uses layers 1–3 of ResNet-18 (output stride 8, 256-channel feature map),
+    Uses layers 1–3 of ResNet-18 (output stride 16, 256-channel feature map:
+    a 256px frame gives a 16x16 map — verified, not inferred),
     then adaptive-pools to a fixed token grid and projects to d_model.
     Layer 4 is excluded to keep spatial resolution higher (better for
     precise localisation tasks like grasping).
@@ -210,6 +214,16 @@ class RobotVisualEncoder(nn.Module):
         Returns:
             (B, out_tokens, out_dim) float32 feature tokens.
         """
+        return self.tokens_from_map(self.trunk(x), out_tokens=out_tokens)
+
+    def trunk(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, 3, H, W) in [0, 1] -> (B, 256, S, S) pre-pool feature map.
+
+        Split out of `forward` so a caller can run the backbone on two frames
+        and difference the MAPS before pooling. Differencing the pooled output
+        instead would subtract post-LayerNorm tokens, which is not the same
+        quantity. `forward` is trunk + tokens_from_map and is unchanged.
+        """
         x = x.float()
 
         # Resize to fixed input size
@@ -224,7 +238,11 @@ class RobotVisualEncoder(nn.Module):
         feat = self.layer1(feat) # (B, 64,  56, 56)
         feat = self.layer2(feat) # (B, 128, 28, 28)
         feat = self.layer3(feat) # (B, 256, 14, 14)
+        return feat
 
+    def tokens_from_map(self, feat: torch.Tensor,
+                        out_tokens: Optional[int] = None) -> torch.Tensor:
+        """(B, 256, S, S) -> (B, out_tokens, out_dim). Pool + project + norm."""
         if self.pool_type == "attn":
             # The queries are PARAMETERS, so their count is fixed at
             # construction -- a per-call override cannot be honoured the way it

@@ -516,7 +516,9 @@ an intermediate layer and projecting them through the connector, we get:
 2. **Language-vision alignment** — SigLIP's contrastive pretraining ensures
    features are naturally aligned with language
 3. **No separate ResNet** — eliminates the need for a parallel vision encoder,
-   saving ~11M ResNet-18 parameters and simplifying the architecture
+   saving 3.0M ResNet-18 parameters and simplifying the architecture
+   (the "~11M" written here originally was the stock ResNet-18; this class
+   truncates at layer3 and layer4 alone is 72% of the stock count)
 4. **Connector-projected** — features go through the same pixel-shuffle
    resampler as the main vision tokens, ensuring consistent representation
 

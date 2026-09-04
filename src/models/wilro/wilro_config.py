@@ -154,6 +154,84 @@ class WilroConfig(PreTrainedConfig):
     # between spatial resolution and semantic richness.
     robot_vlm_layer_offset: int = -3
 
+    # Where Robot CA's K/V actually come from.
+    #
+    #   "vlm_intermediate" -- SigLIP ViT layer `robot_vlm_layer_offset`. Base
+    #       frozen; only the LoRA adapters and the connector train (~0.39M in
+    #       the robot-visual path). This is what ships and what every 2026-08/09
+    #       eval measured.
+    #   "resnet"           -- a separate, fully trainable ResNet-18 truncated
+    #       after layer3. 3.03M at out_dim 960, MEASURED -- not the 11.7M of a
+    #       stock ResNet-18, because layer4 is 72% of that and is excluded. The
+    #       "~11M" in the notes and in interleaved's ARCHITECTURE.md is the
+    #       stock figure and overstates this by ~4x, which matters: a rank-64
+    #       vision LoRA over 27 layers is 5.31M, i.e. ALREADY LARGER than this.
+    #       So if this source helps, raw trainable count is not the reason --
+    #       what differs is the KIND of pathway: full-resolution pixels (256px
+    #       native, stride 16 -> a 16x16 map), ImageNet init, and no frozen
+    #       semantic tower underneath. This was the source until 2026-07-06 (2446dbe
+    #       swapped it, 18fa4de deleted the encoder) and is still what
+    #       wiltechs_moe uses; removing it there cost 34 points of spatial
+    #       success (92 -> 58). wilro's own 82.5 on 2026-06-21 predates the swap
+    #       and the replacement was never A/B'd.
+    #
+    # This REPLACES the source, it does not add a second pathway alongside it.
+    # A parallel second visual encoder has been measured getting gated off by
+    # the optimizer on the sibling (wiltechs_x wrist encoder: 1e-3 -> 6.2e-4,
+    # confirmed twice), so "add and let the model choose" is not a neutral
+    # design -- it reliably chooses the pathway that is already trained.
+    robot_ca_source: str = "vlm_intermediate"
+
+    # ResNet source only. `robot_encoder_tokens` is the pooled grid per camera.
+    #
+    # The default here is deliberately NOT moe's 16. At input_size 224 a 14x14
+    # map pooled to 4x4 makes each token cover 64 native px of a 256px LIBERO
+    # frame -- HALF the granularity of the frozen VLM's 32 px merged patches,
+    # for a module whose stated purpose is the precision the ViT cannot reach.
+    # input_size 256 is the native frame (no resample) giving a 16x16 map:
+    #   64 tok  -> 32 px/token  (parity with the VLM)  <- default
+    #  144 tok  -> 21.3 px/token
+    #  256 tok  -> 16 px/token  (ceiling; every feature cell kept)
+    # Cost is per DiT layer -- Robot CA runs in all `num_vlm_layers` of them --
+    # and scales with num_cameras, so 3 x 256 is 768 extra K/V per layer.
+    robot_encoder_tokens: int = 64
+    robot_encoder_input_size: int = 256
+    # "avg" = adaptive average pooling (what moe runs). "attn" = AttentionPool2d,
+    # learned queries seeded to the position grid. attn cannot honour a per-call
+    # token override, which is why avg stays the default.
+    robot_encoder_pool: str = "avg"
+    # Which cameras get the ResNet. Empty = all of
+    # `cameras_for_vision_state_concat`.
+    robot_cnn_cameras: list[str] = field(default_factory=list)
+
+    # -------- Temporal input (Stage B / Stage C) --------
+    # wilro has no temporal input of any kind: `_encode_images` takes imgs[:, -1]
+    # and `_suffix_pass` slices state_tok[:, -1:], so `--n_obs_steps` has never
+    # changed anything the model sees. These two flags are what turn that off.
+    #
+    # B: keep every state frame instead of slicing to the last one. The leak
+    #    control is already run (notes/wiltechs_x_ablations.md): the momentum
+    #    shortcut sits 33x above the model's own residual, so this channel is
+    #    not a shortcut, and a four-condition dose-response (frozen < noise <
+    #    shuffled < real, Cochran-Armitage z=4.77, p=1.8e-06) says it carries
+    #    real information. The counter-risk is the same file's task 5, where
+    #    three independent corruptions of the window each cut time-to-success
+    #    195 -> ~110 steps: the window can sustain a dithering loop. wilro's
+    #    policy_chunks pins the 700 cap on exactly T1/T4/T5/T8/T9, which is that
+    #    signature -- so read this per task, not in aggregate.
+    use_state_history: bool = False
+
+    # C: a second, older camera frame through the SAME ResNet backbone, with the
+    #    FEATURE MAPS differenced and pooled to this many extra tokens. 0 off.
+    #    The VLM still sees one frame -- it is 40.8% of step time and semantics
+    #    do not change in 100ms; what changes is motion, which is the ResNet's
+    #    job. Requires robot_ca_source="resnet".
+    robot_cnn_motion_tokens: int = 0
+    # How many frames back the second frame is drawn from. At 10Hz demos and
+    # n_action_steps=2 the policy re-plans every 200ms, so 1 frame = 100ms is
+    # the natural pairing.
+    robot_cnn_motion_stride: int = 1
+
     # -------- Latent "thought" tokens --------
     # Task-conditional latent tokens generated from pooled language.
     # 0 disables (no latent tokens in DiT sequence).
