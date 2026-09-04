@@ -8,10 +8,27 @@ Mixture-of-Transformers (MoT) layout — the VLM never sees state/action tokens.
   layers) + SigLIP ViT (frozen base + LoRA adapters on last 8 layers). Runs
   **once per observation**, captures post-RoPE K/V from trailing `num_dit_layers`
   text layers as cross-attention memory for the DiT. Also extracts intermediate
-  SigLIP features for Robot CA.
+  SigLIP features for Robot CA, unless the ResNet source is selected.
 - **Decoder** = a `num_dit_layers`-deep DiT. Runs **N times per observation**
   during the flow-matching denoising loop. Each DiT layer cross-attends to one
-  matched VLM KV pair **and** to SigLIP ViT intermediate features (Robot CA).
+  matched VLM KV pair **and** to robot visual tokens (Robot CA).
+
+**Robot CA has two selectable sources** (`config.robot_ca_source`), and the
+choice is the single largest open question about this model — see
+[Robot Cross-Attention Detail](#robot-cross-attention-detail):
+
+| value | tokens from | trainable in that path |
+|---|---|---|
+| `vlm_intermediate` *(default)* | SigLIP ViT layer `robot_vlm_layer_offset`, connector-projected | 0.39M (LoRA only; base frozen) |
+| `resnet` | a separate ResNet-18 truncated after layer3 | 3.03M (fully trainable) |
+
+Two further pathways are **off by default** and exist to give the model temporal
+input, which it otherwise has none of (image and state are both single-frame):
+
+| flag | effect |
+|---|---|
+| `use_state_history` | stop slicing `state_tok[:, -1:]`, so all `n_obs_steps` frames enter the DiT |
+| `robot_cnn_motion_tokens` | extra tokens from differencing the ResNet feature maps of two camera frames (needs `robot_ca_source="resnet"`) |
 
 ```
 ╔════════════════════════════════════════════════════════════════════════════╗
@@ -35,11 +52,22 @@ Mixture-of-Transformers (MoT) layout — the VLM never sees state/action tokens.
   │  K/V cache (last N   │       │              │
   │  text layers) +      │       │              │
   │  intermediate SigLIP │       │              │
-  │  features (Robot CA) │       │              │
+  │  features (Robot CA, │       │              │
+  │  vlm_intermediate    │       │              │
+  │  source only)        │       │              │
   └──────────┬───────────┘       │              │
              │ kv_cache          │              │
              │ [(K₀,V₀)..(K_{N-1},V_{N-1})]     │
              │ + robot_features  │              │
+             │                   │              │
+  ┌──────────┴───────────┐       │              │
+  │  ResNet-18 → layer3  │       │              │  robot_ca_source
+  │  (trainable, 3.03M)  │       │              │  == "resnet":
+  │  OPTIONAL — replaces │       │              │  robot tokens come
+  │  the SigLIP source,  │       │              │  from here instead,
+  │  never runs beside   │       │              │  and the VLM's
+  │  it                  │       │              │  intermediate is
+  └──────────┬───────────┘       │              │  never computed
              │                   │              │
              ▼                   ▼              ▼
          ┌──────────────────────────────────────────┐
@@ -140,16 +168,24 @@ Also emitted by Stage A:
   projected through the connector. These are **LoRA-adapted** and naturally
   language-vision aligned through SigLIP's contrastive pretraining. Used as
   the source for Robot cross-attention K/V.
+  **`None` under `robot_ca_source="resnet"`** — `output_hidden_states` and the
+  second connector pass are both skipped, since nothing would read the result.
 
 ### Gradient flow in Stage A
 
 ```
-  Vision LoRA gradient path:
+  Vision LoRA gradient path (robot_ca_source = "vlm_intermediate"):
     loss → DiT → robot_tokens → intermediate_features → connector → vision_model
                                                                   │
                                                                   └── LoRA adapters
                                                                       receive gradient
                                                                       (lora_A, lora_B)
+
+  Under robot_ca_source = "resnet" that arm is GONE — robot_tokens no longer
+  touch the ViT. The vision LoRA then receives gradient only through the main
+  vision tokens in the VLM KV cache, and the Robot CA arm instead trains the
+  ResNet end to end:
+    loss → DiT → robot_tokens → RobotVisualEncoder (stem/layer1-3/proj, 3.03M)
 
   Text LoRA gradient path (when enabled):
     loss → DiT cross-attn → KV cache (not detached) → text_model LoRA adapters
@@ -257,9 +293,14 @@ and KV caches are **not detached**, allowing gradients to flow:
 ### Building the DiT input sequence
 
 ```
-  state(B,7) ──► state_encoder ──► state_tok (B,1,h)
-  cameras   ──► SigLIP ViT intermediate ─► robot_tok (B, L_vis, h)
-                (LoRA-adapted, connector-projected)
+  state(B,T_s,7) ► state_encoder ──► state_tok (B,S,h)
+                   S = T_s if use_state_history else 1 (sliced to the last frame)
+  cameras   ──► Robot CA source ──► robot_tok (B, R, h)
+                vlm_intermediate: SigLIP ViT layer_offset, connector-projected
+                                  → R = L_vis
+                resnet:           ResNet-18→layer3, pooled per camera
+                                  → R = n_cam·(robot_encoder_tokens
+                                               + robot_cnn_motion_tokens)
   x_t (B,H,7) ─► action_in_proj + action_pos_emb ─► action_emb (B,H,h)
   prefix?  ───► action_in_proj.detach()  ─────────► prefix_emb (B,P,h)
   sink_token ─► learned 1-token parameter (B,1,h)
@@ -267,13 +308,13 @@ and KV caches are **not detached**, allowing gradients to flow:
 
   DiT sequence (concatenated):
 
-  ┌──────┬────────┬──────────────┬────────────┬──────────┬─────────────────┐
-  │ SINK │ latent │ state │ language(L)? │ prefix(P)? │ robot   │  action(H)      │
-  │  1   │   K    │   1   │      L       │     P      │  L_vis │       H         │
-  └──────┴────────┴───────┴──────────────┴────────────┴────────┴─────────────────┘
-                                                                  ▲
-                                                                  │
-                            action_start_idx = 1 + K + 1 + L + P + L_vis
+  ┌──────┬────────┬───────┬──────────────┬────────────┬───────┬────────────┐
+  │ SINK │ latent │ state │ language(L)? │ prefix(P)? │ robot │ action(H)  │
+  │  1   │   K    │   S   │      L       │     P      │   R   │     H      │
+  └──────┴────────┴───────┴──────────────┴────────────┴───────┴────────────┘
+                                                                ▲
+                                                                │
+                            action_start_idx = 1 + K + S + L + P + R
                                                                   │
                             readout slice for v_t
 
@@ -283,9 +324,10 @@ and KV caches are **not detached**, allowing gradients to flow:
   robot tokens learn to condition on the task instruction through
   self-attention, complementing the VLM cross-attention path.
 
-  Robot tokens come from SigLIP ViT intermediate layers (LoRA-adapted),
-  providing high-resolution spatial features with natural language-vision
-  alignment. No separate ResNet needed.
+  Robot tokens come from whichever source config.robot_ca_source names. The
+  layout is identical either way — only R changes — so the two are a clean
+  A/B, and switching is NOT resume-compatible (robot_ca_k/v_proj are trained
+  against one source's statistics).
 
   Note: latent tokens are DISABLED by default (num_latent_tokens=0).
 ```
@@ -347,11 +389,13 @@ residual stream. The `adaLN_modulation` last-linear is also zero-init, so
 at step 0 the model behaves exactly like a stack of residual no-ops on
 top of the input embedding.
 
-### Robot CA K/V projections (from SigLIP ViT intermediate features)
+### Robot CA K/V projections (from either source)
 
 ```
-  intermediate_features (B, L_vis, h)
-  ── from SigLIP ViT layer_offset (LoRA-adapted, connector-projected)
+  robot_tokens (B, R, h)   ── ONE of:
+    vlm_intermediate: SigLIP ViT layer_offset, LoRA-adapted, connector-projected
+    resnet:           ResNet-18→layer3 per camera, pooled to a token grid,
+                      optionally concatenated with gate·pool(f_t − f_{t−k})
        │
        ▼
   robot_ca_norm (RMSNorm)
@@ -362,7 +406,7 @@ top of the input embedding.
   Linear(h → kv_heads·head_dim)          Linear(h → kv_heads·head_dim)
        │                                     │
        ▼                                     ▼
-  reshape → (B, kv_heads, L_vis, head_dim)  same
+  reshape → (B, kv_heads, R, head_dim)      same
        │                                     │
        └──────────► robot_k, robot_v ────────┘
                     passed to every DiT layer's Robot cross-attn
@@ -468,6 +512,9 @@ velocities for different task instructions ("language forcing").
 | `h`     | hidden size (VLM text hidden_size)            | 960     |
 | `H`     | action horizon (`config.horizon`)             | 64      |
 | `L_vis` | total vision tokens (sum across cameras)      | ~729/cam|
+| `R`     | robot tokens reaching Robot CA                | `L_vis`, or `n_cam·(64+M)` under the ResNet source |
+| `S`     | state tokens in the DiT sequence              | **1** (`n_obs_steps` if `use_state_history`) |
+| `M`ᵣ    | ResNet motion tokens per camera               | **0** |
 | `L_lang`| language tokens after tokenization (padded)   | ≤48     |
 | `L_vlm` | `L_vis + L_lang`                              | —       |
 | `M`     | total SmolVLM2 text layers                    | depends |
@@ -493,7 +540,9 @@ velocities for different task instructions ("language forcing").
 | Time conditioning              | fused into emb   | adaLN-Zero       | **adaLN-Zero**         |
 | Action position in DiT seq     | n/a              | last             | **last**               |
 | Contrastive loss path          | full re-forward  | KV permute       | **KV permute**         |
-| Robot CNN cross-attn           | n/a (joint)      | no               | **yes (SigLIP interp)**|
+| Robot CNN cross-attn           | n/a (joint)      | no               | **yes (source selectable)** |
+| Image frames the VLM sees      | 1                | 1                | **1** (2 to the ResNet only, if motion is on) |
+| State frames reaching the model| all T            | 1                | **1** (all T if `use_state_history`) |
 | Language in DiT sequence       | yes (joint)      | no               | **yes**                |
 | Latent tokens                  | yes (dynamic)    | yes              | **no (disabled)**      |
 | GPU memory (relative)          | high             | very high        | low                    |
@@ -501,26 +550,89 @@ velocities for different task instructions ("language forcing").
 
 ## Robot Cross-Attention Detail
 
-### Why Robot CA from SigLIP ViT intermediate layers?
+### The two sources, and why the choice is still open
 
-The VLM's SigLIP ViT produces ~729 patches at 384×384 resolution. The final
-layer's features are highly semantic but lose fine spatial detail through
-global self-attention.
+**`vlm_intermediate` (default).** The VLM's SigLIP ViT produces ~729 patches at
+384×384. The final layer is highly semantic but loses fine spatial detail
+through global self-attention; an intermediate layer (default -3) retains more
+spatial structure while staying semantically rich. Projecting it through the
+connector gives:
 
-**Intermediate layers** (e.g., layer -3, third-to-last) retain more spatial
-structure while still being semantically rich. By extracting features from
-an intermediate layer and projecting them through the connector, we get:
+1. **LoRA-adapted features** — the trailing ViT layers carry adapters, so the
+   features are robot-domain adapted
+2. **Language-vision alignment** — free from SigLIP's contrastive pretraining
+3. **Connector-projected** — the same pixel-shuffle resampler as the main
+   vision tokens, so the representation is consistent
+4. **No second encoder to train** — 0.39M trainable in this path
 
-1. **LoRA-adapted features** — the last 5 ViT layers have LoRA adapters,
-   so intermediate features are robot-domain adapted
-2. **Language-vision alignment** — SigLIP's contrastive pretraining ensures
-   features are naturally aligned with language
-3. **No separate ResNet** — eliminates the need for a parallel vision encoder,
-   saving 3.0M ResNet-18 parameters and simplifying the architecture
-   (the "~11M" written here originally was the stock ResNet-18; this class
-   truncates at layer3 and layer4 alone is 72% of the stock count)
-4. **Connector-projected** — features go through the same pixel-shuffle
-   resampler as the main vision tokens, ensuring consistent representation
+**`resnet`.** A separate ResNet-18 truncated after layer3 (3.03M, fully
+trainable, ImageNet init), pooled to a token grid per camera. Spatial rather
+than semantic: at `robot_encoder_input_size=256` the feature map is 16×16, and
+the default 64 tokens give 32 native px each — parity with the VLM's merged
+patches, which is the point. It is what this model ran until 2026-07-06 and
+what `wiltechs_moe` still runs.
+
+**Neither list settles it, and the swap between them was never A/B'd.** The
+record, kept because each line cost an experiment:
+
+* wilro's best spatial, 82.5 (2026-06-21, ckpt 144k), predates the swap. That
+  checkpoint no longer exists, so 82.5 cannot be re-measured on the current
+  harness. Every 2026-08/09 number (66–69) is post-swap.
+* Between those two numbers sit a dataset change, a VLABench pretrain and an
+  unrecorded inference cadence, so the gap is not cleanly attributable either.
+* The sibling's ablation is the only controlled measurement of the pathway:
+  `wiltechs_moe` lost **34 points** of spatial success removing its RobotCNN
+  (92 → 58), same checkpoint lineage, same cadence.
+* Four capacity-flavoured interventions on the current architecture (training
+  budget 30k→40k, vision LoRA 8→16 layers, RFT data, +8000 steps) all landed
+  within ±2 points.
+
+**Trainable count is probably not the mechanism.** A rank-64 vision LoRA over
+27 ViT layers is 5.31M — already larger than the ResNet's 3.03M — and that run
+is not ahead. What differs is the *kind* of pathway: full-resolution pixels, a
+16×16 spatial map, ImageNet init, and no frozen semantic tower underneath.
+
+**Do not run both.** `resnet` replaces the source rather than adding a parallel
+encoder, deliberately: a second visual pathway alongside a trained one was
+measured getting gated off on the sibling (wiltechs_x wrist encoder, 1e-3 →
+6.2e-4, confirmed twice). "Add it and let the model choose" reliably chooses
+the incumbent.
+
+### Temporal pathways (both off by default)
+
+wilro has **no temporal input at all** in its default configuration — not a
+short history, one frame of everything. `_encode_images` takes `imgs[:, -1]`
+and `_suffix_pass` slices `state_tok[:, -1:]`, so `--n_obs_steps` has never
+changed what the model sees: the extra state frames are encoded and discarded.
+There is no velocity, no acceleration, and no way to tell a half-open drawer
+from a closing one.
+
+| flag | what it adds | cost |
+|---|---|---|
+| `use_state_history` | drops the state slice; all `n_obs_steps` frames enter the DiT | +`n_obs_steps−1` sequence positions |
+| `robot_cnn_motion_tokens` | `gate · pool(f_t − f_{t−k})` from the same ResNet backbone, concatenated after the current-frame grid | +1 ResNet pass and +1 video decode per camera |
+
+Three notes that are not obvious from the code:
+
+* **The VLM still sees one frame under the motion path, by design.** It is
+  40.8% of step time, and over 100 ms the semantics do not change — only the
+  motion, which is what the ResNet extracts. Doubling the VLM pass buys the
+  wrong thing at the highest price.
+* **The difference is taken on feature MAPS, not on pooled tokens.** Pooling is
+  followed by LayerNorm, so differencing after it is a different quantity. The
+  diff gets its own, smaller grid from the same backbone at no parameter cost
+  (`proj`/`norm` are per-token). The two frames are NOT stacked into a
+  6-channel `conv1`; that would destroy the ImageNet stem.
+* **The motion gate is zero-init**, so Stage C starts as an exact no-op over
+  Stage A, and the gate's magnitude is the instrument that detects suppression.
+
+Counter-evidence to hold onto for `use_state_history`: the leak control is
+already run and clears it (the momentum shortcut sits 33× above the model's own
+residual; frozen < noise < shuffled < real is a dose-response at z=4.77). But
+on the sibling's task 5 three independent corruptions of the window each cut
+time-to-success 195 → ~110 steps — the window can sustain a dithering loop —
+and wilro pins its step cap on exactly the five tasks with that signature.
+Read the result per task, not in aggregate.
 
 ### Architecture
 

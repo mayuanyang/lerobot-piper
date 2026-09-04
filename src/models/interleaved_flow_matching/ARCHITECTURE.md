@@ -335,7 +335,7 @@ Two mechanisms explicitly force the model to USE language:
 |---|---|---|
 | VLM backbone (16 layers, ViT, connector) — SmolVLM2-500M | ~500M | ✅ always |
 | State encoder: Linear(7→960) + RMSNorm | ~7K | ❌ |
-| RobotVisualEncoder ×3 cams: ResNet-18 stem+L1-3 + projection | ~11M | ❌ |
+| RobotVisualEncoder (ONE shared backbone, called per camera): ResNet-18 stem+L1-3 + projection | **2.79M + 256·d_model** (≈3.0M at d_model 960) | ❌ |
 | Latent generator MLP: Linear(960→1920) → SiLU → Linear(1920→8×960) | ~17M | ❌ |
 | Action in proj: Linear(7→960) | ~7K | ❌ |
 | Action time MLP: Linear(1920→960) + Linear(960→960) | ~2.8M | ❌ |

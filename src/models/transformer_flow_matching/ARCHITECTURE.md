@@ -211,7 +211,7 @@ A trainable action expert (16-layer TransformerDecoder) cross-attends to those s
 | SmolLM2 text transformer | `text_model` (16 of 32 layers) | ~240M | ✅ always |
 | context_proj + context_norm | `Linear(960→512) → GELU → Linear(512→512) + LN` | 0.76M | ❌ |
 | state_encoder | `Linear(7→512) + LN` | 0.3M | ❌ |
-| RobotVisualEncoder (×3 cams) | ResNet-18 stem+L1-3 + proj | ~11M | ❌ |
+| RobotVisualEncoder (ONE shared backbone, called per camera) | ResNet-18 stem+L1-3 + proj | **2.79M + 256·d_model** (≈3.0M at d_model 960) | ❌ |
 | robot_layer_projs (16 layers) | `Linear(512→512)` × 16 (no bias) | 4.2M | ❌ |
 | action_in_proj | `Linear(7→512)` | 4K | ❌ |
 | action_time_mlp | `Linear(1024→512) + Linear(512→512)` | 0.8M | ❌ |

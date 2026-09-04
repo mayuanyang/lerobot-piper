@@ -248,7 +248,7 @@ flowchart TD
 | `_run_vlm_and_cache_kv()` | `compute_loss`, `sample_actions` | Run frozen VLM, capture last-N-layer KV caches |
 | `_encode_images()` | `_run_vlm_and_cache_kv` | Vision model + connector forward pass |
 | `_encode_language()` | `_run_vlm_and_cache_kv`, `_generate_latents` | Tokenize + embed language instructions |
-| `_compute_robot_tokens()` | `compute_loss`, `sample_actions` | Robot CNN visual encoder (optional) |
+| `_compute_robot_tokens(batch, robot_features)` | `compute_loss`, `sample_actions` | Robot CA tokens from `config.robot_ca_source`: the VLM's SigLIP intermediate (`robot_features`) or the ResNet (`batch`) |
 | `_generate_latents()` | `compute_loss`, `sample_actions` | Pool language → latent thought tokens |
 | `_run_dit()` | `compute_loss`, `sample_actions` | Full DiT decoder forward (N layers) |
 | `_build_dit_input()` | `_run_dit` | Assemble DiT sequence: [SINK, latent, state, prefix, robot, action] |
