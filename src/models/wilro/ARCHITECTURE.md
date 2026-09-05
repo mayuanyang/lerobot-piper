@@ -37,6 +37,31 @@ input, which it otherwise has none of (image and state are both single-frame):
 | `use_state_history` | stop slicing `state_tok[:, -1:]`, so all `n_obs_steps` frames enter the DiT |
 | `robot_cnn_motion_tokens` | extra tokens from differencing the ResNet feature maps of two camera frames (needs `robot_ca_source="resnet"`) |
 
+### Loading 2026-06/07 checkpoints
+
+`use_robot_cnn`, `gripper_camera` and `gripper_encoder_tokens` are accepted as
+legacy aliases and translated in `__post_init__` (`use_robot_cnn=True` →
+`robot_ca_source="resnet"`; the gripper pair → `robot_cnn_fine_cameras` /
+`robot_cnn_fine_tokens`). Verified against a real 50k config: 873/873 state_dict
+keys, `load_state_dict(strict=True)` clean.
+
+**Architecture timeline — the ResNet and Robot CA are NOT the same change:**
+
+| date | commit | robot visual source | Robot CA sublayer | adaLN |
+|---|---|---|---|---|
+| 2026-05-31 | 29b0afc | ResNet-18 | **no** | 9×960 |
+| **2026-06-21** | — | **ResNet-18** | **no** | **9×960** |
+| 2026-06-30 | b3b89f1 | ResNet-18 | **yes** | 12×960 |
+| 2026-07-06 | 2446dbe/18fa4de | SigLIP intermediate | yes | 12×960 |
+
+The 82.5 checkpoint (2026-06-21) predates Robot CA by nine days: its ResNet
+tokens entered the DiT **sequence** and were reached by self-attention only.
+`robot_ca_source="resnet"` with the current default `use_robot_ca=True`
+therefore reproduces the **2026-07-01** architecture, not the 82.5 one. The
+82.5 arm would additionally need `use_robot_ca=False`, and the encoder is
+currently only constructed when `use_robot_ca` is on — so that combination is
+not yet expressible.
+
 ```
 ╔════════════════════════════════════════════════════════════════════════════╗
 ║                    Top-level forward pass (inference)                      ║

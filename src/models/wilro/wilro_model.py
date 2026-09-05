@@ -1132,6 +1132,11 @@ class WilroTransformer(nn.Module):
         if enc is None:
             return None
         stride = int(getattr(self.config, "robot_cnn_motion_stride", 1) or 1)
+        # Per-camera grid. The wrist view carries contact geometry and wants a
+        # denser grid than the third-person view, which only supplies coarse
+        # approach context. Same backbone, different pooling, no extra params.
+        fine_cams = set(getattr(self.config, "robot_cnn_fine_cameras", None) or [])
+        fine_tok = int(getattr(self.config, "robot_cnn_fine_tokens", 0) or 0)
         out: list[torch.Tensor] = []
         for cam_key in self.robot_cnn_cameras:
             if cam_key not in batch:
@@ -1158,13 +1163,15 @@ class WilroTransformer(nn.Module):
                         f"--robot_cnn_motion_tokens reached build_datasets too.")
                 fm_cur = enc.trunk(cur.float())
                 fm_old = enc.trunk(older.float())
-                toks = enc.tokens_from_map(fm_cur, out_tokens=enc.out_tokens)
+                n_tok = fine_tok if (fine_tok > 0 and cam_key in fine_cams) else enc.out_tokens
+                toks = enc.tokens_from_map(fm_cur, out_tokens=n_tok)
                 mot = enc.tokens_from_map(fm_cur - fm_old,
                                           out_tokens=self.robot_motion_tokens)
                 mot = self.robot_motion_gate.to(mot.dtype) * mot
                 out.append(torch.cat([toks, mot], dim=1))
             else:
-                out.append(enc(cur.float()))
+                n_tok = fine_tok if (fine_tok > 0 and cam_key in fine_cams) else None
+                out.append(enc(cur.float(), out_tokens=n_tok))
 
         if not out:
             return None

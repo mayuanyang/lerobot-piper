@@ -15,6 +15,7 @@ The DiT shares the VLM's attention shape (hidden_size / num_heads / num_kv_heads
 """
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
@@ -203,6 +204,30 @@ class WilroConfig(PreTrainedConfig):
     # Which cameras get the ResNet. Empty = all of
     # `cameras_for_vision_state_concat`.
     robot_cnn_cameras: list[str] = field(default_factory=list)
+    # Per-camera token override: cameras listed here emit `robot_cnn_fine_tokens`
+    # instead of `robot_encoder_tokens`. 0 disables. One shared backbone serves
+    # both grids at no parameter cost -- RobotVisualEncoder.forward takes an
+    # out_tokens override and only the pooling depends on it.
+    #
+    # This exists so "give the wrist more resolution" does not have to be
+    # bundled with "drop the other camera's CNN pathway": those are two changes,
+    # and the sibling's 34-point ablation says the pathway as a whole is
+    # load-bearing. It is also what the 2026-06/07 checkpoints used, under the
+    # names gripper_camera / gripper_encoder_tokens.
+    robot_cnn_fine_cameras: list[str] = field(default_factory=list)
+    robot_cnn_fine_tokens: int = 0
+
+    # ---- Legacy aliases: checkpoints written 2026-06-30 .. 2026-07-06 ----
+    # That window is the only one where the ResNet and Robot CA both existed
+    # (b3b89f1 added Robot CA on 06-30; 2446dbe/18fa4de replaced the ResNet on
+    # 07-06). Their config.json carries three field names that no longer exist,
+    # and draccus refuses the whole file on an unknown key -- so a checkpoint
+    # that trains fine becomes unloadable, the same failure mode as lora_alpha.
+    # Accepted here and translated in __post_init__; None means "not a legacy
+    # config, do not translate".
+    use_robot_cnn: Optional[bool] = None
+    gripper_camera: Optional[str] = None
+    gripper_encoder_tokens: Optional[int] = None
 
     # -------- Temporal input (Stage B / Stage C) --------
     # wilro has no temporal input of any kind: `_encode_images` takes imgs[:, -1]
@@ -308,6 +333,45 @@ class WilroConfig(PreTrainedConfig):
     training_epoch: int = 0
     current_lr: float = 0.0
     training_steps_total: int = 0
+
+    def __post_init__(self):
+        """Translate the 2026-06/07 field names onto the current ones.
+
+        Only fires when a legacy key is actually present, so a current config is
+        untouched. Explicit current values win: if someone passes both
+        use_robot_cnn and robot_ca_source, the new one is authoritative rather
+        than being silently overwritten by a compatibility shim.
+        """
+        parent = getattr(super(), "__post_init__", None)
+        if parent is not None:
+            parent()
+        if self.use_robot_cnn is None and self.gripper_camera is None \
+                and self.gripper_encoder_tokens is None:
+            return
+        moved = []
+        if self.use_robot_cnn is not None:
+            if not self.use_robot_cnn:
+                raise ValueError(
+                    "use_robot_cnn=False came from a checkpoint whose DiT has no "
+                    "robot tokens at all. The current model has no way to express "
+                    "that -- robot_ca_source selects WHICH visual source feeds "
+                    "Robot CA, not whether one exists. This checkpoint needs the "
+                    "code of its own era.")
+            if self.robot_ca_source != "resnet":
+                self.robot_ca_source = "resnet"
+                moved.append("use_robot_cnn=True -> robot_ca_source='resnet'")
+        if self.gripper_camera and self.gripper_encoder_tokens:
+            if not self.robot_cnn_fine_cameras:
+                self.robot_cnn_fine_cameras = [self.gripper_camera]
+                self.robot_cnn_fine_tokens = int(self.gripper_encoder_tokens)
+                moved.append(
+                    f"gripper_camera/gripper_encoder_tokens -> "
+                    f"robot_cnn_fine_cameras={self.robot_cnn_fine_cameras} "
+                    f"/ robot_cnn_fine_tokens={self.robot_cnn_fine_tokens}")
+        if moved:
+            print("[wilro] legacy config translated:")
+            for m in moved:
+                print(f"          {m}")
 
     def validate_features(self) -> None:
         if len(self.image_features) == 0 and self.env_state_feature is None:
