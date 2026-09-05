@@ -154,7 +154,7 @@ def _log_gradient_analysis(policy, step: int) -> None:
         ("Text LoRA",        "text_model.layers"),            # Text model LoRA (trainable)
         ("Connector (frzn)", "connector"),
         ("State Enc",        "state_encoder"),
-        ("Robot CA K/V Proj","robot_ca_k_proj"),
+        ("Robot CA K Proj",  "robot_ca_k_proj"),
         ("Robot CA V Proj",  "robot_ca_v_proj"),
         ("Robot CA Norm",    "robot_ca_norm"),
         ("DiT layers",       "dit_layers"),

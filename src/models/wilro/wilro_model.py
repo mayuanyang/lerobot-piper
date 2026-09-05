@@ -493,6 +493,29 @@ class WilroTransformer(nn.Module):
             print(f"[wilro] SigLIP ViT LoRA: {vision_lora_layers} layers, "
                   f"rank={vision_lora_rank}, alpha={vision_lora_alpha}, "
                   f"{lora_params:,} trainable params")
+            # These adapters can only ever be reached one way. text_lora is 0,
+            # so the whole text stack runs under no_grad, the KV cache is
+            # .detach()ed unconditionally, and lang_embeddings is detached too.
+            # The single surviving path is
+            #   loss -> DiT -> robot_tokens -> intermediate_features
+            #        -> connector -> vision_model (LoRA)
+            # and robot_ca_source="resnet" severs exactly that. The adapters
+            # then sit in the optimizer with grad=None forever, which surfaces
+            # as a MISSING "Vision LoRA" line in the gradient analysis rather
+            # than a zero -- easy to read past.
+            if getattr(config, "robot_ca_source", "vlm_intermediate") == "resnet":
+                print(
+                    "  [WARN] robot_ca_source='resnet' severs the ONLY gradient path to\n"
+                    "         these adapters, so they will NOT train. The ViT is fully\n"
+                    "         frozen in this configuration.\n"
+                    "         This is not a defect -- it is exactly the 2026-06-21\n"
+                    "         architecture that scored 82.5 (18fa4de bundled 'add vision\n"
+                    "         LoRA' with 'remove ResNet'; before it,\n"
+                    "         vision_lora_num_layers defaulted to 0). But it means the\n"
+                    "         run is NOT a one-variable change against sft-40k: the\n"
+                    "         Robot CA source moved AND vision adaptation switched off.\n"
+                    "         Pass --vision_lora_num_layers 0 to make the config say\n"
+                    "         what the run actually does.")
         else:
             print("[wilro] SigLIP ViT LoRA: disabled (vision_lora_num_layers=0)")
 
@@ -777,6 +800,10 @@ class WilroTransformer(nn.Module):
         print(f"[wilro] DiT gradient checkpointing ENABLED "
               f"({self.num_dit_layers} layers will be recomputed in backward)")
         n_vis = int(getattr(self.config, "vision_lora_num_layers", 0) or 0)
+        if getattr(self.config, "robot_ca_source", "vlm_intermediate") == "resnet":
+            # No gradient reaches the ViT under this source, so checkpointing it
+            # buys a recompute in the backward for activations nobody differentiates.
+            n_vis = 0
         if n_vis > 0:
             try:
                 self.vision_model.gradient_checkpointing_enable()

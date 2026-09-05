@@ -20,7 +20,14 @@ choice is the single largest open question about this model — see
 | value | tokens from | trainable in that path |
 |---|---|---|
 | `vlm_intermediate` *(default)* | SigLIP ViT layer `robot_vlm_layer_offset`, connector-projected | 0.39M (LoRA only; base frozen) |
-| `resnet` | a separate ResNet-18 truncated after layer3 | 3.03M (fully trainable) |
+| `resnet` | a separate ResNet-18 truncated after layer3 | 3.03M (fully trainable); **the ViT LoRA goes dead** — see below |
+
+> Selecting `resnet` also freezes the SigLIP tower completely, because the Robot
+> CA arm is the only gradient path to it. That combination — trainable ResNet +
+> fully frozen ViT — is exactly the 2026-06-21 architecture that scored 82.5:
+> `18fa4de` bundled "add vision LoRA" with "remove ResNet", and before it
+> `vision_lora_num_layers` defaulted to 0. So it is a faithful restoration, but
+> it is **not** a one-variable change against the 2026-08/09 runs.
 
 Two further pathways are **off by default** and exist to give the model temporal
 input, which it otherwise has none of (image and state are both single-frame):
@@ -181,11 +188,17 @@ Also emitted by Stage A:
                                                                       receive gradient
                                                                       (lora_A, lora_B)
 
-  Under robot_ca_source = "resnet" that arm is GONE — robot_tokens no longer
-  touch the ViT. The vision LoRA then receives gradient only through the main
-  vision tokens in the VLM KV cache, and the Robot CA arm instead trains the
-  ResNet end to end:
+  Under robot_ca_source = "resnet" that arm is GONE, and NOTHING replaces it:
+  text_lora is 0 so the whole text stack runs under no_grad, the KV cache is
+  .detach()ed unconditionally, and lang_embeddings is detached too. The path
+  above is the ONLY route from the loss to the ViT, so selecting the ResNet
+  source leaves the SigLIP tower fully frozen — the adapters stay in the
+  optimizer with grad=None and never move. The Robot CA arm trains the ResNet
+  end to end instead:
     loss → DiT → robot_tokens → RobotVisualEncoder (stem/layer1-3/proj, 3.03M)
+
+  This surfaces as a MISSING "Vision LoRA" line in the trainer's gradient
+  analysis, not as a zero, because _grad_stats skips params whose grad is None.
 
   Text LoRA gradient path (when enabled):
     loss → DiT cross-attn → KV cache (not detached) → text_model LoRA adapters
