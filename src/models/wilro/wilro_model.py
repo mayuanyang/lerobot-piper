@@ -1025,6 +1025,27 @@ class WilroTransformer(SmolVLMEncoderMixin, nn.Module):
         # ── Flow matching: build noisy actions, predict velocity ────
         noise = self.sample_noise(actions.shape, device)
         t = self.sample_time(B, device)
+        # Prove the knob took, from the DRAWS rather than from the config: a
+        # flag that silently failed to reach sample_time looks identical in the
+        # loss curve, and the loss is not a check either -- `flow`'s residual is
+        # ~Var(noise) at t->0 and ~Var(action|obs) at t->1, so moving the t
+        # distribution moves the number with the model unchanged.
+        if not getattr(self, "_time_sampling_announced", False):
+            self._time_sampling_announced = True
+            mode = getattr(self.config, "time_sampling", "uniform")
+            print(
+                "[wilro] flow time sampling: " + mode
+                + (f"(mean {self.config.time_lognormal_mean:g}, "
+                   f"std {self.config.time_lognormal_std:g})"
+                   if mode == "lognormal" else "")
+                + f" — first batch t: median {float(t.median()):.3f}, "
+                  f"t<0.3 {float((t < 0.3).float().mean()):.0%}, "
+                  f"t>0.7 {float((t > 0.7).float().mean()):.0%}"
+                  "  (uniform is 0.500 / 30% / 30%)"
+                + ("\n[wilro]   `flow` is NOT comparable across time_sampling "
+                   "settings — judge this run on eval, not on the loss curve."
+                   if mode != "uniform" else "")
+            )
         t_exp = t[:, None, None]
         x_t = t_exp * noise + (1.0 - t_exp) * actions
         u_t = noise - actions
