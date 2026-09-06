@@ -683,7 +683,13 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         print(f"Resuming from step {step}, epoch {epoch}")
 
         print(f"Loading weights from: {model_file}")
-        ckpt_state = load_safetensors(model_file, device=str(device))
+        # CPU, not device. Loading the file straight onto the GPU makes the
+        # whole checkpoint resident ALONGSIDE the model that is about to receive
+        # it -- roughly a second copy of every parameter, for the duration of
+        # the copy. load_state_dict moves each tensor to its parameter's device
+        # anyway, so staging on the host costs nothing and is why resuming needs
+        # no more memory than starting fresh.
+        ckpt_state = load_safetensors(model_file, device="cpu")
 
         policy.train()
         policy.to(device)
@@ -697,7 +703,11 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         if missing_from_ckpt:
             print(f"Missing {len(missing_from_ckpt)} keys not in checkpoint (will use init values): {missing_from_ckpt[:10]}")
         policy.load_state_dict(filtered, strict=False)
-        print(f"Loaded {len(filtered)}/{len(cur_state)} model keys from checkpoint ({len(ckpt_state)} keys in file)")
+        n_loaded, n_file = len(filtered), len(ckpt_state)
+        del ckpt_state, filtered, cur_state
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        print(f"Loaded {n_loaded}/{len(policy.state_dict())} model keys from checkpoint ({n_file} keys in file)")
 
         preprocessor, postprocessor = make_pre_post_processors(
             policy.config,
@@ -723,7 +733,16 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         optimizer_state_path = local_ckpt_path / "optimizer_state.pth"
         if optimizer_state_path.exists():
             try:
-                optimizer.load_state_dict(torch.load(optimizer_state_path, map_location=device))
+                # map_location="cpu": Optimizer.load_state_dict casts each state
+                # tensor to its own parameter's device, so the GPU never holds
+                # the loaded dict AND the optimizer's copy at once. Adam state is
+                # 2 x trainable x 4 bytes -- 5.2 GB on wilro_moe -- so the
+                # transient double is what pushes a resume into OOM at a batch
+                # size that trains fine from scratch.
+                optimizer.load_state_dict(
+                    torch.load(optimizer_state_path, map_location="cpu"))
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = base_lr
                     param_group['initial_lr'] = base_lr
