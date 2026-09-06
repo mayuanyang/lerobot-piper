@@ -478,7 +478,7 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
                         batch, x_t.to(torch.bfloat16), t,
                         shuffled_cache, shuffled_pad_mask,
                         vision_tokens, latents, action_prefix, shuffled_lang,
-                        L_vis=L_vis, L_lang=L_lang,
+                        L_vis=L_vis, L_lang=L_lang, record=False,
                     ).float()
 
                 diff_sq = (v_t - v_wrong).pow(2).mean(dim=[1, 2])
@@ -637,7 +637,7 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
 
     def _run_dit(self, batch, noisy_actions, timesteps, kv_cache, vlm_kv_pad_mask,
                  vision_tokens, latents, action_prefix=None, lang_tokens=None,
-                 L_vis=0, L_lang=0):
+                 L_vis=0, L_lang=0, record=True):
         """Same signature as wilro's `_run_dit`, so the loss and sampling code
         extracted from it works unchanged. `latents`, `action_prefix` and
         `lang_tokens` are accepted and ignored: this model has no latent path,
@@ -663,11 +663,25 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
         # still average out flat if different samples collapse to different
         # experts. max_w and entropy read the PRE-noise weights, which is what
         # inference actually uses.
-        cw = self.router._last_clean_weights
-        if cw is not None:
-            self._last_router_max_w = float(cw.max(dim=-1).values.mean())
-            self._last_router_entropy = float(
-                -(cw.clamp(min=1e-9).log() * cw).sum(dim=-1).mean())
+        if record:
+            # record=False on the contrastive negative's forward. It runs AFTER
+            # the real one, under torch.no_grad(), and without this guard it
+            # OVERWRITES every router statistic -- so the log would describe
+            # routing under PERMUTED instructions while claiming to describe the
+            # real forward, and, far worse, `_last_router_usage` would be a
+            # graph-detached tensor. The balance penalty reads it AFTER
+            # compute_loss returns (it lives in the policy's forward), so a
+            # detached value makes the penalty a constant: added to the loss,
+            # contributing exactly zero gradient. Measured consequence of not
+            # having this guard: router collapsed to one expert by step 200 with
+            # `Router - Avg Abs Grad: 0.000000`, entropy 0.000, and nothing
+            # pushing back.
+            self._last_router_usage = usage
+            cw = self.router._last_clean_weights
+            if cw is not None:
+                self._last_router_max_w = float(cw.max(dim=-1).values.mean())
+                self._last_router_entropy = float(
+                    -(cw.clamp(min=1e-9).log() * cw).sum(dim=-1).mean())
 
         lo, hi = vis_span
         outs = []
@@ -689,7 +703,6 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
             outs.append(self.action_out_proj(
                 self.final_norm(x[:, action_start_idx:])))
         stacked = torch.stack(outs, dim=1)
-        self._last_router_usage = usage
         v = (weights.unsqueeze(-1).unsqueeze(-1) * stacked).sum(dim=1)
 
         # Do the experts DISAGREE? The mixture is a weighted mean of velocity
@@ -708,10 +721,11 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
         # the intended measurement once the adaLN gates have moved.
         # It is a diagnostic, not a loss. Driving it to zero would just make the
         # experts redundant, which is the opposite of what they are for.
-        with torch.no_grad():
-            spread = stacked.float().std(dim=1).mean()
-            scale = stacked.float().abs().mean().clamp(min=1e-8)
-            self._last_expert_disagreement = float(spread / scale)
+        if record:
+            with torch.no_grad():
+                spread = stacked.float().std(dim=1).mean()
+                scale = stacked.float().abs().mean().clamp(min=1e-8)
+                self._last_expert_disagreement = float(spread / scale)
         return v
 
     def router_balance_loss(self):
