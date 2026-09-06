@@ -160,7 +160,7 @@ def _log_gradient_analysis(policy, step: int) -> None:
         ("  ├─ VLM KV CA",   "ca_"),
         ("  └─ FFN",         "ffn"),
         ("Router",           "router"),
-        ("Thought QFormer",  "thought_qformer"),
+        ("Expert vis adapt", "expert_vision_adapter"),
         ("Action In/Out",    "action_"),
         ("Sink token",       "sink_token"),
         ("Final Norm",       "final_norm"),
@@ -172,8 +172,8 @@ def _log_gradient_analysis(policy, step: int) -> None:
 
     stats = getattr(policy.model, "_last_attention_stats", None)
     if stats:
-        # Match expert sequence order: [SINK, state, vision, thought, action]
-        order = ["sink", "state", "vision", "thought", "action"]
+        # Match expert sequence order: [SINK, state, vision, action]
+        order = ["sink", "state", "vision", "action"]
         ordered = [(k, stats[k]) for k in order if k in stats]
         cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in ordered)
         print(f"  Action→ self-attn : {cells}    (last DiT layer)")
@@ -281,12 +281,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           expert_num_layers: int = 8,
           dit_hidden_size: int = 960,
           vlm_capture_layers: str = "",
+          resnet_expert_adapter_dim: int = 0,
           router_temperature: float = 1.0,
           router_top_k: int = 0,
-          router_balance_weight: float = 0.1,
-          num_thought_tokens: int = 8,
-          thought_qformer_layers: int = 2,
-          thought_vlm_layer_idx: int = -1):
+          router_balance_weight: float = 0.1):
     """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model.
 
     `dataset_id` may be a single id or a list. Multiple datasets are concatenated
@@ -591,12 +589,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         expert_num_layers=expert_num_layers,
         dit_hidden_size=dit_hidden_size,
         vlm_capture_layers=[int(t) for t in vlm_capture_layers.split(",") if t.strip()],
+        resnet_expert_adapter_dim=resnet_expert_adapter_dim,
         router_temperature=router_temperature,
         router_top_k=router_top_k,
         router_balance_weight=router_balance_weight,
-        num_thought_tokens=num_thought_tokens,
-        thought_qformer_layers=thought_qformer_layers,
-        thought_vlm_layer_idx=thought_vlm_layer_idx,
     )
 
     # Model + checkpoint loading
@@ -1408,6 +1404,23 @@ if __name__ == "__main__":
     parser.add_argument("--vlm_capture_layers", type=str, default="",
                         help="Comma-separated VLM layer indices to capture. "
                              "Empty = all 32, which is what 4 x 8 wants.")
+    parser.add_argument("--resnet_expert_adapter_dim", type=int, default=0,
+                        help="Give each expert its own bottleneck MLP over the "
+                             "SHARED vision tokens (0 = off). The tokens are one "
+                             "set read by every expert, so their encoder gets a "
+                             "router-weighted sum of four demands and has to "
+                             "compromise; this lets the trunk stay generic while "
+                             "each expert learns its own read, at ~0.5M per "
+                             "expert at dim 256. Two caveats: it is partly "
+                             "redundant with each expert's own value projection, "
+                             "which is already a per-expert linear read of these "
+                             "tokens; and it makes router collapse MORE "
+                             "expensive, since a starved expert's adapter gets "
+                             "no gradient at all (mitigated by the zero-init "
+                             "residual, so untrained means identity). Default off "
+                             "because wiltechs_moe scores 92 WITHOUT it -- turning "
+                             "it on for the first run makes that comparison "
+                             "unattributable.")
     parser.add_argument("--router_temperature", type=float, default=1.0,
                         help="Softmax temperature on the router logits.")
     parser.add_argument("--router_top_k", type=int, default=0,
@@ -1422,17 +1435,6 @@ if __name__ == "__main__":
                              "reason. Read BOTH the usage line and the "
                              "per-sample max_w below it -- the batch mean can "
                              "look uniform while every sample is collapsed.")
-    parser.add_argument("--num_thought_tokens", type=int, default=8,
-                        help="Learned queries cross-attending to one VLM layer's "
-                             "KV, emitted into the expert sequence before the "
-                             "action tokens so causal self-attention reaches "
-                             "them. 0 disables.")
-    parser.add_argument("--thought_qformer_layers", type=int, default=2,
-                        help="Depth of the thought QFormer.")
-    parser.add_argument("--thought_vlm_layer_idx", type=int, default=-1,
-                        help="Which captured VLM layer the thoughts read. -1 = "
-                             "the deepest, where vision and the instruction are "
-                             "most fused.")
     parser.add_argument("--resnet_tokens", type=int, default=64,
                         help="ResNet source only: pooled tokens per camera "
                              "(perfect square for avg pooling). 64 at "

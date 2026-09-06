@@ -303,6 +303,36 @@ class WilroMoEConfig(PreTrainedConfig):
     # 4 x 8 = 32 wants. Must be divisible by num_experts.
     vlm_capture_layers: list = field(default_factory=list)
 
+    # Per-expert read of the SHARED vision tokens: a bottleneck MLP applied to
+    # the vision span of each expert's own copy of the sequence. 0 disables.
+    #
+    # The tokens are one set read by every expert, so the encoder that produced
+    # them receives a router-weighted sum of four demands and has to compromise.
+    # This lets the trunk stay generic while each expert learns its own read,
+    # for ~0.5M per expert at dim 256 against the ~3M (and 4x the convolution)
+    # that four separate ResNets would cost.
+    #
+    # Two things to know before turning it on:
+    #
+    #  * It is PARTLY redundant with what the experts already have. Each
+    #    expert's self-attention value projection is already a per-expert linear
+    #    read of these tokens. The adapter adds a nonlinearity and changes the
+    #    tokens' value in the RESIDUAL STREAM, which every later layer sees, so
+    #    it is not pure duplication -- but the marginal capacity is smaller than
+    #    the parameter count suggests.
+    #
+    #  * It makes router collapse MORE expensive, not less. With shared tokens a
+    #    collapsed router still trains the trunk through whichever expert is
+    #    live; with per-expert adapters the unused ones receive no gradient at
+    #    all and sit at init, so an expert coming back later reads vision
+    #    through an untrained map. That is why the adapter is a ZERO-INIT
+    #    RESIDUAL: untrained means identity, not garbage, and the gate doubles
+    #    as the instrument that catches suppression.
+    #
+    # Default off on purpose: wiltechs_moe scores 92 WITHOUT it, so switching it
+    # on for the first wilro_moe run would make that number unattributable.
+    resnet_expert_adapter_dim: int = 0
+
     router_temperature: float = 1.0
     # 0 = soft mixture over all experts. >0 keeps only the top-k.
     router_top_k: int = 0
@@ -311,18 +341,13 @@ class WilroMoEConfig(PreTrainedConfig):
     # training for the same reason.
     router_balance_weight: float = 0.1
 
-    # -------- Thought tokens (spatial reasoning bottleneck) --------
-    # A learned-query QFormer cross-attends to ONE VLM layer's KV -- by default
-    # the deepest, where vision and the instruction are most fused -- and emits
-    # K tokens into the expert input sequence, before the action tokens, so
-    # every action token can read them through causal self-attention.
-    num_thought_tokens: int = 8
-    thought_qformer_layers: int = 2
-    thought_vlm_layer_idx: int = -1
 
-    # -------- Latent "thought" tokens --------
-    # Task-conditional latent tokens generated from pooled language.
-    # 0 disables (no latent tokens in DiT sequence).
+    # -------- Latent tokens: INERT in this model --------
+    # wilro's task-conditional latents (an MLP over pooled language). The MoE
+    # decoder does not build them -- _generate_latents returns None -- so this
+    # is here only because the loss code is shared with wilro, which calls it.
+    # Not to be confused with wiltechs_moe's "thought" tokens, a QFormer over
+    # real VLM KV, which this model does not have either (removed 2026-09-05).
     num_latent_tokens: int = 0
 
     # -------- Vision token dropout (regularizer) --------

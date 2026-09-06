@@ -114,55 +114,6 @@ class ExpertDecoder(nn.Module):
         return x
 
 
-class ThoughtQFormer(nn.Module):
-    """Learned queries cross-attending to ONE VLM layer's K/V.
-
-    Reproduced from wiltechs_vla's LatentQFormer, which wiltechs_moe uses for
-    the same purpose. Gates start at 0.1 rather than 0: the tokens should be
-    gentle at the start, not inert, and `ca_o` keeps its default init so the
-    gated path is non-zero.
-    """
-
-    def __init__(self, dim, num_queries, n_layers, num_heads, num_kv_heads,
-                 head_dim, intermediate_size, rms_norm_eps=1e-5):
-        super().__init__()
-        self.num_heads, self.num_kv_heads, self.head_dim = num_heads, num_kv_heads, head_dim
-        self.queries = nn.Parameter(torch.randn(1, num_queries, dim) * 0.02)
-        self.layers = nn.ModuleList([
-            nn.ModuleDict(dict(
-                ca_norm=RMSNorm(dim, eps=rms_norm_eps),
-                ca_q=nn.Linear(dim, num_heads * head_dim, bias=False),
-                ca_o=nn.Linear(num_heads * head_dim, dim, bias=False),
-                ffn_norm=RMSNorm(dim, eps=rms_norm_eps),
-                ffn=SwiGLU(dim, intermediate_size),
-            )) for _ in range(n_layers)])
-        self.gates = nn.ParameterList(
-            [nn.Parameter(torch.full((2,), 0.1)) for _ in range(n_layers)])
-
-    def forward(self, vlm_k, vlm_v, vlm_kv_pad_mask):
-        B = vlm_k.shape[0]
-        x = self.queries.expand(B, -1, -1).to(vlm_k.dtype)
-        ca_mask = None
-        if vlm_kv_pad_mask is not None:
-            ca_mask = torch.zeros(B, 1, 1, vlm_kv_pad_mask.shape[-1],
-                                  device=x.device, dtype=x.dtype)
-            ca_mask.masked_fill_(
-                (~vlm_kv_pad_mask).unsqueeze(1).unsqueeze(1), float("-inf"))
-        Kv, Vv = vlm_k, vlm_v
-        if self.num_kv_heads != self.num_heads:
-            r = self.num_heads // self.num_kv_heads
-            Kv, Vv = Kv.repeat_interleave(r, dim=1), Vv.repeat_interleave(r, dim=1)
-        for blk, g in zip(self.layers, self.gates):
-            g0, g1 = g[0].to(x.dtype), g[1].to(x.dtype)
-            h = blk["ca_norm"](x)
-            Q = blk["ca_q"](h).view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-            a = F.scaled_dot_product_attention(Q, Kv, Vv, attn_mask=ca_mask)
-            a = a.transpose(1, 2).reshape(B, -1, self.num_heads * self.head_dim)
-            x = x + g0 * blk["ca_o"](a)
-            x = x + g1 * blk["ffn"](blk["ffn_norm"](x))
-        return x
-
-
 class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
     """SmolVLM2 encoder (shared with wilro) + a mixture of expert decoders."""
 
@@ -251,7 +202,7 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
         for e, blk in enumerate(self.expert_kv_blocks):
             print(f"  Expert {e}: VLM layers {blk}")
 
-        # ---- 3. Experts, router, thoughts --------------------------------
+        # ---- 3. Experts and router ---------------------------------------
         self.dit_hidden = int(getattr(config, "dit_hidden_size", 0)) or self.hidden_size
         if self.dit_hidden % self.head_dim != 0:
             raise ValueError(f"dit_hidden_size ({self.dit_hidden}) must be divisible "
@@ -284,22 +235,6 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
                                 vlm_hidden_size=self.hidden_size,
                                 temperature=float(config.router_temperature),
                                 top_k=int(config.router_top_k))
-
-        self.num_thought_tokens = int(getattr(config, "num_thought_tokens", 0) or 0)
-        if self.num_thought_tokens > 0:
-            self.thought_qformer = ThoughtQFormer(
-                dim=self.dit_hidden, num_queries=self.num_thought_tokens,
-                n_layers=int(config.thought_qformer_layers),
-                num_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
-                head_dim=self.head_dim, intermediate_size=self.intermediate_size,
-                rms_norm_eps=self.rms_norm_eps)
-            idx = int(config.thought_vlm_layer_idx)
-            self.thought_layer = capture[idx] if idx < 0 else idx
-            print(f"[wilro_moe] {self.num_thought_tokens} thought tokens from "
-                  f"VLM layer {self.thought_layer}")
-        else:
-            self.thought_qformer = None
-            self.thought_layer = None
 
         # ---- 4. Sequence embeddings --------------------------------------
         h = self.dit_hidden
@@ -342,6 +277,27 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
         else:
             print(f"[wilro_moe] vision tokens: SigLIP intermediate layer "
                   f"{self.vlm_vision_layer_offset}")
+
+        # Per-expert read of the shared vision tokens. Zero-init output over a
+        # residual, so an adapter that never trains is the identity map rather
+        # than noise -- which is what an expert the router starved would
+        # otherwise wake up to.
+        adim = int(getattr(config, "resnet_expert_adapter_dim", 0) or 0)
+        self.expert_vision_adapters = None
+        self.expert_vision_gates = None
+        if adim > 0:
+            self.expert_vision_adapters = nn.ModuleList()
+            for _ in range(n_exp):
+                mlp = nn.Sequential(RMSNorm(h, eps=self.rms_norm_eps),
+                                    nn.Linear(h, adim), nn.SiLU(),
+                                    nn.Linear(adim, h))
+                nn.init.zeros_(mlp[-1].weight)
+                nn.init.zeros_(mlp[-1].bias)
+                self.expert_vision_adapters.append(mlp)
+            self.expert_vision_gates = nn.Parameter(torch.zeros(n_exp))
+            per = (h * adim + adim * h + adim + h) / 1e6
+            print(f"[wilro_moe] per-expert vision adapters: dim {adim}, "
+                  f"{per:.2f}M x {n_exp} = {per * n_exp:.2f}M, zero-init residual")
 
         self.use_state_history = bool(getattr(config, "use_state_history", False))
         self.num_latent_tokens = 0            # wilro's latent path is unused here
@@ -630,8 +586,8 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
     # ---- decoder: mixture of experts --------------------------------------
 
     def _generate_latents(self, batch, B, device, dtype):
-        """wilro's task-conditional latent path is unused here; thought tokens
-        (a QFormer over real VLM KV) play that role and are built separately."""
+        """wilro's task-conditional latent path is unused here. The experts
+        reach the instruction through their cross-attention to the VLM KV."""
         return None
 
     def _pool_vlm_semantic(self, vlm_hidden, pad_mask):
@@ -645,12 +601,18 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
         m = pad_mask.unsqueeze(-1).to(vlm_hidden.dtype)
         return (vlm_hidden * m).sum(dim=1) / m.sum(dim=1).clamp(min=1e-6)
 
-    def _build_expert_input(self, batch, noisy_actions, vision_tokens, thoughts):
-        """[sink, state, vision, thought, action] -> (seq, action_start_idx, ...).
+    def _build_expert_input(self, batch, noisy_actions, vision_tokens):
+        """[sink, state, vision, action] -> (seq, action_start_idx, ...).
 
-        Thought tokens go BEFORE the action tokens so causal self-attention lets
-        every action token read them. Vision tokens likewise: there is no Vision
-        CA sublayer in this model, so the sequence is the only path to them.
+        Vision tokens go BEFORE the action tokens because this model has no
+        Vision CA sublayer: causal self-attention over the sequence is the only
+        path from an action query to them.
+
+        wiltechs_moe additionally puts K "thought" tokens here, from a QFormer
+        over the deepest VLM layer's KV. Dropped 2026-09-05: reported as not
+        earning its keep there, and it cost 18.4M plus a sequence region. No
+        wilro_moe checkpoint existed yet, so removing it was free -- which is
+        the only reason it is a deletion rather than a default-off flag.
         """
         B, H, _ = noisy_actions.shape
         dtype = noisy_actions.dtype
@@ -667,11 +629,11 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
         parts = [sink, state_tok]
         if vision_tokens is not None:
             parts.append(vision_tokens.to(dtype))
-        if thoughts is not None:
-            parts.append(thoughts.to(dtype))
+        vis_lo = 1 + state_tok.shape[1]
+        vis_hi = vis_lo + (0 if vision_tokens is None else vision_tokens.shape[1])
         parts.append(action_emb)
         seq = torch.cat(parts, dim=1)
-        return seq, seq.shape[1] - H, state_tok, action_emb
+        return seq, seq.shape[1] - H, state_tok, action_emb, (vis_lo, vis_hi)
 
     def _run_dit(self, batch, noisy_actions, timesteps, kv_cache, vlm_kv_pad_mask,
                  vision_tokens, latents, action_prefix=None, lang_tokens=None,
@@ -687,13 +649,8 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
             create_sinusoidal_pos_embedding(timesteps, self.dit_hidden).to(dtype).float()
         ).to(dtype)
 
-        thoughts = None
-        if self.thought_qformer is not None:
-            k, v = kv_cache[self.thought_layer]
-            thoughts = self.thought_qformer(k, v, vlm_kv_pad_mask).to(dtype)
-
-        seq, action_start_idx, state_tok, action_emb = self._build_expert_input(
-            batch, noisy_actions, vision_tokens, thoughts)
+        seq, action_start_idx, state_tok, action_emb, vis_span = self._build_expert_input(
+            batch, noisy_actions, vision_tokens)
         L = seq.shape[1]
         causal = torch.triu(torch.full((L, L), float("-inf"), device=device,
                                        dtype=dtype), diagonal=1)
@@ -712,15 +669,22 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
             self._last_router_entropy = float(
                 -(cw.clamp(min=1e-9).log() * cw).sum(dim=-1).mean())
 
+        lo, hi = vis_span
         outs = []
         for e, expert in enumerate(self.experts):
             expert_kv = [kv_cache[i] for i in self.expert_kv_blocks[e]]
+            seq_e = seq
+            if self.expert_vision_adapters is not None and hi > lo:
+                vis = seq[:, lo:hi]
+                delta = (self.expert_vision_gates[e].to(vis.dtype)
+                         * self.expert_vision_adapters[e](vis))
+                seq_e = torch.cat([seq[:, :lo], vis + delta, seq[:, hi:]], dim=1)
             if self.gradient_checkpointing and self.training:
                 x = torch.utils.checkpoint.checkpoint(
-                    expert, seq, t_emb, expert_kv, vlm_kv_pad_mask, causal,
+                    expert, seq_e, t_emb, expert_kv, vlm_kv_pad_mask, causal,
                     use_reentrant=False)
             else:
-                x = expert(seq, t_emb=t_emb, expert_kv_cache=expert_kv,
+                x = expert(seq_e, t_emb=t_emb, expert_kv_cache=expert_kv,
                            vlm_kv_pad_mask=vlm_kv_pad_mask, self_attn_mask=causal)
             outs.append(self.action_out_proj(
                 self.final_norm(x[:, action_start_idx:])))
