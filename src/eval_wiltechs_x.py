@@ -82,6 +82,7 @@ POLICIES = {
     "wiltechs_moe": ("models.wiltechs_moe.wiltechs_moe_policy", "WiltechsMoEPolicy"),
     "wiltechs_vla": ("models.wiltechs_vla.wiltechs_vla_policy", "WiltechsVLAPolicy"),
     "wilro":        ("models.wilro.wilro_policy", "WilroPolicy"),
+    "wilro_moe":    ("models.wilro_moe.wilro_moe_policy", "WilroMoEPolicy"),
     # Off-the-shelf policies, so a CANDIDATE TEACHER can be scored on the same
     # harness before anyone distils from it. Published LIBERO numbers are not
     # comparable to this repo's: everything measured before 2026-08-03 used
@@ -106,6 +107,7 @@ def _register_configs():
                 "models.wiltechs_moe.wiltechs_moe_config",
                 "models.wiltechs_vla.wiltechs_vla_config",
                 "models.wilro.wilro_config",
+                "models.wilro_moe.wilro_moe_config",
                 "lerobot.policies.pi0.configuration_pi0",
                 "lerobot.policies.pi05.configuration_pi05",
                 "lerobot.policies.groot.configuration_groot"):

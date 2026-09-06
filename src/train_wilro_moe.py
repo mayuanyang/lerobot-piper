@@ -15,9 +15,9 @@ import numpy as np
 from torch.utils.data import ConcatDataset
 
 # Wilro-specific components
-from models.wilro.wilro_config import WilroConfig
-from models.wilro.wilro_policy import WilroPolicy
-from models.wilro.processor_wilro import make_pre_post_processors
+from models.wilro_moe.wilro_moe_config import WilroMoEConfig
+from models.wilro_moe.wilro_moe_policy import WilroMoEPolicy
+from models.wilro_moe.processor_wilro_moe import make_pre_post_processors
 from models.wiltechs_vla.task_rewrites import rewrite_instruction
 
 from torchvision.transforms import v2
@@ -154,19 +154,17 @@ def _log_gradient_analysis(policy, step: int) -> None:
         ("Text LoRA",        "text_model.layers"),            # Text model LoRA (trainable)
         ("Connector (frzn)", "connector"),
         ("State Enc",        "state_encoder"),
-        ("Vision CA K Proj", "robot_ca_k_proj"),
-        ("Vision CA V Proj", "robot_ca_v_proj"),
-        ("Vision CA Norm",   "robot_ca_norm"),
-        ("DiT layers",       "dit_layers"),
+        ("ResNet",           "robot_visual_encoder"),
+        ("Experts",          "experts"),
         ("  ├─ Self-attn",   "sa_"),
         ("  ├─ VLM KV CA",   "ca_"),
-        ("  ├─ Vision CA",   "robot_ca_"),
         ("  └─ FFN",         "ffn"),
+        ("Router",           "router"),
+        ("Thought QFormer",  "thought_qformer"),
         ("Action In/Out",    "action_"),
         ("Sink token",       "sink_token"),
         ("Final Norm",       "final_norm"),
         ("Time MLP",         "time_embedder"),
-        ("Latent Gen",       "latent_generator"),
     ]:
         grad, n = _grad_stats(prefix)
         if grad is not None:
@@ -174,8 +172,8 @@ def _log_gradient_analysis(policy, step: int) -> None:
 
     stats = getattr(policy.model, "_last_attention_stats", None)
     if stats:
-        # Match DiT sequence order: [SINK, latent, state, language, prefix, vision, action]
-        order = ["sink", "latent", "state", "language", "prefix", "vision", "action"]
+        # Match expert sequence order: [SINK, state, vision, thought, action]
+        order = ["sink", "state", "vision", "thought", "action"]
         ordered = [(k, stats[k]) for k in order if k in stats]
         cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in ordered)
         print(f"  Action→ self-attn : {cells}    (last DiT layer)")
@@ -193,6 +191,25 @@ def _log_gradient_analysis(policy, step: int) -> None:
     if robot_ca_stats:
         robot_cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in robot_ca_stats.items())
         print(f"  Action→ Robot x-attn: {robot_cells}    (cross-attn to Robot CNN)")
+
+    usage = getattr(policy.model, "_last_router_usage", None)
+    if usage is not None:
+        u = usage.detach().float().cpu()
+        cells = "  ".join(f"E{i}={v*100:5.1f}%" for i, v in enumerate(u.tolist()))
+        cv2 = float((u.std(unbiased=False) / u.mean().clamp(min=1e-8)).pow(2))
+        print(f"  Router usage      : {cells}    CV^2={cv2:.4f}")
+        # usage is a batch MEAN, so a flat CV^2 is ambiguous -- every sample can
+        # be fully collapsed and still average out uniform if different samples
+        # collapse to different experts. These two read the PRE-noise per-sample
+        # weights, which is what inference uses.
+        mw = getattr(policy.model, "_last_router_max_w", None)
+        ent = getattr(policy.model, "_last_router_entropy", None)
+        if mw is not None and ent is not None:
+            E = int(u.numel())
+            import math as _m
+            print(f"                      per-sample max_w={mw:.3f} "
+                  f"(uniform {1.0 / E:.3f})   entropy={ent:.3f} "
+                  f"(uniform {_m.log(E):.3f})")
 
     comps = getattr(policy.model, "_last_loss_components", None)
     cw = getattr(policy.model.config, "contrastive_loss_weight", 0.0)
@@ -252,7 +269,16 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           use_state_history: bool = False,
           resnet_motion_tokens: int = 0,
           resnet_motion_stride: int = 1,
-          no_vision_ca: bool = False):
+          num_experts: int = 4,
+          expert_num_layers: int = 8,
+          dit_hidden_size: int = 960,
+          vlm_capture_layers: str = "",
+          router_temperature: float = 1.0,
+          router_top_k: int = 0,
+          router_balance_weight: float = 0.1,
+          num_thought_tokens: int = 8,
+          thought_qformer_layers: int = 2,
+          thought_vlm_layer_idx: int = -1):
     """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model.
 
     `dataset_id` may be a single id or a list. Multiple datasets are concatenated
@@ -267,6 +293,24 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     # Argument-only preflight, before a single byte is downloaded. Each of these
     # combinations is accepted downstream and produces a run that completes and
     # answers a different question than the one asked.
+    # SmolVLM2 has 32 text layers where Qwen3-VL-4B has 36, and the experts'
+    # KV bands are disjoint, so wiltechs_moe's 4 x 9 = 36 does not port. Caught
+    # here rather than after the VLM download, which is where the model's own
+    # check fires.
+    _need = int(num_experts) * int(expert_num_layers)
+    if not vlm_capture_layers and _need > 32:
+        raise ValueError(
+            f"--num_experts {num_experts} x --expert_num_layers {expert_num_layers} "
+            f"= {_need} exceeds SmolVLM2-500M's 32 text layers. 4 x 8 = 32 fits "
+            f"exactly and is the default.")
+    if _need % int(num_experts) != 0:
+        raise ValueError("capture-layer count must divide by --num_experts")
+    if int(dit_hidden_size) != 960:
+        raise ValueError(
+            f"--dit_hidden_size {dit_hidden_size}: only 960 (the VLM's hidden "
+            f"size) is supported. Below it the expert self- and cross-attention "
+            f"need different head geometries, and this model reuses wilro's "
+            f"single-geometry DiTLayer.")
     if vision_token_source not in ("vlm", "resnet"):
         raise ValueError(f"--vision_token_source must be vlm or resnet, "
                          f"got {vision_token_source!r}")
@@ -388,7 +432,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                 f"Dataset '{did}' schema differs from '{dataset_ids[0]}':\n"
                 f"  cameras {cks} vs {camera_keys}\n"
                 f"  state_dim {sd} vs {state_dim}, action_dim {ad} vs {action_dim}\n"
-                f"train_wilro.py concatenation requires a homogeneous schema. For "
+                f"train_wilro_moe.py concatenation requires a homogeneous schema. For "
                 f"mixed robots use the canonical train_finetune.py path."
             )
 
@@ -496,7 +540,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                   f"is meant to sharpen. Raise --resnet_tokens.")
 
     # Build wilro config
-    cfg = WilroConfig(
+    cfg = WilroMoEConfig(
         input_features=input_features,
         output_features=output_features,
         n_obs_steps=obs,
@@ -535,13 +579,22 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         use_state_history=use_state_history,
         resnet_motion_tokens=resnet_motion_tokens,
         resnet_motion_stride=resnet_motion_stride,
-        use_vision_ca=not no_vision_ca,
+        num_experts=num_experts,
+        expert_num_layers=expert_num_layers,
+        dit_hidden_size=dit_hidden_size,
+        vlm_capture_layers=[int(t) for t in vlm_capture_layers.split(",") if t.strip()],
+        router_temperature=router_temperature,
+        router_top_k=router_top_k,
+        router_balance_weight=router_balance_weight,
+        num_thought_tokens=num_thought_tokens,
+        thought_qformer_layers=thought_qformer_layers,
+        thought_vlm_layer_idx=thought_vlm_layer_idx,
     )
 
     # Model + checkpoint loading
     if resume_from_checkpoint is not None:
         print(f"Resuming training from checkpoint: {resume_from_checkpoint}")
-        policy = WilroPolicy(cfg)
+        policy = WilroMoEPolicy(cfg)
 
         ckpt_path = Path(resume_from_checkpoint)
         if ckpt_path.exists():
@@ -651,7 +704,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         # times below. The checkpoint's saved "optimizer_lr" is the ALREADY-DECAYED
         # lr (overwritten at save time), so using it as the base double-applies the
         # decay → peak·cos(step)². Use the config peak (cfg.optimizer_lr — not in
-        # the WilroConfig kwargs, so it's the default peak) so fast-forwarding
+        # the WilroMoEConfig kwargs, so it's the default peak) so fast-forwarding
         # rebuilds the correct peak·cos(step). Matches train_community.py.
         base_lr = cfg.optimizer_lr
         resume_warmup = saved_cfg_json.get("scheduler_warmup_steps", cfg.scheduler_warmup_steps)
@@ -683,7 +736,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
             scheduler.step()
         print(f"Scheduler fast-forwarded to step {step}, LR = {optimizer.param_groups[0]['lr']:.2e}")
     else:
-        policy = WilroPolicy(cfg)
+        policy = WilroMoEPolicy(cfg)
         policy.train()
         policy.to(device)
 
@@ -1330,19 +1383,48 @@ if __name__ == "__main__":
                              "gated off. Compare against sft-40k (68.2), and hold "
                              "--lora_rank/--vision_lora_num_layers at 16/8 when you "
                              "do, or the two capacity changes are not separable.")
-    parser.add_argument("--no_vision_ca", action="store_true",
-                        help="Drop the per-DiT-layer Robot cross-attention "
-                             "sublayer, so robot tokens are reached ONLY by the "
-                             "sequence's self-attention. adaLN goes 12x960 back "
-                             "to 9x960, which is NOT resume-compatible with a "
-                             "checkpoint trained with the sublayer. "
-                             "This is what the repo's two best results both do: "
-                             "wiltechs_moe (92 spatial) has no robot CA at all, "
-                             "and wilro's 82.5 predates it by nine days "
-                             "(b3b89f1, 2026-06-30). Every wilro number measured "
-                             "WITH it sits between 38 and 68. Correlation across "
-                             "5 runs, not a controlled measurement -- this flag "
-                             "is how it gets controlled.")
+    parser.add_argument("--num_experts", type=int, default=4,
+                        help="Independent expert decoders, each cross-attending "
+                             "to its OWN disjoint band of VLM layers. "
+                             "num_experts x expert_num_layers must not exceed "
+                             "the VLM's 32 text layers.")
+    parser.add_argument("--expert_num_layers", type=int, default=8,
+                        help="Layers per expert (default 8). wiltechs_moe uses 9 "
+                             "on Qwen3-VL's 36 layers; SmolVLM2 has 32, so 4 x 8 "
+                             "is the exact fit here and 4 x 9 raises.")
+    parser.add_argument("--dit_hidden_size", type=int, default=960,
+                        help="Expert width. Only 960 (== the VLM hidden size) is "
+                             "supported: at that width the experts' self- and "
+                             "cross-attention share the VLM's 15/5/64 geometry "
+                             "and reuse wilro's DiTLayer unchanged.")
+    parser.add_argument("--vlm_capture_layers", type=str, default="",
+                        help="Comma-separated VLM layer indices to capture. "
+                             "Empty = all 32, which is what 4 x 8 wants.")
+    parser.add_argument("--router_temperature", type=float, default=1.0,
+                        help="Softmax temperature on the router logits.")
+    parser.add_argument("--router_top_k", type=int, default=0,
+                        help="0 = soft mixture over every expert. >0 keeps only "
+                             "the top-k, which makes the forward cheaper but "
+                             "removes the gradient that keeps unused experts alive.")
+    parser.add_argument("--router_balance_weight", type=float, default=0.1,
+                        help="Weight on CV^2 of expert usage. Collapse to a "
+                             "single expert is the known failure mode of this "
+                             "architecture; the router also injects fixed "
+                             "N(0, 0.5) logit noise during training for the same "
+                             "reason. Read BOTH the usage line and the "
+                             "per-sample max_w below it -- the batch mean can "
+                             "look uniform while every sample is collapsed.")
+    parser.add_argument("--num_thought_tokens", type=int, default=8,
+                        help="Learned queries cross-attending to one VLM layer's "
+                             "KV, emitted into the expert sequence before the "
+                             "action tokens so causal self-attention reaches "
+                             "them. 0 disables.")
+    parser.add_argument("--thought_qformer_layers", type=int, default=2,
+                        help="Depth of the thought QFormer.")
+    parser.add_argument("--thought_vlm_layer_idx", type=int, default=-1,
+                        help="Which captured VLM layer the thoughts read. -1 = "
+                             "the deepest, where vision and the instruction are "
+                             "most fused.")
     parser.add_argument("--resnet_tokens", type=int, default=64,
                         help="ResNet source only: pooled tokens per camera "
                              "(perfect square for avg pooling). 64 at "
