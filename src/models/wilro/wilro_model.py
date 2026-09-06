@@ -683,7 +683,14 @@ class WilroTransformer(nn.Module):
                 f"robot_ca_source='resnet'; got {self.robot_ca_source!r}. The motion "
                 f"tokens come from differencing the ResNet's own feature maps.")
 
-        if self.use_robot_ca and self.robot_ca_source == "resnet":
+        # NOT gated on use_robot_ca. The two are independent for this source:
+        # robot tokens enter the DiT SEQUENCE and are reached by self-attention
+        # whether or not a Robot cross-attention sublayer exists. That is
+        # precisely the 2026-06-21 architecture (b3b89f1 added Robot CA nine
+        # days after it). Gating construction here made use_robot_ca=False
+        # silently produce a model with NO robot visual pathway at all, which
+        # is not what turning off the CA sublayer means.
+        if self.robot_ca_source == "resnet":
             # out_dim is hidden_size, not some CNN width: robot_ca_k_proj /
             # v_proj are built at hidden_size and are SHARED across DiT layers,
             # so the encoder must land in that space directly.
@@ -997,6 +1004,8 @@ class WilroTransformer(nn.Module):
         # Extract intermediate features for Robot CA (SigLIP ViT intermediate layers)
         # Under the ResNet source the VLM intermediate is never read, so do not
         # pay for output_hidden_states + a second connector pass to build it.
+        # The VLM intermediate exists only to feed Robot CA, so it follows
+        # use_robot_ca. The ResNet does not -- see __init__.
         need_intermediate = self.use_robot_ca and self.robot_ca_source != "resnet"
         vis_tokens, intermediate_features = self._encode_images(batch, B, return_intermediate=need_intermediate)
         L_vis = vis_tokens.shape[1]

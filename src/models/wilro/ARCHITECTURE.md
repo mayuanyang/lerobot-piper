@@ -58,9 +58,29 @@ The 82.5 checkpoint (2026-06-21) predates Robot CA by nine days: its ResNet
 tokens entered the DiT **sequence** and were reached by self-attention only.
 `robot_ca_source="resnet"` with the current default `use_robot_ca=True`
 therefore reproduces the **2026-07-01** architecture, not the 82.5 one. The
-82.5 arm would additionally need `use_robot_ca=False`, and the encoder is
-currently only constructed when `use_robot_ca` is on — so that combination is
-not yet expressible.
+82.5 arm additionally needs `use_robot_ca=False`, which IS expressible: the
+ResNet's construction is deliberately not gated on `use_robot_ca`, because for
+that source the two are independent — robot tokens enter the DiT **sequence**
+and are reached by self-attention whether or not a cross-attention sublayer
+exists. (The VLM intermediate is different: it exists only to feed Robot CA, so
+it does follow `use_robot_ca`.)
+
+### Configuration matrix — all verified to construct and forward
+
+| combination | robot tokens | state tokens | trainable |
+|---|---|---|---|
+| default (bit-identical to `main`) | 72 | 1 | 52.1M |
+| `+ use_state_history` | 72 | `n_obs_steps` | 52.1M |
+| `robot_ca_source=resnet` | 2×64 | 1 | 55.1M |
+| `+ robot_cnn_fine_*` (wrist denser) | 64+144 | 1 | 55.1M |
+| `+ robot_cnn_cameras` (wrist only) | 64 | 1 | 55.1M |
+| `+ robot_cnn_motion_tokens 16` | 2×(64+16) | 1 | 55.1M |
+| legacy 2026-06/07 config | 2×100 | 1 | 55.1M |
+| 2026-06-21 arch (`use_robot_ca=False`) | 2×64 | 1 | 45.3M |
+
+`main` compatibility is measured, not assumed: at defaults the branch has the
+same 587 state_dict keys, `load_state_dict(strict=True)` from a `main` model
+succeeds, and `sample_actions` matches to `max|diff| = 0.0`.
 
 ```
 ╔════════════════════════════════════════════════════════════════════════════╗
