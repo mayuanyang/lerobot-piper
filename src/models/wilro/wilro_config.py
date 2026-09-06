@@ -148,16 +148,16 @@ class WilroConfig(PreTrainedConfig):
     #   - adaLN-Zero: 12 modulation vectors (4 sublayers × 3) vs 9 (3 × 3)
     #   - Additional params: robot_ca_q/k/v/o_proj per DiT layer
     #   - Robot features from SigLIP ViT intermediate layer (layer_offset)
-    use_robot_ca: bool = True
+    use_vision_ca: bool = True
     # Which intermediate layer of SigLIP ViT to use for Robot CA features.
     # -1 = last layer (most semantic), -3 = third-to-last (more spatial detail).
     # SigLIP ViT has ~27 layers in SmolVLM2-500M. -3 gives the best trade-off
     # between spatial resolution and semantic richness.
-    robot_vlm_layer_offset: int = -3
+    vlm_vision_layer_offset: int = -3
 
     # Where Robot CA's K/V actually come from.
     #
-    #   "vlm_intermediate" -- SigLIP ViT layer `robot_vlm_layer_offset`. Base
+    #   "vlm" -- SigLIP ViT layer `vlm_vision_layer_offset`. Base
     #       frozen; only the LoRA adapters and the connector train (~0.39M in
     #       the robot-visual path). This is what ships and what every 2026-08/09
     #       eval measured.
@@ -181,9 +181,9 @@ class WilroConfig(PreTrainedConfig):
     # the optimizer on the sibling (wiltechs_x wrist encoder: 1e-3 -> 6.2e-4,
     # confirmed twice), so "add and let the model choose" is not a neutral
     # design -- it reliably chooses the pathway that is already trained.
-    robot_ca_source: str = "vlm_intermediate"
+    vision_token_source: str = "vlm"
 
-    # ResNet source only. `robot_encoder_tokens` is the pooled grid per camera.
+    # ResNet source only. `resnet_tokens` is the pooled grid per camera.
     #
     # The default here is deliberately NOT moe's 16. At input_size 224 a 14x14
     # map pooled to 4x4 makes each token cover 64 native px of a 256px LIBERO
@@ -195,17 +195,17 @@ class WilroConfig(PreTrainedConfig):
     #  256 tok  -> 16 px/token  (ceiling; every feature cell kept)
     # Cost is per DiT layer -- Robot CA runs in all `num_vlm_layers` of them --
     # and scales with num_cameras, so 3 x 256 is 768 extra K/V per layer.
-    robot_encoder_tokens: int = 64
-    robot_encoder_input_size: int = 256
+    resnet_tokens: int = 64
+    resnet_input_size: int = 256
     # "avg" = adaptive average pooling (what moe runs). "attn" = AttentionPool2d,
     # learned queries seeded to the position grid. attn cannot honour a per-call
     # token override, which is why avg stays the default.
-    robot_encoder_pool: str = "avg"
+    resnet_pool: str = "avg"
     # Which cameras get the ResNet. Empty = all of
     # `cameras_for_vision_state_concat`.
-    robot_cnn_cameras: list[str] = field(default_factory=list)
-    # Per-camera token override: cameras listed here emit `robot_cnn_fine_tokens`
-    # instead of `robot_encoder_tokens`. 0 disables. One shared backbone serves
+    resnet_cameras: list[str] = field(default_factory=list)
+    # Per-camera token override: cameras listed here emit `resnet_fine_tokens`
+    # instead of `resnet_tokens`. 0 disables. One shared backbone serves
     # both grids at no parameter cost -- RobotVisualEncoder.forward takes an
     # out_tokens override and only the pooling depends on it.
     #
@@ -214,8 +214,8 @@ class WilroConfig(PreTrainedConfig):
     # and the sibling's 34-point ablation says the pathway as a whole is
     # load-bearing. It is also what the 2026-06/07 checkpoints used, under the
     # names gripper_camera / gripper_encoder_tokens.
-    robot_cnn_fine_cameras: list[str] = field(default_factory=list)
-    robot_cnn_fine_tokens: int = 0
+    resnet_fine_cameras: list[str] = field(default_factory=list)
+    resnet_fine_tokens: int = 0
 
     # ---- Legacy aliases: checkpoints written 2026-06-30 .. 2026-07-06 ----
     # That window is the only one where the ResNet and Robot CA both existed
@@ -228,6 +228,34 @@ class WilroConfig(PreTrainedConfig):
     use_robot_cnn: Optional[bool] = None
     gripper_camera: Optional[str] = None
     gripper_encoder_tokens: Optional[int] = None
+
+    # ---- Renamed 2026-09-05. Old name -> new name, one for one. ----
+    # The old scheme called everything "robot": `robot_ca_source="vlm"` read as
+    # "the robot cross-attention's source is the VLM", right next to a DIFFERENT
+    # cross-attention that is also to the VLM (its text KV cache). Now the two
+    # sources are named for what they are -- `vlm` or `resnet` -- and the
+    # sublayer that consumes them is `vision_ca`, not `robot_ca`.
+    #
+    # EVERY dataclass field is serialised into config.json, so every wilro
+    # checkpoint ever written carries the old spellings -- including runs still
+    # training right now. All of them are accepted and translated.
+    #
+    # The state_dict is deliberately NOT renamed: robot_ca_q/o/norm,
+    # robot_ca_k_proj/v_proj and robot_visual_encoder are module attributes, so
+    # renaming them would invalidate every checkpoint, and six other trainers
+    # read `robot_visual_encoder` by name. Weights keep the old spelling; the
+    # config, CLI and docs use the new one.
+    robot_ca_source: Optional[str] = None
+    use_robot_ca: Optional[bool] = None
+    robot_vlm_layer_offset: Optional[int] = None
+    robot_encoder_tokens: Optional[int] = None
+    robot_encoder_input_size: Optional[int] = None
+    robot_encoder_pool: Optional[str] = None
+    robot_cnn_cameras: Optional[list] = None
+    robot_cnn_fine_cameras: Optional[list] = None
+    robot_cnn_fine_tokens: Optional[int] = None
+    robot_cnn_motion_tokens: Optional[int] = None
+    robot_cnn_motion_stride: Optional[int] = None
 
     # -------- Temporal input (Stage B / Stage C) --------
     # wilro has no temporal input of any kind: `_encode_images` takes imgs[:, -1]
@@ -250,12 +278,12 @@ class WilroConfig(PreTrainedConfig):
     #    FEATURE MAPS differenced and pooled to this many extra tokens. 0 off.
     #    The VLM still sees one frame -- it is 40.8% of step time and semantics
     #    do not change in 100ms; what changes is motion, which is the ResNet's
-    #    job. Requires robot_ca_source="resnet".
-    robot_cnn_motion_tokens: int = 0
+    #    job. Requires vision_token_source="resnet".
+    resnet_motion_tokens: int = 0
     # How many frames back the second frame is drawn from. At 10Hz demos and
     # n_action_steps=2 the policy re-plans every 200ms, so 1 frame = 100ms is
     # the natural pairing.
-    robot_cnn_motion_stride: int = 1
+    resnet_motion_stride: int = 1
 
     # -------- Latent "thought" tokens --------
     # Task-conditional latent tokens generated from pooled language.
@@ -335,39 +363,74 @@ class WilroConfig(PreTrainedConfig):
     training_steps_total: int = 0
 
     def __post_init__(self):
-        """Translate the 2026-06/07 field names onto the current ones.
+        """Accept every spelling a wilro config.json has ever used.
 
-        Only fires when a legacy key is actually present, so a current config is
-        untouched. Explicit current values win: if someone passes both
-        use_robot_cnn and robot_ca_source, the new one is authoritative rather
-        than being silently overwritten by a compatibility shim.
+        Two generations of aliases: the 2026-06/07 fields removed when the
+        ResNet was, and the 2026-09-05 rename. Both translate onto the current
+        names. Explicit current values win, so a shim can never override an
+        intentional setting -- only fill in what the caller left at its default.
         """
         parent = getattr(super(), "__post_init__", None)
         if parent is not None:
             parent()
-        if self.use_robot_cnn is None and self.gripper_camera is None \
-                and self.gripper_encoder_tokens is None:
-            return
+
         moved = []
+        # -- 2026-09-05 rename. One for one, only when the new field is default.
+        DEFAULTS = {
+            "vision_token_source": "vlm", "use_vision_ca": True,
+            "vlm_vision_layer_offset": -3, "resnet_tokens": 64,
+            "resnet_input_size": 256, "resnet_pool": "avg",
+            "resnet_cameras": [], "resnet_fine_cameras": [],
+            "resnet_fine_tokens": 0, "resnet_motion_tokens": 0,
+            "resnet_motion_stride": 1,
+        }
+        for old_name, new_name in (
+                ("robot_ca_source", "vision_token_source"),
+                ("use_robot_ca", "use_vision_ca"),
+                ("robot_vlm_layer_offset", "vlm_vision_layer_offset"),
+                ("robot_encoder_tokens", "resnet_tokens"),
+                ("robot_encoder_input_size", "resnet_input_size"),
+                ("robot_encoder_pool", "resnet_pool"),
+                ("robot_cnn_cameras", "resnet_cameras"),
+                ("robot_cnn_fine_cameras", "resnet_fine_cameras"),
+                ("robot_cnn_fine_tokens", "resnet_fine_tokens"),
+                ("robot_cnn_motion_tokens", "resnet_motion_tokens"),
+                ("robot_cnn_motion_stride", "resnet_motion_stride")):
+            v = getattr(self, old_name)
+            if v is None:
+                continue
+            # "vlm_intermediate" was the old spelling of the source value.
+            if new_name == "vision_token_source" and v == "vlm_intermediate":
+                v = "vlm"
+            if getattr(self, new_name) == DEFAULTS[new_name]:
+                setattr(self, new_name, v)
+                moved.append(f"{old_name}={v!r} -> {new_name}")
+            setattr(self, old_name, None)
+        if self.vision_token_source == "vlm_intermediate":
+            self.vision_token_source = "vlm"
+            moved.append("vision_token_source 'vlm_intermediate' -> 'vlm'")
+
+        # -- 2026-06/07 fields, removed when the ResNet was.
         if self.use_robot_cnn is not None:
             if not self.use_robot_cnn:
                 raise ValueError(
                     "use_robot_cnn=False came from a checkpoint whose DiT has no "
-                    "robot tokens at all. The current model has no way to express "
-                    "that -- robot_ca_source selects WHICH visual source feeds "
-                    "Robot CA, not whether one exists. This checkpoint needs the "
+                    "vision tokens at all. The current model has no way to express "
+                    "that -- vision_token_source selects WHICH source feeds the "
+                    "tokens, not whether they exist. This checkpoint needs the "
                     "code of its own era.")
-            if self.robot_ca_source != "resnet":
-                self.robot_ca_source = "resnet"
-                moved.append("use_robot_cnn=True -> robot_ca_source='resnet'")
-        if self.gripper_camera and self.gripper_encoder_tokens:
-            if not self.robot_cnn_fine_cameras:
-                self.robot_cnn_fine_cameras = [self.gripper_camera]
-                self.robot_cnn_fine_tokens = int(self.gripper_encoder_tokens)
-                moved.append(
-                    f"gripper_camera/gripper_encoder_tokens -> "
-                    f"robot_cnn_fine_cameras={self.robot_cnn_fine_cameras} "
-                    f"/ robot_cnn_fine_tokens={self.robot_cnn_fine_tokens}")
+            if self.vision_token_source != "resnet":
+                self.vision_token_source = "resnet"
+                moved.append("use_robot_cnn=True -> vision_token_source='resnet'")
+        if self.gripper_camera and self.gripper_encoder_tokens \
+                and not self.resnet_fine_cameras:
+            self.resnet_fine_cameras = [self.gripper_camera]
+            self.resnet_fine_tokens = int(self.gripper_encoder_tokens)
+            moved.append(
+                f"gripper_camera/gripper_encoder_tokens -> "
+                f"resnet_fine_cameras={self.resnet_fine_cameras} "
+                f"/ resnet_fine_tokens={self.resnet_fine_tokens}")
+
         if moved:
             print("[wilro] legacy config translated:")
             for m in moved:

@@ -45,7 +45,7 @@ forward(batch)
         │           ├── layer.post_attention_layernorm
         │           └── layer.mlp
         │
-        ├── _compute_robot_tokens(batch)
+        ├── _compute_vision_tokens(batch)
         │     └── self.robot_visual_encoder(img)    (optional, if use_robot_cnn)
         │
         ├── _generate_latents(batch, B, device, dtype)
@@ -60,7 +60,7 @@ forward(batch)
         │     ├── create_sinusoidal_pos_embedding(timesteps, hidden_size)
         │     ├── self.time_embedder(t_emb_raw)
         │     │
-        │     ├── _build_dit_input(batch, noisy_actions, robot_tokens, latents, action_prefix)
+        │     ├── _build_dit_input(batch, noisy_actions, vision_tokens, latents, action_prefix)
         │     │     ├── self.sink_token.expand()
         │     │     ├── self.state_encoder(state)
         │     │     └── self.action_in_proj(noisy_actions) + self.action_pos_emb
@@ -119,7 +119,7 @@ forward(batch)
         │
         ├── _run_vlm_and_cache_kv(batch)          ── Stage A (same as training)
         │
-        ├── _compute_robot_tokens(batch)
+        ├── _compute_vision_tokens(batch)
         │
         ├── _generate_latents(batch, B, device, dtype)
         │
@@ -184,7 +184,7 @@ flowchart TD
     end
 
     subgraph Conditioning[DiT Conditioning]
-        CRT[_compute_robot_tokens]
+        CRT[_compute_vision_tokens]
         GL[_generate_latents]
         SN[sample_noise]
         ST[sample_time]
@@ -248,7 +248,7 @@ flowchart TD
 | `_run_vlm_and_cache_kv()` | `compute_loss`, `sample_actions` | Run frozen VLM, capture last-N-layer KV caches |
 | `_encode_images()` | `_run_vlm_and_cache_kv` | Vision model + connector forward pass |
 | `_encode_language()` | `_run_vlm_and_cache_kv`, `_generate_latents` | Tokenize + embed language instructions |
-| `_compute_robot_tokens(batch, robot_features)` | `compute_loss`, `sample_actions` | Robot CA tokens from `config.robot_ca_source`: the VLM's SigLIP intermediate (`robot_features`) or the ResNet (`batch`) |
+| `_compute_vision_tokens(batch, vlm_vision_features)` | `compute_loss`, `sample_actions` | Robot CA tokens from `config.vision_token_source`: the VLM's SigLIP intermediate (`vlm_vision_features`) or the ResNet (`batch`) |
 | `_generate_latents()` | `compute_loss`, `sample_actions` | Pool language → latent thought tokens |
 | `_run_dit()` | `compute_loss`, `sample_actions` | Full DiT decoder forward (N layers) |
 | `_build_dit_input()` | `_run_dit` | Assemble DiT sequence: [SINK, latent, state, prefix, robot, action] |

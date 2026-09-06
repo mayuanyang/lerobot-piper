@@ -154,13 +154,13 @@ def _log_gradient_analysis(policy, step: int) -> None:
         ("Text LoRA",        "text_model.layers"),            # Text model LoRA (trainable)
         ("Connector (frzn)", "connector"),
         ("State Enc",        "state_encoder"),
-        ("Robot CA K Proj",  "robot_ca_k_proj"),
-        ("Robot CA V Proj",  "robot_ca_v_proj"),
-        ("Robot CA Norm",    "robot_ca_norm"),
+        ("Vision CA K Proj", "robot_ca_k_proj"),
+        ("Vision CA V Proj", "robot_ca_v_proj"),
+        ("Vision CA Norm",   "robot_ca_norm"),
         ("DiT layers",       "dit_layers"),
         ("  ├─ Self-attn",   "sa_"),
-        ("  ├─ VLM CA",      "ca_"),
-        ("  ├─ Robot CA",    "robot_ca_"),
+        ("  ├─ VLM KV CA",   "ca_"),
+        ("  ├─ Vision CA",   "robot_ca_"),
         ("  └─ FFN",         "ffn"),
         ("Action In/Out",    "action_"),
         ("Sink token",       "sink_token"),
@@ -174,8 +174,8 @@ def _log_gradient_analysis(policy, step: int) -> None:
 
     stats = getattr(policy.model, "_last_attention_stats", None)
     if stats:
-        # Match DiT sequence order: [SINK, latent, state, language, prefix, robot, action]
-        order = ["sink", "latent", "state", "language", "prefix", "robot", "action"]
+        # Match DiT sequence order: [SINK, latent, state, language, prefix, vision, action]
+        order = ["sink", "latent", "state", "language", "prefix", "vision", "action"]
         ordered = [(k, stats[k]) for k in order if k in stats]
         cells = "  ".join(f"{k}={v*100:5.1f}%" for k, v in ordered)
         print(f"  Action→ self-attn : {cells}    (last DiT layer)")
@@ -245,14 +245,14 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           cache_sync: bool = False,
           load_image_size: int = 0,
           prefetch_factor: int = 2,
-          robot_ca_source: str = "vlm_intermediate",
-          robot_encoder_tokens: int = 64,
-          robot_encoder_input_size: int = 256,
-          robot_encoder_pool: str = "avg",
+          vision_token_source: str = "vlm",
+          resnet_tokens: int = 64,
+          resnet_input_size: int = 256,
+          resnet_pool: str = "avg",
           use_state_history: bool = False,
-          robot_cnn_motion_tokens: int = 0,
-          robot_cnn_motion_stride: int = 1,
-          no_robot_ca: bool = False):
+          resnet_motion_tokens: int = 0,
+          resnet_motion_stride: int = 1,
+          no_vision_ca: bool = False):
     """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model.
 
     `dataset_id` may be a single id or a list. Multiple datasets are concatenated
@@ -267,20 +267,20 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     # Argument-only preflight, before a single byte is downloaded. Each of these
     # combinations is accepted downstream and produces a run that completes and
     # answers a different question than the one asked.
-    if robot_ca_source not in ("vlm_intermediate", "resnet"):
-        raise ValueError(f"--robot_ca_source must be vlm_intermediate or resnet, "
-                         f"got {robot_ca_source!r}")
-    if robot_cnn_motion_tokens > 0 and robot_ca_source != "resnet":
+    if vision_token_source not in ("vlm", "resnet"):
+        raise ValueError(f"--vision_token_source must be vlm or resnet, "
+                         f"got {vision_token_source!r}")
+    if resnet_motion_tokens > 0 and vision_token_source != "resnet":
         raise ValueError(
-            "--robot_cnn_motion_tokens needs --robot_ca_source resnet. The motion "
+            "--resnet_motion_tokens needs --vision_token_source resnet. The motion "
             "tokens are produced by the ResNet's own feature maps; under the "
-            "vlm_intermediate source there is no encoder to difference and the "
+            "vlm source there is no encoder to difference and the "
             "extra camera frame would be decoded and thrown away.")
-    if robot_ca_source == "resnet" and robot_encoder_pool == "avg":
-        _side = int(robot_encoder_tokens ** 0.5)
-        if _side * _side != robot_encoder_tokens:
-            raise ValueError(f"--robot_encoder_tokens must be a perfect square for "
-                             f"avg pooling, got {robot_encoder_tokens}")
+    if vision_token_source == "resnet" and resnet_pool == "avg":
+        _side = int(resnet_tokens ** 0.5)
+        if _side * _side != resnet_tokens:
+            raise ValueError(f"--resnet_tokens must be a perfect square for "
+                             f"avg pooling, got {resnet_tokens}")
     if use_state_history and (n_obs_steps is None or int(n_obs_steps) < 2):
         raise ValueError(
             f"--use_state_history with --n_obs_steps {n_obs_steps} enables nothing: "
@@ -483,17 +483,17 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     # Preflight. Each of these has a silent-wrong-run failure mode: the flag is
     # accepted, training completes, and the result answers a different question
     # than the one asked.
-    if robot_ca_source == "resnet":
-        side = int(robot_encoder_tokens ** 0.5)
-        px = robot_encoder_input_size / max(side, 1)
+    if vision_token_source == "resnet":
+        side = int(resnet_tokens ** 0.5)
+        px = resnet_input_size / max(side, 1)
         print(f"Robot CA source: ResNet-18 truncated at layer3 (trainable, 3.0M) — "
-              f"{robot_encoder_tokens} tok @ {robot_encoder_input_size}px "
+              f"{resnet_tokens} tok @ {resnet_input_size}px "
               f"= {px:.1f} px/token")
         if px > 32.0:
             print(f"  [WARN] {px:.1f} px/token is COARSER than the frozen VLM's 32 "
                   f"px merged patches. The CNN exists for the precision the ViT "
                   f"cannot reach; at this grid it is running below the backbone it "
-                  f"is meant to sharpen. Raise --robot_encoder_tokens.")
+                  f"is meant to sharpen. Raise --resnet_tokens.")
 
     # Build wilro config
     cfg = WilroConfig(
@@ -528,14 +528,14 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         paraphrase_limit=paraphrase_limit,
         paraphrase_file=paraphrase_file,
         paraphrase_min_variants=paraphrase_min_variants,
-        robot_ca_source=robot_ca_source,
-        robot_encoder_tokens=robot_encoder_tokens,
-        robot_encoder_input_size=robot_encoder_input_size,
-        robot_encoder_pool=robot_encoder_pool,
+        vision_token_source=vision_token_source,
+        resnet_tokens=resnet_tokens,
+        resnet_input_size=resnet_input_size,
+        resnet_pool=resnet_pool,
         use_state_history=use_state_history,
-        robot_cnn_motion_tokens=robot_cnn_motion_tokens,
-        robot_cnn_motion_stride=robot_cnn_motion_stride,
-        use_robot_ca=not no_robot_ca,
+        resnet_motion_tokens=resnet_motion_tokens,
+        resnet_motion_stride=resnet_motion_stride,
+        use_vision_ca=not no_vision_ca,
     )
 
     # Model + checkpoint loading
@@ -745,10 +745,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     # The second frame also doubles per-camera video decode, and these workers
     # have already been SIGKILLed at 5.3 GB of decoded frames in flight -- drop
     # --num_workers if this run starts dying around step 200.
-    if robot_cnn_motion_tokens > 0:
-        cam_window = [-robot_cnn_motion_stride * frame_time, 0.0]
-        print(f"Camera window: {cam_window} ({robot_cnn_motion_stride} frame(s) back "
-              f"= {robot_cnn_motion_stride * frame_time * 1000:.0f}ms) — ResNet motion path")
+    if resnet_motion_tokens > 0:
+        cam_window = [-resnet_motion_stride * frame_time, 0.0]
+        print(f"Camera window: {cam_window} ({resnet_motion_stride} frame(s) back "
+              f"= {resnet_motion_stride * frame_time * 1000:.0f}ms) — ResNet motion path")
     else:
         cam_window = [0.0]
 
@@ -1314,9 +1314,9 @@ if __name__ == "__main__":
                              "LoRA stays at 0 and should: the encoder-decoder "
                              "detaches the VLM KV cache, so no gradient reaches "
                              "the text tower to train an adapter with.")
-    parser.add_argument("--robot_ca_source", choices=("vlm_intermediate", "resnet"),
-                        default="vlm_intermediate",
-                        help="Where Robot CA's K/V come from. 'vlm_intermediate' "
+    parser.add_argument("--vision_token_source", choices=("vlm", "resnet"),
+                        default="vlm",
+                        help="Where Robot CA's K/V come from. 'vlm' "
                              "(default, what ships) reads a SigLIP ViT layer with a "
                              "frozen base -- about 0.39M trainable in the "
                              "robot-visual path. 'resnet' restores the separate "
@@ -1330,7 +1330,7 @@ if __name__ == "__main__":
                              "gated off. Compare against sft-40k (68.2), and hold "
                              "--lora_rank/--vision_lora_num_layers at 16/8 when you "
                              "do, or the two capacity changes are not separable.")
-    parser.add_argument("--no_robot_ca", action="store_true",
+    parser.add_argument("--no_vision_ca", action="store_true",
                         help="Drop the per-DiT-layer Robot cross-attention "
                              "sublayer, so robot tokens are reached ONLY by the "
                              "sequence's self-attention. adaLN goes 12x960 back "
@@ -1343,18 +1343,18 @@ if __name__ == "__main__":
                              "WITH it sits between 38 and 68. Correlation across "
                              "5 runs, not a controlled measurement -- this flag "
                              "is how it gets controlled.")
-    parser.add_argument("--robot_encoder_tokens", type=int, default=64,
+    parser.add_argument("--resnet_tokens", type=int, default=64,
                         help="ResNet source only: pooled tokens per camera "
                              "(perfect square for avg pooling). 64 at "
-                             "--robot_encoder_input_size 256 gives 32 px/token, "
+                             "--resnet_input_size 256 gives 32 px/token, "
                              "parity with the VLM's merged patches. moe's historical "
                              "16 gives 64 px/token, i.e. half the granularity of the "
                              "frozen backbone it is supposed to sharpen. Cost is per "
                              "DiT layer and per camera.")
-    parser.add_argument("--robot_encoder_input_size", type=int, default=256,
+    parser.add_argument("--resnet_input_size", type=int, default=256,
                         help="ResNet input resolution. 256 is the native LIBERO "
                              "frame, so no resample happens.")
-    parser.add_argument("--robot_encoder_pool", choices=("avg", "attn"), default="avg",
+    parser.add_argument("--resnet_pool", choices=("avg", "attn"), default="avg",
                         help="'avg' adaptive average pooling (what moe runs at 92). "
                              "'attn' is AttentionPool2d with grid-seeded learned "
                              "queries; its query count is fixed at construction, so "
@@ -1371,15 +1371,15 @@ if __name__ == "__main__":
                              "the window each cut time-to-success 195 to ~110 steps, "
                              "and wilro pins its step cap on exactly the five tasks "
                              "with that signature. Read the result per task.")
-    parser.add_argument("--robot_cnn_motion_tokens", type=int, default=0,
+    parser.add_argument("--resnet_motion_tokens", type=int, default=0,
                         help="Extra tokens per camera from differencing the ResNet "
                              "FEATURE MAPS of the current and an older frame, "
                              "zero-init gated. 0 disables. Needs "
-                             "--robot_ca_source resnet. The VLM still sees one "
+                             "--vision_token_source resnet. The VLM still sees one "
                              "frame by design. This is the only flag here that "
                              "changes the dataloader: it requests a second camera "
                              "frame, doubling decode bandwidth per camera.")
-    parser.add_argument("--robot_cnn_motion_stride", type=int, default=1,
+    parser.add_argument("--resnet_motion_stride", type=int, default=1,
                         help="How many frames back the differenced frame comes "
                              "from. At 10Hz with n_action_steps=2 the policy "
                              "re-plans every 200ms, so 1 frame = 100ms pairs "

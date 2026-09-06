@@ -270,14 +270,14 @@ class DiTLayer(nn.Module):
         intermediate_size: int,
         rms_norm_eps: float = 1e-5,
         dropout: float = 0.1,
-        use_robot_ca: bool = False,
+        use_vision_ca: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self.use_robot_ca = use_robot_ca
+        self.use_vision_ca = use_vision_ca
 
         # ── Self-attention (over DiT sequence) ──────────────────────────
         self.sa_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -299,7 +299,7 @@ class DiTLayer(nn.Module):
         # (14x14 @ 224x224) instead of only VLM's coarse SigLIP patches
         # (~729 patches @ 384x384). Critical for precise object localization
         # in spatial reasoning tasks (e.g., "bowl closer to plate").
-        if use_robot_ca:
+        if use_vision_ca:
             self.robot_ca_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
             self.robot_ca_q = nn.Linear(hidden_size, num_heads * head_dim, bias=False)
             self.robot_ca_o = nn.Linear(num_heads * head_dim, hidden_size, bias=False)
@@ -313,7 +313,7 @@ class DiTLayer(nn.Module):
         # ── adaLN-Zero: 12 modulation vectors (shift/scale/gate × 4) ────
         # With robot_ca: 4 sublayers (sa, ca, robot_ca, ffn) × 3 = 12
         # Without robot_ca: 3 sublayers (sa, ca, ffn) × 3 = 9
-        adaLN_dim = 12 * hidden_size if use_robot_ca else 9 * hidden_size
+        adaLN_dim = 12 * hidden_size if use_vision_ca else 9 * hidden_size
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, adaLN_dim, bias=True),
@@ -329,8 +329,8 @@ class DiTLayer(nn.Module):
         vlm_v: torch.Tensor,
         vlm_kv_pad_mask: Optional[torch.Tensor],
         self_attn_mask: torch.Tensor,
-        robot_k: Optional[torch.Tensor] = None,
-        robot_v: Optional[torch.Tensor] = None,
+        vision_k: Optional[torch.Tensor] = None,
+        vision_v: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         x:               (B, L_dit, H)
@@ -338,13 +338,13 @@ class DiTLayer(nn.Module):
         vlm_k, vlm_v:    (B, num_kv_heads, L_vlm, head_dim) — frozen VLM cache
         vlm_kv_pad_mask: (B, L_vlm) bool, True at valid VLM positions
         self_attn_mask:  (1, 1, L_dit, L_dit) additive mask
-        robot_k, robot_v: (B, num_kv_heads, R, head_dim) — Robot CNN K/V for
+        vision_k, vision_v: (B, num_kv_heads, R, head_dim) — Robot CNN K/V for
                          high-resolution spatial cross-attention (optional)
         """
         B, L_dit, _ = x.shape
 
         mod = self.adaLN_modulation(t_emb)
-        if self.use_robot_ca and robot_k is not None:
+        if self.use_vision_ca and vision_k is not None:
             # 12 chunks: sa(3), ca(3), robot_ca(3), ffn(3)
             (
                 s_sa, sc_sa, g_sa,
@@ -395,10 +395,10 @@ class DiTLayer(nn.Module):
         x = x + g_ca.unsqueeze(1) * ca
 
         # ── Robot CNN cross-attention (high-res spatial grounding) ───
-        if self.use_robot_ca and robot_k is not None:
+        if self.use_vision_ca and vision_k is not None:
             h = _modulate(self.robot_ca_norm(x), s_rca, sc_rca)
             Q = self.robot_ca_q(h).view(B, L_dit, self.num_heads, self.head_dim).transpose(1, 2)
-            Kr, Vr = robot_k, robot_v
+            Kr, Vr = vision_k, vision_v
             if self.num_kv_heads != self.num_heads:
                 r = self.num_heads // self.num_kv_heads
                 Kr = Kr.repeat_interleave(r, dim=1)
@@ -497,15 +497,15 @@ class WilroTransformer(nn.Module):
             # so the whole text stack runs under no_grad, the KV cache is
             # .detach()ed unconditionally, and lang_embeddings is detached too.
             # The single surviving path is
-            #   loss -> DiT -> robot_tokens -> intermediate_features
+            #   loss -> DiT -> vision_tokens -> intermediate_features
             #        -> connector -> vision_model (LoRA)
-            # and robot_ca_source="resnet" severs exactly that. The adapters
+            # and vision_token_source="resnet" severs exactly that. The adapters
             # then sit in the optimizer with grad=None forever, which surfaces
             # as a MISSING "Vision LoRA" line in the gradient analysis rather
             # than a zero -- easy to read past.
-            if getattr(config, "robot_ca_source", "vlm_intermediate") == "resnet":
+            if getattr(config, "vision_token_source", "vlm") == "resnet":
                 print(
-                    "  [WARN] robot_ca_source='resnet' severs the ONLY gradient path to\n"
+                    "  [WARN] vision_token_source='resnet' severs the ONLY gradient path to\n"
                     "         these adapters, so they will NOT train. The ViT is fully\n"
                     "         frozen in this configuration.\n"
                     "         This is not a defect -- it is exactly the 2026-06-21\n"
@@ -597,8 +597,8 @@ class WilroTransformer(nn.Module):
               f"sourcing KV from VLM layers {self.capture_indices}")
 
         # Robot CNN cross-attention config
-        self.use_robot_ca = getattr(config, "use_robot_ca", False)
-        if self.use_robot_ca:
+        self.use_vision_ca = getattr(config, "use_vision_ca", False)
+        if self.use_vision_ca:
             print(f"[wilro] Robot CNN cross-attention ENABLED — action queries will "
                   f"directly attend to high-res Robot CNN features for spatial grounding")
 
@@ -611,7 +611,7 @@ class WilroTransformer(nn.Module):
                 intermediate_size=self.intermediate_size,
                 rms_norm_eps=self.rms_norm_eps,
                 dropout=config.dropout,
-                use_robot_ca=self.use_robot_ca,
+                use_vision_ca=self.use_vision_ca,
             ) for _ in range(self.num_dit_layers)
         ])
 
@@ -620,7 +620,7 @@ class WilroTransformer(nn.Module):
         # cross-attention heads. This allows action queries to directly
         # attend to high-resolution spatial features (14x14 grid) instead
         # of only VLM's coarse SigLIP patches (~729 patches).
-        if self.use_robot_ca:
+        if self.use_vision_ca:
             self.robot_ca_k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
             self.robot_ca_v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
             self.robot_ca_norm = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
@@ -660,77 +660,77 @@ class WilroTransformer(nn.Module):
         # No separate ResNet model — features are extracted during the VLM
         # forward pass, with natural language-vision alignment from SigLIP's
         # contrastive pretraining.
-        self.robot_vlm_layer_offset = getattr(config, "robot_vlm_layer_offset", -3)
-        self.robot_ca_source = getattr(config, "robot_ca_source", "vlm_intermediate")
-        if self.robot_ca_source not in ("vlm_intermediate", "resnet"):
+        self.vlm_vision_layer_offset = getattr(config, "vlm_vision_layer_offset", -3)
+        self.vision_token_source = getattr(config, "vision_token_source", "vlm")
+        if self.vision_token_source not in ("vlm", "resnet"):
             raise ValueError(
-                f"robot_ca_source must be 'vlm_intermediate' or 'resnet', "
-                f"got {self.robot_ca_source!r}")
+                f"vision_token_source must be 'vlm' or 'resnet', "
+                f"got {self.vision_token_source!r}")
         self.robot_visual_encoder = None
-        self.robot_motion_gate = None
-        self.robot_motion_tokens = 0
+        self.resnet_motion_gate = None
+        self.resnet_motion_tokens = 0
 
         # Guard here as well as in the trainer. The trainer's preflight cannot
         # see a config that arrives from a checkpoint, and this combination
         # fails silently rather than loudly: the motion tokens are simply never
         # produced, so an eval reports on a model that has no motion path while
         # its config says it does.
-        if (int(getattr(config, "robot_cnn_motion_tokens", 0) or 0) > 0
-                and self.robot_ca_source != "resnet"):
+        if (int(getattr(config, "resnet_motion_tokens", 0) or 0) > 0
+                and self.vision_token_source != "resnet"):
             raise ValueError(
-                f"robot_cnn_motion_tokens="
-                f"{getattr(config, 'robot_cnn_motion_tokens')} requires "
-                f"robot_ca_source='resnet'; got {self.robot_ca_source!r}. The motion "
+                f"resnet_motion_tokens="
+                f"{getattr(config, 'resnet_motion_tokens')} requires "
+                f"vision_token_source='resnet'; got {self.vision_token_source!r}. The motion "
                 f"tokens come from differencing the ResNet's own feature maps.")
 
-        # NOT gated on use_robot_ca. The two are independent for this source:
+        # NOT gated on use_vision_ca. The two are independent for this source:
         # robot tokens enter the DiT SEQUENCE and are reached by self-attention
         # whether or not a Robot cross-attention sublayer exists. That is
         # precisely the 2026-06-21 architecture (b3b89f1 added Robot CA nine
-        # days after it). Gating construction here made use_robot_ca=False
+        # days after it). Gating construction here made use_vision_ca=False
         # silently produce a model with NO robot visual pathway at all, which
         # is not what turning off the CA sublayer means.
-        if self.robot_ca_source == "resnet":
+        if self.vision_token_source == "resnet":
             # out_dim is hidden_size, not some CNN width: robot_ca_k_proj /
             # v_proj are built at hidden_size and are SHARED across DiT layers,
             # so the encoder must land in that space directly.
             self.robot_visual_encoder = RobotVisualEncoder(
-                input_size=int(config.robot_encoder_input_size),
-                out_tokens=int(config.robot_encoder_tokens),
+                input_size=int(config.resnet_input_size),
+                out_tokens=int(config.resnet_tokens),
                 out_dim=self.hidden_size,
-                pool=str(getattr(config, "robot_encoder_pool", "avg")),
+                pool=str(getattr(config, "resnet_pool", "avg")),
             )
-            self.robot_motion_tokens = int(getattr(config, "robot_cnn_motion_tokens", 0) or 0)
-            if self.robot_motion_tokens > 0 and getattr(config, "robot_encoder_pool", "avg") == "attn":
+            self.resnet_motion_tokens = int(getattr(config, "resnet_motion_tokens", 0) or 0)
+            if self.resnet_motion_tokens > 0 and getattr(config, "resnet_pool", "avg") == "attn":
                 raise ValueError(
-                    "robot_cnn_motion_tokens needs a second pooling grid from the same "
+                    "resnet_motion_tokens needs a second pooling grid from the same "
                     "backbone, and AttentionPool2d's queries are parameters fixed at "
-                    "construction. Use robot_encoder_pool='avg' for the motion path.")
-            if self.robot_motion_tokens > 0:
+                    "construction. Use resnet_pool='avg' for the motion path.")
+            if self.resnet_motion_tokens > 0:
                 # Zero-init scalar, exactly like moe's robot_pos_gate. Two jobs:
                 # the motion path starts as a no-op so Stage C cannot break
                 # Stage A's initialisation, and the gate's magnitude is the
                 # instrument that catches suppression -- the sibling's wrist
                 # encoder was only caught because its gate was logged.
-                self.robot_motion_gate = nn.Parameter(torch.zeros(1))
-            cams = list(getattr(config, "robot_cnn_cameras", None) or [])
-            self.robot_cnn_cameras = cams or list(config.cameras_for_vision_state_concat)
-            n_cam = len(self.robot_cnn_cameras)
-            px = config.robot_encoder_input_size / max(int(config.robot_encoder_tokens) ** 0.5, 1)
+                self.resnet_motion_gate = nn.Parameter(torch.zeros(1))
+            cams = list(getattr(config, "resnet_cameras", None) or [])
+            self.resnet_cameras = cams or list(config.cameras_for_vision_state_concat)
+            n_cam = len(self.resnet_cameras)
+            px = config.resnet_input_size / max(int(config.resnet_tokens) ** 0.5, 1)
             print(f"[wilro] Robot CA: ResNet-18 (trainable) — "
-                  f"{config.robot_encoder_tokens} tok x {n_cam} cam "
-                  f"@ {config.robot_encoder_input_size}px = {px:.0f} px/token, "
-                  f"pool={getattr(config, 'robot_encoder_pool', 'avg')!r}")
-            if self.robot_motion_tokens > 0:
-                print(f"[wilro] Robot CA motion: +{self.robot_motion_tokens} tok/cam from "
-                      f"feature-map diff at stride {config.robot_cnn_motion_stride} "
+                  f"{config.resnet_tokens} tok x {n_cam} cam "
+                  f"@ {config.resnet_input_size}px = {px:.0f} px/token, "
+                  f"pool={getattr(config, 'resnet_pool', 'avg')!r}")
+            if self.resnet_motion_tokens > 0:
+                print(f"[wilro] Robot CA motion: +{self.resnet_motion_tokens} tok/cam from "
+                      f"feature-map diff at stride {config.resnet_motion_stride} "
                       f"(zero-init gate; VLM still sees ONE frame)")
-        elif self.use_robot_ca:
-            self.robot_cnn_cameras = []
+        elif self.use_vision_ca:
+            self.resnet_cameras = []
             print(f"[wilro] Robot CA: SigLIP ViT intermediate layer "
-                  f"(offset={self.robot_vlm_layer_offset}, LoRA-adapted, language-aligned)")
+                  f"(offset={self.vlm_vision_layer_offset}, LoRA-adapted, language-aligned)")
         else:
-            self.robot_cnn_cameras = []
+            self.resnet_cameras = []
 
         # Stage B. The slice this guards has meant --n_obs_steps changed nothing
         # the model sees; see the config comment for the leak control.
@@ -807,7 +807,7 @@ class WilroTransformer(nn.Module):
         print(f"[wilro] DiT gradient checkpointing ENABLED "
               f"({self.num_dit_layers} layers will be recomputed in backward)")
         n_vis = int(getattr(self.config, "vision_lora_num_layers", 0) or 0)
-        if getattr(self.config, "robot_ca_source", "vlm_intermediate") == "resnet":
+        if getattr(self.config, "vision_token_source", "vlm") == "resnet":
             # No gradient reaches the ViT under this source, so checkpointing it
             # buys a recompute in the backward for activations nobody differentiates.
             n_vis = 0
@@ -851,7 +851,7 @@ class WilroTransformer(nn.Module):
                 language-vision aligned.
         """
         vlm_dtype = next(self.vision_model.parameters()).dtype
-        layer_offset = getattr(self.config, "robot_vlm_layer_offset", -3)
+        layer_offset = getattr(self.config, "vlm_vision_layer_offset", -3)
         all_vis: list[torch.Tensor] = []
         all_intermediate: list[torch.Tensor] = []
 
@@ -976,7 +976,7 @@ class WilroTransformer(nn.Module):
     # VLM encoder: run all layers, cache K/V from the trailing num_dit_layers
     # =========================================================================
     # NOTE: No @torch.no_grad() here — vision_model LoRA adapters need gradient
-    # flow through: loss → DiT → robot_tokens → intermediate_features → connector
+    # flow through: loss → DiT → vision_tokens → intermediate_features → connector
     # → vision_model (LoRA). The text_model portion runs under no_grad context
     # below since KV caches are detached and text weights are frozen.
     def _run_vlm_and_cache_kv(
@@ -993,7 +993,7 @@ class WilroTransformer(nn.Module):
           L_lang:          number of language tokens.
           lang_embeddings: (B, L_lang, H) — VLM-processed language embeddings
                            from final hidden state (for DiT sequence injection).
-          robot_features:  (B, L_vis, H) — intermediate vision features for
+          vlm_vision_features:  (B, L_vis, H) — intermediate vision features for
                            Robot CA from SigLIP ViT (with LoRA adaptation).
                            These features are naturally language-vision aligned
                            through SigLIP's contrastive pretraining.
@@ -1005,8 +1005,8 @@ class WilroTransformer(nn.Module):
         # Under the ResNet source the VLM intermediate is never read, so do not
         # pay for output_hidden_states + a second connector pass to build it.
         # The VLM intermediate exists only to feed Robot CA, so it follows
-        # use_robot_ca. The ResNet does not -- see __init__.
-        need_intermediate = self.use_robot_ca and self.robot_ca_source != "resnet"
+        # use_vision_ca. The ResNet does not -- see __init__.
+        need_intermediate = self.use_vision_ca and self.vision_token_source != "resnet"
         vis_tokens, intermediate_features = self._encode_images(batch, B, return_intermediate=need_intermediate)
         L_vis = vis_tokens.shape[1]
 
@@ -1128,11 +1128,11 @@ class WilroTransformer(nn.Module):
     # =========================================================================
     # DiT-side helpers: robot CNN, latents, time, input assembly
     # =========================================================================
-    def _resnet_robot_tokens(self, batch: dict) -> Optional[torch.Tensor]:
+    def _resnet_tokens(self, batch: dict) -> Optional[torch.Tensor]:
         """Robot tokens from the trainable ResNet-18, one grid per camera.
 
         Layout per camera: [ pool_N(f_t) , gate * pool_M(f_t - f_{t-k}) ], the
-        motion half present only when `robot_cnn_motion_tokens > 0`. Both halves
+        motion half present only when `resnet_motion_tokens > 0`. Both halves
         come from ONE shared backbone -- proj/norm are per-token, so the second
         grid costs no parameters, and the ImageNet stem stays intact (stacking
         the two frames into a 6-channel conv1 would destroy it).
@@ -1140,14 +1140,14 @@ class WilroTransformer(nn.Module):
         enc = self.robot_visual_encoder
         if enc is None:
             return None
-        stride = int(getattr(self.config, "robot_cnn_motion_stride", 1) or 1)
+        stride = int(getattr(self.config, "resnet_motion_stride", 1) or 1)
         # Per-camera grid. The wrist view carries contact geometry and wants a
         # denser grid than the third-person view, which only supplies coarse
         # approach context. Same backbone, different pooling, no extra params.
-        fine_cams = set(getattr(self.config, "robot_cnn_fine_cameras", None) or [])
-        fine_tok = int(getattr(self.config, "robot_cnn_fine_tokens", 0) or 0)
+        fine_cams = set(getattr(self.config, "resnet_fine_cameras", None) or [])
+        fine_tok = int(getattr(self.config, "resnet_fine_tokens", 0) or 0)
         out: list[torch.Tensor] = []
-        for cam_key in self.robot_cnn_cameras:
+        for cam_key in self.resnet_cameras:
             if cam_key not in batch:
                 continue
             imgs = batch[cam_key]
@@ -1162,21 +1162,21 @@ class WilroTransformer(nn.Module):
             else:
                 cur, older = imgs, None
 
-            if self.robot_motion_tokens > 0:
+            if self.resnet_motion_tokens > 0:
                 if older is None:
                     raise ValueError(
-                        f"robot_cnn_motion_tokens={self.robot_motion_tokens} needs two "
+                        f"resnet_motion_tokens={self.resnet_motion_tokens} needs two "
                         f"camera frames, but '{cam_key}' arrived with "
                         f"{tuple(imgs.shape)}. The trainer must request "
                         f"[-{stride}*frame_time, 0.0] for the cameras; check that "
-                        f"--robot_cnn_motion_tokens reached build_datasets too.")
+                        f"--resnet_motion_tokens reached build_datasets too.")
                 fm_cur = enc.trunk(cur.float())
                 fm_old = enc.trunk(older.float())
                 n_tok = fine_tok if (fine_tok > 0 and cam_key in fine_cams) else enc.out_tokens
                 toks = enc.tokens_from_map(fm_cur, out_tokens=n_tok)
                 mot = enc.tokens_from_map(fm_cur - fm_old,
-                                          out_tokens=self.robot_motion_tokens)
-                mot = self.robot_motion_gate.to(mot.dtype) * mot
+                                          out_tokens=self.resnet_motion_tokens)
+                mot = self.resnet_motion_gate.to(mot.dtype) * mot
                 out.append(torch.cat([toks, mot], dim=1))
             else:
                 n_tok = fine_tok if (fine_tok > 0 and cam_key in fine_cams) else None
@@ -1186,14 +1186,14 @@ class WilroTransformer(nn.Module):
             return None
         return torch.cat(out, dim=1)
 
-    def _compute_robot_tokens(
+    def _compute_vision_tokens(
         self,
         batch: dict,
         vlm_robot_features: Optional[torch.Tensor],
     ) -> Optional[torch.Tensor]:
         """Compute robot visual tokens for Robot CA.
 
-        Source is `config.robot_ca_source`: either the VLM's own SigLIP ViT
+        Source is `config.vision_token_source`: either the VLM's own SigLIP ViT
         intermediate layer (frozen base + LoRA) or a separate trainable
         ResNet-18. Exactly one of them -- see the config for why this replaces
         rather than adds.
@@ -1205,10 +1205,10 @@ class WilroTransformer(nn.Module):
                 source, where it is never computed.
 
         Returns:
-            robot_tokens: (B, R, hidden_size) — robot visual tokens
+            vision_tokens: (B, R, hidden_size) — robot visual tokens
         """
-        if self.robot_ca_source == "resnet":
-            toks = self._resnet_robot_tokens(batch)
+        if self.vision_token_source == "resnet":
+            toks = self._resnet_tokens(batch)
             if toks is None:
                 return None
         elif vlm_robot_features is None:
@@ -1242,7 +1242,7 @@ class WilroTransformer(nn.Module):
         self,
         batch: dict,
         noisy_actions: torch.Tensor,
-        robot_tokens: Optional[torch.Tensor],
+        vision_tokens: Optional[torch.Tensor],
         latents: Optional[torch.Tensor],
         action_prefix: Optional[torch.Tensor],
         lang_tokens: Optional[torch.Tensor] = None,
@@ -1306,8 +1306,8 @@ class WilroTransformer(nn.Module):
             # Detach: prefix is treated as conditioning, not a target.
             prefix_emb = self.action_in_proj(action_prefix.detach()).to(dtype)
             parts.append(prefix_emb)
-        if robot_tokens is not None:
-            parts.append(robot_tokens.to(dtype))
+        if vision_tokens is not None:
+            parts.append(vision_tokens.to(dtype))
 
         action_start_idx = sum(p.size(1) for p in parts)
         parts.append(action_emb)
@@ -1371,8 +1371,8 @@ class WilroTransformer(nn.Module):
             return {}
         layer = self.dit_layers[-1]
         mod = layer.adaLN_modulation(t_emb)
-        # Chunk count depends on use_robot_ca: 12 (4 sublayers × 3) or 9 (3 × 3)
-        n_chunks = 12 if layer.use_robot_ca else 9
+        # Chunk count depends on use_vision_ca: 12 (4 sublayers × 3) or 9 (3 × 3)
+        n_chunks = 12 if layer.use_vision_ca else 9
         chunks = mod.chunk(n_chunks, dim=-1)
         s_ca, sc_ca = chunks[3], chunks[4]
         h = _modulate(layer.ca_norm(x), s_ca, sc_ca)
@@ -1424,8 +1424,8 @@ class WilroTransformer(nn.Module):
         """
         layer = self.dit_layers[-1]
         mod = layer.adaLN_modulation(t_emb)
-        # Chunk count depends on use_robot_ca: 12 (4 sublayers × 3) or 9 (3 × 3)
-        n_chunks = 12 if layer.use_robot_ca else 9
+        # Chunk count depends on use_vision_ca: 12 (4 sublayers × 3) or 9 (3 × 3)
+        n_chunks = 12 if layer.use_vision_ca else 9
         chunks = mod.chunk(n_chunks, dim=-1)
         s_sa, sc_sa = chunks[0], chunks[1]
         h = _modulate(layer.sa_norm(x), s_sa, sc_sa)
@@ -1469,7 +1469,7 @@ class WilroTransformer(nn.Module):
         timesteps: torch.Tensor,
         kv_cache: list[tuple[torch.Tensor, torch.Tensor]],
         vlm_kv_pad_mask: torch.Tensor,
-        robot_tokens: Optional[torch.Tensor],
+        vision_tokens: Optional[torch.Tensor],
         latents: Optional[torch.Tensor],
         action_prefix: Optional[torch.Tensor],
         lang_tokens: Optional[torch.Tensor] = None,
@@ -1486,7 +1486,7 @@ class WilroTransformer(nn.Module):
 
         # Build sequence (lang_tokens injected into DiT for language grounding)
         dit_seq, action_start_idx, prefix_start_idx, latent_start_idx, lang_start_idx = self._build_dit_input(
-            batch, noisy_actions, robot_tokens, latents, action_prefix, lang_tokens,
+            batch, noisy_actions, vision_tokens, latents, action_prefix, lang_tokens,
         )
         L_dit = dit_seq.shape[1]
         prefix_len = action_prefix.shape[1] if action_prefix is not None else 0
@@ -1496,21 +1496,21 @@ class WilroTransformer(nn.Module):
 
         # Region boundaries (used by attention-mass diagnostic). Layout:
         #   [SINK(1), (latent(K))?, state(1), (language(L))?, (prefix(P))?, robot(R), action(H)]
-        robot_len = robot_tokens.shape[1] if robot_tokens is not None else 0
+        vision_len = vision_tokens.shape[1] if vision_tokens is not None else 0
         latent_len = latents.shape[1] if latents is not None else 0
         lang_len = lang_tokens.shape[1] if lang_tokens is not None else 0
         H_horizon = self.config.horizon
         # state always sits right after sink + optional latent block
         state_idx = 1 + latent_len
         # robot sits right before action
-        robot_idx = action_start_idx - robot_len
+        vision_idx = action_start_idx - vision_len
         regions: dict[str, Optional[tuple[int, int]]] = {
             "sink":         (0, 1),
             "latent":       (latent_start_idx, latent_len) if latent_len > 0 else None,
             "state":        (state_idx, 1),
             "language":     (lang_start_idx, lang_len) if lang_len > 0 else None,
             "prefix":       (prefix_start_idx, prefix_len) if prefix_len > 0 else None,
-            "robot":        (robot_idx, robot_len),
+            "vision":       (vision_idx, vision_len),
             "action":       (action_start_idx, H_horizon),
         }
 
@@ -1518,14 +1518,14 @@ class WilroTransformer(nn.Module):
         # Project robot tokens into K/V format matching DiT's cross-attention
         # heads. This enables action queries to directly attend to high-res
         # spatial features (14x14 grid) for precise object localization.
-        robot_k, robot_v = None, None
-        if self.use_robot_ca and robot_tokens is not None:
-            robot_normed = self.robot_ca_norm(robot_tokens)
-            B_r, R, _ = robot_normed.shape
-            robot_k = self.robot_ca_k_proj(robot_normed).view(
+        vision_k, vision_v = None, None
+        if self.use_vision_ca and vision_tokens is not None:
+            vision_normed = self.robot_ca_norm(vision_tokens)
+            B_r, R, _ = vision_normed.shape
+            vision_k = self.robot_ca_k_proj(vision_normed).view(
                 B_r, R, self.num_kv_heads, self.head_dim
             ).transpose(1, 2)  # (B, num_kv_heads, R, head_dim)
-            robot_v = self.robot_ca_v_proj(robot_normed).view(
+            vision_v = self.robot_ca_v_proj(vision_normed).view(
                 B_r, R, self.num_kv_heads, self.head_dim
             ).transpose(1, 2)
 
@@ -1560,7 +1560,7 @@ class WilroTransformer(nn.Module):
             if use_ckpt:
                 x = torch.utils.checkpoint.checkpoint(
                     layer, x, t_emb, vlm_k, vlm_v, vlm_kv_pad_mask, attn_mask,
-                    robot_k, robot_v,
+                    vision_k, vision_v,
                     use_reentrant=False,
                 )
             else:
@@ -1569,7 +1569,7 @@ class WilroTransformer(nn.Module):
                     vlm_k=vlm_k, vlm_v=vlm_v,
                     vlm_kv_pad_mask=vlm_kv_pad_mask,
                     self_attn_mask=attn_mask,
-                    robot_k=robot_k, robot_v=robot_v,
+                    vision_k=vision_k, vision_v=vision_v,
                 )
 
         H = self.config.horizon
@@ -1607,10 +1607,10 @@ class WilroTransformer(nn.Module):
 
         # ── Encoder: run VLM once, cache KV + extract lang + robot features ──
         (kv_cache, vlm_kv_pad_mask, L_vis, L_lang,
-         lang_embeddings, robot_features) = self._run_vlm_and_cache_kv(batch)
+         lang_embeddings, vlm_vision_features) = self._run_vlm_and_cache_kv(batch)
 
         # ── DiT-side conditioning that does NOT depend on noise ─────
-        robot_tokens = self._compute_robot_tokens(batch, robot_features)
+        vision_tokens = self._compute_vision_tokens(batch, vlm_vision_features)
         latents = self._generate_latents(batch, B, device, torch.bfloat16)
 
         # ── Action prefix for async execution training ──────────────
@@ -1630,7 +1630,7 @@ class WilroTransformer(nn.Module):
 
         v_t = self._run_dit(
             batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask,
-            robot_tokens, latents, action_prefix, lang_embeddings,
+            vision_tokens, latents, action_prefix, lang_embeddings,
             L_vis=L_vis, L_lang=L_lang,
         ).float()
 
@@ -1743,7 +1743,7 @@ class WilroTransformer(nn.Module):
                     v_wrong = self._run_dit(
                         batch, x_t.to(torch.bfloat16), t,
                         shuffled_cache, shuffled_pad_mask,
-                        robot_tokens, latents, action_prefix, shuffled_lang,
+                        vision_tokens, latents, action_prefix, shuffled_lang,
                         L_vis=L_vis, L_lang=L_lang,
                     ).float()
 
@@ -1792,8 +1792,8 @@ class WilroTransformer(nn.Module):
 
         with autocast_ctx:
             (kv_cache, vlm_kv_pad_mask, L_vis, L_lang,
-             lang_embeddings, robot_features) = self._run_vlm_and_cache_kv(batch)
-            robot_tokens = self._compute_robot_tokens(batch, robot_features)
+             lang_embeddings, vlm_vision_features) = self._run_vlm_and_cache_kv(batch)
+            vision_tokens = self._compute_vision_tokens(batch, vlm_vision_features)
             latents = self._generate_latents(batch, B, device, torch.bfloat16)
 
             N = int(getattr(self.config, "num_inference_steps", 10))
@@ -1803,7 +1803,7 @@ class WilroTransformer(nn.Module):
             for _ in range(N):
                 v_t = self._run_dit(
                     batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask,
-                    robot_tokens, latents, action_prefix=None, lang_tokens=lang_embeddings,
+                    vision_tokens, latents, action_prefix=None, lang_tokens=lang_embeddings,
                     L_vis=L_vis, L_lang=L_lang,
                 ).float()
                 x_t = x_t + dt * v_t
@@ -1822,8 +1822,8 @@ class WilroTransformer(nn.Module):
 
         with autocast_ctx:
             (kv_cache, vlm_kv_pad_mask, L_vis, L_lang,
-             lang_embeddings, robot_features) = self._run_vlm_and_cache_kv(batch)
-            robot_tokens = self._compute_robot_tokens(batch, robot_features)
+             lang_embeddings, vlm_vision_features) = self._run_vlm_and_cache_kv(batch)
+            vision_tokens = self._compute_vision_tokens(batch, vlm_vision_features)
             latents = self._generate_latents(batch, B, device, torch.bfloat16)
 
             N = int(getattr(self.config, "num_inference_steps", 10))
@@ -1836,7 +1836,7 @@ class WilroTransformer(nn.Module):
             for _ in range(N):
                 v_t = self._run_dit(
                     batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask,
-                    robot_tokens, latents, action_prefix=None, lang_tokens=lang_embeddings,
+                    vision_tokens, latents, action_prefix=None, lang_tokens=lang_embeddings,
                     L_vis=L_vis, L_lang=L_lang,
                 ).float()
                 x_t = x_t + dt * v_t
