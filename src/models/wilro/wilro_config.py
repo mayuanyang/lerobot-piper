@@ -369,13 +369,36 @@ class WilroConfig(PreTrainedConfig):
         ResNet was, and the 2026-09-05 rename. Both translate onto the current
         names. Explicit current values win, so a shim can never override an
         intentional setting -- only fill in what the caller left at its default.
+
+        The aliases are MIRRORED back at the end, never left as None. Setting
+        them to None and saving is what broke: draccus writes `"use_robot_ca":
+        null` into config.json, and on a draccus older than 0.10 the field
+        resolves to decode_bool rather than the union decoder, so the file this
+        class wrote is a file this class cannot read --
+
+            DecodingError: `use_robot_ca`: Couldn't parse 'None' into a bool
+
+        Mirroring keeps every alias holding the same value as the field it
+        aliases, which makes a re-read a no-op and means no null is ever
+        serialised. Round-tripped in tests, which the None version was not.
         """
         parent = getattr(super(), "__post_init__", None)
         if parent is not None:
             parent()
 
-        moved = []
-        # -- 2026-09-05 rename. One for one, only when the new field is default.
+        RENAMED = (
+            ("robot_ca_source", "vision_token_source"),
+            ("use_robot_ca", "use_vision_ca"),
+            ("robot_vlm_layer_offset", "vlm_vision_layer_offset"),
+            ("robot_encoder_tokens", "resnet_tokens"),
+            ("robot_encoder_input_size", "resnet_input_size"),
+            ("robot_encoder_pool", "resnet_pool"),
+            ("robot_cnn_cameras", "resnet_cameras"),
+            ("robot_cnn_fine_cameras", "resnet_fine_cameras"),
+            ("robot_cnn_fine_tokens", "resnet_fine_tokens"),
+            ("robot_cnn_motion_tokens", "resnet_motion_tokens"),
+            ("robot_cnn_motion_stride", "resnet_motion_stride"),
+        )
         DEFAULTS = {
             "vision_token_source": "vlm", "use_vision_ca": True,
             "vlm_vision_layer_offset": -3, "resnet_tokens": 64,
@@ -384,42 +407,34 @@ class WilroConfig(PreTrainedConfig):
             "resnet_fine_tokens": 0, "resnet_motion_tokens": 0,
             "resnet_motion_stride": 1,
         }
-        for old_name, new_name in (
-                ("robot_ca_source", "vision_token_source"),
-                ("use_robot_ca", "use_vision_ca"),
-                ("robot_vlm_layer_offset", "vlm_vision_layer_offset"),
-                ("robot_encoder_tokens", "resnet_tokens"),
-                ("robot_encoder_input_size", "resnet_input_size"),
-                ("robot_encoder_pool", "resnet_pool"),
-                ("robot_cnn_cameras", "resnet_cameras"),
-                ("robot_cnn_fine_cameras", "resnet_fine_cameras"),
-                ("robot_cnn_fine_tokens", "resnet_fine_tokens"),
-                ("robot_cnn_motion_tokens", "resnet_motion_tokens"),
-                ("robot_cnn_motion_stride", "resnet_motion_stride")):
+        # Which aliases actually arrived. A mirrored re-read has them ALL set,
+        # which is how the use_robot_cnn=False guard below tells a genuine
+        # 2026-06/07 config from a config this class wrote.
+        present = {o for o, _ in RENAMED if getattr(self, o) is not None}
+        moved = []
+        for old_name, new_name in RENAMED:
             v = getattr(self, old_name)
             if v is None:
                 continue
-            # "vlm_intermediate" was the old spelling of the source value.
             if new_name == "vision_token_source" and v == "vlm_intermediate":
                 v = "vlm"
-            if getattr(self, new_name) == DEFAULTS[new_name]:
+            if getattr(self, new_name) == DEFAULTS[new_name] and v != DEFAULTS[new_name]:
                 setattr(self, new_name, v)
                 moved.append(f"{old_name}={v!r} -> {new_name}")
-            setattr(self, old_name, None)
         if self.vision_token_source == "vlm_intermediate":
             self.vision_token_source = "vlm"
             moved.append("vision_token_source 'vlm_intermediate' -> 'vlm'")
 
-        # -- 2026-06/07 fields, removed when the ResNet was.
+        # 2026-06/07 fields, removed when the ResNet was.
         if self.use_robot_cnn is not None:
-            if not self.use_robot_cnn:
+            if not self.use_robot_cnn and "robot_ca_source" not in present:
                 raise ValueError(
                     "use_robot_cnn=False came from a checkpoint whose DiT has no "
                     "vision tokens at all. The current model has no way to express "
                     "that -- vision_token_source selects WHICH source feeds the "
                     "tokens, not whether they exist. This checkpoint needs the "
                     "code of its own era.")
-            if self.vision_token_source != "resnet":
+            if self.use_robot_cnn and self.vision_token_source != "resnet":
                 self.vision_token_source = "resnet"
                 moved.append("use_robot_cnn=True -> vision_token_source='resnet'")
         if self.gripper_camera and self.gripper_encoder_tokens \
@@ -435,6 +450,16 @@ class WilroConfig(PreTrainedConfig):
             print("[wilro] legacy config translated:")
             for m in moved:
                 print(f"          {m}")
+
+        # MIRROR, never None: see the docstring. Every alias ends up holding the
+        # value of the field it aliases, so nothing serialises as null and a
+        # re-read translates each name onto itself.
+        for old_name, new_name in RENAMED:
+            setattr(self, old_name, getattr(self, new_name))
+        self.use_robot_cnn = (self.vision_token_source == "resnet")
+        self.gripper_camera = (self.resnet_fine_cameras[0]
+                               if self.resnet_fine_cameras else "")
+        self.gripper_encoder_tokens = int(self.resnet_fine_tokens)
 
     def validate_features(self) -> None:
         if len(self.image_features) == 0 and self.env_state_feature is None:
