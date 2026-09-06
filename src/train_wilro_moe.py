@@ -202,6 +202,14 @@ def _log_gradient_analysis(policy, step: int) -> None:
         # be fully collapsed and still average out uniform if different samples
         # collapse to different experts. These two read the PRE-noise per-sample
         # weights, which is what inference uses.
+        dis = getattr(policy.model, "_last_expert_disagreement", None)
+        if dis is not None:
+            hint = ("  <- adaLN-Zero: experts are still the identity map, "
+                    "so this is 'not differentiated yet', NOT 'in agreement'"
+                    if dis < 1e-4 else
+                    "  (large = the mixture's mean sits between what the "
+                    "experts want)")
+            print(f"                      expert disagreement={dis:.4f}{hint}")
         mw = getattr(policy.model, "_last_router_max_w", None)
         ent = getattr(policy.model, "_last_router_entropy", None)
         if mw is not None and ent is not None:

@@ -350,6 +350,7 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
         self._last_router_usage = None
         self._last_router_max_w = None
         self._last_router_entropy = None
+        self._last_expert_disagreement = None
         self._last_loss_components = None
         self._capture_attention_stats = False
         self._last_attention_stats = None
@@ -725,7 +726,29 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
                 self.final_norm(x[:, action_start_idx:])))
         stacked = torch.stack(outs, dim=1)
         self._last_router_usage = usage
-        return (weights.unsqueeze(-1).unsqueeze(-1) * stacked).sum(dim=1)
+        v = (weights.unsqueeze(-1).unsqueeze(-1) * stacked).sum(dim=1)
+
+        # Do the experts DISAGREE? The mixture is a weighted mean of velocity
+        # predictions, which is only benign because all experts see the same
+        # x_t and t and are therefore approximating the SAME target field --
+        # the mode was already chosen by the noise draw, not by the expert. If
+        # that stops being true the mean lands between modes and satisfies none
+        # of them, and this is the number that says so:
+        #   ~0    experts agree; the mixture is variance reduction
+        #   ~1    they predict unrelated velocities and the mean is a compromise
+        #
+        # READ IT WITH THE STEP NUMBER. adaLN-Zero makes every residual branch
+        # start at zero, so at init each expert IS the identity map and this
+        # reads EXACTLY 0.000 -- "not yet differentiated", not "in agreement".
+        # The two are indistinguishable from the number alone. It only becomes
+        # the intended measurement once the adaLN gates have moved.
+        # It is a diagnostic, not a loss. Driving it to zero would just make the
+        # experts redundant, which is the opposite of what they are for.
+        with torch.no_grad():
+            spread = stacked.float().std(dim=1).mean()
+            scale = stacked.float().abs().mean().clamp(min=1e-8)
+            self._last_expert_disagreement = float(spread / scale)
+        return v
 
     def router_balance_loss(self):
         """CV^2 of expert usage. Router collapse to a single expert is the known
