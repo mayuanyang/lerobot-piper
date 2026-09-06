@@ -251,7 +251,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           robot_encoder_pool: str = "avg",
           use_state_history: bool = False,
           robot_cnn_motion_tokens: int = 0,
-          robot_cnn_motion_stride: int = 1):
+          robot_cnn_motion_stride: int = 1,
+          no_robot_ca: bool = False):
     """Train the Wilro (SmolVLM2 KV-cache → DiT) flow matching model.
 
     `dataset_id` may be a single id or a list. Multiple datasets are concatenated
@@ -534,6 +535,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         use_state_history=use_state_history,
         robot_cnn_motion_tokens=robot_cnn_motion_tokens,
         robot_cnn_motion_stride=robot_cnn_motion_stride,
+        use_robot_ca=not no_robot_ca,
     )
 
     # Model + checkpoint loading
@@ -1328,6 +1330,19 @@ if __name__ == "__main__":
                              "gated off. Compare against sft-40k (68.2), and hold "
                              "--lora_rank/--vision_lora_num_layers at 16/8 when you "
                              "do, or the two capacity changes are not separable.")
+    parser.add_argument("--no_robot_ca", action="store_true",
+                        help="Drop the per-DiT-layer Robot cross-attention "
+                             "sublayer, so robot tokens are reached ONLY by the "
+                             "sequence's self-attention. adaLN goes 12x960 back "
+                             "to 9x960, which is NOT resume-compatible with a "
+                             "checkpoint trained with the sublayer. "
+                             "This is what the repo's two best results both do: "
+                             "wiltechs_moe (92 spatial) has no robot CA at all, "
+                             "and wilro's 82.5 predates it by nine days "
+                             "(b3b89f1, 2026-06-30). Every wilro number measured "
+                             "WITH it sits between 38 and 68. Correlation across "
+                             "5 runs, not a controlled measurement -- this flag "
+                             "is how it gets controlled.")
     parser.add_argument("--robot_encoder_tokens", type=int, default=64,
                         help="ResNet source only: pooled tokens per camera "
                              "(perfect square for avg pooling). 64 at "
