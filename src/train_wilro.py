@@ -170,7 +170,7 @@ def _log_gradient_analysis(policy, step: int) -> None:
     ]:
         grad, n = _grad_stats(prefix)
         if grad is not None:
-            print(f"  {label:22s} - Avg Abs Grad: {grad:.6f} ({n:,} params)")
+            print(f"  {label:22s} - Avg Abs Grad: {grad:.3e} ({n:,} params)")
 
     stats = getattr(policy.model, "_last_attention_stats", None)
     if stats:

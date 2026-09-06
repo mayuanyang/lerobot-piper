@@ -168,7 +168,7 @@ def _log_gradient_analysis(policy, step: int) -> None:
     ]:
         grad, n = _grad_stats(prefix)
         if grad is not None:
-            print(f"  {label:22s} - Avg Abs Grad: {grad:.6f} ({n:,} params)")
+            print(f"  {label:22s} - Avg Abs Grad: {grad:.3e} ({n:,} params)")
 
     stats = getattr(policy.model, "_last_attention_stats", None)
     if stats:
@@ -204,11 +204,12 @@ def _log_gradient_analysis(policy, step: int) -> None:
         # weights, which is what inference uses.
         dis = getattr(policy.model, "_last_expert_disagreement", None)
         if dis is not None:
-            hint = ("  <- adaLN-Zero: experts are still the identity map, "
-                    "so this is 'not differentiated yet', NOT 'in agreement'"
+            hint = ("  <- adaLN-Zero: experts are still the identity map, so "
+                    "this is 'not differentiated yet', NOT 'in agreement'"
                     if dis < 1e-4 else
-                    "  (large = the mixture's mean sits between what the "
-                    "experts want)")
+                    "  <- experts have differentiated; watch the trend, a rise "
+                    "toward ~1 means the mixture's mean is landing between what "
+                    "they want")
             print(f"                      expert disagreement={dis:.4f}{hint}")
         mw = getattr(policy.model, "_last_router_max_w", None)
         ent = getattr(policy.model, "_last_router_entropy", None)
