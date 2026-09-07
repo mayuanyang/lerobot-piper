@@ -214,7 +214,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           gradient_checkpointing=False, max_episode_index=None, batch_size=64,
           contrastive_loss_weight=0.1, contrastive_margin=0.05,
           contrastive_hard_negatives=False,
-          lock_joint_index: int | None = 3, kv_capture_strategy: str = "last",
+          lock_joint_index: int | None = None, kv_capture_strategy: str = "last",
           kv_capture_layers: list | None = None,
           cameras: list | None = None,
           rewrite_instructions: bool = False,
@@ -405,15 +405,60 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     horizon = 64
     n_action_steps = 64
 
-    # Build action_dim_weights — uniform by default. piper_arm's joint 4
-    # (index 3) is always 0, so for that dataset pass --lock_joint_index 3
-    # (the default) to zero out its loss contribution. For LIBERO / other
-    # full-DOF robots, pass --lock_joint_index "" (None) to weight all dims.
+    # Build action_dim_weights FROM THE DATA, not from a flag default.
+    #
+    # A zero weight does not suppress a dim, it randomises it. action_out_proj
+    # is zero-init; with weight 0 that row gets no gradient from the flow loss,
+    # and none from the contrastive term either (v_t and v_wrong share the row,
+    # so their difference on that dim is identically 0). The row stays at zero
+    # forever => v_t[..., i] == 0 => the Euler loop never moves x_t[..., i] =>
+    # the emitted value is the INITIAL NOISE, unnormalized: a fresh draw from
+    # that dim's marginal on every single step.
+    #
+    # That is harmless only when the dim is genuinely constant, where the
+    # marginal is a point mass. When it is not, sampling the marginal costs
+    # 2*sigma^2 against sigma^2 for simply emitting the mean -- i.e. a zero
+    # weight is strictly WORSE than doing nothing.
+    #
+    # This defaulted to index 3 for piper_arm's mechanically-locked joint 4,
+    # and that dataset-specific default leaked into every LIBERO run. LIBERO's
+    # dim 3 has std 0.0392 -- 62% of dim 4's and 50% of dim 5's, an ordinary
+    # rotation axis -- so it was fed marginal noise for entire runs while the
+    # log said only "Locking action dim 3".
+    act_std = np.asarray(combined_stats["action"]["std"], dtype=float).reshape(-1)
+    widest = float(act_std.max()) if act_std.size else 1.0
+    # A dim varying <0.1% of the widest is a point mass in practice. piper_arm's
+    # joint 4 is exactly 0; LIBERO's dim 3 sits 39x above this line.
+    degenerate = [i for i in range(min(action_dim, act_std.size))
+                  if act_std[i] <= 1e-3 * widest]
+
+    if lock_joint_index is None:
+        locked, why = degenerate, "the data (std is a point mass)"
+    else:
+        locked = [lock_joint_index] if 0 <= lock_joint_index < action_dim else []
+        why = f"--lock_joint_index {lock_joint_index}"
+
     action_dim_weights = [1.0] * action_dim
-    if lock_joint_index is not None and 0 <= lock_joint_index < action_dim:
-        action_dim_weights[lock_joint_index] = 0.0
-        print(f"Locking action dim {lock_joint_index} (weight=0); "
+    for i in locked:
+        action_dim_weights[i] = 0.0
+
+    # Always print the stds. The old message named the locked index and nothing
+    # else, so there was no way to tell a mechanically-dead joint from a live
+    # one being silently randomised.
+    print("Action dim std: " + "  ".join(
+        f"[{i}]{act_std[i]:.4f}{'*' if i in locked else ''}"
+        for i in range(min(action_dim, act_std.size))))
+    if locked:
+        print(f"Locked action dims {locked} (weight=0) from {why}; "
               f"action_dim_weights={action_dim_weights}")
+        for i in locked:
+            if i not in degenerate:
+                print(f"  [WARN] dim {i} std {act_std[i]:.4f} is "
+                      f"{100 * act_std[i] / widest:.1f}% of the widest dim -- it is "
+                      f"NOT constant. Weight 0 makes the model SAMPLE this dim "
+                      f"from its marginal every step, which is worse than "
+                      f"emitting its mean. Drop --lock_joint_index unless the "
+                      f"joint is mechanically dead.")
     else:
         print(f"All {action_dim} action dims weighted equally; "
               f"action_dim_weights={action_dim_weights}")
@@ -1492,10 +1537,14 @@ if __name__ == "__main__":
                              "variants than this. Partial augmentation is worse "
                              "than none: the unvaried tasks keep surface form as "
                              "a key and the run answers nothing.")
-    parser.add_argument("--lock_joint_index", type=int, default=3,
-                        help="Action dim with weight 0 (piper_arm joint 4 = "
-                             "index 3 is mechanically locked). Pass -1 to "
-                             "disable for LIBERO / other full-DOF robots.")
+    parser.add_argument("--lock_joint_index", type=int, default=None,
+                        help="Force one action dim to loss weight 0. Default is "
+                             "None: dims are locked FROM THE DATA (std <= 0.1%% "
+                             "of the widest), which catches piper_arm's dead "
+                             "joint 4 and leaves LIBERO's dim 3 alone. A zero "
+                             "weight does not suppress a dim, it makes the model "
+                             "sample it from its marginal -- only correct for a "
+                             "mechanically locked joint. Pass -1 to force none.")
     parser.add_argument("--kv_capture_strategy", type=str, default="last",
                         choices=["last", "stride2", "custom"],
                         help="Which VLM layers the DiT sources KV from. "
@@ -1544,9 +1593,11 @@ if __name__ == "__main__":
                              "original and rewritten instruction (50/50) for each sample. "
                              "This trains the model to understand BOTH phrasings.")
     args = parser.parse_args()
-    # Argparse can't express None for an int, so use -1 sentinel.
-    if args.lock_joint_index is not None and args.lock_joint_index < 0:
-        args.lock_joint_index = None
+    # -1 must NOT be folded to None any more: None now means "decide from the
+    # data" and -1 means "lock nothing at all". Folding them together would
+    # make --lock_joint_index -1 silently re-enable auto-detection, which on
+    # piper_arm still locks joint 4. The block in train() reads -1 as
+    # out-of-range and produces an empty lock list, which is the intent.
     # Parse the comma-separated custom layer list into ints.
     args.kv_capture_layers = [
         int(tok) for tok in args.kv_capture_layers.split(",") if tok.strip() != ""
