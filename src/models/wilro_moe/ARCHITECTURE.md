@@ -38,7 +38,7 @@ into the DiT sequence**, and **the pooled hidden state feeding the router**.
 | config | vision tokens in sequence | ViT LoRA | text LoRA | trainable in encoder |
 |---|---|---|---|---|
 | **A** `vlm` + ViT LoRA *(default)* | **NONE** ⚠ | **DEAD, silently** | off | **nothing** |
-| **B** `resnet` | ResNet-18, 64×N tok | DEAD (warned) | off | ResNet-18, 3.03M |
+| **B** `resnet` **← the 79.5% run** | ResNet-18, 100×2 = 200 tok | n/a (set to 0) | off | ResNet-18, 3.03M |
 | **C** no LoRA at all | NONE | — | — | nothing (honest) |
 | **D** `vlm` + text LoRA | NONE | via router only | trains via router | text LoRA |
 
@@ -50,7 +50,8 @@ puts them in the optimizer, and never updates them. See
 
 ## Config A — default (`vision_token_source="vlm"`, ViT LoRA on, text LoRA off)
 
-What every wilro_moe run so far has actually executed.
+**No run has used this.** It is the default a fresh `--` invocation lands on, and
+it is the one with two dead pathways. The 17k / 79.5% checkpoint is **config B**.
 
 ```mermaid
 flowchart TB
@@ -85,7 +86,12 @@ it simply has **one** visual pathway where the docstrings describe two.
 ## Config B — `vision_token_source="resnet"`
 
 The only configuration with a *trainable* visual encoder. This is the shape of
-the 2026-06-21 architecture that scored 82.5 on wilro.
+the 2026-06-21 architecture that scored 82.5 on wilro, and **it is what the
+17k checkpoint that scored 79.5% spatial actually ran**: `resnet_tokens 100`
+x 2 cameras @ 224px = **200 sequence vision tokens**, with
+`vision_lora_num_layers: 0` and `text_lora_num_layers: 0`, so the SmolVLM2
+encoder is entirely frozen and the ResNet-18 is the only trainable visual
+parameter. Sequence length `1 + 1 + 200 + 64 = 266`, against `66` under config A.
 
 ```mermaid
 flowchart TB
