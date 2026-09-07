@@ -2,81 +2,170 @@
 
 `wiltechs_moe` with the backbone swapped from Qwen3-VL-4B to SmolVLM2-500M.
 Equivalently: **wilro's encoder under wiltechs_moe's decoder.** The encoder half
-is *imported* (`SmolVLMEncoderMixin`), not copied, so wilro and wilro_moe share
-one implementation of image/language encoding and KV capture.
+is *imported* (`SmolVLMEncoderMixin`), not copied.
 
-- **Encoder** = SmolVLM2-500M (SigLIP ViT + connector + 32-layer text stack),
-  frozen, optionally LoRA-adapted. Runs **once per observation**. Emits three
-  things: a post-RoPE K/V cache for **all 32 text layers**, the mean-pooled final
-  hidden state (for the router), and spatial vision tokens.
-- **Decoder** = **4 experts × 8 DiT layers**. Every expert runs on every forward
-  and their outputs are combined by a softmax router. Runs **N times per
-  observation** during the flow-matching loop.
+- **Encoder** = SmolVLM2-500M (SigLIP ViT + connector + 32-layer text stack).
+  Runs **once per observation**. Emits a post-RoPE K/V cache for **all 32 text
+  layers**, the mean-pooled final hidden state (for the router), and — *in some
+  configurations only* — spatial vision tokens for the sequence.
+- **Decoder** = **4 experts × 8 DiT layers**, reading **disjoint** bands of those
+  32 layers. Every expert runs on every forward; a softmax router weights them.
+  Runs **N times per observation** during the flow-matching loop.
 
-The defining structural choice: **the four experts read *disjoint* bands of the
-VLM's layers.** 4 × 8 = 32 = exactly SmolVLM2's text depth, so the partition is
-exact with nothing left over.
+4 × 8 = 32 = exactly SmolVLM2's text depth, so the partition is exact.
 
-> `dit_hidden_size` defaults to **960 = the VLM's hidden size**, which is what
-> lets the experts reuse wilro's `DiTLayer` verbatim: self- and cross-attention
-> can share one head geometry (15 heads / 5 KV heads / head_dim 64). A narrower
-> expert would need the split `sa_`/`ca_` variant from `wiltechs_vla`, which is
-> **not ported** — the constructor raises `NotImplementedError` rather than
-> silently mis-shaping the cross-attention.
+> `dit_hidden_size` defaults to **960 = the VLM's hidden size**, which lets the
+> experts reuse wilro's `DiTLayer` verbatim (one head geometry — 15 heads / 5 KV
+> heads / head_dim 64 — for both self- and cross-attention). A narrower expert
+> needs the split `sa_`/`ca_` variant from `wiltechs_vla`, which is **not
+> ported**: the constructor raises rather than mis-shaping cross-attention.
 
 ---
 
-## Overall data flow
+## Read this table before any diagram
+
+The configurations below differ in exactly one thing that matters — **where
+gradient can reach**. Two facts fix the whole picture:
+
+| | |
+|---|---|
+| `smolvlm_encoder.py:524` | the KV cache is **always** `.detach()`ed — cross-attention **never** backprops into the VLM, in any config |
+| `smolvlm_encoder.py:501` | the text stack runs under `no_grad` **unless text LoRA is on** |
+
+So the encoder has only two possible gradient inlets: **vision tokens injected
+into the DiT sequence**, and **the pooled hidden state feeding the router**.
+
+| config | vision tokens in sequence | ViT LoRA | text LoRA | trainable in encoder |
+|---|---|---|---|---|
+| **A** `vlm` + ViT LoRA *(default)* | **NONE** ⚠ | **DEAD, silently** | off | **nothing** |
+| **B** `resnet` | ResNet-18, 64×N tok | DEAD (warned) | off | ResNet-18, 3.03M |
+| **C** no LoRA at all | NONE | — | — | nothing (honest) |
+| **D** `vlm` + text LoRA | NONE | via router only | trains via router | text LoRA |
+
+**A and C are the same computation.** A just also allocates ViT LoRA parameters,
+puts them in the optimizer, and never updates them. See
+[The default config's dead pathways](#the-default-configs-dead-pathways).
+
+---
+
+## Config A — default (`vision_token_source="vlm"`, ViT LoRA on, text LoRA off)
+
+What every wilro_moe run so far has actually executed.
 
 ```mermaid
 flowchart TB
-    subgraph ENC["ENCODER — frozen SmolVLM2-500M, runs ONCE per observation"]
-        direction TB
-        IMG["images<br/>N cameras"] --> ViT["SigLIP ViT<br/>frozen + LoRA rank r"]
-        ViT --> CONN["connector<br/>pixel-shuffle + MLP"]
-        TASK["task text<br/>+ paraphrase aug"] --> TE["embed_tokens<br/>frozen"]
-        CONN --> TXT["text_model — 32 layers<br/>frozen + optional LoRA"]
-        TE --> TXT
-    end
+    IMG["images<br/>N cameras"] --> ViT["SigLIP ViT<br/>FROZEN + LoRA"]
+    ViT --> CONN["connector<br/>FROZEN"]
+    TASK["task text"] --> TE["embed_tokens<br/>FROZEN"]
+    CONN --> CAT["vlm_seq = vis | lang"]
+    TE --> CAT
+    CAT --> TXT["text_model, 32 layers<br/>FROZEN, under no_grad"]
+    TXT -->|"K,V per layer — DETACHED"| KV[("VLM KV cache<br/>32 x K,V")]
+    TXT -->|"final hidden, mean-pool — DETACHED"| SEM["vlm_semantic"]
+    ViT -.->|"intermediate NEVER COMPUTED<br/>need_intermediate = use_vision_ca = False"| X(("x"))
+    X -.->|"vision_tokens = None"| SEQ
 
-    TXT -->|"post-RoPE K/V, all 32 layers"| KV[("VLM KV cache<br/>32 x (K,V)")]
-    TXT -->|"final hidden, mean-pool over valid"| SEM["vlm_semantic (960)"]
-    ViT -->|"intermediate layer -3, connector-projected"| VTOK["vision tokens"]
+    SEQ["DiT sequence<br/>sink | state | action<br/>NO vision tokens"]
+    KV --> DEC["4 experts x 8 DiT layers"]
+    SEM --> R{{"router"}}
+    SEQ --> DEC
+    R --> DEC
+    DEC --> V["v_t"]
 
-    subgraph DEC["DECODER — 4 experts x 8 DiT layers, runs N times per observation"]
-        direction TB
-        SEQ["sequence:<br/>sink | state | vision | action(H)"]
-        SEQ --> E0["Expert 0<br/>8 DiT layers"]
-        SEQ --> E1["Expert 1<br/>8 DiT layers"]
-        SEQ --> E2["Expert 2<br/>8 DiT layers"]
-        SEQ --> E3["Expert 3<br/>8 DiT layers"]
-    end
-
-    VTOK --> SEQ
-    XT["x_t = t*noise + (1-t)*a"] --> SEQ
-    ST["observation.state"] --> SEQ
-
-    KV -->|"layers 0-7"| E0
-    KV -->|"layers 8-15"| E1
-    KV -->|"layers 16-23"| E2
-    KV -->|"layers 24-31"| E3
-
-    SEM --> R{{"MoERouter"}}
-    ST --> R
-    XT --> R
-    TEMB["t embedding"] --> R
-
-    E0 --> MIX["weighted sum<br/>sum_e w_e * v_e"]
-    E1 --> MIX
-    E2 --> MIX
-    E3 --> MIX
-    R -->|"w (B,4) softmax"| MIX
-    MIX --> V["v_t — predicted velocity<br/>(B, H, 7)"]
+    LORA["ViT LoRA params<br/>allocated, in optimizer<br/>ZERO GRADIENT"] -.- ViT
 ```
 
-**Read the arrow counts, not the boxes:** the encoder arrow fires once, the
-decoder block fires `num_inference_steps` times at eval (default 10) and once
-per training step. The KV cache is what makes that cheap.
+**Every arrow leaving the encoder is detached.** The experts reach vision only
+through cross-attention to the KV cache — which does cover the vision token
+positions, since `vlm_seq = [vis_tokens, lang_tokens]`. The model is not blind;
+it simply has **one** visual pathway where the docstrings describe two.
+
+---
+
+## Config B — `vision_token_source="resnet"`
+
+The only configuration with a *trainable* visual encoder. This is the shape of
+the 2026-06-21 architecture that scored 82.5 on wilro.
+
+```mermaid
+flowchart TB
+    IMG["images"] --> ViT["SigLIP ViT<br/>FROZEN, LoRA DEAD (warned)"]
+    ViT --> CONN["connector FROZEN"]
+    TASK["task text"] --> TE["embed_tokens FROZEN"]
+    CONN --> CAT["vlm_seq"]
+    TE --> CAT
+    CAT --> TXT["text_model 32L<br/>FROZEN, no_grad"]
+    TXT -->|"DETACHED"| KV[("VLM KV cache")]
+    TXT -->|"DETACHED"| SEM["vlm_semantic"]
+
+    IMG2["camera tensors<br/>resnet_cameras"] ==> RN["ResNet-18 to layer3<br/>TRAINABLE 3.03M"]
+    RN ==>|"resnet_tokens x N cams"| SEQ
+    SEQ["DiT sequence<br/>sink | state | VISION | action"]
+    SEQ ==> ADPT["per-expert vision adapters<br/>zero-init residual, opt-in"]
+    ADPT ==> DEC["4 experts x 8 DiT layers"]
+    KV --> DEC
+    SEM --> R{{"router"}} --> DEC
+    DEC ==> V["v_t"]
+```
+
+Double lines = the gradient-carrying path. `RobotVisualEncoder` is truncated
+after `layer3` (layer4 is 72% of stock ResNet-18 and is excluded), hence 3.03M.
+
+> Selecting `resnet` prints a `[WARN]` that the ViT LoRA will not train. That
+> warning is **correct but incomplete** — the same is true under config A, where
+> nothing is printed.
+
+---
+
+## Config C — no LoRA anywhere
+
+```mermaid
+flowchart LR
+    IMG["images"] --> ViT["SigLIP ViT FROZEN"] --> CONN["connector FROZEN"]
+    TASK["text"] --> TE["embed_tokens FROZEN"]
+    CONN --> TXT["text_model 32L FROZEN"]
+    TE --> TXT
+    TXT -->|"detached"| KV[("KV cache")]
+    TXT -->|"detached"| SEM["vlm_semantic"]
+    KV --> DEC["4 experts x 8 DiT<br/>THE ONLY TRAINABLE MODULE"]
+    SEM --> DEC
+    SEQ["sink | state | action"] --> DEC
+    DEC --> V["v_t"]
+```
+
+The encoder is a pure frozen feature extractor: one VLM forward per observation
+produces a fixed 32-layer KV cache and one pooled vector, and **646M of decoder
+is the entire trainable model.** Computationally identical to config A.
+
+---
+
+## Config D — text LoRA on (`text_lora_num_layers > 0`)
+
+The only `vlm`-source config where any encoder gradient exists — and the path is
+unusual enough to be worth its own diagram.
+
+```mermaid
+flowchart TB
+    IMG["images"] --> ViT["SigLIP ViT<br/>FROZEN + LoRA"]
+    ViT ==> CAT["vlm_seq"]
+    TASK["text"] --> TE["embed_tokens FROZEN"] ==> CAT
+    CAT ==> TXT["text_model 32L<br/>FROZEN + LoRA<br/>NOT under no_grad"]
+    TXT -->|"K,V STILL DETACHED"| KV[("KV cache")]
+    TXT ==>|"final hidden, NOT detached"| SEM["mean-pool -> vlm_semantic"]
+    SEM ==> R{{"router MLP"}}
+    R ==>|"w (B,4)"| MIX["weighted sum of 4 experts"]
+    KV --> DEC["4 experts"] --> MIX
+    MIX --> V["v_t"]
+    NOTE["lang_embeddings is RETURNED with gradient<br/>but wilro_moe's _run_dit IGNORES it"] -.- TXT
+```
+
+**In wilro this is not how text LoRA trains.** wilro injects `lang_embeddings`
+into the DiT sequence, giving a short, direct path. wilro_moe's `_run_dit`
+accepts and ignores `lang_tokens` — it reaches language through the experts'
+cross-attention to the KV instead. So here the *entire* encoder gradient is
+squeezed through a **4-way softmax router**. That is a very thin channel to
+train a LoRA with, and no run has used it. (wilro's own branch also records text
+LoRA causing NaN, which is why the KV is unconditionally detached.)
 
 ---
 
@@ -174,17 +263,19 @@ would make it sparse, but no run has used it.
 ```
 index:   0        1 .. S      S+1 .. S+V         S+V+1 .. S+V+H
        [ sink ] [ state ] [ vision tokens ] [ noisy actions x_t ]
-                                            ^ action_start_idx
+                          ^ PRESENT ONLY    ^ action_start_idx
+                            IN CONFIG B
 ```
 
 with a **causal** mask over the whole thing. `S` is 1 unless
-`use_state_history`; `V` is 0 if `vision_token_source` yields nothing;
-`H = horizon`.
+`use_state_history`; `H = horizon`.
 
-**Vision tokens sit BEFORE the actions because there is no Vision CA sublayer.**
-Causal self-attention is the *only* path from an action query to a vision token,
-so their order in the sequence is not cosmetic — put them after the actions and
-the causal mask hides them completely.
+**`V = 0` in configs A, C and D** — see the table at the top. Only the ResNet
+source produces sequence vision tokens today.
+
+When they *are* present, they sit **before** the actions because there is no
+Vision CA sublayer: causal self-attention is the only path from an action query
+to a vision token, so put them after and the mask hides them completely.
 
 > wiltechs_moe additionally places K "thought" tokens here, from a QFormer over
 > the deepest VLM layer's KV. **Dropped 2026-09-05** (18.4M params + a sequence
@@ -247,6 +338,8 @@ never trains is the identity map rather than noise — which matters precisely f
 an expert the router has starved, since that is the one whose adapter gets no
 gradient. At `d=256` this is 0.49M × 4 = **1.98M**, ~0.3% of the decoder.
 
+> **Inert in configs A / C / D.** The adapter is applied under `if self.expert_vision_adapters is not None and hi > lo`, and `hi == lo` whenever there are no sequence vision tokens. Turning `resnet_expert_adapter_dim` on without `vision_token_source="resnet"` allocates 1.98M that never runs.
+
 ---
 
 ## Parameter budget
@@ -308,6 +401,57 @@ Permutes only the **language band** `[L_vis : L_vis+L_lang]` of the cached KV
 across the batch and re-runs the DiT — no second VLM forward. The wrong-language
 prediction is a **detached** negative target, and the second DiT forward runs
 under `no_grad`, which avoids storing a full second backward graph (~2× memory).
+
+---
+
+## The default config's dead pathways
+
+Found 2026-09-07 while separating the diagrams above. **Not fixed** — recorded
+first, because fixing it changes the model's forward and would break comparison
+against the 17k checkpoint.
+
+The chain, all four links verified in the source:
+
+```
+wilro_moe_model.py:258   self.use_vision_ca = False                 (hardcoded)
+smolvlm_encoder.py:438   need_intermediate = self.use_vision_ca and (src != "resnet")
+                         -> False
+                         -> _encode_images(..., return_intermediate=False)
+                         -> intermediate_features = None
+smolvlm_encoder.py:650   elif vlm_robot_features is None: return None
+                         -> _compute_vision_tokens returns None
+_build_expert_input      -> seq = [sink, state, action], vis_lo == vis_hi
+```
+
+### Consequence 1 — the sequence has no vision tokens
+
+`_build_expert_input`'s docstring says "vision tokens go BEFORE the action
+tokens because ... causal self-attention is the only path from an action query
+to them", and `wilro_moe_model.py:278` prints
+`[wilro_moe] vision tokens: SigLIP intermediate layer -3` at startup. **The log
+claims they exist; at runtime they are `None`.**
+
+The model is *not* blind — `vlm_seq = [vis_tokens, lang_tokens]`, so the KV
+cache the experts cross-attend to does cover the vision positions. But the
+second visual pathway the design describes is absent, and the per-expert vision
+adapters are skipped with it.
+
+### Consequence 2 — the ViT LoRA has no gradient, silently
+
+The only two inlets to the ViT LoRA are the sequence injection (now `None`) and
+the text stack (`no_grad` unless text LoRA is on). The KV is unconditionally
+detached. So under the default config the adapters are **allocated, placed in
+the optimizer, and never updated.**
+
+`vision_token_source="resnet"` prints a `[WARN]` for exactly this. The default
+path prints nothing — and it is the path every run has taken.
+
+### What this does NOT explain
+
+wilro_moe still reached **79.5% spatial at 17k**, the best number in the family.
+So the missing pathway is not load-bearing for that result, and "fix it and the
+number goes up" is a hypothesis, not a conclusion. Fixing it is a **new
+architecture**, not a bug fix, and needs its own A/B.
 
 ---
 
