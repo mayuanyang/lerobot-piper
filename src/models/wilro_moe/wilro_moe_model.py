@@ -307,6 +307,7 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
         self._last_router_max_w = None
         self._last_router_entropy = None
         self._last_expert_disagreement = None
+        self._last_expert_ambiguity = None
         self._last_loss_components = None
         self._capture_attention_stats = False
         self._last_attention_stats = None
@@ -705,26 +706,58 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
         stacked = torch.stack(outs, dim=1)
         v = (weights.unsqueeze(-1).unsqueeze(-1) * stacked).sum(dim=1)
 
-        # Do the experts DISAGREE? The mixture is a weighted mean of velocity
-        # predictions, which is only benign because all experts see the same
-        # x_t and t and are therefore approximating the SAME target field --
-        # the mode was already chosen by the noise draw, not by the expert. If
-        # that stops being true the mean lands between modes and satisfies none
-        # of them, and this is the number that says so:
-        #   ~0    experts agree; the mixture is variance reduction
-        #   ~1    they predict unrelated velocities and the mean is a compromise
+        # Do the experts DISAGREE, and is the disagreement WORTH anything?
         #
-        # READ IT WITH THE STEP NUMBER. adaLN-Zero makes every residual branch
-        # start at zero, so at init each expert IS the identity map and this
-        # reads EXACTLY 0.000 -- "not yet differentiated", not "in agreement".
-        # The two are indistinguishable from the number alone. It only becomes
-        # the intended measurement once the adaLN gates have moved.
-        # It is a diagnostic, not a loss. Driving it to zero would just make the
-        # experts redundant, which is the opposite of what they are for.
+        # Two numbers, because the dimensionless one alone cannot answer the
+        # question it looks like it answers.
+        #
+        # (1) AMBIGUITY -- read this one. Krogh-Vedelsby, exact per sample for
+        #     any weights summing to 1:
+        #
+        #       (v_bar - u)^2 = sum_e w_e (v_e - u)^2  -  sum_e w_e (v_e-v_bar)^2
+        #       ^ mixture MSE   ^ mean individual MSE     ^ AMBIGUITY
+        #
+        #     So the disagreement is the term the mixture SUBTRACTS: it is the
+        #     ensemble gain itself, in loss units, and it needs no target to
+        #     compute. Divided by the flow loss it says directly what fraction
+        #     of the MSE the mixture is buying. No threshold required:
+        #       ~0 of flow   the experts are redundant copies; 4x8 is computing
+        #                    what one 8-layer decoder would, and the parameters
+        #                    would do more as depth (--num_experts 1
+        #                    --expert_num_layers 32, same params, same FLOPs).
+        #       large        the mixture is doing real work.
+        #     A large value with a large flow loss means they are all bad in
+        #     different ways -- check the flow loss before celebrating.
+        #
+        # (2) DISAGREEMENT -- the old dimensionless ratio, kept for continuity.
+        #     Note its upper anchor is NOT 1: for independent experts it is
+        #     E[s_n]/E|N(0,1)|, i.e. 0.997 at n=2, 2/sqrt(3)=1.155 at n=4,
+        #     1.193 at n=6. It drifts with num_experts, so it does not compare
+        #     across configurations.
+        #
+        # A rising ambiguity is NOT the "mean lands between modes" failure. That
+        # needs a genuinely multimodal target, and flow matching removes it
+        # here: given (x_t, t, c) with deterministic demos, x_t determines the
+        # noise draw, so Var(u | x_t, t, c) ~ 0 and there is one right answer.
+        # The spread is estimation error, and averaging estimation error is
+        # pure gain -- it is removed at the fixed rate 1 - 1/n regardless of how
+        # large it is. Driving either number to zero would just make the experts
+        # redundant, which is the opposite of what they are for.
+        #
+        # READ BOTH WITH THE STEP NUMBER. adaLN-Zero makes every residual branch
+        # start at zero, so at init each expert IS the identity map and both
+        # read EXACTLY 0.000 -- "not yet differentiated", not "in agreement".
         if record:
             with torch.no_grad():
-                spread = stacked.float().std(dim=1).mean()
-                scale = stacked.float().abs().mean().clamp(min=1e-8)
+                st = stacked.float()
+                w = weights.float().unsqueeze(-1).unsqueeze(-1)
+                # Biased (weighted) second moment, to match the identity above.
+                # stacked.std() below is Bessel-corrected and does NOT.
+                v_bar = (w * st).sum(dim=1, keepdim=True)
+                self._last_expert_ambiguity = float(
+                    (w * (st - v_bar).pow(2)).sum(dim=1).mean())
+                spread = st.std(dim=1).mean()
+                scale = st.abs().mean().clamp(min=1e-8)
                 self._last_expert_disagreement = float(spread / scale)
         return v
 

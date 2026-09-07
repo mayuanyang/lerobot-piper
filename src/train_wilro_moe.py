@@ -202,15 +202,47 @@ def _log_gradient_analysis(policy, step: int) -> None:
         # be fully collapsed and still average out uniform if different samples
         # collapse to different experts. These two read the PRE-noise per-sample
         # weights, which is what inference uses.
+        # AMBIGUITY is the one to read. By Krogh-Vedelsby it is exactly what
+        # the mixture subtracts from the mean individual MSE, so as a fraction
+        # of the flow loss it IS the ensemble gain -- no threshold needed. The
+        # dimensionless `disagreement` is kept for continuity but its upper
+        # anchor moves with num_experts (0.997 at 2, 1.155 at 4, 1.193 at 6),
+        # so it does not compare across configurations.
+        amb = getattr(policy.model, "_last_expert_ambiguity", None)
         dis = getattr(policy.model, "_last_expert_disagreement", None)
-        if dis is not None:
-            hint = ("  <- adaLN-Zero: experts are still the identity map, so "
-                    "this is 'not differentiated yet', NOT 'in agreement'"
-                    if dis < 1e-4 else
-                    "  <- experts have differentiated; watch the trend, a rise "
-                    "toward ~1 means the mixture's mean is landing between what "
-                    "they want")
-            print(f"                      expert disagreement={dis:.4f}{hint}")
+        if amb is not None or dis is not None:
+            _c = getattr(policy.model, "_last_loss_components", None) or {}
+            flow = _c.get("main")
+            if amb is not None and flow and flow > 0:
+                pct = 100.0 * amb / flow
+                # The two are normalised slightly differently -- the flow loss
+                # carries the position/dim weights and this does not -- so read
+                # the percentage to within ~20%, and read its TREND exactly.
+                if pct < 1.0:
+                    verdict = ("  <- the experts are near-redundant; these "
+                               "parameters would do more as depth "
+                               "(--num_experts 1 --expert_num_layers 32, "
+                               "same params, same FLOPs)")
+                elif pct < 5.0:
+                    verdict = "  <- small but real ensemble gain"
+                else:
+                    verdict = ("  <- the mixture is doing real work; check the "
+                               "flow loss too, since 'all bad in different "
+                               "ways' looks the same here")
+                print(f"                      expert ambiguity={amb:.5f} "
+                      f"= {pct:.1f}% of flow {flow:.4f}{verdict}")
+            elif amb is not None:
+                print(f"                      expert ambiguity={amb:.5f} "
+                      f"(no flow loss recorded to compare against)")
+            if dis is not None:
+                E = int(u.numel())
+                iid = {2: 0.997, 4: 1.155, 6: 1.193, 8: 1.209}.get(E)
+                anchor = f" (independent-expert anchor {iid:.3f})" if iid else ""
+                hint = ("  <- adaLN-Zero: experts are still the identity map, "
+                        "so this is 'not differentiated yet', NOT 'in "
+                        "agreement'" if dis < 1e-4 else "")
+                print(f"                      expert disagreement={dis:.4f}"
+                      f"{anchor}{hint}")
         mw = getattr(policy.model, "_last_router_max_w", None)
         ent = getattr(policy.model, "_last_router_entropy", None)
         if mw is not None and ent is not None:
