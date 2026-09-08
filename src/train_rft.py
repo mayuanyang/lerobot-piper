@@ -108,11 +108,32 @@ from lerobot.utils.utils import get_safe_torch_device
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # ensure src/ importable
 
 # (config_module, policy_module, ClassName) keyed by the registered policy type.
+#
+# THIS MUST STAY IN SYNC WITH `POLICIES` IN eval_wiltechs_x.py. The two drifted
+# once already: wilro_moe was added there and not here, and the only symptom is
+# draccus failing to decode the checkpoint's own config.json --
+#   DecodingError: Couldn't find a choice class for 'wilro_moe'
+# -- which reads like a corrupt checkpoint rather than a missing import.
 _POLICY_CLASS: dict[str, tuple[str, str, str]] = {
     "wilro": (
         "models.wilro.wilro_config",
         "models.wilro.wilro_policy",
         "WilroPolicy",
+    ),
+    "wilro_moe": (
+        "models.wilro_moe.wilro_moe_config",
+        "models.wilro_moe.wilro_moe_policy",
+        "WilroMoEPolicy",
+    ),
+    "wiltechs_x": (
+        "models.wiltechs_x.wiltechs_x_config",
+        "models.wiltechs_x.wiltechs_x_policy",
+        "WiltechsXPolicy",
+    ),
+    "wiltechs_moe": (
+        "models.wiltechs_moe.wiltechs_moe_config",
+        "models.wiltechs_moe.wiltechs_moe_policy",
+        "WiltechsMoEPolicy",
     ),
     "interleaved_flow_matching": (
         "models.interleaved_flow_matching.interleaved_flow_matching_config",
@@ -130,7 +151,14 @@ for _cfg_mod, _pol_mod, _ in _POLICY_CLASS.values():
         importlib.import_module(_cfg_mod)   # registers the config choice for draccus
         importlib.import_module(_pol_mod)   # makes the policy class importable
     except Exception as _e:                 # e.g. wiltechs_vla's Qwen3-VL deps absent
-        print(f"[train_rft] could not register '{_cfg_mod}' ({type(_e).__name__}: {_e})")
+        # Deliberately non-fatal: wiltechs_* pull in Qwen3-VL, which is absent
+        # from the wilro env. But say plainly what the consequence is, because
+        # the failure resurfaces much later as an opaque draccus DecodingError
+        # on the checkpoint's own config.json.
+        _kind = _cfg_mod.rsplit(".", 1)[-1].replace("_config", "")
+        print(f"[train_rft] could not register '{_kind}' ({type(_e).__name__}: "
+              f"{_e}) -- a {_kind} checkpoint will now fail with "
+              f"\"Couldn't find a choice class for '{_kind}'\"")
 
 
 # ---------------------------------------------------------------------------
