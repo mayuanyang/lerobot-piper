@@ -305,6 +305,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           prefetch_factor: int = 2,
           vision_token_source: str = "vlm",
           resnet_tokens: int = 64,
+          resnet_fine_cameras: list | None = None,
+          resnet_fine_tokens: int = 0,
           resnet_input_size: int = 256,
           resnet_pool: str = "avg",
           use_state_history: bool = False,
@@ -622,6 +624,45 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                   f"px merged patches. The CNN exists for the precision the ViT "
                   f"cannot reach; at this grid it is running below the backbone it "
                   f"is meant to sharpen. Raise --resnet_tokens.")
+        # Per-camera fine grid. The native map is input_size/16 (ResNet-18 cut at
+        # layer3), so out_tokens above (input/16)^2 upsamples an already-pooled
+        # map and buys nothing; at the native value the read is 1:1.
+        native = (resnet_input_size // 16) ** 2
+        print(f"  native feature map = {resnet_input_size}//16 squared = {native} "
+              f"tok; resnet_tokens={resnet_tokens} "
+              f"({'1:1' if resnet_tokens == native else 'pooled from ' + str(native)})")
+        fine_cams = list(resnet_fine_cameras or [])
+        if resnet_fine_tokens > 0 or fine_cams:
+            if resnet_fine_tokens <= 0 or not fine_cams:
+                raise ValueError(
+                    "--resnet_fine_cameras and --resnet_fine_tokens must be given "
+                    "together; one without the other is a no-op that completes a "
+                    f"full run (got cameras={fine_cams}, tokens={resnet_fine_tokens}).")
+            _fs = int(resnet_fine_tokens ** 0.5)
+            if _fs * _fs != resnet_fine_tokens:
+                raise ValueError(f"--resnet_fine_tokens must be a perfect square "
+                                 f"for avg pooling, got {resnet_fine_tokens}")
+            # A name that is not a real camera key falls through to resnet_tokens
+            # inside _resnet_tokens, silently. That costs a whole run.
+            unknown = [c for c in fine_cams if c not in camera_keys]
+            if unknown:
+                raise ValueError(
+                    f"--resnet_fine_cameras {unknown} are not cameras in this "
+                    f"dataset. Available: {camera_keys}. Left unchecked these "
+                    f"fall back to --resnet_tokens with no warning, and the fine "
+                    f"grid never runs.")
+            if resnet_fine_tokens > native:
+                print(f"  [WARN] --resnet_fine_tokens {resnet_fine_tokens} exceeds "
+                      f"the native {native}; this upsamples a pooled map and adds "
+                      f"sequence length for no new information.")
+            n_fine, n_coarse = len(fine_cams), len(camera_keys) - len(fine_cams)
+            total = n_fine * resnet_fine_tokens + n_coarse * resnet_tokens
+            print(f"  fine grid: {fine_cams} -> {resnet_fine_tokens} tok "
+                  f"({resnet_input_size / max(int(resnet_fine_tokens ** 0.5), 1):.1f} "
+                  f"px/token); others -> {resnet_tokens} tok")
+            print(f"  vision tokens in the DiT sequence: {total} "
+                  f"(was {len(camera_keys) * resnet_tokens} at a uniform grid) "
+                  f"-> sequence length {2 + total + 64}")
 
     # Build wilro config
     cfg = WilroMoEConfig(
@@ -658,6 +699,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         paraphrase_min_variants=paraphrase_min_variants,
         vision_token_source=vision_token_source,
         resnet_tokens=resnet_tokens,
+        resnet_fine_cameras=list(resnet_fine_cameras or []),
+        resnet_fine_tokens=int(resnet_fine_tokens),
         resnet_input_size=resnet_input_size,
         resnet_pool=resnet_pool,
         use_state_history=use_state_history,
@@ -1540,6 +1583,25 @@ if __name__ == "__main__":
                              "16 gives 64 px/token, i.e. half the granularity of the "
                              "frozen backbone it is supposed to sharpen. Cost is per "
                              "DiT layer and per camera.")
+    parser.add_argument("--resnet_fine_cameras", type=str, nargs="+", default=None,
+                        help="Cameras that get a DENSER ResNet grid than "
+                             "--resnet_tokens, e.g. the wrist view, which carries "
+                             "contact geometry while the third-person view only "
+                             "supplies coarse approach context. Same backbone, "
+                             "different pooling, NO extra parameters. Must be "
+                             "given with --resnet_fine_tokens. Names are checked "
+                             "against the dataset: a typo would otherwise fall "
+                             "back to --resnet_tokens silently.")
+    parser.add_argument("--resnet_fine_tokens", type=int, default=0,
+                        help="Token grid for --resnet_fine_cameras (perfect "
+                             "square). The native map is (input_size/16)^2 -- 196 "
+                             "at 224px -- so 196 there is a 1:1 read and anything "
+                             "lower throws spatial resolution away. Raises the DiT "
+                             "sequence length, which is quadratic in attention "
+                             "FLOPs; lower --resnet_tokens for the other cameras "
+                             "before lowering --batch_size, because a batch change "
+                             "breaks the step-to-samples mapping against earlier "
+                             "runs.")
     parser.add_argument("--resnet_input_size", type=int, default=256,
                         help="ResNet input resolution. 256 is the native LIBERO "
                              "frame, so no resample happens.")
