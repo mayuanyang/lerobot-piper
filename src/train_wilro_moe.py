@@ -213,12 +213,26 @@ def _log_gradient_analysis(policy, step: int) -> None:
         if amb is not None or dis is not None:
             _c = getattr(policy.model, "_last_loss_components", None) or {}
             flow = _c.get("main")
+            # The verdict below is MEANINGLESS until the adaLN-Zero gates have
+            # opened. At init every expert is the identity map and
+            # action_out_proj is zero, so v_e == 0 for every e, ambiguity is
+            # exactly 0, and the flow loss still sits at its "predict nothing"
+            # value -- the ratio would read 0.0% and scream "redundant" on every
+            # run's first thousand steps. Warmup is the honest boundary: before
+            # 2x warmup the LR has not been at peak for any meaningful span.
+            warm = int(getattr(policy.model.config, "scheduler_warmup_steps", 1500) or 1500)
+            settled = step >= 2 * warm
             if amb is not None and flow and flow > 0:
                 pct = 100.0 * amb / flow
                 # The two are normalised slightly differently -- the flow loss
                 # carries the position/dim weights and this does not -- so read
                 # the percentage to within ~20%, and read its TREND exactly.
-                if pct < 1.0:
+                if not settled:
+                    verdict = (f"  <- too early to read (step {step} < 2x warmup "
+                               f"{warm}); adaLN-Zero starts every expert as the "
+                               f"identity map, so this reads ~0 whatever the "
+                               f"topology is worth")
+                elif pct < 1.0:
                     verdict = ("  <- the experts are near-redundant; these "
                                "parameters would do more as depth "
                                "(--num_experts 1 --expert_num_layers 32, "
