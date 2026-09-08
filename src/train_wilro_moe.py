@@ -49,12 +49,46 @@ def get_augmentations():
     ])
 
 
-def apply_joint_augmentations(batch):
-    """Add small Gaussian noise to observation.state (50% probability)."""
-    if torch.rand(1).item() > 0.5:
-        if "observation.state" in batch:
-            noise = torch.randn_like(batch["observation.state"]) * 0.01
-            batch["observation.state"] = batch["observation.state"] + noise
+def apply_joint_augmentations(batch, abs_sigma: float = 0.01,
+                              frac_sigma: float = 0.0, state_std=None,
+                              prob: float = 0.5):
+    """Gaussian noise on observation.state, applied with probability `prob`.
+
+    Runs BEFORE the preprocessor, so it is in RAW units -- metres for the
+    end-effector position and the gripper finger joints, radians for the
+    orientation. That matters, because `abs_sigma` is then one number spread
+    over dims whose natural scales differ by 65x. On LIBERO the default 0.01
+    lands as:
+
+        eef x/y/z   9.5% / 6.6% / 2.6%  of that dim's own std
+        rot 0/1/2   2.9% / 1.1% / 3.1%
+        gripper L/R      70.5% / 71.1%   <-- 70% of the signal's own spread
+
+    i.e. it is heaviest exactly on the channel that carries "am I holding it",
+    and invisible on rotation. Nobody would choose that ratio; it is what one
+    absolute sigma does to a heterogeneous state vector.
+
+    `frac_sigma` scales per dim instead, so the knob means ONE thing everywhere:
+    frac 0.04 is 4% of each dim's own std. It is off by default -- every result
+    in notes/libero_benchmark_tracker.md was trained with the absolute path, and
+    switching is a change, not a bug fix.
+
+    NOTE the direction this teaches. The action is an OSC DELTA, not an absolute
+    target, so perturbing the state while keeping the demo action label trains
+    "produce the same motion regardless", i.e. INVARIANCE. The offset is carried
+    forward, not corrected. Recovery would need the label compensated too
+    (s+eps paired with d-eps); this does not do that.
+    """
+    if prob <= 0.0 or torch.rand(1).item() >= prob:
+        return batch
+    if "observation.state" not in batch:
+        return batch
+    st = batch["observation.state"]
+    if frac_sigma > 0.0 and state_std is not None:
+        sigma = frac_sigma * state_std.to(device=st.device, dtype=st.dtype)
+        batch["observation.state"] = st + torch.randn_like(st) * sigma
+    elif abs_sigma > 0.0:
+        batch["observation.state"] = st + torch.randn_like(st) * abs_sigma
     return batch
 
 
@@ -319,6 +353,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           prefetch_factor: int = 2,
           vision_token_source: str = "vlm",
           resnet_tokens: int = 64,
+          state_noise_abs: float = 0.01,
+          state_noise_frac: float = 0.0,
+          state_noise_prob: float = 0.5,
           resnet_fine_cameras: list | None = None,
           resnet_fine_tokens: int = 0,
           resnet_input_size: int = 256,
@@ -623,6 +660,39 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         lora_kw["lora_alpha"] = float(lora_alpha)
     if vision_lora_num_layers is not None:
         lora_kw["vision_lora_num_layers"] = int(vision_lora_num_layers)
+
+    # ---- state-noise augmentation: resolve the mode and SAY what it does ----
+    # This has been invisible since it was written: one hardcoded 0.01 on a
+    # state vector whose dims span 65x in natural scale. Print the realised
+    # per-dim strength so it can never be invisible again.
+    _ss = (combined_stats.get("observation.state") or {}).get("std")
+    state_std_t = None if _ss is None else torch.as_tensor(
+        np.asarray(_ss, dtype=np.float32).reshape(-1))
+    if state_noise_frac > 0.0 and state_std_t is None:
+        raise ValueError("--state_noise_frac needs observation.state stats to "
+                         "scale by, and none were found in the dataset "
+                         "metadata. Use --state_noise_abs instead.")
+    if state_noise_prob > 0.0 and (state_noise_frac > 0.0 or state_noise_abs > 0.0):
+        _mode = ("per-dim, frac %.4g of each dim's own std" % state_noise_frac
+                 if state_noise_frac > 0.0
+                 else "ABSOLUTE, sigma %.4g in RAW units" % state_noise_abs)
+        print(f"State-noise augmentation: {_mode}, p={state_noise_prob:g} "
+              f"(applied BEFORE normalisation)")
+        if state_std_t is not None:
+            eff = [(state_noise_frac if state_noise_frac > 0.0
+                    else state_noise_abs / max(float(v), 1e-12))
+                   for v in state_std_t.tolist()]
+            print("  realised noise / that dim's own std: " + "  ".join(
+                f"[{i}]{100 * e:.1f}%" for i, e in enumerate(eff)))
+            worst = max(range(len(eff)), key=lambda i: eff[i])
+            if eff[worst] > 0.25:
+                print(f"  [WARN] dim {worst} receives {100 * eff[worst]:.0f}% of its "
+                      f"own std. On LIBERO dims 6/7 are the gripper finger joints "
+                      f"(std ~0.014 m), i.e. the 'am I holding it' channel. "
+                      f"--state_noise_frac scales per dim instead of flattening "
+                      f"a 65x range onto one number.")
+    else:
+        print("State-noise augmentation: OFF")
 
     # Preflight. Each of these has a silent-wrong-run failure mode: the flag is
     # accepted, training completes, and the result answers a different question
@@ -1330,7 +1400,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                 ]
 
             batch = apply_image_augmentations(batch, camera_keys, image_transforms)
-            batch = apply_joint_augmentations(batch)
+            batch = apply_joint_augmentations(
+                batch, abs_sigma=state_noise_abs,
+                frac_sigma=state_noise_frac,
+                state_std=state_std_t, prob=state_noise_prob)
 
             if step == 0:
                 raw_st = batch["observation.state"].float()
@@ -1597,6 +1670,26 @@ if __name__ == "__main__":
                              "16 gives 64 px/token, i.e. half the granularity of the "
                              "frozen backbone it is supposed to sharpen. Cost is per "
                              "DiT layer and per camera.")
+    parser.add_argument("--state_noise_abs", type=float, default=0.01,
+                        help="Gaussian sigma added to observation.state in RAW "
+                             "units (metres / radians), the historical default "
+                             "and what every result in the tracker was trained "
+                             "with. One number across dims whose natural scales "
+                             "differ by 65x: on LIBERO it lands as 2.6-9.5%% of "
+                             "std on position, 1.1-3.1%% on rotation, and 70%% on "
+                             "the gripper finger joints. Pass 0 to disable.")
+    parser.add_argument("--state_noise_frac", type=float, default=0.0,
+                        help="Scale the state noise PER DIM instead: sigma_i = "
+                             "frac * std_i, so the knob means one thing "
+                             "everywhere. 0 (default) keeps --state_noise_abs. "
+                             "frac 0.04 is close to the historical strength on "
+                             "position and rotation while taking the gripper "
+                             "channel from 70%% down to 4%% -- a near-null change "
+                             "on six of eight dims and a real one on two, which "
+                             "is why it is opt-in rather than the default.")
+    parser.add_argument("--state_noise_prob", type=float, default=0.5,
+                        help="Probability per batch that state noise is applied "
+                             "at all (default 0.5, the historical value).")
     parser.add_argument("--resnet_fine_cameras", type=str, nargs="+", default=None,
                         help="Cameras that get a DENSER ResNet grid than "
                              "--resnet_tokens, e.g. the wrist view, which carries "
