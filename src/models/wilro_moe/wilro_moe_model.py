@@ -308,6 +308,13 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
         self._last_router_entropy = None
         self._last_expert_disagreement = None
         self._last_expert_ambiguity = None
+        # Opt-in per-denoising-step routing trace. The router runs INSIDE
+        # _run_dit, which sample_actions calls num_inference_steps times, and
+        # two of its four inputs (time_emb, and the pooled NOISY action) change
+        # every step -- so the expert mixture is re-decided at every step of
+        # the ODE, not once per chunk. Nothing recorded that until now.
+        self._record_routing = False
+        self._routing_trace = None
         self._last_loss_components = None
         self._capture_attention_stats = False
         self._last_attention_stats = None
@@ -549,6 +556,8 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
     def sample_actions(self, batch: dict) -> torch.Tensor:
         B = batch["observation.state"].shape[0]
         device = batch["observation.state"].device
+        if self._record_routing:
+            self._routing_trace = []      # one trace per chunk, N entries long
 
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -659,6 +668,16 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
         hidden = self._last_vlm_hidden
         vlm_semantic = self._pool_vlm_semantic(hidden, vlm_kv_pad_mask).to(dtype)
         weights, usage = self.router(state_tok, vlm_semantic, t_emb, action_emb)
+        if self._record_routing:
+            # PRE-noise weights: what inference actually uses. Appended in ODE
+            # order, so index 0 is t=1 (coarse) and index -1 is the last step
+            # (fine placement) -- which is the axis the disjoint VLM bands were
+            # meant to specialise along.
+            cw = self.router._last_clean_weights
+            if cw is not None:
+                if self._routing_trace is None:
+                    self._routing_trace = []
+                self._routing_trace.append(cw.detach().float().cpu())
         # Per-sample stats alongside the batch mean. `usage` is a MEAN, so a
         # uniform CV^2 is ambiguous: every sample can be fully collapsed and
         # still average out flat if different samples collapse to different

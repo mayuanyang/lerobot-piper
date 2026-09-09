@@ -269,7 +269,9 @@ class StateHistory:
 def load_policy(ckpt: Path, device: str, num_inference_steps: int | None,
                 n_action_steps: int | None = None,
                 fixed_episode_noise: bool = False,
-                sample_noise_scale: float | None = None):
+                sample_noise_scale: float | None = None,
+                router_top_k: int | None = None,
+                log_routing: bool = False):
     from lerobot.configs.policies import PreTrainedConfig
 
     cfg = PreTrainedConfig.from_pretrained(ckpt)
@@ -307,7 +309,28 @@ def load_policy(ckpt: Path, device: str, num_inference_steps: int | None,
              "--sample_noise_scale")
     kind = getattr(cfg, "type", None) or getattr(cfg, "name", "")
     print(f"policy type: {kind}")
+    if router_top_k is not None:
+        # TRAIN/TEST MISMATCH BY CONSTRUCTION. The model was trained with the
+        # config's own top_k and with N(0, 0.5) exploration noise on the router
+        # logits; inference has no noise, so it already sees a distribution it
+        # never trained on. Changing k widens that gap deliberately. Nothing
+        # breaks -- the mask is applied then renormalised -- but the mixture is
+        # not the one the loss was minimised over.
+        _k = int(router_top_k)
+        _n = int(getattr(cfg, "num_experts", 0) or 0)
+        if _n and not (0 <= _k <= _n):
+            raise SystemExit(f"--router_top_k {_k} outside [0, num_experts={_n}]")
+        print(f"[eval] router_top_k {getattr(cfg, 'router_top_k', '?')} -> {_k}"
+              + (" (0 = dense, all experts weighted)" if _k == 0 else ""))
+        _set("router_top_k", _k, "--router_top_k")
+
     policy = _policy_class(kind).from_pretrained(ckpt, config=cfg)
+    if log_routing:
+        m = getattr(policy, "model", None)
+        if m is None or not hasattr(m, "_record_routing"):
+            raise SystemExit("--log_routing needs a policy whose model carries "
+                             "a routing trace; only wilro_moe has one.")
+        m._record_routing = True
     policy.to(device)
     policy.eval()
     for m in policy.model.modules():                      # deterministic rollout
@@ -629,6 +652,74 @@ def build_batch(obs_list, tasks, hist: StateHistory, preprocessor, device,
 
 
 @torch.no_grad()
+class RoutingAccumulator:
+    """Per-denoising-step routing statistics, accumulated over chunks.
+
+    The router runs inside _run_dit, and sample_actions calls that
+    num_inference_steps times. Two of the router's four inputs (the time
+    embedding and the pooled NOISY action) change at every one of those steps,
+    so the expert mixture is re-decided all the way down the ODE. Three things
+    follow that nothing in this repo has ever measured:
+
+      SWITCH RATE  does the selected top-k SET change within one chunk? The ODE
+                   is then integrating a field whose own definition moves
+                   mid-trajectory.
+      EARLY->LATE  does the first step (t=1, coarse: WHICH object) prefer
+                   different experts from the last (t->0, fine: placement)?
+                   That is the axis the disjoint VLM depth bands exist for, and
+                   a flat answer means the bands are not being used as designed.
+      DRAW SPREAD  how much does routing differ between chunks? action_pool is a
+                   quarter of the router's input and is derived from the noise
+                   draw, so the per-chunk re-draw ALREADY perturbs expert
+                   selection -- this says by how much.
+    """
+
+    def __init__(self, top_k: int):
+        self.top_k = int(top_k)
+        self.n_chunks = 0
+        self.n_switch = 0
+        self.first = None      # summed weights at t=1
+        self.last = None       # summed weights at the final step
+        self.mean = None
+        self.first_sets, self.last_sets = [], []
+
+    def add(self, trace, live_idx):
+        """trace: list of (B, E) tensors, one per denoising step, ODE order."""
+        import numpy as _np
+        if not trace or not live_idx:
+            return
+        W = _np.stack([t.numpy() for t in trace], axis=0)   # (steps, B, E)
+        W = W[:, live_idx, :]
+        S, B, E = W.shape
+        k = self.top_k if 0 < self.top_k < E else E
+        if self.first is None:
+            self.first = _np.zeros(E); self.last = _np.zeros(E); self.mean = _np.zeros(E)
+        self.first += W[0].sum(0); self.last += W[-1].sum(0); self.mean += W.sum((0, 1)) / S
+        sel = _np.argsort(-W, axis=-1)[:, :, :k]            # (steps, B, k)
+        for b in range(B):
+            sets = [frozenset(sel[s, b].tolist()) for s in range(S)]
+            self.n_chunks += 1
+            self.n_switch += int(len(set(sets)) > 1)
+            self.first_sets.append(sets[0]); self.last_sets.append(sets[-1])
+
+    def report(self) -> dict | None:
+        if not self.n_chunks or self.first is None:
+            return None
+        import numpy as _np
+        n = self.n_chunks
+        f, l, m = self.first / n, self.last / n, self.mean / n
+        jac = [len(a & b) / max(len(a | b), 1) for a, b in zip(self.first_sets, self.last_sets)]
+        return {
+            "chunks": n,
+            "switch_rate": self.n_switch / n,
+            "first_step_weights": [round(float(x), 4) for x in f],
+            "last_step_weights": [round(float(x), 4) for x in l],
+            "mean_weights": [round(float(x), 4) for x in m],
+            "early_late_L1": round(float(_np.abs(f - l).sum()), 4),
+            "early_late_set_jaccard": round(float(_np.mean(jac)), 4),
+        }
+
+
 def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
               task_id: int, episodes: int, num_envs: int, device: str,
               max_episode_steps: int, seed: int, expected_cams: list[str],
@@ -636,7 +727,7 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
               video_cb=None, videos_per_task: int = 0, heartbeat: int = 50,
               instruction: str | None = None, state_noise: float = 0.0,
               state_noise_dims=None, blur: int = 0, blur_cams=None,
-              history_mode: str = "real"):
+              history_mode: str = "real", routing_acc=None):
     """-> (n_success, n_episodes, mean_success_steps, n_chunks, task_description,
     per_episode_success).
 
@@ -757,6 +848,10 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
                 with autocast:
                     action = policy.select_action(batch)
                 n_chunks += int(drew_chunk)
+                if drew_chunk and routing_acc is not None:
+                    tr = getattr(policy.model, "_routing_trace", None)
+                    if tr:
+                        routing_acc.add(tr, [i for i in range(num_envs) if not done[i]])
                 env_action = postprocessor(action.float().cpu()).numpy()
 
                 for i in range(num_envs):
@@ -920,7 +1015,7 @@ def main():
                         "same checkpoint, same layouts, same inputs, different "
                         "x_1. However many episodes flip is the floor that any "
                         "--state_noise or --image_blur delta has to clear.")
-    p.add_argument("--video_dir", default=None,
+    p.add_argument("--video_dir", default="/content/failed_rollouts", type=Path,
                    help="Write up to --videos_per_task FAILED episodes per task. "
                         "This repo's grasp-vs-selection diagnoses came from "
                         "watching these, not from the success rate.")
@@ -974,6 +1069,28 @@ def main():
                         "'frozen' repeats the newest frame, which is what "
                         "every episode's first step already looks like. "
                         "Read 'shuffled'; 'frozen' alone is ambiguous.")
+    p.add_argument("--router_top_k", type=int, default=None,
+                   help="Override the checkpoint's router_top_k at inference "
+                        "(wilro_moe). 0 = dense, all experts weighted. The "
+                        "model trained with its own k AND with N(0, 0.5) "
+                        "exploration noise on the router logits that inference "
+                        "does not have, so it already runs a routing "
+                        "distribution it never saw; changing k widens that "
+                        "deliberately. Nothing breaks -- the mask is applied "
+                        "then renormalised -- but the mixture is not the one "
+                        "the loss was minimised over. Raising k averages in the "
+                        "experts the router ranked WORST for this sample, which "
+                        "lowers output variance: that helps MSE and may hurt SR, "
+                        "since this family's success rate rides on the per-chunk "
+                        "re-draw. Measure, do not predict.")
+    p.add_argument("--log_routing", action="store_true",
+                   help="Record which experts the router picks at EACH "
+                        "denoising step (it re-decides at every one -- two of "
+                        "its four inputs change with t and with the noisy "
+                        "action). Reports the within-chunk switch rate and the "
+                        "first-step vs last-step weights, i.e. whether the "
+                        "disjoint VLM depth bands are actually specialising "
+                        "coarse-vs-fine. Writes a 'routing' block to the JSON.")
     p.add_argument("--state_noise", type=float, default=0.0,
                    help="Gaussian offset added to observation.state, sigma in "
                         "NORMALIZED units -- the same units the sibling trainers "
@@ -1049,7 +1166,11 @@ def main():
 
     policy = load_policy(ckpt, device, a.num_inference_steps,
                          a.n_action_steps, a.fixed_episode_noise,
-                         a.sample_noise_scale)
+                         a.sample_noise_scale,
+                         router_top_k=a.router_top_k,
+                         log_routing=a.log_routing)
+    routing_acc = (RoutingAccumulator(int(getattr(policy.config, "router_top_k", 0) or 0))
+                   if a.log_routing else None)
     report_new_config_fields(policy.config, ckpt)
     report_missing_weights(policy, ckpt, a.allow_missing_weights)
     pre, post = load_processors(ckpt, device, a.dataset_id)
@@ -1158,7 +1279,8 @@ def main():
                 a.policy_seed, video_cb,
                 a.videos_per_task, a.heartbeat, wrong.get(tid),
                 a.state_noise, a.state_noise_dims,
-                a.image_blur, a.image_blur_cams, a.history_mode)
+                a.image_blur, a.image_blur_cams, a.history_mode,
+                routing_acc)
             sr = 100.0 * n_ok / max(n_ep, 1)
             per_task[tid] = {"success_rate": sr, "n_success": n_ok,
                              "n_episodes": n_ep, "mean_success_steps": mean_steps,
@@ -1213,6 +1335,25 @@ def main():
     # policy in 92ec163, so a JSON written before it recorded a draw that
     # cannot be reproduced -- and nothing in the file said which side it was
     # on. A baseline you cannot re-run is not a baseline.
+    if routing_acc is not None:
+        r = routing_acc.report()
+        if r:
+            E = len(r["mean_weights"])
+            print("\n=== routing (per denoising step, pre-noise weights) ===")
+            print(f"  chunks measured           : {r['chunks']}")
+            print(f"  top-k set CHANGES within a chunk: {100 * r['switch_rate']:.1f}%"
+                  "   <- the ODE integrates a field whose definition moves")
+            print(f"  first step (t=1, coarse)  : " +
+                  "  ".join(f"E{i}={100 * w:.1f}%" for i, w in enumerate(r["first_step_weights"])))
+            print(f"  last  step (t->0, fine)   : " +
+                  "  ".join(f"E{i}={100 * w:.1f}%" for i, w in enumerate(r["last_step_weights"])))
+            print(f"  early->late L1 distance   : {r['early_late_L1']:.3f} "
+                  f"(0 = the depth bands are NOT specialising coarse vs fine; "
+                  f"max 2.0)")
+            print(f"  early/late top-k overlap  : {r['early_late_set_jaccard']:.3f} "
+                  f"(1.0 = the same k experts run the whole trajectory)")
+            print(f"  uniform reference         : {100.0 / E:.1f}% per expert\n")
+
     payload = {"checkpoint": str(ckpt), "control_freq": a.control_freq,
                "fixed_init_states": not a.stock_init,
                "seed": a.seed,
@@ -1234,6 +1375,8 @@ def main():
                "state_noise_dims": a.state_noise_dims,
                "image_blur": a.image_blur,
                "image_blur_cams": a.image_blur_cams,
+               "router_top_k": getattr(policy.config, "router_top_k", None),
+               "routing": (routing_acc.report() if routing_acc else None),
                "episodes_per_task": a.episodes, "ablate_lang": a.ablate_lang,
                "instruction_override": a.instruction_override,
                "instruction_from_task": a.instruction_from_task,
