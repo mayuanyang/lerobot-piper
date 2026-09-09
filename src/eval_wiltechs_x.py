@@ -691,7 +691,12 @@ class RoutingAccumulator:
         W = _np.stack([t.numpy() for t in trace], axis=0)   # (steps, B, E)
         W = W[:, live_idx, :]
         S, B, E = W.shape
-        k = self.top_k if 0 < self.top_k < E else E
+        # top_k=0 is DENSE: the "selected set" is all E, so switch_rate would be
+        # trivially 0 and jaccard trivially 1 -- both uninformative. Fall back to
+        # the top half, which keeps the set statistics meaningful and is stated
+        # in the report as set_k.
+        k = self.top_k if 0 < self.top_k < E else max(1, E // 2)
+        self.set_k = k
         if self.first is None:
             self.first = _np.zeros(E); self.last = _np.zeros(E); self.mean = _np.zeros(E)
         self.first += W[0].sum(0); self.last += W[-1].sum(0); self.mean += W.sum((0, 1)) / S
@@ -711,6 +716,8 @@ class RoutingAccumulator:
         jac = [len(a & b) / max(len(a | b), 1) for a, b in zip(self.first_sets, self.last_sets)]
         return {
             "chunks": n,
+            "set_k": getattr(self, "set_k", self.top_k),
+            "dense": self.top_k == 0,
             "switch_rate": self.n_switch / n,
             "first_step_weights": [round(float(x), 4) for x in f],
             "last_step_weights": [round(float(x), 4) for x in l],
@@ -1341,7 +1348,11 @@ def main():
             E = len(r["mean_weights"])
             print("\n=== routing (per denoising step, pre-noise weights) ===")
             print(f"  chunks measured           : {r['chunks']}")
-            print(f"  top-k set CHANGES within a chunk: {100 * r['switch_rate']:.1f}%"
+            if r.get("dense"):
+                print(f"  (router_top_k=0, DENSE -- set stats use the top "
+                      f"{r['set_k']} of {E} so they stay informative; the "
+                      f"WEIGHTS below are the real measurement)")
+            print(f"  top-{r['set_k']} set CHANGES within a chunk: {100 * r['switch_rate']:.1f}%"
                   "   <- the ODE integrates a field whose definition moves")
             print(f"  first step (t=1, coarse)  : " +
                   "  ".join(f"E{i}={100 * w:.1f}%" for i, w in enumerate(r["first_step_weights"])))
