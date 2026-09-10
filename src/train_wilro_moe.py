@@ -300,6 +300,38 @@ def _log_gradient_analysis(policy, step: int) -> None:
                   f"(uniform {1.0 / E:.3f})   entropy={ent:.3f} "
                   f"(uniform {_m.log(E):.3f})")
 
+    # ---- zero-init gates ----------------------------------------------------
+    # Both of these start at EXACTLY 0 so that a pathway which never earns its
+    # keep is the identity map rather than noise. The cost of that safety is
+    # that a pathway which never opens is INVISIBLE: the run completes, the
+    # tokens are computed and multiplied by ~0, and nothing in the loss curve
+    # says so. resnet_motion_tokens in particular doubles per-camera video
+    # decode to build its second frame, so a gate stuck at 0 means paying that
+    # for nothing.
+    _gates = [("resnet_motion_gate", getattr(policy.model, "resnet_motion_gate", None)),
+              ("expert_vision_gates", getattr(policy.model, "expert_vision_gates", None))]
+    _gates = [(n, g) for n, g in _gates if g is not None]
+    if _gates:
+        warm = int(getattr(policy.model.config, "scheduler_warmup_steps", 1500) or 1500)
+        print("  Zero-init gates    :")
+        for name, g in _gates:
+            v = g.detach().float().flatten()
+            gr = (g.grad.detach().float().flatten().abs().mean().item()
+                  if g.grad is not None else float("nan"))
+            vals = "  ".join(f"{x:+.3e}" for x in v.tolist())
+            print(f"    {name:<22}{vals}   |grad| {gr:.3e}")
+            peak = float(v.abs().max())
+            if step >= 2 * warm and peak < 1e-3:
+                print(f"      [WARN] still {peak:.1e} after {step} steps -- this "
+                      f"pathway is effectively OFF. Its tokens are being computed "
+                      f"and multiplied by ~0"
+                      + (", and the second camera frame that feeds it is doubling "
+                         "video decode for nothing" if name == "resnet_motion_gate"
+                         else "") + ".")
+            elif step < 2 * warm:
+                print(f"      (too early to judge: zero-init, step {step} "
+                      f"< 2x warmup {warm})")
+
     comps = getattr(policy.model, "_last_loss_components", None)
     cw = getattr(policy.model.config, "contrastive_loss_weight", 0.0)
     if comps is not None and cw > 0.0:
