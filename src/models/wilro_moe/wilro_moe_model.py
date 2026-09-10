@@ -67,7 +67,15 @@ class MoERouter(nn.Module):
         B = state_emb.shape[0]
         vlm_proj = self.vlm_proj(vlm_semantic_emb)
         action_pool = action_emb.mean(dim=1)
-        state_flat = state_emb.squeeze(1) if state_emb.dim() == 3 else state_emb
+        # POOL, do not squeeze. squeeze(1) is a no-op once there is more than one
+        # state frame, and the cat below then mixes a 3-D tensor with three 2-D
+        # ones -- "Tensors must have same number of dimensions: got 3 and 2".
+        # --use_state_history with n_obs_steps > 1 crashed here, at the first
+        # forward, for every n_obs_steps except 1. Flattening instead of pooling
+        # would not fix it either: the router's first Linear is 4*hidden wide, so
+        # n_obs frames would need 4+n_obs-1 slots. Mean-pooling keeps the width
+        # fixed for any n_obs and matches how action_emb is reduced one line up.
+        state_flat = state_emb.mean(dim=1) if state_emb.dim() == 3 else state_emb
         logits = self.router(torch.cat(
             [state_flat, vlm_proj, time_emb, action_pool], dim=-1)
         ) / max(self.temperature, 1e-6)
