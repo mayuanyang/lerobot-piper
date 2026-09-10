@@ -676,7 +676,14 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
         hidden = self._last_vlm_hidden
         vlm_semantic = self._pool_vlm_semantic(hidden, vlm_kv_pad_mask).to(dtype)
         weights, usage = self.router(state_tok, vlm_semantic, t_emb, action_emb)
-        if self._record_routing:
+        if self._record_routing and record:
+            # `and record` for the same reason every other statistic here carries
+            # it: the contrastive negative calls _run_dit a second time with the
+            # LANGUAGE band of the KV permuted. Without the guard the trace would
+            # interleave real and permuted-instruction forwards while claiming to
+            # describe the real one. Dropping that guard on _last_router_usage
+            # once collapsed the router to a single expert by step 200.
+            #
             # PRE-noise weights: what inference actually uses. Appended in ODE
             # order, so index 0 is t=1 (coarse) and index -1 is the last step
             # (fine placement) -- which is the axis the disjoint VLM bands were
