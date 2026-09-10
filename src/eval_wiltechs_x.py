@@ -652,6 +652,74 @@ def build_batch(obs_list, tasks, hist: StateHistory, preprocessor, device,
 
 
 @torch.no_grad()
+class MotionAccumulator:
+    """End-effector displacement per policy chunk, split by success.
+
+    The evidence that this family's success rate rides on the per-chunk noise
+    re-draw is that --fixed_episode_noise costs 25 points. A 25-point drop from
+    freezing x_1 is too large for "one draw was unlucky": with a FIXED draw the
+    same observation returns the same action forever, so a policy that walks
+    into a bad state never leaves it. That reading says the re-draw is an
+    ESCAPE mechanism, not a lottery -- and it predicts something measurable that
+    nothing here has ever recorded: failures should contain long stretches where
+    the arm is not moving at all.
+
+    So log the distance the end-effector travels between consecutive chunk
+    boundaries (state dims 0:3, metres) and report, separately for successful
+    and failed episodes:
+
+      median   the typical per-chunk travel
+      still%   fraction of chunks under `still_m`
+      streak   longest CONSECUTIVE run of still chunks -- the actual "stuck"
+               number, and the one a scripted retreat or an adaptive noise
+               scale would trigger on
+
+    A failure profile that looks like the success profile means the policy is
+    moving the whole time and simply missing: a precision problem, and retreating
+    to a home pose would not help. A failure profile with long still streaks
+    means it is wedged, and escape is worth engineering.
+    """
+
+    def __init__(self, still_m: float = 0.002):
+        self.still_m = float(still_m)
+        self.ok, self.bad = [], []      # per episode: (median, still_frac, streak, n)
+
+    @staticmethod
+    def _summarise(disp, still_m):
+        import numpy as _np
+        if not disp:
+            return None
+        d = _np.asarray(disp, dtype=float)
+        still = d < still_m
+        best = cur = 0
+        for v in still:
+            cur = cur + 1 if v else 0
+            best = max(best, cur)
+        return float(_np.median(d)), float(still.mean()), int(best), int(d.size)
+
+    def add(self, disp, success: bool):
+        r = self._summarise(disp, self.still_m)
+        if r is not None:
+            (self.ok if success else self.bad).append(r)
+
+    def report(self) -> dict | None:
+        import numpy as _np
+        if not self.ok and not self.bad:
+            return None
+        def agg(rows):
+            if not rows:
+                return None
+            a = _np.asarray(rows, dtype=float)
+            return {"episodes": int(a.shape[0]),
+                    "median_disp_m": round(float(_np.median(a[:, 0])), 5),
+                    "still_frac": round(float(_np.mean(a[:, 1])), 4),
+                    "max_still_streak_chunks": int(a[:, 2].max()),
+                    "mean_still_streak_chunks": round(float(_np.mean(a[:, 2])), 1),
+                    "mean_chunks": round(float(_np.mean(a[:, 3])), 1)}
+        return {"still_threshold_m": self.still_m,
+                "success": agg(self.ok), "failure": agg(self.bad)}
+
+
 class RoutingAccumulator:
     """Per-denoising-step routing statistics, accumulated over chunks.
 
@@ -734,7 +802,7 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
               video_cb=None, videos_per_task: int = 0, heartbeat: int = 50,
               instruction: str | None = None, state_noise: float = 0.0,
               state_noise_dims=None, blur: int = 0, blur_cams=None,
-              history_mode: str = "real", routing_acc=None):
+              history_mode: str = "real", routing_acc=None, motion_acc=None):
     """-> (n_success, n_episodes, mean_success_steps, n_chunks, task_description,
     per_episode_success).
 
@@ -838,6 +906,8 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
 
             done = [i >= n_live for i in range(num_envs)]   # pad slots start done
             succ = [False] * num_envs
+            _mo_prev = [None] * num_envs
+            _mo_disp = [[] for _ in range(num_envs)]
             steps = [0] * num_envs
             t = 0
             while not all(done) and t < horizon_cap:
@@ -855,6 +925,14 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
                 with autocast:
                     action = policy.select_action(batch)
                 n_chunks += int(drew_chunk)
+                if drew_chunk and motion_acc is not None:
+                    for i in range(num_envs):
+                        if done[i]:
+                            continue
+                        _p = np.asarray(obs_list[i]["agent_pos"], dtype=float).reshape(-1)[:3]
+                        if _mo_prev[i] is not None:
+                            _mo_disp[i].append(float(np.linalg.norm(_p - _mo_prev[i])))
+                        _mo_prev[i] = _p
                 if drew_chunk and routing_acc is not None:
                     tr = getattr(policy.model, "_routing_trace", None)
                     if tr:
@@ -881,6 +959,8 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
                         # episode and pollutes the next chunk's observation.
                         done[i] = True
                         succ[i] = bool(info.get("is_success", False))
+                        if motion_acc is not None:
+                            motion_acc.add(_mo_disp[i], succ[i])
                 t += 1
 
                 # Heartbeat. Without it a batch that runs to the cap is many
@@ -896,6 +976,17 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
                           f"success={hit}  {el:5.0f}s  "
                           f"({el / max(t, 1) * horizon_cap:.0f}s if it runs to cap)",
                           flush=True)
+
+            if motion_acc is not None:
+                # Episodes that ran to horizon_cap never reach the terminated /
+                # truncated branch, so done[i] stays False and they were never
+                # flushed. Those are exactly the failures this measurement is
+                # for -- on libero_10 T8 the whole batch runs to the cap -- so
+                # dropping them would have measured only the episodes that
+                # ENDED, i.e. overwhelmingly the successes.
+                for i in range(n_live):
+                    if not done[i]:
+                        motion_acc.add(_mo_disp[i], False)
 
             hit = sum(succ[:n_live])
             print(f"    batch {start // num_envs + 1}/{n_batches}: "
@@ -1076,6 +1167,25 @@ def main():
                         "'frozen' repeats the newest frame, which is what "
                         "every episode's first step already looks like. "
                         "Read 'shuffled'; 'frozen' alone is ambiguous.")
+    p.add_argument("--log_motion", action="store_true",
+                   help="Record how far the end-effector travels between "
+                        "consecutive policy chunks (state dims 0:3), reported "
+                        "separately for successful and failed episodes. This is "
+                        "the measurement that decides what 'stuck' means here: "
+                        "--fixed_episode_noise costs 25 points, which is too "
+                        "large for bad luck on one draw and reads instead as "
+                        "'a frozen draw returns the same action forever, so a "
+                        "policy that walks into a bad state never leaves it'. "
+                        "If that is right, failures carry long motionless "
+                        "streaks and escape is worth engineering; if failures "
+                        "move as much as successes, the arm is missing rather "
+                        "than wedged and a retreat would not help.")
+    p.add_argument("--still_threshold", type=float, default=0.002,
+                   help="Metres of end-effector travel between chunk boundaries "
+                        "below which a chunk counts as motionless (default "
+                        "0.002 = 2 mm). For scale: one control step can command "
+                        "at most 0.9375 x 0.05 m = 47 mm, and typical demo "
+                        "motion is ~17-22 mm per step.")
     p.add_argument("--router_top_k", type=int, default=None,
                    help="Override the checkpoint's router_top_k at inference "
                         "(wilro_moe). 0 = dense, all experts weighted. The "
@@ -1178,6 +1288,7 @@ def main():
                          log_routing=a.log_routing)
     routing_acc = (RoutingAccumulator(int(getattr(policy.config, "router_top_k", 0) or 0))
                    if a.log_routing else None)
+    motion_acc = MotionAccumulator(a.still_threshold) if a.log_motion else None
     report_new_config_fields(policy.config, ckpt)
     report_missing_weights(policy, ckpt, a.allow_missing_weights)
     pre, post = load_processors(ckpt, device, a.dataset_id)
@@ -1287,7 +1398,7 @@ def main():
                 a.videos_per_task, a.heartbeat, wrong.get(tid),
                 a.state_noise, a.state_noise_dims,
                 a.image_blur, a.image_blur_cams, a.history_mode,
-                routing_acc)
+                routing_acc, motion_acc)
             sr = 100.0 * n_ok / max(n_ep, 1)
             per_task[tid] = {"success_rate": sr, "n_success": n_ok,
                              "n_episodes": n_ep, "mean_success_steps": mean_steps,
@@ -1365,6 +1476,32 @@ def main():
                   f"(1.0 = the same k experts run the whole trajectory)")
             print(f"  uniform reference         : {100.0 / E:.1f}% per expert\n")
 
+    if motion_acc is not None:
+        m = motion_acc.report()
+        if m:
+            print("\n=== end-effector motion per policy chunk ===")
+            print(f"  {'':<10}{'episodes':>9}{'median (mm)':>13}{'still %':>9}"
+                  f"{'max streak':>12}{'mean streak':>13}{'chunks':>8}")
+            for lab, k in (("success", "success"), ("FAILURE", "failure")):
+                d = m.get(k)
+                if d:
+                    print(f"  {lab:<10}{d['episodes']:>9}{1000 * d['median_disp_m']:>13.1f}"
+                          f"{100 * d['still_frac']:>8.1f}%{d['max_still_streak_chunks']:>12}"
+                          f"{d['mean_still_streak_chunks']:>13.1f}{d['mean_chunks']:>8.1f}")
+            so, fa = m.get("success"), m.get("failure")
+            if so and fa:
+                print(f"  still = under {1000 * m['still_threshold_m']:.0f} mm between chunk "
+                      f"boundaries")
+                if fa["mean_still_streak_chunks"] > 3 * max(so["mean_still_streak_chunks"], 0.5):
+                    print("  -> failures contain long motionless stretches: the arm is "
+                          "WEDGED, not missing. Escape (scripted retreat, adaptive noise "
+                          "scale, staged RL) is worth engineering.")
+                else:
+                    print("  -> failures move about as much as successes: the arm is "
+                          "MISSING, not stuck. Retreating to a home pose would not help; "
+                          "this is the precision bottleneck.")
+            print()
+
     payload = {"checkpoint": str(ckpt), "control_freq": a.control_freq,
                "fixed_init_states": not a.stock_init,
                "seed": a.seed,
@@ -1388,6 +1525,7 @@ def main():
                "image_blur_cams": a.image_blur_cams,
                "router_top_k": getattr(policy.config, "router_top_k", None),
                "routing": (routing_acc.report() if routing_acc else None),
+               "motion": (motion_acc.report() if motion_acc else None),
                "episodes_per_task": a.episodes, "ablate_lang": a.ablate_lang,
                "instruction_override": a.instruction_override,
                "instruction_from_task": a.instruction_from_task,
