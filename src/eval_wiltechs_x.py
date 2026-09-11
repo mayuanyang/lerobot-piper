@@ -1492,14 +1492,30 @@ def main():
             if so and fa:
                 print(f"  still = under {1000 * m['still_threshold_m']:.0f} mm between chunk "
                       f"boundaries")
-                if fa["mean_still_streak_chunks"] > 3 * max(so["mean_still_streak_chunks"], 0.5):
-                    print("  -> failures contain long motionless stretches: the arm is "
-                          "WEDGED, not missing. Escape (scripted retreat, adaptive noise "
-                          "scale, staged RL) is worth engineering.")
+                # Compare ABSOLUTE motionless time, not the streak length.
+                # Failures run far longer than successes (259 vs 80 chunks on
+                # the first real measurement), so a streak ratio understates
+                # them: 9.2 vs 3.4 reads as "only 2.7x" while the actual time
+                # spent not moving is 8.4x. Report speed and time separately
+                # rather than forcing a binary verdict -- the first real
+                # measurement landed between the two hypotheses.
+                still_s = so["mean_chunks"] * so["still_frac"]
+                still_f = fa["mean_chunks"] * fa["still_frac"]
+                spd = so["median_disp_m"] / max(fa["median_disp_m"], 1e-9)
+                print(f"  speed:  successes move {spd:.1f}x further per chunk")
+                print(f"  stalls: failures spend {still_f:.0f} chunks motionless vs "
+                      f"{still_s:.0f} ({still_f / max(still_s, 1e-9):.1f}x)")
+                if spd < 1.5 and still_f < 2 * still_s:
+                    print("  -> failures look like successes: the arm is MISSING, not "
+                          "stuck. A retreat would not help; this is precision.")
+                elif spd > 2.5 and fa["still_frac"] > 0.5:
+                    print("  -> failures are mostly frozen: the arm is WEDGED. Escape "
+                          "(scripted retreat, adaptive noise, staged RL) is the lever.")
                 else:
-                    print("  -> failures move about as much as successes: the arm is "
-                          "MISSING, not stuck. Retreating to a home pose would not help; "
-                          "this is the precision bottleneck.")
+                    print("  -> DITHERING: failures still move on most chunks but at a "
+                          "fraction of the speed, with long pauses. Neither pure "
+                          "precision nor pure wedging -- watch the videos of the "
+                          "slowest failures before choosing a lever.")
             print()
 
     payload = {"checkpoint": str(ckpt), "control_freq": a.control_freq,
