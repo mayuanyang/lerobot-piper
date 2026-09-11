@@ -785,9 +785,21 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
             print(f"  fine grid: {fine_cams} -> {resnet_fine_tokens} tok "
                   f"({resnet_input_size / max(int(resnet_fine_tokens ** 0.5), 1):.1f} "
                   f"px/token); others -> {resnet_tokens} tok")
+            # Count the STATE tokens rather than assuming one. --n_obs_steps
+            # alone is inert (wilro_moe slices state_tok[:, -1:] unless
+            # use_state_history), and nothing else in the startup log says
+            # whether the temporal pathway is on -- so this line was the only
+            # place it could have shown, and it hardcoded 1.
+            n_state = obs if use_state_history else 1
             print(f"  vision tokens in the DiT sequence: {total} "
-                  f"(was {len(camera_keys) * resnet_tokens} at a uniform grid) "
-                  f"-> sequence length {2 + total + 64}")
+                  f"(was {len(camera_keys) * resnet_tokens} at a uniform grid); "
+                  f"state tokens: {n_state}"
+                  + (f" (n_obs_steps={obs}, use_state_history ON -- the model "
+                     f"can see velocity)" if use_state_history else
+                     (f" (n_obs_steps={obs} FETCHED but sliced to the last "
+                      f"frame: --use_state_history is OFF, so the extra frames "
+                      f"are encoded and discarded)" if obs > 1 else ""))
+                  + f"\n  -> DiT sequence length {1 + n_state + total + 64}")
 
     # Build wilro config
     cfg = WilroMoEConfig(
