@@ -255,7 +255,15 @@ def _log_gradient_analysis(policy, step: int) -> None:
             # run's first thousand steps. Warmup is the honest boundary: before
             # 2x warmup the LR has not been at peak for any meaningful span.
             warm = int(getattr(policy.model.config, "scheduler_warmup_steps", 1500) or 1500)
-            settled = step >= 2 * warm
+            # Gate on DIFFERENTIATION, not on the step counter alone. The step
+            # guard exists because adaLN-Zero makes every expert the identity
+            # map at init, so the statistic reads ~0 whatever the topology is
+            # worth. But --start_step_override 0 restarts the counter on
+            # ALREADY-TRAINED weights: step 0 with disagreement 0.574 and
+            # ambiguity at 74% of flow, where the "too early to read" message
+            # is not merely unhelpful, it is false. Disagreement is the direct
+            # test of the thing the step counter was standing in for.
+            settled = step >= 2 * warm or (dis is not None and dis > 0.05)
             if amb is not None and flow and flow > 0:
                 pct = 100.0 * amb / flow
                 # The two are normalised slightly differently -- the flow loss
@@ -263,9 +271,10 @@ def _log_gradient_analysis(policy, step: int) -> None:
                 # the percentage to within ~20%, and read its TREND exactly.
                 if not settled:
                     verdict = (f"  <- too early to read (step {step} < 2x warmup "
-                               f"{warm}); adaLN-Zero starts every expert as the "
-                               f"identity map, so this reads ~0 whatever the "
-                               f"topology is worth")
+                               f"{warm} and the experts have not differentiated); "
+                               f"adaLN-Zero starts every expert as the identity "
+                               f"map, so this reads ~0 whatever the topology is "
+                               f"worth")
                 elif pct < 1.0:
                     verdict = ("  <- the experts are near-redundant; these "
                                "parameters would do more as depth "
