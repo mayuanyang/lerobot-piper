@@ -834,6 +834,14 @@ def grpo_update(
     for k in ("loss", "ratio_mean", "clip_frac", "approx_kl", "approx_kl_median"):
         agg[k] = agg.get(k, 0.0) / n
     agg["rollout_drift"] /= max(1, len(minibatches))
+    # How much of the update actually RAN. stopped_early alone does not say
+    # whether the trust region cost you one minibatch out of 125 or 123 of them,
+    # and that is the difference between a normal PPO early stop and an update
+    # that is effectively a no-op. It was printed to stdout and nowhere else, so
+    # the JSON -- the thing anyone reads afterwards -- could not answer it.
+    agg["n_minibatches"] = agg.get("n_minibatches", 0)
+    agg["minibatches_total"] = len(minibatches)
+    agg["update_frac"] = agg["n_minibatches"] / max(1, len(minibatches))
     return agg
 
 
