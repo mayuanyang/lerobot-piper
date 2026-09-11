@@ -807,18 +807,58 @@ def grpo_update(
 # Setup helpers
 # ---------------------------------------------------------------------------
 
+# (config_module, policy_module, ClassName) keyed by the checkpoint's own
+# "type" field. MUST STAY IN SYNC with eval_wiltechs_x.py's POLICIES and
+# train_rft.py's _POLICY_CLASS -- those two drifted once already and the only
+# symptom was draccus failing to decode the checkpoint's own config.json.
+# Importing the CONFIG module is what runs @PreTrainedConfig.register_subclass,
+# so an unregistered type is indistinguishable from an unparseable file.
+_RL_POLICY_CLASS: dict[str, tuple[str, str, str]] = {
+    "wilro":     ("models.wilro.wilro_config",
+                  "models.wilro.wilro_policy", "WilroPolicy"),
+    "wilro_moe": ("models.wilro_moe.wilro_moe_config",
+                  "models.wilro_moe.wilro_moe_policy", "WilroMoEPolicy"),
+}
+
+
+def _policy_type_of(path: str) -> str:
+    """Read "type" out of the checkpoint's config.json without draccus, so the
+    error for an unknown type names the type instead of dying inside decoding."""
+    import json as _json
+    import huggingface_hub
+    p = Path(path)
+    local = p if p.exists() else Path(huggingface_hub.snapshot_download(str(path)))
+    cfg_file = local / "config.json"
+    if not cfg_file.exists():
+        raise SystemExit(f"[rl] no config.json under {local}")
+    kind = _json.loads(cfg_file.read_text()).get("type")
+    if kind not in _RL_POLICY_CLASS:
+        raise SystemExit(
+            f"[rl] checkpoint type '{kind}' is not registered here.\n"
+            f"    Known: {', '.join(sorted(_RL_POLICY_CLASS))}\n"
+            f"    Add it to _RL_POLICY_CLASS in {Path(__file__).name} -- three "
+            f"lines, and keep it in sync with eval_wiltechs_x.py.")
+    return kind
+
+
 def load_policy_and_processors(args, device):
-    """Load WilR SFT checkpoint and zero all dropout."""
-    from models.wilro.wilro_policy import WilroPolicy
+    """Load a WilR-family SFT checkpoint and zero all dropout."""
+    import importlib
     from lerobot.configs.policies import PreTrainedConfig
     from lerobot.policies.factory import make_pre_post_processors
+
+    kind = _policy_type_of(args.policy_path)
+    cfg_mod, pol_mod, cls_name = _RL_POLICY_CLASS[kind]
+    importlib.import_module(cfg_mod)          # registers the draccus choice
+    PolicyCls = getattr(importlib.import_module(pol_mod), cls_name)
+    print(f"[rl] policy type: {kind} -> {cls_name}")
 
     # Pin the checkpoint's device to THIS process's GPU BEFORE loading. lerobot
     # maps the safetensors weights to config.device, which is cuda:0 by default —
     # so under torchrun every rank would otherwise load onto GPU 0 and OOM it.
     cfg = PreTrainedConfig.from_pretrained(args.policy_path)
     cfg.device = str(device)
-    policy = WilroPolicy.from_pretrained(args.policy_path, config=cfg)
+    policy = PolicyCls.from_pretrained(args.policy_path, config=cfg)
     policy.config.pretrained_path = args.policy_path
 
     # Zero all dropout for deterministic rollout/update matching
