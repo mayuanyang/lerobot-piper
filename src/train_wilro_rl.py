@@ -34,6 +34,21 @@ import os
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
+# Same reason, one layer up: LIBERO's env_wrapper imports matplotlib.cm, and
+# matplotlib resolves MPLBACKEND at import time. A notebook exports
+# MPLBACKEND=module://matplotlib_inline.backend_inline, which is only importable
+# inside the notebook's OWN interpreter -- launch this script from a Colab cell
+# against any other environment (a venv, say) and matplotlib raises before
+# LIBERO loads. eval_wiltechs_x.py has carried this guard for a while; this file
+# did not, and the failure is opaque:
+#   ValueError: Key backend: 'module://matplotlib_inline.backend_inline' is not
+#   a valid value for backend
+# Nothing here draws, so agg is right; a deliberate non-inline choice is left
+# alone.
+_mpl = os.environ.get("MPLBACKEND", "")
+if not _mpl or "inline" in _mpl:
+    os.environ["MPLBACKEND"] = "agg"
+
 import argparse
 import json
 import math
@@ -219,6 +234,8 @@ def _env_worker(conn, suite_name: str, task_id: int, max_episode_steps: int,
     The worker auto-banks staged progress: tracker.update() on each non-terminal
     step, and reward = 1.0 if success else tracker.reward() on termination."""
     os.environ.setdefault("MUJOCO_GL", "egl")
+    if "inline" in os.environ.get("MPLBACKEND", ""):
+        os.environ["MPLBACKEND"] = "agg"      # env subprocesses import LIBERO too
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
     # Render this worker on its assigned GPU so EGL contexts (and their GPU memory)
     # spread across devices instead of exhausting one. _make_envs_task reads

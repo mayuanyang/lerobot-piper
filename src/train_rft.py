@@ -244,6 +244,13 @@ def _start_virtual_display():
         print(f"[train_rft] virtual display not started ({type(e).__name__}: {e}); "
               f"assuming one already exists.")
     os.environ.setdefault("MUJOCO_GL", "egl")
+    # LIBERO's env_wrapper imports matplotlib.cm, and matplotlib resolves
+    # MPLBACKEND at import time. A Colab cell exports
+    # MPLBACKEND=module://matplotlib_inline.backend_inline, importable only
+    # inside the notebook's OWN interpreter -- against a venv it raises before
+    # LIBERO loads. Nothing here draws.
+    if not os.environ.get("MPLBACKEND") or "inline" in os.environ.get("MPLBACKEND", ""):
+        os.environ["MPLBACKEND"] = "agg"
     os.environ.setdefault("DISPLAY", ":99")
 
 
