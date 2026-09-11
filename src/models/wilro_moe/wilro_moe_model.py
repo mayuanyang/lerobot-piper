@@ -728,7 +728,12 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
                 delta = (self.expert_vision_gates[e].to(vis.dtype)
                          * self.expert_vision_adapters[e](vis))
                 seq_e = torch.cat([seq[:, :lo], vis + delta, seq[:, hi:]], dim=1)
-            if self.gradient_checkpointing and self.training:
+            # is_grad_enabled, NOT self.training: checkpointing exists to trade
+            # compute for the backward graph, and whether a backward graph is
+            # being built is exactly torch.is_grad_enabled(). Gating on
+            # training broke RL, where the update must run in eval mode to
+            # reproduce the rollout but still needs gradients.
+            if self.gradient_checkpointing and torch.is_grad_enabled():
                 x = torch.utils.checkpoint.checkpoint(
                     expert, seq_e, t_emb, expert_kv, vlm_kv_pad_mask, causal,
                     use_reentrant=False)

@@ -720,10 +720,27 @@ def rollout_groups_concurrent(
 def grpo_update(
     policy, preprocessor, optimizer, records: list[ChunkRecord], args, device,
 ) -> dict:
-    policy.model.train()
-    # Keep RobotCNN in eval mode (BatchNorm running stats mismatch)
-    if getattr(policy.model, "robot_visual_encoder", None) is not None:
-        policy.model.robot_visual_encoder.eval()
+    # EVAL MODE, NOT TRAIN. .eval() only sets self.training=False; it does not
+    # touch autograd, so gradients still flow. Train mode was silently making
+    # the update forward a DIFFERENT POLICY from the rollout forward:
+    #
+    #   wilro_moe_model.py:87    router logits += randn * 0.5  (exploration)
+    #   smolvlm_encoder.py:390   paraphrase_augment picks a RANDOM variant
+    #
+    # Neither is an nn.Dropout module nor the vision_dropout config, so the
+    # loader's dropout-zeroing above does not catch them. Measured consequence
+    # on the first real wilro_moe RL run: rollout_drift 0.63-0.99 in normalised
+    # action units (per-dim std is 1.0), which drives log_ratio into
+    # grpo_clip_loss's clamp(-20, 20) -- the logged ratio_max of 485,165,216 is
+    # exactly exp(20) -- so approx_kl blew past --target_kl on every iteration
+    # and 24 of 27 updates were discarded with loss 0.0. The handful that got
+    # through were garbage, and task 4's rollout SR fell 0.75 -> 0.40 across 14
+    # iterations.
+    #
+    # The invariant is simple: the update must reproduce the rollout. Any
+    # train-only branch is a drift source, so run the update in the same mode
+    # the rollout ran in.
+    policy.model.eval()
     horizon = policy.config.horizon
 
     autocast_ctx = (
