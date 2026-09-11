@@ -802,7 +802,8 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
               video_cb=None, videos_per_task: int = 0, heartbeat: int = 50,
               instruction: str | None = None, state_noise: float = 0.0,
               state_noise_dims=None, blur: int = 0, blur_cams=None,
-              history_mode: str = "real", routing_acc=None, motion_acc=None):
+              history_mode: str = "real", routing_acc=None, motion_acc=None,
+              action_offset=None):
     """-> (n_success, n_episodes, mean_success_steps, n_chunks, task_description,
     per_episode_success).
 
@@ -938,6 +939,20 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
                     if tr:
                         routing_acc.add(tr, [i for i in range(num_envs) if not done[i]])
                 env_action = postprocessor(action.float().cpu()).numpy()
+                if action_offset:
+                    # Applied AFTER the postprocessor, so the units are the
+                    # controller's own [-1, 1] and the value is exactly what the
+                    # env receives (before its clip).
+                    #
+                    # NOTE the action is an OSC DELTA. A constant offset is a
+                    # constant VELOCITY bias, not a fixed position shift, and the
+                    # policy is closed-loop: it sees the drift and commands
+                    # against it, so the steady-state height change is smaller
+                    # than offset x output_max and depends on the policy's own
+                    # feedback. Sweep it and read the success rate; do not try to
+                    # predict the millimetres.
+                    for _d, _v in action_offset:
+                        env_action[:, _d] += _v
 
                 for i in range(num_envs):
                     if done[i]:
@@ -1167,6 +1182,23 @@ def main():
                         "'frozen' repeats the newest frame, which is what "
                         "every episode's first step already looks like. "
                         "Read 'shuffled'; 'frozen' alone is ambiguous.")
+    p.add_argument("--action_offset", nargs=2, action="append", default=None,
+                   metavar=("DIM", "VALUE"),
+                   help="Add a constant to one action dim at inference, in the "
+                        "controller's own [-1, 1] units, every step. Repeatable: "
+                        "--action_offset 2 0.04 --action_offset 0 -0.02. This is "
+                        "the cheap test for whether a placement error is BIAS or "
+                        "VARIANCE: if a small +z offset moves the success rate on "
+                        "the tasks that 'get near but land a little low', the "
+                        "residual is a systematic offset -- which RL can learn "
+                        "away as a constant, and which behaviour cloning cannot, "
+                        "because the demos never contain 'you are 5 mm low, go "
+                        "up'. If nothing moves, it is variance and the lever is "
+                        "perception, not RL. The action is an OSC DELTA, so a "
+                        "constant here is a VELOCITY bias that the closed loop "
+                        "partially rejects: sweep small values (0.02-0.10) and "
+                        "read the success rate rather than predicting the "
+                        "millimetres.")
     p.add_argument("--log_motion", action="store_true",
                    help="Record how far the end-effector travels between "
                         "consecutive policy chunks (state dims 0:3), reported "
@@ -1289,6 +1321,24 @@ def main():
     routing_acc = (RoutingAccumulator(int(getattr(policy.config, "router_top_k", 0) or 0))
                    if a.log_routing else None)
     motion_acc = MotionAccumulator(a.still_threshold) if a.log_motion else None
+    action_offset = None
+    if a.action_offset:
+        action_dim = int(policy.config.action_dim)
+        action_offset = []
+        for _d, _v in a.action_offset:
+            _d, _v = int(_d), float(_v)
+            if not 0 <= _d < action_dim:
+                raise SystemExit(f"--action_offset dim {_d} outside [0, {action_dim})")
+            action_offset.append((_d, _v))
+        print("[eval] action offsets (controller units, applied every step, "
+              "BEFORE the env clip):")
+        for _d, _v in action_offset:
+            print(f"    dim {_d}: {_v:+.4f}"
+                  + (f"   ~= {_v * 50:+.1f} mm/step commanded, if robosuite's OSC "
+                     f"output_max is 0.05 m (UNVERIFIED -- check the LIBERO "
+                     f"controller config)" if _d < 3 else ""))
+        print("    the action is a DELTA, so this is a velocity bias the "
+              "closed loop partially rejects; read SR, not millimetres.")
     report_new_config_fields(policy.config, ckpt)
     report_missing_weights(policy, ckpt, a.allow_missing_weights)
     pre, post = load_processors(ckpt, device, a.dataset_id)
@@ -1398,7 +1448,7 @@ def main():
                 a.videos_per_task, a.heartbeat, wrong.get(tid),
                 a.state_noise, a.state_noise_dims,
                 a.image_blur, a.image_blur_cams, a.history_mode,
-                routing_acc, motion_acc)
+                routing_acc, motion_acc, action_offset)
             sr = 100.0 * n_ok / max(n_ep, 1)
             per_task[tid] = {"success_rate": sr, "n_success": n_ok,
                              "n_episodes": n_ep, "mean_success_steps": mean_steps,
@@ -1542,6 +1592,8 @@ def main():
                "router_top_k": getattr(policy.config, "router_top_k", None),
                "routing": (routing_acc.report() if routing_acc else None),
                "motion": (motion_acc.report() if motion_acc else None),
+               "action_offset": ([[d, v] for d, v in action_offset]
+                                 if action_offset else None),
                "episodes_per_task": a.episodes, "ablate_lang": a.ablate_lang,
                "instruction_override": a.instruction_override,
                "instruction_from_task": a.instruction_from_task,
