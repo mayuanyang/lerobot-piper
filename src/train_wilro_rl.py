@@ -1262,6 +1262,17 @@ def main():
                            "successes": int(n_succ), "of": len(res.successes)}
                 if this_staged:
                     summary["reward_mean"] = round(float(np.mean(res.rewards)), 3)
+                    # The WITHIN-GROUP spread is what GRPO divides by:
+                    #   adv = (r - r.mean()) / (r.std() + 1e-4)
+                    # and the degeneracy guard only drops a group at std < 1e-8.
+                    # A group whose 8 rollouts all did roughly the same thing --
+                    # the common case on a hard task under a dense staged reward
+                    # -- has a small but nonzero std, and dividing by it turns
+                    # ladder noise into confident +-1 advantages. Logging the
+                    # mean alone could never show that.
+                    _rstd = float(np.std(res.rewards))
+                    summary["reward_std"] = round(_rstd, 4)
+                    summary["adv_amplification"] = round(1.0 / (_rstd + 1e-4), 1)
                 group_summaries.append(summary)
 
                 # Staged (dense, in [0,1]) for staged tasks; binary 0/1 for tasks in
