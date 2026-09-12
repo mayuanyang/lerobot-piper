@@ -780,6 +780,22 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
 
     awr = (AWRWeights(awr_rewards, awr_beta, awr_clip, awr_reward)
            if awr_rewards else None)
+    if awr is not None and len(dataset_ids) > 1:
+        # The weights are keyed on episode_index, and ConcatDataset does NOT
+        # renumber: every sub-dataset starts its own episodes at 0, so mixing
+        # the demo set in would apply the corpus's weight for episode 5 to the
+        # demo set's episode 5 as well. Silently. There is no dataset_index in
+        # the batch to disambiguate on, so this is refused rather than guessed.
+        #
+        # Mixing IS the right defence against narrow-distribution drift; it just
+        # needs a disambiguator first. Until then, keep the corpus broad -- the
+        # collector covers the whole suite by default, and --rft.task_ids is
+        # what narrows it.
+        raise ValueError(
+            f"--awr_rewards with {len(dataset_ids)} datasets: the weights join on "
+            f"episode_index, and concatenated datasets each restart it at 0, so "
+            f"the corpus's weights would also land on the other set's episodes. "
+            f"Pass a single --dataset_id.")
 
     # ---- state-noise augmentation: resolve the mode and SAY what it does ----
     # This has been invisible since it was written: one hardcoded 0.01 on a
