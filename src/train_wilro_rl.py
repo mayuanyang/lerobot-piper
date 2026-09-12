@@ -883,6 +883,59 @@ def _policy_type_of(path: str) -> str:
     return kind
 
 
+
+class ParamDrift:
+    """How far the policy has wandered from the SFT weights it started at.
+
+    grpo_clip_loss carries NO KL term -- its docstring says so -- and
+    --target_kl bounds only the CURRENT step against the rollout that produced
+    it. Nothing bounds the CUMULATIVE distance from the reference. Over a few
+    hundred Adam steps that is an unbounded random walk, and Adam is the worst
+    optimiser to take it with: its step is ~lr regardless of gradient
+    magnitude, so a pure-noise gradient still produces a full-size step in a
+    random direction.
+
+    That matters because an SFT checkpoint sits at a peak. Movement in ANY
+    direction costs performance, which is why a noise-dominated run degrades
+    MONOTONICALLY rather than wandering up and down -- the shape actually
+    observed on task 8 (20.5% -> 5.4% paired across the init_state wrap).
+
+    Snapshots a strided sample of the trainable tensors rather than all 649M,
+    and reports ||theta - theta_0|| / ||theta_0||. Watch it against the success
+    rate: drift climbing while SR falls is the random walk; drift climbing while
+    SR climbs is learning.
+    """
+
+    def __init__(self, model, n_tensors: int = 24, slice_elems: int = 200_000):
+        named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        total = sum(p.numel() for _, p in named)
+        # Evenly spaced by index so the sample spans the whole stack -- the
+        # ResNet, every expert band, the router and the action head -- rather
+        # than clustering wherever the small tensors happen to be. Each sampled
+        # tensor contributes a FIXED-LENGTH leading slice, so one 8.3M adaLN
+        # matrix cannot crowd the rest out and the memory is exactly bounded.
+        idx = sorted({round(i * (len(named) - 1) / max(n_tensors - 1, 1))
+                      for i in range(n_tensors)}) if named else []
+        self.ref, kept = {}, 0
+        for i in idx:
+            n, prm = named[i]
+            k = min(slice_elems, prm.numel())
+            self.ref[n] = (k, prm.detach().float().reshape(-1)[:k].cpu().clone())
+            kept += k
+        self.ref_norm = math.sqrt(sum(float(v.pow(2).sum())
+                                      for _, v in self.ref.values())) or 1.0
+        print(f"[rl] param-drift probe: {len(self.ref)}/{len(named)} tensors sampled, "
+              f"{kept:,} elems ({kept * 4 / 1e6:.0f} MB on CPU) out of "
+              f"{total:,} trainable")
+
+    def measure(self, model) -> float:
+        cur = dict(model.named_parameters())
+        sq = 0.0
+        for n, (k, r) in self.ref.items():
+            sq += float((cur[n].detach().float().reshape(-1)[:k].cpu() - r).pow(2).sum())
+        return math.sqrt(sq) / self.ref_norm
+
+
 def load_policy_and_processors(args, device):
     """Load a WilR-family SFT checkpoint and zero all dropout."""
     import importlib
@@ -1131,6 +1184,7 @@ def main():
     log_path = out_dir / "rl_log.jsonl"
 
     policy, preprocessor, postprocessor = load_policy_and_processors(args, device)
+    drift_probe = ParamDrift(policy.model)
     trainable = [p for p in policy.model.parameters() if p.requires_grad]
     print(f"[rl] trainable params: {sum(p.numel() for p in trainable):,}")
     optimizer = make_optimizer(trainable, args.lr, args.use_8bit_adam)
@@ -1329,6 +1383,7 @@ def main():
                 "rollout_s": round(rollout_s, 1),
                 "update_s": round(update_s, 1),
                 **{k: v for k, v in stats.items() if k != "n_minibatches"},
+                "param_drift": round(drift_probe.measure(policy.model), 6),
                 "sr": {tid: (float(np.mean(sr_track[tid])) if sr_track[tid] else None) for tid in task_ids},
             }
             with open(log_path, "a") as f:
