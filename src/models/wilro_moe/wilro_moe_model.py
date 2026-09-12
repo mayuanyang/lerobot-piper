@@ -402,6 +402,14 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
         # a weighted MEAN (reweight, not rescale) — effective LR is unchanged.
         w_pos = pos_w[None, :, None].expand(loss.shape[0], H, 1).clone()
 
+        # AWR: a per-SAMPLE weight, exp(A/beta), supplied by the trainer from a
+        # collected corpus. Folded into w_pos so it lands in the DENOMINATOR too
+        # and the loss stays a weighted MEAN -- reweight, not rescale, so the
+        # effective LR does not move with beta. Absent => unchanged.
+        awr_w = batch.get("awr_weight")
+        if awr_w is not None:
+            w_pos = w_pos * awr_w.to(w_pos.device, w_pos.dtype).view(-1, 1, 1)
+
         gpw = float(getattr(self.config, "gripper_phase_weight", 1.0))
         if gpw != 1.0:
             # Up-weight frames near a gripper open<->close transition (grasp /

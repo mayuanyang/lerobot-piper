@@ -282,6 +282,10 @@ class RFTParams:
     # dataset — no sim in the training loop. `iterations` x `rollouts_per_task`
     # controls how much is collected.
     collect_only: bool = False
+    keep_failures: bool = False       # collect_only: also write FAILED episodes, for AWR.
+                                      # RFT drops them; AWR wants them at low weight, because
+                                      # a discarded failure is a gradient that never said
+                                      # "not that way". Writes awr_rewards.json alongside.
     save_dataset_dir: str = ""        # output dataset root (default: <output_dir>/collected_dataset)
     save_dataset_repo_id: str = "rft/collected"  # local repo_id label (no hub push)
     save_fps: int = 0                 # fps stamped into the dataset. 0 = follow control_freq, which is the rate the frames are ACTUALLY produced at. Any other value is a lie the loader cannot detect.
@@ -424,9 +428,15 @@ def _rft_rollout(env, policy, preprocessor, postprocessor, device, action_dim,
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def _rft_collect_episodes(env, policy, preprocessor, postprocessor, device,
-                          desc="", max_steps_cap=0):
-    """One batched rollout. Returns (episodes, n_success, B) where `episodes` is a
-    list of SUCCESSFUL episodes, each a list of per-frame dicts holding RAW
+                          desc="", max_steps_cap=0, keep_failures: bool = False):
+    """One batched rollout. Returns (episodes, n_success, B, succ_flags, ep_meta).
+
+    `episodes` holds successful episodes, plus the failures too when
+    keep_failures is set -- which is what turns this collector from RFT into an
+    AWR corpus. `ep_meta` runs parallel to it with {"success", "steps"} so the
+    reward can be chosen at TRAINING time without re-collecting.
+
+    Historically a list of SUCCESSFUL episodes, each a list of per-frame dicts holding RAW
     (un-normalized) data ready to write to a LeRobot dataset:
         {<cam_key>: jpeg-buffer, "observation.state": tensor,
          "action": env-space tensor, "task": str}
@@ -444,6 +454,7 @@ def _rft_collect_episodes(env, policy, preprocessor, postprocessor, device,
         max_steps = min(max_steps, max_steps_cap)
 
     episodes: list[list[dict]] = []
+    ep_meta: list[dict] = []
     n_success = 0
     # Per-env, not just the count: the caller pins a different init state on each
     # env, so this is what says WHICH states the policy can already solve.
@@ -482,10 +493,16 @@ def _rft_collect_episodes(env, policy, preprocessor, postprocessor, device,
         newly_done = (terminated | truncated) & (~done)
         for i in range(B):
             if newly_done[i]:
-                if bool(successes[i]):
-                    episodes.append(frames[i])
+                ok = bool(successes[i])
+                if ok:
                     n_success += 1
                     succ_flags[i] = True
+                # Rejection sampling throws away every failure, and with it
+                # every gradient that could say "not that way". AWR keeps them
+                # at a LOW weight instead, so they still constrain the policy.
+                if ok or keep_failures:
+                    episodes.append(frames[i])
+                    ep_meta.append({"success": ok, "steps": len(frames[i])})
                 frames[i] = []                          # free either way
         done = terminated | truncated | done
         step += 1
@@ -493,7 +510,7 @@ def _rft_collect_episodes(env, policy, preprocessor, postprocessor, device,
         pbar.set_postfix(done=f"{int(done.sum())}/{B}", success=n_success)
 
     pbar.close()
-    return episodes, n_success, B, succ_flags
+    return episodes, n_success, B, succ_flags, ep_meta
 
 
 def _create_collect_dataset(save_dir: str, repo_id: str, fps: int,
@@ -588,6 +605,7 @@ def _run_collect_only(cfg, task_envs, policy, preprocessor, postprocessor, devic
     # dense reward, not more rollouts. The aggregate success rate hides them.
     attempts: dict = {}
     wins: dict = {}
+    all_meta: list = []
     interrupted = False
     try:
         for it in range(1, cfg.rft.iterations + 1):
@@ -613,17 +631,21 @@ def _run_collect_only(cfg, task_envs, policy, preprocessor, postprocessor, devic
                         ids = [(b * num_envs + i) % n_init for i in range(num_envs)]
                         env.set_attr("_init_state_id", ids)
                     desc = f"pass{it} collect {label} [{t_idx+1}/{len(task_envs)}] b{b+1}/{n_batches}"
-                    episodes, n_succ, B, succ_flags = _rft_collect_episodes(
+                    episodes, n_succ, B, succ_flags, ep_meta = _rft_collect_episodes(
                         env, policy, preprocessor, postprocessor, device,
                         desc=desc, max_steps_cap=cfg.rft.max_steps,
+                        keep_failures=cfg.rft.keep_failures,
                     )
                     if cycle > 0:
                         for i in range(min(B, len(ids))):
                             key = (label, ids[i])
                             attempts[key] = attempts.get(key, 0) + 1
                             wins[key] = wins.get(key, 0) + int(succ_flags[i])
-                    for ep in episodes:
+                    for ep, meta in zip(episodes, ep_meta):
                         _write_episode(ds, ep, cam_keys, state_key)
+                        meta["episode_index"] = saved
+                        meta["task"] = label
+                        all_meta.append(meta)
                         saved += 1
                     total_ep += B
                     total_succ += n_succ
@@ -639,6 +661,20 @@ def _run_collect_only(cfg, task_envs, policy, preprocessor, postprocessor, devic
         # one being collected at the moment of the stop is lost.
         ds.finalize()
         print(f"[collect] dataset finalized → {save_dir}", flush=True)
+        # Sidecar rather than a dataset column: v3's schema is fixed at creation
+        # and adding a field means touching the writer, the loader and every
+        # consumer. A JSON keyed by episode_index costs nothing and the trainer
+        # joins on it. success AND steps are both recorded so the AWR reward can
+        # be chosen at training time -- plain success, or one that prefers FAST
+        # successes, which on this policy is the difference between "it worked"
+        # and "it worked after fumbling".
+        import json as _json
+        side = Path(save_dir) / "awr_rewards.json"
+        side.write_text(_json.dumps(
+            {"n_episodes": len(all_meta), "episodes": all_meta}, indent=1))
+        n_ok = sum(1 for m in all_meta if m["success"])
+        print(f"[collect] AWR sidecar → {side}  ({len(all_meta)} episodes, "
+              f"{n_ok} success / {len(all_meta) - n_ok} failure)", flush=True)
 
     status = "INTERRUPTED" if interrupted else "done"
     print(f"\n[collect] {status}: {total_succ}/{total_ep} successful episodes "

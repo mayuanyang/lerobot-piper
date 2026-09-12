@@ -49,6 +49,78 @@ def get_augmentations():
     ])
 
 
+
+class AWRWeights:
+    """Advantage-weighted regression weights, joined to episodes by index.
+
+    The closed-form solution of "improve the policy but stay within KL eps of
+    the data policy" is pi* = mu * exp(A/beta) / Z. Projecting that onto the
+    parametric family is weighted maximum likelihood on the data you already
+    have -- so the whole method is the existing flow-matching loss with a
+    per-sample weight, and there is NO importance ratio: the weight comes from
+    the reward and does not move as theta does.
+
+    That is the property that matters here. GRPO's ratio is what exploded
+    (485,165,216 = exp(20), the clamp) and what forces on-policy data. AWR has
+    none, so a corpus collected once can be trained on for many epochs, and the
+    gradient keeps the character of supervised learning rather than of a
+    noise-dominated policy gradient -- which is what walked the policy off the
+    SFT peak, 20.5% -> 5.4%.
+
+    RFT is the beta -> 0 limit of this with a binary advantage: failures get
+    weight 0 and are discarded. AWR keeps them at a low weight instead, so they
+    still say "not that way".
+    """
+
+    def __init__(self, path: str, beta: float, clip: float, kind: str):
+        import json as _json
+        d = _json.loads(Path(path).read_text())
+        eps = d["episodes"]
+        if not eps:
+            raise ValueError(f"{path} lists no episodes")
+        max_steps = max(int(e["steps"]) for e in eps) or 1
+        if kind == "success":
+            r = np.array([1.0 if e["success"] else 0.0 for e in eps], dtype=np.float64)
+        elif kind == "fast_success":
+            # A slow success fumbled and recovered; a fast one did not. On this
+            # policy that is a real distinction -- successful episodes average
+            # 80 chunks and failures 259 -- so it separates "it worked" from
+            # "it worked eventually".
+            r = np.array([(1.0 - 0.5 * e["steps"] / max_steps) if e["success"] else 0.0
+                          for e in eps], dtype=np.float64)
+        else:
+            raise ValueError(f"unknown --awr_reward {kind!r}")
+
+        # Standardise PER TASK: the reward scale is not comparable across tasks,
+        # and without this beta means something different for each one.
+        tasks = np.array([e.get("task", "") for e in eps])
+        adv = np.zeros_like(r)
+        for t in np.unique(tasks):
+            m = tasks == t
+            sd = r[m].std()
+            adv[m] = (r[m] - r[m].mean()) / (sd if sd > 1e-6 else 1.0)
+        w = np.clip(np.exp(adv / max(beta, 1e-6)), 0.0, clip)
+        # Renormalise to mean 1 so the loss scale -- and therefore the effective
+        # learning rate -- does not move when beta or the success rate does.
+        w = w / max(w.mean(), 1e-8)
+        self.w = {int(e["episode_index"]): float(x) for e, x in zip(eps, w)}
+        n_ok = int(sum(1 for e in eps if e["success"]))
+        print(f"AWR weights: {len(eps)} episodes ({n_ok} success / {len(eps) - n_ok} "
+              f"failure), reward={kind}, beta={beta:g}, clip={clip:g}")
+        print(f"  weight  min {w.min():.3f}  median {np.median(w):.3f}  "
+              f"max {w.max():.3f}  (mean 1.000 by construction)")
+        if n_ok:
+            wo = w[[i for i, e in enumerate(eps) if e["success"]]]
+            wf = w[[i for i, e in enumerate(eps) if not e["success"]]]
+            print(f"  success mean {wo.mean():.3f}   failure mean "
+                  f"{(wf.mean() if len(wf) else float('nan')):.3f}   "
+                  f"ratio {(wo.mean() / wf.mean() if len(wf) and wf.mean() > 0 else float('inf')):.1f}x")
+
+    def lookup(self, episode_index) -> "torch.Tensor":
+        return torch.tensor([self.w.get(int(i), 1.0) for i in episode_index],
+                            dtype=torch.float32)
+
+
 def apply_joint_augmentations(batch, abs_sigma: float = 0.01,
                               frac_sigma: float = 0.0, state_std=None,
                               prob: float = 0.5):
@@ -394,6 +466,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           prefetch_factor: int = 2,
           vision_token_source: str = "vlm",
           resnet_tokens: int = 64,
+          awr_rewards: str = "",
+          awr_beta: float = 1.0,
+          awr_clip: float = 20.0,
+          awr_reward: str = "success",
           state_noise_abs: float = 0.01,
           state_noise_frac: float = 0.0,
           state_noise_prob: float = 0.5,
@@ -701,6 +777,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         lora_kw["lora_alpha"] = float(lora_alpha)
     if vision_lora_num_layers is not None:
         lora_kw["vision_lora_num_layers"] = int(vision_lora_num_layers)
+
+    awr = (AWRWeights(awr_rewards, awr_beta, awr_clip, awr_reward)
+           if awr_rewards else None)
 
     # ---- state-noise augmentation: resolve the mode and SAY what it does ----
     # This has been invisible since it was written: one hardcoded 0.01 on a
@@ -1453,6 +1532,13 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                 ]
 
             batch = apply_image_augmentations(batch, camera_keys, image_transforms)
+            if awr is not None:
+                if "episode_index" not in batch:
+                    raise KeyError(
+                        "--awr_rewards needs episode_index in the batch to join "
+                        "the weights, and this dataset does not provide it.")
+                batch["awr_weight"] = awr.lookup(
+                    batch["episode_index"].reshape(-1).tolist())
             batch = apply_joint_augmentations(
                 batch, abs_sigma=state_noise_abs,
                 frac_sigma=state_noise_frac,
@@ -1723,6 +1809,31 @@ if __name__ == "__main__":
                              "16 gives 64 px/token, i.e. half the granularity of the "
                              "frozen backbone it is supposed to sharpen. Cost is per "
                              "DiT layer and per camera.")
+    parser.add_argument("--awr_rewards", type=str, default="",
+                        help="Path to awr_rewards.json written by "
+                             "train_rft.py --rft.collect_only --rft.keep_failures. "
+                             "Turns this into ADVANTAGE-WEIGHTED REGRESSION: the "
+                             "same flow-matching loss with a per-sample weight "
+                             "exp(A/beta). No importance ratio, so the corpus can "
+                             "be trained on for many epochs, and the gradient "
+                             "keeps the character of supervised learning instead "
+                             "of a noise-dominated policy gradient. Empty = off.")
+    parser.add_argument("--awr_beta", type=float, default=1.0,
+                        help="AWR temperature. Large => all weights 1, i.e. plain "
+                             "BC on everything including failures, no improvement. "
+                             "Small => the weight collapses onto the single best "
+                             "episode, maximum greed and overfit. beta 1 on this "
+                             "policy's staged spread gives roughly 55:1 best-to-worst.")
+    parser.add_argument("--awr_clip", type=float, default=20.0,
+                        help="Cap on exp(A/beta). Without it one lucky episode "
+                             "dominates the batch.")
+    parser.add_argument("--awr_reward", type=str, default="success",
+                        choices=["success", "fast_success"],
+                        help="What the advantage is computed from. 'fast_success' "
+                             "discounts by episode length: a slow success fumbled "
+                             "and recovered, a fast one did not, and on this "
+                             "policy successes average 80 chunks against 259 for "
+                             "failures.")
     parser.add_argument("--state_noise_abs", type=float, default=0.01,
                         help="Gaussian sigma added to observation.state in RAW "
                              "units (metres / radians), the historical default "
