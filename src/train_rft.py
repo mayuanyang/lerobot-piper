@@ -363,6 +363,72 @@ def _episode_to_samples(obs_hist: list[dict], act_hist: list[torch.Tensor], hori
 
 
 @torch.no_grad()
+class _StateWindow:
+    """Rolling (B, T, D) window of `observation.state` for n_obs_steps > 1.
+
+    Training builds this with delta_timestamps; eval_wiltechs_x rebuilds it with
+    its own StateHistory. This file fed a bare (B, D) to the preprocessor, so any
+    checkpoint with use_state_history ON saw a malformed state and ran without
+    proprioception -- no error, just a policy that cannot find its own gripper.
+
+    At reset there is only one frame, so seed the window full of it: LeRobot's
+    left-padding repeats the earliest frame and this reproduces it exactly.
+    """
+
+    def __init__(self, n_envs: int, t: int):
+        self.t = max(1, int(t))
+        self.buf = [deque(maxlen=self.t) for _ in range(n_envs)]
+
+    def seed(self, states: np.ndarray, only=None):
+        for i in range(len(self.buf)):
+            if only is not None and not only[i]:
+                continue
+            self.buf[i].clear()
+            for _ in range(self.t):
+                self.buf[i].append(np.asarray(states[i], np.float32))
+
+    def push(self, states: np.ndarray):
+        for i, b in enumerate(self.buf):
+            b.append(np.asarray(states[i], np.float32))
+
+    def stack(self) -> np.ndarray:
+        return np.stack([np.stack(list(b)) for b in self.buf])
+
+
+def _with_state_window(obs_lr: dict, win) -> dict:
+    """Shallow copy of obs_lr whose state is the (B, T, D) window.
+
+    A copy, not in-place: the caller records the plain (B, D) state into the
+    dataset, where train_finetune builds its own window from delta_timestamps.
+    """
+    if win is None or win.t <= 1 or "observation.state" not in obs_lr:
+        return obs_lr
+    out = dict(obs_lr)
+    out["observation.state"] = torch.from_numpy(win.stack()).float()
+    return out
+
+
+def _env_action_bounds(env):
+    """(low, high) of a SINGLE env's action space, or (None, None).
+
+    eval_wiltechs_x and train_wilro_rl both clip the postprocessor's output to
+    this before stepping; this file did not. MEAN_STD denormalization can put a
+    dim outside [-1, 1] and robosuite's OSC reads an out-of-range delta as a
+    much larger commanded motion, so the same checkpoint behaves differently
+    here than under eval -- silently, with no error anywhere.
+    """
+    for attr in ("single_action_space", "action_space"):
+        sp = getattr(env, attr, None)
+        lo, hi = getattr(sp, "low", None), getattr(sp, "high", None)
+        if lo is None:
+            continue
+        lo, hi = np.asarray(lo, np.float32), np.asarray(hi, np.float32)
+        if attr == "action_space" and lo.ndim == 2:      # batched space
+            lo, hi = lo[0], hi[0]
+        return lo, hi
+    return None, None
+
+
 def _rft_rollout(env, policy, preprocessor, postprocessor, device, action_dim,
                  desc="", max_steps_cap=0):
     """One batched rollout. Returns a flat list of (obs_t, action_chunk, is_pad)
@@ -376,6 +442,8 @@ def _rft_rollout(env, policy, preprocessor, postprocessor, device, action_dim,
     act_hist = [[] for _ in range(B)]
     done = np.zeros(B, dtype=bool)
     max_steps = int(env.call("_max_episode_steps")[0])
+    _alo, _ahi = _env_action_bounds(env)
+    _win = _StateWindow(B, int(getattr(policy.config, "n_obs_steps", 1) or 1))
     if max_steps_cap > 0:
         max_steps = min(max_steps, max_steps_cap)   # --rft.max_steps: stop early (episodes
         #   not done by here are dropped — they almost never succeed later for this policy)
@@ -388,7 +456,11 @@ def _rft_rollout(env, policy, preprocessor, postprocessor, device, action_dim,
     while not np.all(done) and step < max_steps:
         obs_lr = preprocess_observation(obs)            # → lerobot keys, float images
         obs_lr = add_envs_task(env, obs_lr)             # inject per-env "task" string
-        proc = preprocessor(obs_lr)                     # model-space input (normalized)
+        _st = obs_lr.get("observation.state")
+        if _st is not None:
+            _st = _st.detach().cpu().numpy()
+            _win.push(_st) if step else _win.seed(_st)
+        proc = preprocessor(_with_state_window(obs_lr, _win))   # model-space input (normalized)
         with torch.inference_mode():
             norm_action = policy.select_action(proc)    # (B, action_dim) — NORMALIZED
         env_action = postprocessor(norm_action.clone())  # → env (un-normalized) space
@@ -399,7 +471,10 @@ def _rft_rollout(env, policy, preprocessor, postprocessor, device, action_dim,
                 obs_hist[i].append(_slice_obs(obs_lr, i))
                 act_hist[i].append(norm_action[i].detach().to("cpu").float())
 
-        obs, _, terminated, truncated, info = env.step(env_action.to("cpu").numpy())
+        act_np = env_action.to("cpu").numpy()
+        if _alo is not None:
+            act_np = np.clip(act_np, _alo, _ahi).astype(np.float32)
+        obs, _, terminated, truncated, info = env.step(act_np)
 
         successes = (
             info["final_info"]["is_success"]
@@ -413,6 +488,13 @@ def _rft_rollout(env, policy, preprocessor, postprocessor, device, action_dim,
                     n_success += 1
                 # free this episode's buffers either way
                 obs_hist[i], act_hist[i] = [], []
+        # LiberoEnv self-resets inside step(), so a terminated env's next state
+        # belongs to a NEW episode: carrying the old window across would hand it
+        # a velocity that never happened.
+        if _win.t > 1 and newly_done.any():
+            _nxt = preprocess_observation(obs).get("observation.state")
+            if _nxt is not None:
+                _win.seed(_nxt.detach().cpu().numpy(), only=newly_done)
         done = terminated | truncated | done
         step += 1
         pbar.update(1)
@@ -450,6 +532,8 @@ def _rft_collect_episodes(env, policy, preprocessor, postprocessor, device,
     frames: list[list[dict]] = [[] for _ in range(B)]
     done = np.zeros(B, dtype=bool)
     max_steps = int(env.call("_max_episode_steps")[0])
+    _alo, _ahi = _env_action_bounds(env)
+    _win = _StateWindow(B, int(getattr(policy.config, "n_obs_steps", 1) or 1))
     if max_steps_cap > 0:
         max_steps = min(max_steps, max_steps_cap)
 
@@ -459,12 +543,18 @@ def _rft_collect_episodes(env, policy, preprocessor, postprocessor, device,
     # Per-env, not just the count: the caller pins a different init state on each
     # env, so this is what says WHICH states the policy can already solve.
     succ_flags = np.zeros(B, dtype=bool)
+    _seen_keys: set = set()
+    _any_term = False
     step = 0
     pbar = tqdm(total=max_steps, desc=desc, leave=False, dynamic_ncols=True)
     while not np.all(done) and step < max_steps:
         obs_lr = preprocess_observation(obs)            # → lerobot keys, float images
         obs_lr = add_envs_task(env, obs_lr)             # inject per-env "task" string
-        proc = preprocessor(obs_lr)
+        _st = obs_lr.get("observation.state")
+        if _st is not None:
+            _st = _st.detach().cpu().numpy()
+            _win.push(_st) if step else _win.seed(_st)
+        proc = preprocessor(_with_state_window(obs_lr, _win))
         with torch.inference_mode():
             norm_action = policy.select_action(proc)    # (B, action_dim) — NORMALIZED
         env_action = postprocessor(norm_action.clone())  # → env (un-normalized) space
@@ -485,12 +575,23 @@ def _rft_collect_episodes(env, policy, preprocessor, postprocessor, device,
             fr["action"] = env_action[i].detach().to("cpu").float()
             frames[i].append(fr)
 
-        obs, _, terminated, truncated, info = env.step(env_action.to("cpu").numpy())
+        act_np = env_action.to("cpu").numpy()
+        if _alo is not None:
+            act_np = np.clip(act_np, _alo, _ahi).astype(np.float32)
+        obs, _, terminated, truncated, info = env.step(act_np)
         successes = (
             info["final_info"]["is_success"]
-            if "final_info" in info else np.zeros(B, dtype=bool)
+            if "final_info" in info else
+            # LiberoEnv puts is_success in the TOP-LEVEL info on every step and
+            # only mirrors it into final_info on the terminating one. The
+            # vector wrapper may aggregate either. Falling straight through to
+            # zeros (the old behaviour) scores every episode a failure with no
+            # error -- the way a 56%-SR checkpoint reports 0/200.
+            np.asarray(info.get("is_success", np.zeros(B, dtype=bool)))
         )
+        _seen_keys.update(info.keys())
         newly_done = (terminated | truncated) & (~done)
+        _any_term = _any_term or bool(newly_done.any())
         for i in range(B):
             if newly_done[i]:
                 ok = bool(successes[i])
@@ -504,10 +605,39 @@ def _rft_collect_episodes(env, policy, preprocessor, postprocessor, device,
                     episodes.append(frames[i])
                     ep_meta.append({"success": ok, "steps": len(frames[i])})
                 frames[i] = []                          # free either way
+        # LiberoEnv self-resets inside step(), so a terminated env's next state
+        # belongs to a NEW episode: carrying the old window across would hand it
+        # a velocity that never happened.
+        if _win.t > 1 and newly_done.any():
+            _nxt = preprocess_observation(obs).get("observation.state")
+            if _nxt is not None:
+                _win.seed(_nxt.detach().cpu().numpy(), only=newly_done)
         done = terminated | truncated | done
         step += 1
         pbar.update(1)
         pbar.set_postfix(done=f"{int(done.sum())}/{B}", success=n_success)
+
+    # LiberoEnv.step() returns truncated=False ALWAYS and terminates only on
+    # `done or is_success`, so an episode that simply runs out the horizon never
+    # reaches the newly_done branch above -- its frames are dropped on the floor.
+    # Without this flush --rft.keep_failures cannot save a single failure, which
+    # is exactly the "0 success / 0 failure" an all-failing pass produces.
+    for i in range(B):
+        if done[i] or not frames[i]:
+            continue
+        if keep_failures:
+            episodes.append(frames[i])
+            ep_meta.append({"success": False, "steps": len(frames[i])})
+        frames[i] = []
+
+    if n_success == 0 and not _any_term:
+        # Distinguishes "the policy failed" from "success never got read". The
+        # silent `else np.zeros(B)` fallback on info["final_info"] makes those
+        # two look identical in the counters.
+        print(f"\n  [collect] WARNING: {B} episode(s) ran {step} steps and NONE "
+              f"terminated. info keys seen: {sorted(_seen_keys)}. If "
+              f"'final_info' is absent, is_success is being read as all-False.",
+              flush=True)
 
     pbar.close()
     return episodes, n_success, B, succ_flags, ep_meta
@@ -595,6 +725,17 @@ def _run_collect_only(cfg, task_envs, policy, preprocessor, postprocessor, devic
     print(f"  max_steps  : {cfg.rft.max_steps if cfg.rft.max_steps > 0 else 'env default per suite'}")
     print(f"  dataset    : {save_dir}  (fps={save_fps}"
           + ("" if cfg.rft.save_fps else f", from control_freq") + ")")
+    # The knobs that silently change what gets collected. keep_failures is the
+    # difference between an RFT corpus and an AWR one; n_obs_steps decides
+    # whether the policy is given proprioceptive history at all.
+    _nobs = int(getattr(policy.config, "n_obs_steps", 1) or 1)
+    print(f"  policy in  : n_obs_steps={_nobs}"
+          + ("  (state window (B,T,D) rebuilt from the rollout)" if _nobs > 1
+             else "  (single frame)")
+          + f", n_action_steps={getattr(policy.config, 'n_action_steps', '?')}")
+    print(f"  keep_fail  : {bool(cfg.rft.keep_failures)}"
+          + ("  -> failures kept, AWR corpus" if cfg.rft.keep_failures
+             else "  -> successes only, RFT corpus"))
     print("=" * 64 + "\n")
 
     cycle = int(cfg.rft.init_states_per_task)
