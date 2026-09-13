@@ -729,10 +729,22 @@ def _run_collect_only(cfg, task_envs, policy, preprocessor, postprocessor, devic
     # difference between an RFT corpus and an AWR one; n_obs_steps decides
     # whether the policy is given proprioceptive history at all.
     _nobs = int(getattr(policy.config, "n_obs_steps", 1) or 1)
+    _nact = int(getattr(policy.config, "n_action_steps", 0) or 0)
     print(f"  policy in  : n_obs_steps={_nobs}"
           + ("  (state window (B,T,D) rebuilt from the rollout)" if _nobs > 1
              else "  (single frame)")
-          + f", n_action_steps={getattr(policy.config, 'n_action_steps', '?')}")
+          + f", n_action_steps={_nact}")
+    if _nact >= 8:
+        # The checkpoint's own n_action_steps is a TRAINING artefact (horizon).
+        # Every eval of this family overrides it to 2, and the gap is not a
+        # detail: at 10 Hz, n=64 commits 6.4 s of open-loop motion per chunk and
+        # draws flow noise ~31x less often. A checkpoint measured at 56% has
+        # collected 0/200 this way. Match the eval or you are collecting a
+        # policy you have never scored.
+        print(f"  !! n_action_steps={_nact} but evals of this family run at 2. "
+              f"That is {_nact / 10:.1f}s of open-loop motion per chunk and "
+              f"{_nact // 2}x fewer noise draws -- pass "
+              f"--policy.n_action_steps=2 to match the measured policy.")
     print(f"  keep_fail  : {bool(cfg.rft.keep_failures)}"
           + ("  -> failures kept, AWR corpus" if cfg.rft.keep_failures
              else "  -> successes only, RFT corpus"))
