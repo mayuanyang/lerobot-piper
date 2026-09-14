@@ -390,6 +390,9 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
             dim_w = torch.tensor(self.config.action_dim_weights, device=loss.device, dtype=loss.dtype)
             loss = loss * dim_w[None, None, :]
 
+        # Kept before pos_w is applied: the per-position diagnostic wants the RAW
+        # flow loss, not the one already reweighted by the thing being questioned.
+        loss_raw = loss
         H = loss.shape[1]
         n_exec = self.config.n_action_steps
         pos_w = torch.ones(H, device=loss.device, dtype=loss.dtype)
@@ -443,6 +446,20 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
         loss = loss * valid_cells
         denom = (w_pos * valid_cells).sum().clamp(min=1e-6)
         main_loss = loss.sum() / denom
+
+        # Per-horizon-position flow loss, unweighted and pad-masked. The headline
+        # flow number averages all H positions, but only n_action_steps of them are
+        # ever executed -- so it cannot say whether the error lives in the part that
+        # runs or in the far horizon, which is intrinsically less predictable.
+        # E[u^2] is recorded alongside because it varies with position too: the
+        # scale-free reading is loss / E[u^2], where 1.0 means "predicted nothing".
+        if getattr(self, "_record_position_loss", False):
+            with torch.no_grad():
+                self._position_loss = (
+                    (loss_raw * valid_cells).sum(dim=(0, 2)).detach().float().cpu(),
+                    ((u_t ** 2) * valid_cells).sum(dim=(0, 2)).detach().float().cpu(),
+                    valid_cells.sum(dim=(0, 2)).detach().float().cpu(),
+                )
 
         # ── Contrastive language loss: permute the LANGUAGE portion of
         # the cached KV across batch and re-run only the DiT. Avoids a
