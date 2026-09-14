@@ -90,6 +90,14 @@ def main():
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="auto")
+    ap.add_argument("--full_chunks_only", action="store_true",
+                    help="Drop any sample whose 64-step chunk is padded. THE "
+                         "CONTROL for the horizon profile: without it the far "
+                         "bucket is averaged over the ~71%% of samples that are "
+                         "not near an episode end, while the executed bucket "
+                         "sees all of them -- so the two buckets are scored on "
+                         "different subpopulations, and end-of-episode is "
+                         "exactly where placement happens.")
     a = ap.parse_args()
 
     device = pick_device(a.device)
@@ -144,6 +152,7 @@ def main():
     u2 = torch.zeros(horizon)
     cnt = torch.zeros(horizon)
     seen = 0
+    kept = 0
     # Same pin as train_wilro_moe's validate(): compute_loss draws a fresh t and
     # a fresh source noise per sample, and on that run two adjacent UNPINNED
     # passes moved the fit/held-out gap 8.3 -> 22.2 while the model itself did
@@ -164,13 +173,32 @@ def main():
             # the whole profile is measured on the wrong model.
             if "task" in batch and isinstance(batch["task"], (list, tuple)):
                 batch["task_description"] = batch["task"]
+            if a.full_chunks_only:
+                pad = batch.get("action_is_pad")
+                if pad is not None:
+                    keep = ~pad.bool().any(dim=1)
+                    if not bool(keep.any()):
+                        continue
+                    kl = keep.tolist()
+                    batch = {k: (v[keep] if torch.is_tensor(v) and v.shape[:1] == keep.shape
+                                 else [x for x, m in zip(v, kl) if m]
+                                 if isinstance(v, (list, tuple)) and len(v) == len(kl)
+                                 else v)
+                             for k, v in batch.items()}
+                    kept += int(keep.sum())
             with autocast:
                 policy.model.compute_loss(preprocessor(batch))
             n, u, c = policy.model._position_loss
             num += n; u2 += u; cnt += c
             seen += a.batch_size
             print(f"  batch {i + 1}/{a.batches}", end="\r", flush=True)
-    print(f"\n[done] {seen} samples over {min(a.batches, i + 1)} batches\n")
+    if a.full_chunks_only:
+        print(f"\n[done] {kept}/{seen} samples kept (unpadded chunks only) over "
+              f"{min(a.batches, i + 1)} batches\n")
+    else:
+        print(f"\n[done] {seen} samples over {min(a.batches, i + 1)} batches\n")
+        print("NOTE valid% below is the confound: buckets are scored on different\n"
+              "     subpopulations. Re-run with --full_chunks_only to control it.\n")
 
     if cnt.sum() == 0:
         raise SystemExit("No valid cells -- every action cell was masked as padding.")
