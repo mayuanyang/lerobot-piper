@@ -455,10 +455,15 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
         # scale-free reading is loss / E[u^2], where 1.0 means "predicted nothing".
         if getattr(self, "_record_position_loss", False):
             with torch.no_grad():
+                amb = getattr(self, "_position_ambiguity", None)
+                amb_sum = (((amb.float() * valid_cells).sum(dim=(0, 2)).cpu())
+                           if amb is not None
+                           else torch.zeros(Hn, dtype=torch.float32))
                 self._position_loss = (
                     (loss_raw * valid_cells).sum(dim=(0, 2)).detach().float().cpu(),
                     ((u_t ** 2) * valid_cells).sum(dim=(0, 2)).detach().float().cpu(),
                     valid_cells.sum(dim=(0, 2)).detach().float().cpu(),
+                    amb_sum,
                 )
 
         # ── Contrastive language loss: permute the LANGUAGE portion of
@@ -818,8 +823,27 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
                 # Biased (weighted) second moment, to match the identity above.
                 # stacked.std() below is Bessel-corrected and does NOT.
                 v_bar = (w * st).sum(dim=1, keepdim=True)
-                self._last_expert_ambiguity = float(
-                    (w * (st - v_bar).pow(2)).sum(dim=1).mean())
+                amb_bhd = (w * (st - v_bar).pow(2)).sum(dim=1)   # (B, H, D)
+                self._last_expert_ambiguity = float(amb_bhd.mean())
+                # Handed to compute_loss so it can be pad-masked and bucketed by
+                # horizon position with the SAME valid_cells the flow loss uses.
+                # Split per position, ambiguity separates the two reasons a
+                # position can be hard, which the flow loss alone cannot:
+                #   amb/flow LOW   the experts agree and are all wrong together
+                #                  -> the target is genuinely uncertain given the
+                #                     conditioning (demonstrator timing jitter),
+                #                     irreducible, and reweighting that position
+                #                     spends capacity on noise.
+                #   amb/flow HIGH  the experts scatter -> estimation error, which
+                #                  averaging removes at 1 - 1/n and more gradient
+                #                  can genuinely reduce.
+                # The comment above argues Var(u | x_t, t, c) ~ 0 because x_t
+                # determines the noise draw -- but that holds only if the demos
+                # are deterministic given c. Where they are not, this is the
+                # measurement that says so.
+                self._position_ambiguity = (amb_bhd.detach()
+                                            if getattr(self, "_record_position_loss", False)
+                                            else None)
                 spread = st.std(dim=1).mean()
                 scale = st.abs().mean().clamp(min=1e-8)
                 self._last_expert_disagreement = float(spread / scale)

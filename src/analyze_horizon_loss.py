@@ -151,6 +151,7 @@ def main():
     num = torch.zeros(horizon)
     u2 = torch.zeros(horizon)
     cnt = torch.zeros(horizon)
+    amb = torch.zeros(horizon)
     seen = 0
     kept = 0
     # Same pin as train_wilro_moe's validate(): compute_loss draws a fresh t and
@@ -188,8 +189,8 @@ def main():
                     kept += int(keep.sum())
             with autocast:
                 policy.model.compute_loss(preprocessor(batch))
-            n, u, c = policy.model._position_loss
-            num += n; u2 += u; cnt += c
+            n, u, c, m = policy.model._position_loss
+            num += n; u2 += u; cnt += c; amb += m
             seen += a.batch_size
             print(f"  batch {i + 1}/{a.batches}", end="\r", flush=True)
     if a.full_chunks_only:
@@ -203,30 +204,45 @@ def main():
     if cnt.sum() == 0:
         raise SystemExit("No valid cells -- every action cell was masked as padding.")
 
+    n_exp = int(getattr(cfg, "num_experts", 1) or 1)
     cells_per_pos = cnt.max().clamp(min=1)
-    print(f"{'positions':>12}  {'seconds':>12}  {'flow':>8}  {'E[u^2]':>8}  "
-          f"{'flow/E[u^2]':>11}  {'valid%':>7}")
-    print("-" * 68)
-    rows = []
-    for lo, hi in buckets_for(horizon, n_exec):
+
+    def decompose(lo, hi):
+        """-> flow, E[u^2], ambiguity, bias^2, valid%. Krogh-Vedelsby, per bucket.
+
+        bias^2 = flow - tau^2/n with tau^2 = amb*n/(n-1): the error component
+        every expert shares, which no amount of ensemble diversity removes.
+        """
         c = cnt[lo:hi].sum()
         if c == 0:
-            continue
+            return None
         f = (num[lo:hi].sum() / c).item()
         e = (u2[lo:hi].sum() / c).item()
-        v = (c / (cells_per_pos * (hi - lo))).item() * 100
-        tag = "  <- EXECUTED" if lo == 0 else ""
-        rows.append((lo, hi, f, e, f / e if e else float("nan")))
-        print(f"{f'{lo}-{hi - 1}':>12}  {f'{lo / fps:.1f}-{hi / fps:.1f}s':>12}  "
-              f"{f:8.4f}  {e:8.4f}  {f / e if e else float('nan'):11.4f}  "
-              f"{v:6.1f}%{tag}")
+        m = (amb[lo:hi].sum() / c).item()
+        tau2 = m * n_exp / (n_exp - 1) if n_exp > 1 else 0.0
+        return f, e, m, f - tau2 / max(n_exp, 1), (c / (cells_per_pos * (hi - lo))).item() * 100
 
-    c_all = cnt.sum()
-    f_all = (num.sum() / c_all).item()
-    e_all = (u2.sum() / c_all).item()
-    print("-" * 68)
-    print(f"{'ALL':>12}  {f'0-{horizon / fps:.1f}s':>12}  {f_all:8.4f}  {e_all:8.4f}  "
-          f"{f_all / e_all:11.4f}")
+    print(f"{'positions':>10} {'seconds':>11} {'flow':>7} {'amb':>7} {'bias^2':>7}"
+          f" {'flow/E[u2]':>10} {'amb/flow':>9} {'bias2/flow':>11} {'valid%':>7}")
+    print("-" * 90)
+    rows = []
+    for lo, hi in buckets_for(horizon, n_exec):
+        r = decompose(lo, hi)
+        if r is None:
+            continue
+        f, e, m, b2, v = r
+        rows.append((lo, hi, f, e, f / e if e else float("nan"), m / f if f else 0.0, b2 / f if f else 0.0))
+        print(f"{f'{lo}-{hi - 1}':>10} {f'{lo / fps:.1f}-{hi / fps:.1f}s':>11} "
+              f"{f:7.4f} {m:7.4f} {b2:7.4f} {f / e if e else float('nan'):10.4f} "
+              f"{m / f if f else 0:9.3f} {b2 / f if f else 0:11.3f} {v:6.1f}%"
+              + ("  <- EXECUTED" if lo == 0 else ""))
+    r = decompose(0, horizon)
+    f_all, e_all, m_all, b2_all, _ = r
+    print("-" * 90)
+    print(f"{'ALL':>10} {f'0-{horizon / fps:.1f}s':>11} {f_all:7.4f} {m_all:7.4f} "
+          f"{b2_all:7.4f} {f_all / e_all:10.4f} {m_all / f_all:9.3f} {b2_all / f_all:11.3f}")
+    print(f"\n(n_experts={n_exp}; ensemble removes at most 1 - 1/n = "
+          f"{(1 - 1 / n_exp) * 100:.1f}% of the average individual expert loss)")
 
     if rows:
         near = rows[0]
@@ -235,17 +251,25 @@ def main():
         print(f"\nExecuted prefix (pos {near[0]}-{near[1] - 1}) sits at "
               f"{near[4]:.3f} of 'predict nothing'; the far bucket "
               f"(pos {far[0]}-{far[1] - 1}) at {far[4]:.3f}. Ratio {ratio:.2f}x.")
-        print("\nReading it:")
-        print("  ratio >> 1  the headline flow is dominated by far-horizon entropy.")
-        print("              The executed steps are already accurate, and moving")
-        print("              n_action_steps down buys little -- the near horizon")
-        print("              has nothing left to squeeze.")
-        print("  ratio ~ 1   error is flat across the horizon. The executed steps")
-        print("              are as wrong as the rest, so concentrating weight on")
-        print("              them (n_action_steps=8, lower future_steps_weight) is")
-        print("              correctly aimed.")
-        print("  near ~ 1.0  the executed prefix is predicting ~nothing. That is")
-        print("              the training-side face of the stalling failure mode.")
+        print("\nWHERE the error is (flow/E[u2] column):")
+        print("  ratio >> 1  far-horizon entropy dominates; the executed steps are")
+        print("              already accurate and reweighting buys little.")
+        print("  ratio <= 1  the executed steps are the WORST part of the chunk, so")
+        print("              n_action_steps currently spends the gradient on the")
+        print("              positions that need it least.")
+        print("\nWHETHER reweighting can fix it (amb/flow column, executed row):")
+        print("  amb/flow LOW vs the other buckets")
+        print("     -> the experts agree and are wrong together. The target is")
+        print("        genuinely uncertain given the conditioning (demonstrator")
+        print("        timing jitter at the contact phase). IRREDUCIBLE -- more")
+        print("        weight there spends capacity on noise and can cost the far")
+        print("        horizon, which is currently the healthy part.")
+        print("  amb/flow COMPARABLE or higher")
+        print("     -> estimation error, which averaging removes at 1 - 1/n and")
+        print("        more gradient genuinely reduces. n_action_steps=8 with")
+        print("        future_steps_weight 0.3 is then correctly aimed.")
+        print("\nBoth columns are needed: the first says where to aim, the second")
+        print("says whether aiming there does anything.")
 
 
 if __name__ == "__main__":
