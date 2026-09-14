@@ -99,6 +99,19 @@ class WilroMoEConfig(PreTrainedConfig):
     # -------- Flow matching sampling --------
     num_inference_steps: int = 10
     noise_temporal_correlation: float = 0.0
+    # INFERENCE ONLY -- scales x_1, the ODE's starting point. 1.0 is the trained
+    # setting and anything else is off-distribution for the network, so this is a
+    # PROBE, not a tuning knob: shrinking x_1 pulls the sampled chunk toward the
+    # conditional mean E[a|c], which is the cheap one-line stand-in for averaging
+    # K independent draws. It is deliberately NOT applied in compute_loss, which
+    # shares sample_noise() -- training must stay at 1.0.
+    #
+    # Worth it because the 2026-09-14 policy_seed pairing showed HALF of this
+    # policy's goal failures are lost coin flips (21/42 rescued by nothing but a
+    # different noise stream). If sampling variance costs points, this says so in
+    # one eval. Because it SCALES the same draws rather than redrawing them, a
+    # run at 0.9 is still paired with the 1.0 baseline and McNemar applies.
+    sample_noise_scale: float = 1.0
 
     # Flow-matching TIME sampling. "uniform" (default) spends equal capacity at
     # every noise level; "lognormal" (SD3-style logit-normal) biases toward LOW t

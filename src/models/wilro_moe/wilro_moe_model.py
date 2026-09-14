@@ -612,6 +612,11 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
             x_t = self.sample_noise(
                 (B, self.config.horizon, self.config.action_dim), device=device,
             )
+            # Applied HERE and not inside sample_noise(): compute_loss calls the
+            # same helper and training must keep x_1 ~ N(0, I).
+            ns = float(getattr(self.config, "sample_noise_scale", 1.0) or 1.0)
+            if ns != 1.0:
+                x_t = x_t * ns
             dt = -1.0 / N
             t = torch.ones(B, device=device, dtype=torch.float32)
 
