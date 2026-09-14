@@ -271,7 +271,8 @@ def load_policy(ckpt: Path, device: str, num_inference_steps: int | None,
                 fixed_episode_noise: bool = False,
                 sample_noise_scale: float | None = None,
                 router_top_k: int | None = None,
-                log_routing: bool = False):
+                log_routing: bool = False,
+                vision_input_size: int | None = None):
     from lerobot.configs.policies import PreTrainedConfig
 
     cfg = PreTrainedConfig.from_pretrained(ckpt)
@@ -296,6 +297,22 @@ def load_policy(ckpt: Path, device: str, num_inference_steps: int | None,
                 f"--n_action_steps {n} exceeds the trained horizon "
                 f"{cfg.horizon}: the chunk has no steps past that to execute.")
         cfg.n_action_steps = n
+    if vision_input_size:
+        v = int(vision_input_size)
+        # The VLM tower is FROZEN, so this is a no-retrain probe: the encoder
+        # runs at a different resolution and the token count changes with it
+        # (SmolVLM2-500M is patch 16, pixel-shuffle 4, so tokens = (v/16/4)^2
+        # per camera -- 36 at 384, 64 at its native 512). The trainable proj is
+        # per-token and the experts cross-attend over a variable-length KV, so
+        # it runs. Read the result ASYMMETRICALLY: an improvement is real
+        # evidence, a drop is not, because everything downstream was fitted to
+        # the old token count.
+        if v % 64:
+            raise SystemExit(
+                f"--vision_input_size {v} must be divisible by 64 "
+                f"(patch 16 x pixel-shuffle 4); {v // 16} patches per side is "
+                f"not divisible by the shuffle factor.")
+        _set("vision_input_size", v, "--vision_input_size")
     if fixed_episode_noise:
         _set("fixed_episode_noise", True, "--fixed_episode_noise")
     if sample_noise_scale is not None:
@@ -1262,6 +1279,17 @@ def main():
                         "does not use fine visual detail, so a finer DINO path, "
                         "a larger --vision_input_size, or LoRA on the vision "
                         "tower is buying resolution it declines to read.")
+    p.add_argument("--vision_input_size", type=int, default=0,
+                   help="Override the resolution the FROZEN VLM tower reads. "
+                        "SmolVLM2-500M is pretrained at 512; the shipped "
+                        "configs run it at 384, i.e. BELOW native, at 36 tokens "
+                        "per camera instead of 64. No retraining is needed to "
+                        "try it, but read it asymmetrically: a gain is "
+                        "evidence, a loss is not, since the projection and the "
+                        "experts were fitted to the old token count. Gate this "
+                        "behind --image_blur 2 -- if SR is flat under blur the "
+                        "policy declines to read fine detail and more "
+                        "resolution cannot help.")
     p.add_argument("--image_blur_cams", nargs="+", default=None,
                    help="Restrict --image_blur to camera keys containing these "
                         "substrings, e.g. image2 for the wrist view alone. "
@@ -1317,7 +1345,8 @@ def main():
                          a.n_action_steps, a.fixed_episode_noise,
                          a.sample_noise_scale,
                          router_top_k=a.router_top_k,
-                         log_routing=a.log_routing)
+                         log_routing=a.log_routing,
+                         vision_input_size=a.vision_input_size)
     routing_acc = (RoutingAccumulator(int(getattr(policy.config, "router_top_k", 0) or 0))
                    if a.log_routing else None)
     motion_acc = MotionAccumulator(a.still_threshold) if a.log_motion else None
@@ -1580,6 +1609,7 @@ def main():
                "eval_commit": _git_commit(),
                "num_inference_steps": getattr(policy.config, "num_inference_steps", None),
                "n_action_steps": policy.config.n_action_steps,
+               "vision_input_size": getattr(policy.config, "vision_input_size", None),
                "fixed_episode_noise": bool(a.fixed_episode_noise),
                "policy_type": getattr(policy.config, "type", None),
                "sample_noise_scale": getattr(
