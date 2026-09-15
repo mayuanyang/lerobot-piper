@@ -476,6 +476,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           resnet_fine_cameras: list | None = None,
           resnet_fine_tokens: int = 0,
           resnet_input_size: int = 256,
+          vision_input_size: int = 384,
           resnet_pool: str = "avg",
           use_state_history: bool = False,
           resnet_motion_tokens: int = 0,
@@ -897,6 +898,21 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                   + f"\n  -> DiT sequence length {1 + n_state + total + 64}")
 
     # Build wilro config
+    # SmolVLM2-500M's tower is pretrained at 512 with patch 16 and pixel-shuffle
+    # 4, so tokens per camera = (v/16/4)^2: 36 at the shipped 384, 64 at native.
+    # 384 is BELOW native, not a safe default.
+    if vision_input_size % 64:
+        raise SystemExit(
+            f"--vision_input_size {vision_input_size} must be divisible by 64 "
+            f"(patch 16 x pixel-shuffle 4). {vision_input_size // 16} patches "
+            f"per side is not divisible by the shuffle factor of 4.")
+    _vtok = (vision_input_size // 64) ** 2
+    print(f"[wilro_moe] VLM tower at {vision_input_size}px -> "
+          f"{(vision_input_size // 16)}^2 patches -> {_vtok} tokens/camera"
+          + ("  (SmolVLM2-500M's NATIVE resolution)" if vision_input_size == 512
+             else f"  (native is 512 = 64 tokens; this is "
+                  f"{'below' if vision_input_size < 512 else 'above'} it)"))
+
     cfg = WilroMoEConfig(
         input_features=input_features,
         output_features=output_features,
@@ -934,6 +950,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         resnet_fine_cameras=list(resnet_fine_cameras or []),
         resnet_fine_tokens=int(resnet_fine_tokens),
         resnet_input_size=resnet_input_size,
+        vision_input_size=vision_input_size,
         resnet_pool=resnet_pool,
         use_state_history=use_state_history,
         resnet_motion_tokens=resnet_motion_tokens,
@@ -991,6 +1008,24 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                 elif saved_total > 0:
                     training_steps = saved_total
                 print(f"Read config from {config_file.name}: step={step}, epoch={epoch}, training_steps_total={training_steps}")
+                # A changed VLM resolution LOADS fine -- proj is per-token and the
+                # experts cross-attend over a variable-length KV, so no shape
+                # mismatches. What changes is the statistics the cross-attention
+                # was fitted to, and re-adapting costs LR that a late cosine does
+                # not have.
+                _sv = saved_cfg_json.get("vision_input_size")
+                if _sv is not None and int(_sv) != int(vision_input_size):
+                    print(f"\n  !! RESUMING WITH A CHANGED VLM RESOLUTION: "
+                          f"{_sv} -> {vision_input_size}  "
+                          f"({(int(_sv)//64)**2} -> {(vision_input_size//64)**2} "
+                          f"tokens/camera)\n"
+                          f"     Nothing mismatches in shape, so this will NOT "
+                          f"error -- it will quietly run the experts against "
+                          f"cross-attention statistics they were not trained on.\n"
+                          f"     Read the 'Scheduler fast-forwarded' LR below "
+                          f"before trusting it: with no LR budget left the run "
+                          f"cannot re-adapt and will finish degraded.\n",
+                          flush=True)
                 # Warn only on an ACTUAL geometry change. Passing --lora_rank 64
                 # to continue a run that already trained at 64 is the normal way
                 # to resume, and a warning there says the adapters are being
@@ -1889,6 +1924,18 @@ if __name__ == "__main__":
                              "before lowering --batch_size, because a batch change "
                              "breaks the step-to-samples mapping against earlier "
                              "runs.")
+    parser.add_argument("--vision_input_size", type=int, default=384,
+                        help="Resolution the FROZEN SmolVLM2 tower reads. Must "
+                             "be divisible by 64 (patch 16 x pixel-shuffle 4). "
+                             "Tokens per camera = (v/64)^2: 36 at the 384 "
+                             "default, 64 at 512. **512 is the tower's NATIVE "
+                             "pretrained resolution -- 384 runs it BELOW what it "
+                             "was trained at**, so this is not a safe default, "
+                             "it is a cost saving. Raising it costs ~1.78x the "
+                             "vision patches and lengthens the KV the experts "
+                             "cross-attend to; budget ~1.4x step time. Changing "
+                             "it on a resume is legal but needs LR left to "
+                             "re-adapt -- see the warning the preflight prints.")
     parser.add_argument("--resnet_input_size", type=int, default=256,
                         help="ResNet input resolution. 256 is the native LIBERO "
                              "frame, so no resample happens.")
