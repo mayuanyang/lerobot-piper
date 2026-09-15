@@ -202,6 +202,27 @@ class StateHistory:
         self.buf = [deque(maxlen=self.t) for _ in range(n_envs)]
         if mode not in self.MODES:
             raise SystemExit(f"--history_mode must be one of {self.MODES}")
+        # `shuffled` permutes the OLDER T-1 frames, leaving frame -1 alone
+        # because that slot is the current proprioceptive reading. At T=2 that
+        # leaves exactly ONE frame to permute, and a permutation of one element
+        # is the identity -- the run returns results BIT-IDENTICAL to `real` and
+        # reads as "the state window does not matter" when in fact nothing was
+        # ablated. Refuse rather than return that.
+        if mode == "shuffled" and self.t < 3:
+            raise SystemExit(
+                f"--history_mode shuffled is a NO-OP at n_obs_steps={self.t}: it "
+                f"permutes the older T-1 = {self.t - 1} frame(s), and permuting "
+                f"{self.t - 1} element(s) is the identity. It would return "
+                f"bit-identical results to --history_mode real.\n"
+                f"  At T=2 use --history_mode noise (replaces the older frame "
+                f"with the newest plus Gaussian jitter at the window's own "
+                f"per-dim std: motion MAGNITUDE survives, DIRECTION dies, and "
+                f"unlike `frozen` it asserts nothing).\n"
+                f"  --history_mode frozen also works at T=2 (velocity "
+                f"identically zero) but is in-distribution -- every episode's "
+                f"first inference call already sees it -- so a NULL result "
+                f"under frozen is ambiguous. Read `noise`; use `frozen` as the "
+                f"second reading.")
         self.mode = mode
         self.rng = np.random.default_rng(seed)
 
