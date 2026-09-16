@@ -121,9 +121,14 @@ class WilroMoEPolicy(PreTrainedPolicy):
             scale = self._stall_scale(batch, B, dev, torch.float32)
             self.model._noise_scale_override = scale
             try:
-                chunk = self.model.sample_actions(batch)
+                chunk = self.model.sample_actions(batch, full=True)
             finally:
                 self.model._noise_scale_override = None
+            if chunk.shape[1] < H:
+                raise RuntimeError(
+                    f"temporal ensembling needs the full horizon: sample_actions "
+                    f"returned {chunk.shape[1]} steps, config.horizon is {H}. "
+                    f"Pass full=True.")
             if self._te_buf and self._te_buf[-1][1].shape[0] != chunk.shape[0]:
                 # Batch width changed under us; the aligned buffer is meaningless.
                 self._te_buf.clear()

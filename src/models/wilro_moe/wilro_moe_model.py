@@ -591,7 +591,7 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
         return x_t
 
     @torch.no_grad()
-    def sample_actions(self, batch: dict) -> torch.Tensor:
+    def sample_actions(self, batch: dict, full: bool = False) -> torch.Tensor:
         B = batch["observation.state"].shape[0]
         device = batch["observation.state"].device
         if self._record_routing:
@@ -636,7 +636,11 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
                 x_t = x_t + dt * v_t
                 t = t + dt
 
-        return x_t[:, : self.config.n_action_steps]
+        # Truncated by default, which is all the plain chunked path executes.
+        # `full=True` returns every horizon step, which is what temporal
+        # ensembling averages over -- the whole point is that 31 of the 32
+        # chunks covering a timestep are otherwise thrown away here.
+        return x_t if full else x_t[:, : self.config.n_action_steps]
 
     def count_parameters(self) -> dict:
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
