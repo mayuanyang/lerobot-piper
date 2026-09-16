@@ -113,6 +113,41 @@ class WilroMoEConfig(PreTrainedConfig):
     # run at 0.9 is still paired with the 1.0 baseline and McNemar applies.
     sample_noise_scale: float = 1.0
 
+    # -------- Temporal ensembling (inference only) --------
+    # horizon=64 with n_action_steps=2 means every timestep has already been
+    # predicted by up to 32 chunks, each from its own noise draw and its own
+    # observation, and 31 of them are thrown away. Averaging them costs ZERO
+    # extra forward passes -- the draw cadence stays n_action_steps -- and the
+    # variance of the emitted action falls as 1/K_eff.
+    #
+    # Worth it because the 2026-09-14 policy_seed pairing put HALF of this
+    # policy's goal failures down to the noise draw alone (21/42 rescued, 93%
+    # of episodes win at least once), i.e. ~14 points of goal sit in sampling
+    # variance. sample_noise_scale captured 2.0 of them by shrinking ONE draw;
+    # this averages many.
+    #
+    # w_i = exp(-coeff * age_in_steps). 0.0 = OFF (bit-identical to the old
+    # deque path). Large coeff -> only the newest chunk survives, which IS the
+    # old path. ~0.01 is near-uniform over the 64-step window, ~0.1 gives
+    # K_eff ~ 10 and keeps the ensemble fresh.
+    temporal_ensemble_coeff: float = 0.0
+
+    # -------- Stall escape (inference only) --------
+    # Every intervention in this project that lowered sampling variance made
+    # the DEEPEST freezes worse: sample_noise_scale 0.8 took goal's max still
+    # streak 64 -> 114 chunks, and the 512 run's long failures reached 146
+    # chunks = 29.2 s motionless. Noise is what escapes a stall, so averaging
+    # it away is expected to inherit that cost.
+    #
+    # This raises the noise scale for the envs that have stopped moving, and
+    # only those. The threshold is RELATIVE to the episode's own largest
+    # observed state step, so it needs no units and no dataset stats.
+    # 0.0 = OFF. UNTESTED -- it is a hypothesis from the motion column, not a
+    # measured result.
+    stall_noise_scale: float = 0.0
+    stall_rel_threshold: float = 0.1   # "still" = step < this x the episode max
+    stall_patience: int = 5            # consecutive still chunks before firing
+
     # Flow-matching TIME sampling. "uniform" (default) spends equal capacity at
     # every noise level; "lognormal" (SD3-style logit-normal) biases toward LOW t
     # — t≈0 is x_t≈actions, where the FINE action detail that sets placement

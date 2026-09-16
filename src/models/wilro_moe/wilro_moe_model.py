@@ -614,8 +614,15 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
             )
             # Applied HERE and not inside sample_noise(): compute_loss calls the
             # same helper and training must keep x_1 ~ N(0, I).
+            #
+            # `_noise_scale_override` is a (B,) tensor set by the policy's stall
+            # escape, so the envs that have stopped moving get more noise and the
+            # healthy ones are untouched. A batch-wide scalar cannot do that.
+            ov = getattr(self, "_noise_scale_override", None)
             ns = float(getattr(self.config, "sample_noise_scale", 1.0) or 1.0)
-            if ns != 1.0:
+            if ov is not None:
+                x_t = x_t * ov.to(x_t.device, x_t.dtype).view(-1, 1, 1)
+            elif ns != 1.0:
                 x_t = x_t * ns
             dt = -1.0 / N
             t = torch.ones(B, device=device, dtype=torch.float32)

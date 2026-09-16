@@ -293,7 +293,11 @@ def load_policy(ckpt: Path, device: str, num_inference_steps: int | None,
                 sample_noise_scale: float | None = None,
                 router_top_k: int | None = None,
                 log_routing: bool = False,
-                vision_input_size: int | None = None):
+                vision_input_size: int | None = None,
+                temporal_ensemble_coeff: float | None = None,
+                stall_noise_scale: float | None = None,
+                stall_rel_threshold: float | None = None,
+                stall_patience: int | None = None):
     from lerobot.configs.policies import PreTrainedConfig
 
     cfg = PreTrainedConfig.from_pretrained(ckpt)
@@ -334,6 +338,14 @@ def load_policy(ckpt: Path, device: str, num_inference_steps: int | None,
                 f"(patch 16 x pixel-shuffle 4); {v // 16} patches per side is "
                 f"not divisible by the shuffle factor.")
         _set("vision_input_size", v, "--vision_input_size")
+    for _val, _name, _flag in (
+            (temporal_ensemble_coeff, "temporal_ensemble_coeff",
+             "--temporal_ensemble_coeff"),
+            (stall_noise_scale, "stall_noise_scale", "--stall_noise_scale"),
+            (stall_rel_threshold, "stall_rel_threshold", "--stall_rel_threshold"),
+            (stall_patience, "stall_patience", "--stall_patience")):
+        if _val is not None:
+            _set(_name, type(getattr(cfg, _name, _val))(_val), _flag)
     if fixed_episode_noise:
         _set("fixed_episode_noise", True, "--fixed_episode_noise")
     if sample_noise_scale is not None:
@@ -960,7 +972,9 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
                 # An empty queue means this call will run the prefix. Counting
                 # it here rather than after the call keeps it correct at
                 # n_action_steps=1, where the queue is empty again on return.
-                drew_chunk = not policy._action_queue
+                drew_chunk = getattr(policy, "_drew_chunk", None)
+                if drew_chunk is None:
+                    drew_chunk = not policy._action_queue
                 with autocast:
                     action = policy.select_action(batch)
                 n_chunks += int(drew_chunk)
@@ -1311,6 +1325,30 @@ def main():
                         "behind --image_blur 2 -- if SR is flat under blur the "
                         "policy declines to read fine detail and more "
                         "resolution cannot help.")
+    p.add_argument("--temporal_ensemble_coeff", type=float, default=None,
+                   help="Average every chunk still covering the current "
+                        "timestep, weighted exp(-coeff x age_in_steps). COSTS "
+                        "NO EXTRA FORWARD PASSES -- the draw cadence stays "
+                        "n_action_steps; horizon 64 / n_action_steps 2 means 32 "
+                        "chunks already predict each step and 31 are discarded. "
+                        "0 = off (bit-identical to the old path); a large coeff "
+                        "also reduces to it. Try 0.01 (near-uniform over the "
+                        "window) and 0.1 (K_eff ~ 10, fresher). Expect the "
+                        "DEEPEST stalls to get worse -- every variance "
+                        "reduction in this project did -- and pair it with "
+                        "--stall_noise_scale.")
+    p.add_argument("--stall_noise_scale", type=float, default=None,
+                   help="Noise scale used for the envs that have stopped "
+                        "moving, and only those. 0 = off. UNTESTED: it is a "
+                        "hypothesis from the motion column (noise is what "
+                        "escapes a stall), not a measured result.")
+    p.add_argument("--stall_rel_threshold", type=float, default=None,
+                   help="'Still' = state step below this fraction of the "
+                        "episode's own largest step. Relative, so it needs no "
+                        "units. Default 0.1.")
+    p.add_argument("--stall_patience", type=int, default=None,
+                   help="Consecutive still chunks before the stall scale "
+                        "fires. Default 5.")
     p.add_argument("--image_blur_cams", nargs="+", default=None,
                    help="Restrict --image_blur to camera keys containing these "
                         "substrings, e.g. image2 for the wrist view alone. "
@@ -1367,7 +1405,11 @@ def main():
                          a.sample_noise_scale,
                          router_top_k=a.router_top_k,
                          log_routing=a.log_routing,
-                         vision_input_size=a.vision_input_size)
+                         vision_input_size=a.vision_input_size,
+                         temporal_ensemble_coeff=a.temporal_ensemble_coeff,
+                         stall_noise_scale=a.stall_noise_scale,
+                         stall_rel_threshold=a.stall_rel_threshold,
+                         stall_patience=a.stall_patience)
     routing_acc = (RoutingAccumulator(int(getattr(policy.config, "router_top_k", 0) or 0))
                    if a.log_routing else None)
     motion_acc = MotionAccumulator(a.still_threshold) if a.log_motion else None
@@ -1631,6 +1673,9 @@ def main():
                "num_inference_steps": getattr(policy.config, "num_inference_steps", None),
                "n_action_steps": policy.config.n_action_steps,
                "vision_input_size": getattr(policy.config, "vision_input_size", None),
+               "temporal_ensemble_coeff": getattr(
+                   policy.config, "temporal_ensemble_coeff", None),
+               "stall_noise_scale": getattr(policy.config, "stall_noise_scale", None),
                "fixed_episode_noise": bool(a.fixed_episode_noise),
                "policy_type": getattr(policy.config, "type", None),
                "sample_noise_scale": getattr(
