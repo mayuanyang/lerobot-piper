@@ -465,6 +465,19 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
                     valid_cells.sum(dim=(0, 2)).detach().float().cpu(),
                     amb_sum,
                 )
+                # Same quantities kept PER CELL (B, H) rather than summed over the
+                # batch. The horizon profile only needs per-position sums, but
+                # bucketing by "distance to the nearest gripper transition" is a
+                # per-SAMPLE alignment -- the transition sits at a different
+                # position in every chunk -- so the caller must do the summing
+                # after it has located each row's transitions.
+                self._cell_loss = (
+                    (loss_raw * valid_cells).sum(dim=2).detach().float().cpu(),
+                    ((u_t ** 2) * valid_cells).sum(dim=2).detach().float().cpu(),
+                    valid_cells.sum(dim=2).detach().float().cpu(),
+                    ((amb.float() * valid_cells).sum(dim=2).detach().float().cpu()
+                     if amb is not None else torch.zeros(Bn, Hn)),
+                )
 
         # ── Contrastive language loss: permute the LANGUAGE portion of
         # the cached KV across batch and re-run only the DiT. Avoids a
