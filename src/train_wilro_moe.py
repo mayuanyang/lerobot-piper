@@ -165,6 +165,50 @@ class AWRWeights:
             dtype=torch.float32)
 
 
+class AWRWeightSet:
+    """Several AWR corpora at once, each bound to one --dataset_id position.
+
+    The collector does ONE suite per run, so covering libero_10 + goal +
+    spatial + object means four sidecars and four collected datasets. Each one
+    is standardised per task inside itself and renormalised to mean 1, so the
+    corpora stay comparable to each other and to the unweighted demo set, and
+    the mix ratio is set by their frame counts rather than by an accident of
+    reward scale.
+
+    Everything not named by a sidecar gets 1.0 -- the demo set included, which
+    is the point: it is the reference behaviour holding the policy in place
+    while the corpora pull on it.
+    """
+
+    def __init__(self, paths, indices, beta: float, clip: float, kind: str):
+        paths = [p for p in paths if p]
+        if len(indices) != len(paths):
+            raise ValueError(
+                f"--awr_rewards has {len(paths)} path(s) but "
+                f"--awr_dataset_index has {len(indices)}; they are positional "
+                f"pairs and must match.")
+        if len(set(indices)) != len(indices):
+            raise ValueError(
+                f"--awr_dataset_index {indices} repeats a position; two "
+                f"sidecars cannot describe the same dataset.")
+        self.by_ds = {int(i): AWRWeights(p, beta, clip, kind, dataset_index=int(i))
+                      for p, i in zip(paths, indices)}
+        self.indices = sorted(self.by_ds)
+
+    def lookup(self, episode_index, dataset_index=None) -> "torch.Tensor":
+        if dataset_index is None:
+            if len(self.by_ds) != 1:
+                raise KeyError(
+                    "several AWR corpora but no dataset_index in the batch; "
+                    "the weights cannot be told apart.")
+            return next(iter(self.by_ds.values())).lookup(episode_index)
+        out = []
+        for e, d in zip(episode_index, dataset_index):
+            w = self.by_ds.get(int(d))
+            out.append(w.w.get(int(e), 1.0) if w is not None else 1.0)
+        return torch.tensor(out, dtype=torch.float32)
+
+
 def apply_joint_augmentations(batch, abs_sigma: float = 0.01,
                               frac_sigma: float = 0.0, state_std=None,
                               prob: float = 0.5):
@@ -514,8 +558,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           prefetch_factor: int = 2,
           vision_token_source: str = "vlm",
           resnet_tokens: int = 64,
-          awr_rewards: str = "",
-          awr_dataset_index: int = 0,
+          awr_rewards=(),
+          awr_dataset_index=(0,),
           awr_beta: float = 1.0,
           awr_clip: float = 20.0,
           awr_reward: str = "success",
@@ -850,9 +894,19 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     if vision_lora_num_layers is not None:
         lora_kw["vision_lora_num_layers"] = int(vision_lora_num_layers)
 
-    awr = (AWRWeights(awr_rewards, awr_beta, awr_clip, awr_reward,
-                      dataset_index=awr_dataset_index)
-           if awr_rewards else None)
+    _awr_paths = ([awr_rewards] if isinstance(awr_rewards, str)
+                  else list(awr_rewards or []))
+    _awr_paths = [q for q in _awr_paths if q]
+    _awr_idx = ([awr_dataset_index] if isinstance(awr_dataset_index, int)
+                else list(awr_dataset_index or []))
+    if len(_awr_paths) > 1 and len(_awr_idx) == 1 and _awr_idx == [0]:
+        raise ValueError(
+            f"{len(_awr_paths)} sidecars but --awr_dataset_index left at its "
+            f"default: say which --dataset_id position each one describes, "
+            f"e.g. --awr_dataset_index 0 1 2.")
+    awr = (AWRWeightSet(_awr_paths, _awr_idx[:len(_awr_paths)],
+                        awr_beta, awr_clip, awr_reward)
+           if _awr_paths else None)
     if awr is not None and len(dataset_ids) > 1:
         # Mixing the demo set in is the right defence against the corpus being
         # narrow -- AWR trains on the collected suite alone, so without demos
@@ -865,16 +919,24 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         # keys on the pair, so only the dataset the sidecar describes is
         # reweighted and everything else gets 1.0. All that is left to get
         # wrong is WHICH position the sidecar describes.
-        if not (0 <= awr.dataset_index < len(dataset_ids)):
+        bad = [i for i in awr.indices if not (0 <= i < len(dataset_ids))]
+        if bad:
             raise ValueError(
-                f"--awr_dataset_index {awr.dataset_index} is out of range for "
+                f"--awr_dataset_index {bad} out of range for "
                 f"{len(dataset_ids)} datasets.")
-        print(f"AWR mixing: weights apply ONLY to --dataset_id position "
-              f"{awr.dataset_index} ({dataset_ids[awr.dataset_index]}); the "
-              f"other {len(dataset_ids) - 1} dataset(s) get weight 1.0. The mix "
-              f"ratio is set by their relative SIZES -- the sampler is uniform "
-              f"over the concatenation -- so check the frame counts printed "
-              f"below against how much anti-forgetting pressure you want.")
+        unweighted = [d for k, d in enumerate(dataset_ids) if k not in awr.indices]
+        print(f"AWR mixing: weights apply to --dataset_id position(s) "
+              f"{awr.indices} "
+              f"({', '.join(dataset_ids[i] for i in awr.indices)}).")
+        print(f"  weight 1.0 (unreweighted): "
+              f"{', '.join(unweighted) if unweighted else '<none>'}")
+        if not unweighted:
+            print("  [WARN] every dataset is a collected corpus -- nothing here "
+                  "holds the policy to the demonstrations, which is the whole "
+                  "reason mixing exists.")
+        print("  The mix ratio is set by their relative SIZES (the sampler is "
+              "uniform over the concatenation), so read the frame counts below "
+              "against how much anti-forgetting pressure you want.")
 
     # ---- state-noise augmentation: resolve the mode and SAY what it does ----
     # This has been invisible since it was written: one hardcoded 0.01 on a
@@ -2005,7 +2067,7 @@ if __name__ == "__main__":
                              "16 gives 64 px/token, i.e. half the granularity of the "
                              "frozen backbone it is supposed to sharpen. Cost is per "
                              "DiT layer and per camera.")
-    parser.add_argument("--awr_rewards", type=str, default="",
+    parser.add_argument("--awr_rewards", type=str, nargs="+", default=[],
                         help="Path to awr_rewards.json written by "
                              "train_rft.py --rft.collect_only --rft.keep_failures. "
                              "Turns this into ADVANTAGE-WEIGHTED REGRESSION: the "
@@ -2014,7 +2076,7 @@ if __name__ == "__main__":
                              "be trained on for many epochs, and the gradient "
                              "keeps the character of supervised learning instead "
                              "of a noise-dominated policy gradient. Empty = off.")
-    parser.add_argument("--awr_dataset_index", type=int, default=0,
+    parser.add_argument("--awr_dataset_index", type=int, nargs="+", default=[0],
                         help="Which --dataset_id the awr_rewards sidecar "
                              "describes (0 = the first). Every other dataset in "
                              "the mix gets weight 1.0, which is what you want "
