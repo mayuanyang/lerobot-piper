@@ -440,6 +440,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           rewrite_augment: bool = False,
           noise_temporal_correlation: float = 0.0,
           gripper_phase_weight: float = 1.0,
+          gripper_transition_window: int = 2,
+          gripper_transition_thresh: float = 0.5,
           time_sampling: str = "uniform",
           time_lognormal_mean: float = -0.5,
           time_lognormal_std: float = 1.0,
@@ -934,6 +936,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         contrastive_hard_negatives=contrastive_hard_negatives,
         noise_temporal_correlation=noise_temporal_correlation,
         gripper_phase_weight=gripper_phase_weight,
+        gripper_transition_window=int(gripper_transition_window),
+        gripper_transition_thresh=float(gripper_transition_thresh),
         gripper_action_index=action_dim - 1,  # LIBERO OSC: gripper is the last dim
         time_sampling=time_sampling,
         time_lognormal_mean=time_lognormal_mean,
@@ -1331,6 +1335,67 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     dataset = ConcatDataset(sub_datasets)
     print(f"Combined dataset: {len(dataset)} frames, {len(ep_from)} episodes "
           f"across {len(sub_datasets)} dataset(s)")
+
+    # Gripper-transition preflight. The mask is built from |delta gripper| over
+    # the action chunk, so a dataset whose gripper RAMPS instead of flipping
+    # makes the threshold catch only the steepest frame of the ramp and the
+    # window then dilates around several wrong centres -- silently, since the
+    # loss still runs. Sample a few hundred chunks and say which case this is.
+    if gripper_phase_weight != 1.0:
+        import random as _rnd
+        _gi = action_dim - 1
+        _r = _rnd.Random(0)
+        _dg = []
+        _runs, _with = [], 0
+        # dataset[i] decodes this sample's video frames too, so keep the count
+        # modest -- this is a preflight, not a statistic.
+        _n = min(150, len(dataset))
+        print(f"  gripper phase: sampling {_n} chunks to check transition "
+              f"detection...", end="", flush=True)
+        for _i in _r.sample(range(len(dataset)), _n):
+            _a = dataset[_i].get("action")
+            if _a is None or _a.ndim != 2:
+                continue
+            _g = _a[:, _gi].float()
+            _d = (_g[1:] - _g[:-1]).abs()
+            _dg.append(_d)
+            _t = (_d > gripper_transition_thresh)
+            _with += int(bool(_t.any()))
+            _run = 0
+            for _v in _t.tolist():
+                if _v:
+                    _run += 1
+                elif _run:
+                    _runs.append(_run); _run = 0
+            if _run:
+                _runs.append(_run)
+        if _dg:
+            _all = torch.cat(_dg)
+            _q = [float(_all.quantile(q)) for q in (0.5, 0.95, 0.99)]
+            _flag = float((_all > gripper_transition_thresh).float().mean())
+            _w = int(gripper_transition_window)
+            print(f"\r  gripper phase: weight {gripper_phase_weight}, window +/-{_w} "
+                  f"= {2 * _w + 1} positions ({(2 * _w + 1) / fps:.1f}s), "
+                  f"thresh {gripper_transition_thresh}")
+            print(f"    |d gripper| over {_n} chunks: p50={_q[0]:.3f} "
+                  f"p95={_q[1]:.3f} p99={_q[2]:.3f}   flagged {_flag * 100:.2f}% "
+                  f"of positions, {_with / max(_n, 1) * 100:.0f}% of chunks have one")
+            if _runs:
+                _one = sum(1 for r in _runs if r == 1) / len(_runs)
+                if _one > 0.9:
+                    print(f"    run length 1 in {_one * 100:.0f}% of transitions -- "
+                          f"the gripper FLIPS in a single step and the threshold "
+                          f"sees it cleanly.")
+                else:
+                    print(f"    [WARN] only {_one * 100:.0f}% of transitions are a "
+                          f"single step: this gripper RAMPS. The threshold is "
+                          f"catching part of the ramp and the window is dilating "
+                          f"around several centres -- retune "
+                          f"--gripper_transition_thresh before trusting the "
+                          f"window.")
+            if _flag == 0.0:
+                print(f"    [WARN] the threshold flags NOTHING. "
+                      f"--gripper_phase_weight {gripper_phase_weight} is inert.")
 
     # Build task_index → description mapping from the first dataset's tasks.parquet.
     # Batches carry the per-frame "task" string directly (preferred by the loop);
@@ -2089,6 +2154,29 @@ if __name__ == "__main__":
                              "smooth). Source dist changes, so this is NOT inference-only — "
                              "resume from a rho=0 checkpoint and fine-tune to adapt. Too high "
                              "(>0.95) over-smooths sharp/contact motions.")
+    parser.add_argument("--gripper_transition_window", type=int, default=2,
+                        help="Dilate the gripper-transition mask by +/- this "
+                             "many chunk positions; the up-weighted span is "
+                             "2*win+1. Measured 2026-09-18 on 8x4-22k-obs2 "
+                             "(analyze_gripper_window.py): the residual is "
+                             "elevated over the far-field baseline out to d=8-16, "
+                             "not d=2 -- 1.99x at d=1, 1.66x at d=2, 1.63x at "
+                             "d=3-4, 1.42x at d=5-8, 1.23x at d=9-16. The default "
+                             "2 cuts between d=2 and d=3-4, which are equally "
+                             "elevated. **4 is what that profile supports.** Note "
+                             "the peak is at d=1, NOT at the transition itself "
+                             "(d=0 reads 1.49x): the flip is a saturated binary "
+                             "value and easy, its neighbours are where the "
+                             "positioning has to be right.")
+    parser.add_argument("--gripper_transition_thresh", type=float, default=0.5,
+                        help="|delta gripper| above which a chunk position counts "
+                             "as a transition, in NORMALISED units. On "
+                             "lerobot/libero this is not a tunable: the gripper "
+                             "is strictly binary, |dg| is 0.000 at every "
+                             "percentile up to p95 and exactly 2.002 at p99, so "
+                             "anything in (0, 2) gives identical masks. It "
+                             "matters only for a dataset whose gripper RAMPS -- "
+                             "the preflight below reports which case you are in.")
     parser.add_argument("--gripper_phase_weight", type=float, default=1.0,
                         help="Up-weight the flow-matching loss on frames near a gripper "
                              "open<->close transition (grasp/release) — the precision-critical "
