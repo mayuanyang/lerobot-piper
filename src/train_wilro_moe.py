@@ -440,6 +440,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           rewrite_augment: bool = False,
           noise_temporal_correlation: float = 0.0,
           gripper_phase_weight: float = 1.0,
+          n_action_steps_cli: int | None = None,
           gripper_transition_window: int = 2,
           gripper_transition_thresh: float = 0.5,
           time_sampling: str = "uniform",
@@ -659,7 +660,29 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     # Training parameters — match train_transformer.py for like-for-like comparison
     obs = 2 if n_obs_steps is None else max(1, int(n_obs_steps))
     horizon = 64
-    n_action_steps = 64
+    # TRAINING-SIDE ONLY. It is the boundary in compute_loss:
+    #   pos_w[n_action_steps:] = future_steps_weight
+    # so with the historical 64 that slice is EMPTY and future_steps_weight has
+    # never once been in effect -- all 64 positions trained at weight 1.0 while
+    # eval executes 2. The 2026-09-13 horizon profile measured the executed
+    # prefix as the WORST bucket of the chunk (0.213 of "predict nothing"
+    # against 0.153 at positions 16-31) while it carried 3.1% of the gradient.
+    # 8 puts that at 8.1%. Inference is unaffected: every eval overrides
+    # n_action_steps on the command line.
+    n_action_steps = 64 if n_action_steps_cli is None else int(n_action_steps_cli)
+    if n_action_steps > horizon:
+        raise SystemExit(
+            f"--n_action_steps {n_action_steps} exceeds horizon {horizon}; "
+            f"there are no chunk positions past the horizon to weight.")
+    if n_action_steps == horizon:
+        # Not an error -- it is the historical default and every checkpoint in
+        # this repo carries it -- but it must not pass silently, because it is
+        # the reason future_steps_weight has never done anything.
+        print(f"  NOTE n_action_steps == horizon ({horizon}): pos_w"
+              f"[{n_action_steps}:] is an EMPTY slice, so future_steps_weight is "
+              f"INERT and all {horizon} positions train at weight 1.0. The "
+              f"executed prefix then carries {2 / horizon * 100:.1f}% of the "
+              f"gradient. Pass --n_action_steps 8 to give it a real boundary.")
 
     # Build action_dim_weights FROM THE DATA, not from a flag default.
     #
@@ -2154,6 +2177,21 @@ if __name__ == "__main__":
                              "smooth). Source dist changes, so this is NOT inference-only — "
                              "resume from a rho=0 checkpoint and fine-tune to adapt. Too high "
                              "(>0.95) over-smooths sharp/contact motions.")
+    parser.add_argument("--n_action_steps_cli", "--n_action_steps", type=int,
+                        default=None, dest="n_action_steps_cli",
+                        help="TRAINING-SIDE position-weight boundary, not an "
+                             "inference setting: compute_loss sets "
+                             "pos_w[n_action_steps:] = future_steps_weight. The "
+                             "historical 64 equals the horizon, so that slice is "
+                             "EMPTY and future_steps_weight has never been in "
+                             "effect on any run in this repo. Meanwhile the "
+                             "2026-09-13 horizon profile put the EXECUTED prefix "
+                             "(positions 0-1) at 0.213 of 'predict nothing' "
+                             "against 0.153 at positions 16-31 -- the worst part "
+                             "of the chunk -- carrying 3.1% of the gradient "
+                             "weight. 8 raises that to 8.1%. Every eval overrides "
+                             "n_action_steps on its own command line, so this "
+                             "does not change what inference executes.")
     parser.add_argument("--gripper_transition_window", type=int, default=2,
                         help="Dilate the gripper-transition mask by +/- this "
                              "many chunk positions; the up-weighted span is "
