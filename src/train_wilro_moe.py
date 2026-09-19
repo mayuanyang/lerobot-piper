@@ -440,6 +440,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           rewrite_augment: bool = False,
           noise_temporal_correlation: float = 0.0,
           gripper_phase_weight: float = 1.0,
+          video_backend: str | None = None,
           n_action_steps_cli: int | None = None,
           gripper_transition_window: int = 2,
           gripper_transition_thresh: float = 0.5,
@@ -1308,6 +1309,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
             did, delta_timestamps=delta_timestamps,
             force_cache_sync=cache_sync, revision="main", tolerance_s=tolerance_s,
             image_transforms=img_tf,
+            **({} if video_backend is None else {"video_backend": video_backend}),
         )
         print(f"[data]   ...{time.time() - _t:.0f}s", flush=True)
         if first_root is None:
@@ -2177,6 +2179,17 @@ if __name__ == "__main__":
                              "smooth). Source dist changes, so this is NOT inference-only — "
                              "resume from a rho=0 checkpoint and fine-tune to adapt. Too high "
                              "(>0.95) over-smooths sharp/contact motions.")
+    parser.add_argument("--video_backend", default=None,
+                        choices=("torchcodec", "pyav", "video_reader"),
+                        help="Frame decoder. Default is lerobot's own choice, "
+                             "which prefers torchcodec where it is available. "
+                             "Switch to pyav when a worker dies with "
+                             "'Could not push packet to decoder: Invalid data "
+                             "found when processing input' -- torchcodec is the "
+                             "newer path and is the more likely suspect after an "
+                             "environment change. If pyav fails on the same "
+                             "sample the file itself is bad and the cache needs "
+                             "re-syncing, not the backend switching.")
     parser.add_argument("--n_action_steps_cli", "--n_action_steps", type=int,
                         default=None, dest="n_action_steps_cli",
                         help="TRAINING-SIDE position-weight boundary, not an "
