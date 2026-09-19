@@ -51,6 +51,33 @@ def get_augmentations():
 
 
 
+class _TagDataset(torch.utils.data.Dataset):
+    """Stamp which sub-dataset a sample came from.
+
+    LeRobotDataset's `episode_index` is dataset-LOCAL and ConcatDataset does not
+    renumber, so mixing the AWR corpus with the demo set would apply the
+    corpus's weight for episode 5 to the demo set's episode 5 as well --
+    silently, because the join is a dict lookup that cannot tell them apart.
+    This is the disambiguator that makes mixing safe, and mixing is the right
+    defence against the corpus being narrow: AWR trains on ONE dataset_id, so
+    without it the model only ever sees the suite that was collected.
+    """
+
+    def __init__(self, ds, tag: int):
+        self.ds, self.tag = ds, tag
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, i):
+        sample = self.ds[i]
+        sample["dataset_index"] = torch.tensor(self.tag, dtype=torch.long)
+        return sample
+
+    def __getattr__(self, name):          # meta, stats, fps, ... pass through
+        return getattr(self.__dict__["ds"], name)
+
+
 class AWRWeights:
     """Advantage-weighted regression weights, joined to episodes by index.
 
@@ -73,7 +100,12 @@ class AWRWeights:
     still say "not that way".
     """
 
-    def __init__(self, path: str, beta: float, clip: float, kind: str):
+    def __init__(self, path: str, beta: float, clip: float, kind: str,
+                 dataset_index: int = 0):
+        # Which position in --dataset_id this sidecar describes. Every other
+        # dataset in the mix gets weight 1.0, which is exactly right for demos:
+        # they are the reference behaviour, not something to reweight.
+        self.dataset_index = int(dataset_index)
         import json as _json
         d = _json.loads(Path(path).read_text())
         eps = d["episodes"]
@@ -117,9 +149,20 @@ class AWRWeights:
                   f"{(wf.mean() if len(wf) else float('nan')):.3f}   "
                   f"ratio {(wo.mean() / wf.mean() if len(wf) and wf.mean() > 0 else float('inf')):.1f}x")
 
-    def lookup(self, episode_index) -> "torch.Tensor":
-        return torch.tensor([self.w.get(int(i), 1.0) for i in episode_index],
-                            dtype=torch.float32)
+    def lookup(self, episode_index, dataset_index=None) -> "torch.Tensor":
+        """Weight per sample; 1.0 for anything this sidecar does not describe.
+
+        With several datasets mixed, `dataset_index` is what keeps the corpus's
+        weights off the demo set. Passing None is only safe for a single
+        dataset, and train() refuses the multi-dataset case without it.
+        """
+        if dataset_index is None:
+            return torch.tensor([self.w.get(int(i), 1.0) for i in episode_index],
+                                dtype=torch.float32)
+        return torch.tensor(
+            [self.w.get(int(e), 1.0) if int(d) == self.dataset_index else 1.0
+             for e, d in zip(episode_index, dataset_index)],
+            dtype=torch.float32)
 
 
 def apply_joint_augmentations(batch, abs_sigma: float = 0.01,
@@ -472,6 +515,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           vision_token_source: str = "vlm",
           resnet_tokens: int = 64,
           awr_rewards: str = "",
+          awr_dataset_index: int = 0,
           awr_beta: float = 1.0,
           awr_clip: float = 20.0,
           awr_reward: str = "success",
@@ -806,24 +850,31 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
     if vision_lora_num_layers is not None:
         lora_kw["vision_lora_num_layers"] = int(vision_lora_num_layers)
 
-    awr = (AWRWeights(awr_rewards, awr_beta, awr_clip, awr_reward)
+    awr = (AWRWeights(awr_rewards, awr_beta, awr_clip, awr_reward,
+                      dataset_index=awr_dataset_index)
            if awr_rewards else None)
     if awr is not None and len(dataset_ids) > 1:
-        # The weights are keyed on episode_index, and ConcatDataset does NOT
-        # renumber: every sub-dataset starts its own episodes at 0, so mixing
-        # the demo set in would apply the corpus's weight for episode 5 to the
-        # demo set's episode 5 as well. Silently. There is no dataset_index in
-        # the batch to disambiguate on, so this is refused rather than guessed.
+        # Mixing the demo set in is the right defence against the corpus being
+        # narrow -- AWR trains on the collected suite alone, so without demos
+        # the model only ever sees that suite and the others drift. What used to
+        # make it unsafe is that the join is on episode_index, which is
+        # dataset-LOCAL: ConcatDataset does not renumber, so the corpus's weight
+        # for episode 5 would also land on the demo set's episode 5, silently.
         #
-        # Mixing IS the right defence against narrow-distribution drift; it just
-        # needs a disambiguator first. Until then, keep the corpus broad -- the
-        # collector covers the whole suite by default, and --rft.task_ids is
-        # what narrows it.
-        raise ValueError(
-            f"--awr_rewards with {len(dataset_ids)} datasets: the weights join on "
-            f"episode_index, and concatenated datasets each restart it at 0, so "
-            f"the corpus's weights would also land on the other set's episodes. "
-            f"Pass a single --dataset_id.")
+        # _TagDataset now stamps dataset_index on every sample and lookup()
+        # keys on the pair, so only the dataset the sidecar describes is
+        # reweighted and everything else gets 1.0. All that is left to get
+        # wrong is WHICH position the sidecar describes.
+        if not (0 <= awr.dataset_index < len(dataset_ids)):
+            raise ValueError(
+                f"--awr_dataset_index {awr.dataset_index} is out of range for "
+                f"{len(dataset_ids)} datasets.")
+        print(f"AWR mixing: weights apply ONLY to --dataset_id position "
+              f"{awr.dataset_index} ({dataset_ids[awr.dataset_index]}); the "
+              f"other {len(dataset_ids) - 1} dataset(s) get weight 1.0. The mix "
+              f"ratio is set by their relative SIZES -- the sampler is uniform "
+              f"over the concatenation -- so check the frame counts printed "
+              f"below against how much anti-forgetting pressure you want.")
 
     # ---- state-noise augmentation: resolve the mode and SAY what it does ----
     # This has been invisible since it was written: one hardcoded 0.01 on a
@@ -1355,7 +1406,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
             kept += 1
         suffix = f" (<= ep {max_episode_index})" if max_episode_index is not None else ""
         print(f"  {did}: {len(ds)} frames, {kept} episodes{suffix}")
-        sub_datasets.append(ds)
+        sub_datasets.append(_TagDataset(ds, len(sub_datasets)))
         offset += len(ds)
 
     dataset = ConcatDataset(sub_datasets)
@@ -1680,8 +1731,10 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                     raise KeyError(
                         "--awr_rewards needs episode_index in the batch to join "
                         "the weights, and this dataset does not provide it.")
+                _di = batch.get("dataset_index")
                 batch["awr_weight"] = awr.lookup(
-                    batch["episode_index"].reshape(-1).tolist())
+                    batch["episode_index"].reshape(-1).tolist(),
+                    None if _di is None else _di.reshape(-1).tolist())
             batch = apply_joint_augmentations(
                 batch, abs_sigma=state_noise_abs,
                 frac_sigma=state_noise_frac,
@@ -1961,6 +2014,13 @@ if __name__ == "__main__":
                              "be trained on for many epochs, and the gradient "
                              "keeps the character of supervised learning instead "
                              "of a noise-dominated policy gradient. Empty = off.")
+    parser.add_argument("--awr_dataset_index", type=int, default=0,
+                        help="Which --dataset_id the awr_rewards sidecar "
+                             "describes (0 = the first). Every other dataset in "
+                             "the mix gets weight 1.0, which is what you want "
+                             "for demos: they are the reference behaviour, not "
+                             "something to reweight. Mixing demos in is the "
+                             "defence against the corpus being one suite wide.")
     parser.add_argument("--awr_beta", type=float, default=1.0,
                         help="AWR temperature. Large => all weights 1, i.e. plain "
                              "BC on everything including failures, no improvement. "
