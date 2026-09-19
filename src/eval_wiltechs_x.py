@@ -63,6 +63,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from env_fingerprint import fingerprint, fingerprint_line
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from libero_env_fixed import patch_lerobot_libero
@@ -1395,6 +1397,11 @@ def main():
             "all replace what the policy is told. Pick one; combining them "
             "would report a number nobody could attribute.")
 
+    # Every comparison in the tracker is paired and pins eval_commit; nothing
+    # pinned the environment, and the GPU alone decides the kernels' reduction
+    # order. Two results with different digests are not strictly paired.
+    print(fingerprint_line(), flush=True)
+
     ckpt = resolve_checkpoint(a.checkpoint, for_resume=False)
 
     patch_lerobot_libero(enable=not a.stock_init)
@@ -1672,6 +1679,7 @@ def main():
                "eval_commit": _git_commit(),
                "num_inference_steps": getattr(policy.config, "num_inference_steps", None),
                "n_action_steps": policy.config.n_action_steps,
+               "env": fingerprint(),
                "vision_input_size": getattr(policy.config, "vision_input_size", None),
                "temporal_ensemble_coeff": getattr(
                    policy.config, "temporal_ensemble_coeff", None),

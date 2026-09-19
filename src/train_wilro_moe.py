@@ -18,6 +18,7 @@ from torch.utils.data import ConcatDataset
 from models.wilro_moe.wilro_moe_config import WilroMoEConfig
 from models.wilro_moe.wilro_moe_policy import WilroMoEPolicy
 from models.wilro_moe.processor_wilro_moe import make_pre_post_processors
+from env_fingerprint import fingerprint_line
 from models.wiltechs_vla.task_rewrites import rewrite_instruction
 
 from torchvision.transforms import v2
@@ -1358,6 +1359,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         offset += len(ds)
 
     dataset = ConcatDataset(sub_datasets)
+    print(fingerprint_line(), flush=True)
     print(f"Combined dataset: {len(dataset)} frames, {len(ep_from)} episodes "
           f"across {len(sub_datasets)} dataset(s)")
 

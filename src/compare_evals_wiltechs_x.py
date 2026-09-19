@@ -90,6 +90,32 @@ def _warn_build(ca, cb):
               f"predates {SEED_FIX} and nothing in the eval path changed")
 
 
+def _warn_env(ea, eb):
+    """eval_commit pins the repo; this pins everything under it.
+
+    The GPU decides which kernels run and therefore the floating-point
+    reduction order, and the rollout integrates 10 ODE steps through 280
+    closed-loop chunks -- a chaotic system, where any perturbation eventually
+    separates. Two arms measured on different hardware or different decoder
+    builds are not strictly paired, and nothing else in this file can tell.
+    """
+    if not ea or not eb:
+        missing = [n for n, e in (("before", ea), ("after", eb)) if not e]
+        print(f"  [WARN] no environment fingerprint in the {' and '.join(missing)} "
+              f"file -- it predates the stamp, so hardware and library drift "
+              f"between these two arms cannot be ruled out.")
+        return
+    if ea.get("digest") == eb.get("digest"):
+        return
+    diff = sorted({k for k in set(ea) | set(eb)
+                   if k != "digest" and ea.get(k) != eb.get(k)})
+    print(f"  [WARN] DIFFERENT ENVIRONMENTS ({ea.get('digest')} vs "
+          f"{eb.get('digest')}); these arms are not strictly paired.")
+    for k in diff:
+        flag = "  <- kernels, hence reduction order" if k == "gpu" else ""
+        print(f"           {k}: {ea.get(k)} -> {eb.get(k)}{flag}")
+
+
 def _unpaired_z(n1, k1, n2, k2):
     p1, p2 = k1 / n1, k2 / n2
     se = math.sqrt(p1 * (1 - p1) / n1 + p2 * (1 - p2) / n2)
@@ -125,6 +151,7 @@ def main():
         print("  [WARN] a file predates seed recording; if it also predates "
               "92ec163 the policy noise was unseeded there")
     _warn_build(A.get("eval_commit"), B.get("eval_commit"))
+    _warn_env(A.get("env"), B.get("env"))
 
     ta, tb = _tasks(A), _tasks(B)
     shared = sorted(set(ta) & set(tb))
