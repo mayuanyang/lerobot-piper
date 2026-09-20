@@ -616,12 +616,31 @@ def _log_gradient_analysis(policy, step: int) -> None:
                   f"{comps['diff_sq_under'] * 100:.0f}% of "
                   f"{int(comps['n_pairs'])} pairs under the margin   "
                   f"({'HARD' if comps.get('hard_neg') else 'random'} negatives)")
-            if comps["diff_sq_under"] == 0.0 and margin > 0:
-                ratio = comps["diff_sq_min"] / margin
-                print(f"                      [note] the closest pair is "
-                      f"{ratio:.1f}x the margin -- this term is INERT. "
-                      f"Raise --contrastive_margin toward {comps['diff_sq_p10']:.3f} "
-                      f"(the p10 separation) to make it bite.")
+            # Against the main loss, not against the margin. The margin is an
+            # arbitrary constant; the flow loss is the model's own error scale,
+            # so separation/main says whether permuting the instruction moves
+            # the prediction by more or less than the model is already wrong by.
+            if main_v == main_v and main_v > 0:
+                rel = comps["diff_sq_mean"] / main_v
+                verdict = ("language is LOAD-BEARING: permuting it moves the "
+                           "prediction further than the model's own error, so "
+                           "the hinge reading 0.0000 means satisfied, not broken"
+                           if rel >= 1.0 else
+                           "permuting the instruction moves the prediction LESS "
+                           "than the model's own error -- the pressure is worth "
+                           "applying")
+                print(f"                      separation is {rel * 100:.0f}% of "
+                      f"the main loss {main_v:.4f} -- {verdict}")
+            if comps["diff_sq_under"] < 0.05 and margin > 0:
+                print(f"                      [note] only "
+                      f"{comps['diff_sq_under'] * 100:.0f}% of pairs are under "
+                      f"the margin, so this term is numerically INERT. Making "
+                      f"it bite needs --contrastive_margin near the MEAN "
+                      f"separation ({comps['diff_sq_mean']:.2f}), not near p10 "
+                      f"-- but read the ratio above first: if separation "
+                      f"already exceeds the main loss, raising the margin "
+                      f"demands more language sensitivity than any measurement "
+                      f"says is missing.")
 
     print("--- End Gradient Analysis ---\n")
 
