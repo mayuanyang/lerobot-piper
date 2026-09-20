@@ -1898,6 +1898,16 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
                     "lr": f"{lr:.2e}",
                     "grad_norm": f"{grad_norm:.2f}"
                 })
+                # tqdm writes to STDERR and redraws in place with \r. Under any
+                # redirection that keeps only stdout -- or in a log file, where
+                # the carriage returns collapse into one unreadable line -- the
+                # loss simply disappears, while the gradient analysis (plain
+                # print, stdout) survives. Emit it to stdout too, on the same
+                # cadence, so the number does not depend on how the run was
+                # launched. `total` is the full objective; the analysis block's
+                # `main` above it is the flow term alone.
+                print(f"  step {step}  total {loss.item():.4f}  lr {lr:.2e}  "
+                      f"grad_norm {grad_norm:.2f}", flush=True)
 
             if val_loader is not None and step > 0 and step % val_every == 0:
                 v, ap, at = run_eval_loss(val_loader)
