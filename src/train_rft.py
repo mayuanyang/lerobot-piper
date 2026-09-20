@@ -603,7 +603,14 @@ def _rft_collect_episodes(env, policy, preprocessor, postprocessor, device,
                 # at a LOW weight instead, so they still constrain the policy.
                 if ok or keep_failures:
                     episodes.append(frames[i])
-                    ep_meta.append({"success": ok, "steps": len(frames[i])})
+                    # env_slot, not the append order: episodes are appended as
+                    # they TERMINATE, so the caller cannot recover which init
+                    # state produced which episode without it. Without that the
+                    # sidecar's `steps` conflates how hard the layout was with
+                    # how well the policy did, and there is no way to separate
+                    # them after the fact.
+                    ep_meta.append({"success": ok, "steps": len(frames[i]),
+                                    "env_slot": i})
                 frames[i] = []                          # free either way
         # LiberoEnv self-resets inside step(), so a terminated env's next state
         # belongs to a NEW episode: carrying the old window across would hand it
@@ -627,7 +634,8 @@ def _rft_collect_episodes(env, policy, preprocessor, postprocessor, device,
             continue
         if keep_failures:
             episodes.append(frames[i])
-            ep_meta.append({"success": False, "steps": len(frames[i])})
+            ep_meta.append({"success": False, "steps": len(frames[i]),
+                            "env_slot": i})
         frames[i] = []
 
     if n_success == 0 and not _any_term:
@@ -798,6 +806,9 @@ def _run_collect_only(cfg, task_envs, policy, preprocessor, postprocessor, devic
                         _write_episode(ds, ep, cam_keys, state_key)
                         meta["episode_index"] = saved
                         meta["task"] = label
+                        _slot = meta.pop("env_slot", None)
+                        if cycle > 0 and _slot is not None and _slot < len(ids):
+                            meta["init_state"] = int(ids[_slot])
                         all_meta.append(meta)
                         saved += 1
                     total_ep += B

@@ -101,7 +101,7 @@ class AWRWeights:
     """
 
     def __init__(self, path: str, beta: float, clip: float, kind: str,
-                 dataset_index: int = 0):
+                 dataset_index: int = 0, group_by: str = "task"):
         # Which position in --dataset_id this sidecar describes. Every other
         # dataset in the mix gets weight 1.0, which is exactly right for demos:
         # they are the reference behaviour, not something to reweight.
@@ -124,13 +124,38 @@ class AWRWeights:
         else:
             raise ValueError(f"unknown --awr_reward {kind!r}")
 
-        # Standardise PER TASK: the reward scale is not comparable across tasks,
-        # and without this beta means something different for each one.
+        # Standardise PER TASK by default: the reward scale is not comparable
+        # across tasks, and without this beta means something different for
+        # each one.
+        #
+        # group_by="state" standardises within (task, init_state) instead,
+        # which is what GRPO's group baseline does and for the same reason --
+        # it cancels LAYOUT DIFFICULTY so the advantage is about the policy.
+        # Per task, `steps` conflates the two: a 200-step success may only mean
+        # the object started far away. But it needs several rollouts PER STATE
+        # to have anything to compare, and the collector's default sweep gives
+        # exactly one, which makes every group degenerate (std=0 -> adv=0 ->
+        # weight 1). At libero_10's 71% it takes k=5 rollouts per state to get
+        # the degenerate share under 20%, i.e. 2500 episodes. Hence the default.
         tasks = np.array([e.get("task", "") for e in eps])
+        if group_by == "state":
+            if any("init_state" not in e for e in eps):
+                raise ValueError(
+                    "--awr_group_by state needs init_state in every sidecar "
+                    "entry; this one predates the field. Re-collect, or use "
+                    "--awr_group_by task.")
+            keys = np.array([f"{e['task']}#{e['init_state']}" for e in eps])
+        elif group_by == "task":
+            keys = tasks
+        else:
+            raise ValueError(f"unknown --awr_group_by {group_by!r}")
         adv = np.zeros_like(r)
-        for t in np.unique(tasks):
-            m = tasks == t
+        n_degenerate = 0
+        for t in np.unique(keys):
+            m = keys == t
             sd = r[m].std()
+            if sd <= 1e-6:
+                n_degenerate += int(m.sum())
             adv[m] = (r[m] - r[m].mean()) / (sd if sd > 1e-6 else 1.0)
         w = np.clip(np.exp(adv / max(beta, 1e-6)), 0.0, clip)
         # Renormalise to mean 1 so the loss scale -- and therefore the effective
@@ -139,7 +164,16 @@ class AWRWeights:
         self.w = {int(e["episode_index"]): float(x) for e, x in zip(eps, w)}
         n_ok = int(sum(1 for e in eps if e["success"]))
         print(f"AWR weights: {len(eps)} episodes ({n_ok} success / {len(eps) - n_ok} "
-              f"failure), reward={kind}, beta={beta:g}, clip={clip:g}")
+              f"failure), reward={kind}, beta={beta:g}, clip={clip:g}, "
+              f"group_by={group_by} ({len(np.unique(keys))} groups)")
+        if n_degenerate:
+            print(f"  [{'WARN' if n_degenerate > len(eps) // 2 else 'note'}] "
+                  f"{n_degenerate}/{len(eps)} episodes sit in a group whose "
+                  f"outcomes are all identical -- their advantage is 0 and they "
+                  f"carry weight 1, i.e. they are plain SFT samples."
+                  + ("  Over half the corpus: this grouping has too few "
+                     "rollouts per group to say anything."
+                     if n_degenerate > len(eps) // 2 else ""))
         print(f"  weight  min {w.min():.3f}  median {np.median(w):.3f}  "
               f"max {w.max():.3f}  (mean 1.000 by construction)")
         if n_ok:
@@ -180,7 +214,8 @@ class AWRWeightSet:
     while the corpora pull on it.
     """
 
-    def __init__(self, paths, indices, beta: float, clip: float, kind: str):
+    def __init__(self, paths, indices, beta: float, clip: float, kind: str,
+                 group_by: str = "task"):
         paths = [p for p in paths if p]
         if len(indices) != len(paths):
             raise ValueError(
@@ -191,7 +226,8 @@ class AWRWeightSet:
             raise ValueError(
                 f"--awr_dataset_index {indices} repeats a position; two "
                 f"sidecars cannot describe the same dataset.")
-        self.by_ds = {int(i): AWRWeights(p, beta, clip, kind, dataset_index=int(i))
+        self.by_ds = {int(i): AWRWeights(p, beta, clip, kind,
+                                        dataset_index=int(i), group_by=group_by)
                       for p, i in zip(paths, indices)}
         self.indices = sorted(self.by_ds)
 
@@ -560,6 +596,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           resnet_tokens: int = 64,
           awr_rewards=(),
           awr_dataset_index=(0,),
+          awr_group_by: str = "task",
           awr_beta: float = 1.0,
           awr_clip: float = 20.0,
           awr_reward: str = "success",
@@ -905,7 +942,7 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
             f"default: say which --dataset_id position each one describes, "
             f"e.g. --awr_dataset_index 0 1 2.")
     awr = (AWRWeightSet(_awr_paths, _awr_idx[:len(_awr_paths)],
-                        awr_beta, awr_clip, awr_reward)
+                        awr_beta, awr_clip, awr_reward, group_by=awr_group_by)
            if _awr_paths else None)
     if awr is not None and len(dataset_ids) > 1:
         # Mixing the demo set in is the right defence against the corpus being
@@ -2083,6 +2120,23 @@ if __name__ == "__main__":
                              "for demos: they are the reference behaviour, not "
                              "something to reweight. Mixing demos in is the "
                              "defence against the corpus being one suite wide.")
+    parser.add_argument("--awr_group_by", default="task",
+                        choices=("task", "state"),
+                        help="What the advantage is standardised within. "
+                             "'task' (default) makes beta mean the same thing "
+                             "across tasks. 'state' standardises within (task, "
+                             "init_state), which cancels LAYOUT DIFFICULTY the "
+                             "way GRPO's group baseline does -- per task, a "
+                             "200-step success may only mean the object started "
+                             "far away, and `steps` cannot tell that from a "
+                             "fumble. It needs several rollouts per state to "
+                             "have anything to compare: the collector's default "
+                             "sweep gives ONE, so every group is degenerate. At "
+                             "libero_10's 71% it takes 5 per state to get the "
+                             "degenerate share under 20%, i.e. 2500 episodes. "
+                             "Use it with --rft.iterations 5, or stay on 'task' "
+                             "and use --awr_reward success, which does not read "
+                             "length at all.")
     parser.add_argument("--awr_beta", type=float, default=1.0,
                         help="AWR temperature. Large => all weights 1, i.e. plain "
                              "BC on everything including failures, no improvement. "
