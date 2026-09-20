@@ -292,6 +292,7 @@ class RFTParams:
     control_freq: int = 10            # LIBERO sim control Hz (demos are 10; stock env default is 20). 0 = leave stock.
     stock_init: bool = False          # True = lerobot's reset ordering (layouts 3-10x wider than canonical). For A/B only.
     init_states_per_task: int = 0     # >0: sweep this many LIBERO init states across batches (50 = full set), so a small batch_size still covers them all. 0 = legacy (only init states 0..batch_size-1).
+    shard_per_task: bool = False      # collect_only: finalise a SEPARATE dataset per task. A hard kill (OOM, a dropped Colab) leaves the finished shards loadable; one un-finalised dataset is not, no matter when the sidecar was written.
     task_ids: str = ""                # comma-separated task indices within the suite to collect (e.g. "0,3,7"). Empty = all tasks.
 
 
@@ -716,9 +717,36 @@ def _run_collect_only(cfg, task_envs, policy, preprocessor, postprocessor, devic
               f"nothing downstream can tell. ***")
     _obs0, _ = task_envs[0][1].reset()
     _obs0 = preprocess_observation(_obs0)
-    ds, cam_keys, state_key = _create_collect_dataset(
-        save_dir, cfg.rft.save_dataset_repo_id, save_fps, _obs0, action_dim,
-    )
+    # v3 buffers metadata and only writes the parquet footers in finalize(), so
+    # an un-finalised dataset CANNOT be loaded -- writing the sidecar earlier
+    # would not help, because the frames it describes are unreadable. Sharding
+    # is what survives a hard kill: each finished shard is a complete dataset.
+    #
+    # Shard on TASK boundaries, not episode counts: AWRWeights standardises the
+    # advantage per task, so a task split across two shards would be
+    # standardised twice against two different means and get two different sets
+    # of weights for the same outcomes.
+    shard_per_task = bool(getattr(cfg.rft, "shard_per_task", False))
+    _shard = {"n": 0}
+
+    def _open_shard(suffix=""):
+        d = f"{save_dir}{suffix}"
+        ds_, ck, sk = _create_collect_dataset(
+            d, cfg.rft.save_dataset_repo_id, save_fps, _obs0, action_dim)
+        return ds_, ck, sk, d
+
+    def _close_shard(ds_, d, meta):
+        ds_.finalize()
+        import json as _json
+        side = Path(d) / "awr_rewards.json"
+        side.write_text(_json.dumps({"n_episodes": len(meta), "episodes": meta},
+                                    indent=1))
+        n_ok = sum(1 for m in meta if m["success"])
+        print(f"[collect] shard finalised → {d}  ({len(meta)} episodes, "
+              f"{n_ok} success / {len(meta) - n_ok} failure)", flush=True)
+
+    ds, cam_keys, state_key, cur_dir = _open_shard(
+        "_t00" if shard_per_task else "")
 
     print("\n" + "=" * 64)
     print("RFT collect-only  (sim → LeRobot dataset, no training)")
@@ -766,11 +794,18 @@ def _run_collect_only(cfg, task_envs, policy, preprocessor, postprocessor, devic
     # dense reward, not more rollouts. The aggregate success rate hides them.
     attempts: dict = {}
     wins: dict = {}
-    all_meta: list = []
+    all_meta: list = []          # every episode, for the coverage report
+    shard_meta: list = []        # the current shard's, for its own sidecar
     interrupted = False
     try:
         for it in range(1, cfg.rft.iterations + 1):
             for t_idx, (label, env) in enumerate(task_envs):
+                if shard_per_task and (it, t_idx) != (1, 0):
+                    _close_shard(ds, cur_dir, shard_meta)
+                    _shard["n"] += 1
+                    ds, cam_keys, state_key, cur_dir = _open_shard(
+                        f"_t{_shard['n']:02d}")
+                    shard_meta, saved = [], 0     # episode_index is per DATASET
                 num_envs = env.num_envs
                 if cycle > 0:
                     # Sweep init states 0..n_init-1 across batches by mutating each
@@ -810,6 +845,7 @@ def _run_collect_only(cfg, task_envs, policy, preprocessor, postprocessor, devic
                         if cycle > 0 and _slot is not None and _slot < len(ids):
                             meta["init_state"] = int(ids[_slot])
                         all_meta.append(meta)
+                        shard_meta.append(meta)
                         saved += 1
                     total_ep += B
                     total_succ += n_succ
@@ -823,22 +859,15 @@ def _run_collect_only(cfg, task_envs, policy, preprocessor, postprocessor, devic
         # dataset CANNOT be loaded. try/finally also makes Ctrl-C safe: every
         # episode whose save_episode() finished before the stop is kept; only the
         # one being collected at the moment of the stop is lost.
-        ds.finalize()
-        print(f"[collect] dataset finalized → {save_dir}", flush=True)
-        # Sidecar rather than a dataset column: v3's schema is fixed at creation
-        # and adding a field means touching the writer, the loader and every
-        # consumer. A JSON keyed by episode_index costs nothing and the trainer
-        # joins on it. success AND steps are both recorded so the AWR reward can
-        # be chosen at training time -- plain success, or one that prefers FAST
-        # successes, which on this policy is the difference between "it worked"
-        # and "it worked after fumbling".
-        import json as _json
-        side = Path(save_dir) / "awr_rewards.json"
-        side.write_text(_json.dumps(
-            {"n_episodes": len(all_meta), "episodes": all_meta}, indent=1))
-        n_ok = sum(1 for m in all_meta if m["success"])
-        print(f"[collect] AWR sidecar → {side}  ({len(all_meta)} episodes, "
-              f"{n_ok} success / {len(all_meta) - n_ok} failure)", flush=True)
+        _close_shard(ds, cur_dir, shard_meta if shard_per_task else all_meta)
+        # The sidecar is written by _close_shard, per shard, so it always
+        # describes exactly the episodes that shard actually holds. Keying it
+        # on episode_index means it MUST be per dataset: a global numbering
+        # would point past the end of every shard but the first.
+        if shard_per_task:
+            print(f"[collect] {_shard['n'] + 1} shard(s) written; pass each to "
+                  f"--dataset_id with its own --awr_rewards and a matching "
+                  f"--awr_dataset_index.", flush=True)
 
     status = "INTERRUPTED" if interrupted else "done"
     print(f"\n[collect] {status}: {total_succ}/{total_ep} successful episodes "
