@@ -75,7 +75,19 @@ class _TagDataset(torch.utils.data.Dataset):
         return sample
 
     def __getattr__(self, name):          # meta, stats, fps, ... pass through
-        return getattr(self.__dict__["ds"], name)
+        # Guard the dunders. Unpickling builds the instance WITHOUT __init__, so
+        # __dict__ is empty when pickle looks for __setstate__/__reduce_ex__;
+        # routing that through here raises KeyError('ds') and the whole
+        # DataLoader dies. It has not bitten yet only because Linux forks its
+        # workers and fork does not pickle -- it would fail instantly under
+        # spawn, i.e. on macOS/Windows or with multiprocessing_context="spawn".
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        try:
+            ds = self.__dict__["ds"]
+        except KeyError:
+            raise AttributeError(name) from None
+        return getattr(ds, name)
 
 
 class AWRWeights:
