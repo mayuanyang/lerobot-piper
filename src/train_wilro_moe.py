@@ -108,8 +108,15 @@ class AWRWeights:
     SFT peak, 20.5% -> 5.4%.
 
     RFT is the beta -> 0 limit of this with a binary advantage: failures get
-    weight 0 and are discarded. AWR keeps them at a low weight instead, so they
-    still say "not that way".
+    weight 0 and are discarded. AWR keeps them at a low weight instead -- but
+    be clear about what that low weight MEANS. There are no negative weights
+    here: the loss is w * ||v - u||^2, so every w > 0 is an ATTRACTION. A
+    failure at weight 0.26 does not say "not that way", it says "this way, but
+    gently". The only repulsion AWR has is relative -- successes pull harder --
+    and that is not enough when the failures share a systematic behaviour, as
+    the never-grasped goal rollouts did. Saying "don't" needs a different
+    algorithm: a policy gradient whose negative advantage carries a real minus
+    sign, or a paired/contrastive objective. Hence --awr_drop_failures.
     """
 
     def __init__(self, path: str, beta: float, clip: float, kind: str,
