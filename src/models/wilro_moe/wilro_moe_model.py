@@ -484,6 +484,11 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
         # second full VLM forward.
         contrastive_w = float(getattr(self.config, "contrastive_loss_weight", 0.0))
         contrastive_v = 0.0
+        # The hinge alone cannot be read. relu(margin - diff_sq) = 0 says only
+        # "satisfied", and 0.051 against 5.0 are the same 0.0000 while meaning
+        # opposite things about whether hard negatives can bite. Record the
+        # separation itself.
+        contr_stats: dict[str, float] = {}
         if (
             self.training and contrastive_w > 0.0
             and L_lang > 0 and B >= 2
@@ -542,6 +547,17 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
 
                 diff_sq = (v_t - v_wrong).pow(2).mean(dim=[1, 2])
                 margin = float(getattr(self.config, "contrastive_margin", 0.05))
+                with torch.no_grad():
+                    ds = diff_sq[pair_diff].detach().float()
+                    if ds.numel():
+                        contr_stats = {
+                            "diff_sq_mean": float(ds.mean()),
+                            "diff_sq_min": float(ds.min()),
+                            "diff_sq_p10": float(ds.quantile(0.1)),
+                            "diff_sq_under": float((ds < margin).float().mean()),
+                            "n_pairs": float(ds.numel()),
+                            "hard_neg": float(bool(use_hard_neg)),
+                        }
                 hinge = F.relu(margin - diff_sq) * pair_diff.float()
                 n_valid = pair_diff.float().sum().clamp(min=1.0)
                 loss_contrastive = hinge.sum() / n_valid
@@ -551,6 +567,7 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
         self._last_loss_components = {
             "main": float(main_loss.detach() - contrastive_w * contrastive_v),
             "contrastive": contrastive_v,
+            **contr_stats,
         }
         return main_loss
 

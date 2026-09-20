@@ -605,6 +605,23 @@ def _log_gradient_analysis(policy, step: int) -> None:
         pct = (contr_v / margin * 100.0) if margin > 0 else float("nan")
         print(f"  Contrastive       - main: {main_v:.4f}   contrastive: {contr_v:.4f} "
               f"({pct:.0f}% of margin {margin:.3f})   weight: {cw}")
+        if "diff_sq_mean" in comps:
+            # How far the permuted-language prediction actually sits from the
+            # correct one. A hinge of 0.0000 is compatible with a separation of
+            # 0.051 and with one of 5.0; only this tells them apart, and it is
+            # what says whether the margin is set anywhere near the action.
+            print(f"                      separation diff_sq  mean "
+                  f"{comps['diff_sq_mean']:.4f}  p10 {comps['diff_sq_p10']:.4f}  "
+                  f"min {comps['diff_sq_min']:.4f}   "
+                  f"{comps['diff_sq_under'] * 100:.0f}% of "
+                  f"{int(comps['n_pairs'])} pairs under the margin   "
+                  f"({'HARD' if comps.get('hard_neg') else 'random'} negatives)")
+            if comps["diff_sq_under"] == 0.0 and margin > 0:
+                ratio = comps["diff_sq_min"] / margin
+                print(f"                      [note] the closest pair is "
+                      f"{ratio:.1f}x the margin -- this term is INERT. "
+                      f"Raise --contrastive_margin toward {comps['diff_sq_p10']:.3f} "
+                      f"(the p10 separation) to make it bite.")
 
     print("--- End Gradient Analysis ---\n")
 
