@@ -113,7 +113,8 @@ class AWRWeights:
     """
 
     def __init__(self, path: str, beta: float, clip: float, kind: str,
-                 dataset_index: int = 0, group_by: str = "task"):
+                 dataset_index: int = 0, group_by: str = "task",
+                 drop_failures: bool = False, min_weight: float = 0.0):
         # Which position in --dataset_id this sidecar describes. Every other
         # dataset in the mix gets weight 1.0, which is exactly right for demos:
         # they are the reference behaviour, not something to reweight.
@@ -170,6 +171,35 @@ class AWRWeights:
                 n_degenerate += int(m.sum())
             adv[m] = (r[m] - r[m].mean()) / (sd if sd > 1e-6 else 1.0)
         w = np.clip(np.exp(adv / max(beta, 1e-6)), 0.0, clip)
+        if min_weight > 0.0:
+            # A floor on the low tail, applied BEFORE the zeroing below so
+            # --awr_drop_failures still wins on failures. Use it when a small
+            # beta has pushed the weaker successes to nearly nothing and the
+            # corpus has effectively shrunk to its best few episodes.
+            w = np.maximum(w, float(min_weight))
+        n_dropped = 0
+        if drop_failures:
+            # The beta -> 0 (RFT) limit applied to the failure side only: keep
+            # the graded weight among successes, discard the rest outright.
+            #
+            # The standardised weight does not suppress failures enough to be
+            # harmless. On the goal corpus the gripper channel is bimodal +-1
+            # in both the demos and the rollouts, and the only difference is
+            # how often it is commanded closed: 47.5% of demo frames against
+            # 31.2% of rollout frames. That gap IS the episodes that never
+            # grasped. Carrying weight ~0.7 they still taught the policy to
+            # hover, and libero_goal T0 -- "open the middle drawer of the
+            # cabinet", a grasp-and-pull -- went 90% -> 35% after 4000 steps
+            # of it.
+            fail = r <= 0.0
+            w = np.where(fail, 0.0, w)
+            n_dropped = int(fail.sum())
+            if not np.any(w > 0):
+                raise ValueError(
+                    f"{path}: --awr_drop_failures zeroed every episode. This "
+                    f"corpus has no successes, so there is nothing left to "
+                    f"weight -- collect more, or drop the flag and let the "
+                    f"failures train at low weight.")
         # Renormalise to mean 1 so the loss scale -- and therefore the effective
         # learning rate -- does not move when beta or the success rate does.
         w = w / max(w.mean(), 1e-8)
@@ -188,6 +218,13 @@ class AWRWeights:
                      if n_degenerate > len(eps) // 2 else ""))
         print(f"  weight  min {w.min():.3f}  median {np.median(w):.3f}  "
               f"max {w.max():.3f}  (mean 1.000 by construction)")
+        if n_dropped:
+            surv = w[w > 0]
+            print(f"  --awr_drop_failures: {n_dropped}/{len(eps)} episodes "
+                  f"zeroed; the {len(surv)} survivors carry mean "
+                  f"{surv.mean():.3f}. The corpus pulls on the run exactly as "
+                  f"hard as before -- same total weight, now concentrated on "
+                  f"the successes.")
         if n_ok:
             wo = w[[i for i, e in enumerate(eps) if e["success"]]]
             wf = w[[i for i, e in enumerate(eps) if not e["success"]]]
@@ -227,7 +264,8 @@ class AWRWeightSet:
     """
 
     def __init__(self, paths, indices, beta: float, clip: float, kind: str,
-                 group_by: str = "task"):
+                 group_by: str = "task", drop_failures: bool = False,
+                 min_weight: float = 0.0):
         paths = [p for p in paths if p]
         if len(indices) != len(paths):
             raise ValueError(
@@ -239,7 +277,9 @@ class AWRWeightSet:
                 f"--awr_dataset_index {indices} repeats a position; two "
                 f"sidecars cannot describe the same dataset.")
         self.by_ds = {int(i): AWRWeights(p, beta, clip, kind,
-                                        dataset_index=int(i), group_by=group_by)
+                                        dataset_index=int(i), group_by=group_by,
+                                        drop_failures=drop_failures,
+                                        min_weight=min_weight)
                       for p, i in zip(paths, indices)}
         self.indices = sorted(self.by_ds)
 
@@ -612,6 +652,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
           awr_beta: float = 1.0,
           awr_clip: float = 20.0,
           awr_reward: str = "success",
+          awr_drop_failures: bool = False,
+          awr_min_weight: float = 0.0,
           state_noise_abs: float = 0.01,
           state_noise_frac: float = 0.0,
           state_noise_prob: float = 0.5,
@@ -954,7 +996,9 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
             f"default: say which --dataset_id position each one describes, "
             f"e.g. --awr_dataset_index 0 1 2.")
     awr = (AWRWeightSet(_awr_paths, _awr_idx[:len(_awr_paths)],
-                        awr_beta, awr_clip, awr_reward, group_by=awr_group_by)
+                        awr_beta, awr_clip, awr_reward, group_by=awr_group_by,
+                        drop_failures=awr_drop_failures,
+                        min_weight=awr_min_weight)
            if _awr_paths else None)
     if awr is not None and len(dataset_ids) > 1:
         # Mixing the demo set in is the right defence against the corpus being
@@ -2175,6 +2219,27 @@ if __name__ == "__main__":
                              "and recovered, a fast one did not, and on this "
                              "policy successes average 80 chunks against 259 for "
                              "failures.")
+    parser.add_argument("--awr_drop_failures", action="store_true",
+                        help="Zero the weight of every failed episode instead "
+                             "of leaving it at a low one, i.e. train only on "
+                             "the successes (graded among themselves). The "
+                             "standardised weight alone does NOT make failures "
+                             "harmless: on the goal corpus they are the "
+                             "episodes that never closed the gripper -- 31.2%% "
+                             "of rollout frames command a close against 47.5%% "
+                             "of demo frames -- and at weight ~0.7 they taught "
+                             "the policy to hover. libero_goal T0, a "
+                             "grasp-and-pull, went 90%% -> 35%% after 4000 "
+                             "steps. Weights are still renormalised to mean 1, "
+                             "so the corpus keeps the same total pull; it just "
+                             "lands on the successes.")
+    parser.add_argument("--awr_min_weight", type=float, default=0.0,
+                        help="Floor on the weight before renormalisation, "
+                             "applied BEFORE --awr_drop_failures so failures "
+                             "still go to zero. Use it when a small beta has "
+                             "starved the weaker successes and the corpus has "
+                             "effectively collapsed onto its best few "
+                             "episodes. 0 disables.")
     parser.add_argument("--state_noise_abs", type=float, default=0.01,
                         help="Gaussian sigma added to observation.state in RAW "
                              "units (metres / radians), the historical default "
