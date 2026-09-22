@@ -59,6 +59,20 @@ class _RowIndexed(torch.utils.data.Dataset):
         return s
 
 
+def _load_stats(spec: str) -> dict:
+    """meta/stats.json for a dataset root, a hub id, or the lerobot cache."""
+    q = Path(spec)
+    for cand in (q / "meta" / "stats.json", q / "stats.json", q):
+        if cand.is_file():
+            return json.loads(cand.read_text())
+    cache = Path.home() / ".cache" / "huggingface" / "lerobot" / spec / "meta" / "stats.json"
+    if cache.is_file():
+        return json.loads(cache.read_text())
+    from huggingface_hub import hf_hub_download
+    return json.loads(
+        Path(hf_hub_download(spec, "meta/stats.json", repo_type="dataset")).read_text())
+
+
 def pick_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
@@ -105,9 +119,12 @@ def main() -> int:
                          "LENGTH comes from the dataset itself, so a sidecar "
                          "whose `steps` disagrees cannot corrupt the targets.")
     ap.add_argument("--output_dir", required=True)
-    ap.add_argument("--horizon", type=int, default=50,
-                    help="MUST match the policy's horizon: the scorer is fed "
-                         "the policy's own chunks at selection time.")
+    ap.add_argument("--horizon", type=int, default=64,
+                    help="MUST match the policy's horizon -- the scorer is fed "
+                         "the policy's own chunks at selection time. 64 is "
+                         "wilro_moe's; read `horizon` out of the checkpoint's "
+                         "config.json rather than trusting this default. A "
+                         "wrong value is refused at eval, not silently scored.")
     ap.add_argument("--max_shift", type=int, default=20,
                     help="Hard negative = the action chunk from the same "
                          "observation, shifted this many steps at most. Right "
@@ -141,6 +158,18 @@ def main() -> int:
                          "n_action_steps 2.")
     ap.add_argument("--val_every_nth_episode", type=int, default=10)
     ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument("--norm_from", default=None,
+                    help="Normalise state and action with THIS dataset's stats "
+                         "instead of the corpus's own -- pass the policy's "
+                         "--dataset_id (lerobot/libero) so the scorer lives in "
+                         "the same space the policy's chunks arrive in and the "
+                         "eval-time bridge becomes the identity. Without it "
+                         "the bridge is a real affine: corpus-vs-demo differs "
+                         "by up to 3.4x on observation.state dim 2, because "
+                         "the corpus is goal-only (a kitchen worked at one "
+                         "height) while the demos span all four suites. That "
+                         "bridge is exact, but it is one more thing that has "
+                         "to be right.")
     ap.add_argument("--video_backend", default=None)
     args = ap.parse_args()
 
@@ -213,6 +242,15 @@ def main() -> int:
           f"({len(va_idx) / offset:.1%} held out, split BY EPISODE)")
 
     st = first_stats
+    if args.norm_from:
+        st = _load_stats(args.norm_from)
+        for k in ("action", "observation.state"):
+            if k not in st:
+                print(f"ERROR: --norm_from {args.norm_from} has no '{k}' in its "
+                      f"meta/stats.json", file=sys.stderr)
+                return 1
+        print(f"normalization taken from {args.norm_from}, not from the corpus "
+              f"-- the eval-time bridge will be the identity")
     a_mean = torch.tensor(np.asarray(st["action"]["mean"], np.float32))
     a_std = torch.tensor(np.asarray(st["action"]["std"], np.float32)).clamp_min(1e-6)
     s_mean = torch.tensor(np.asarray(st["observation.state"]["mean"], np.float32))
