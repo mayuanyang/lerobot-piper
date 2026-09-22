@@ -679,6 +679,12 @@ def build_batch(obs_list, tasks, hist: StateHistory, preprocessor, device,
     # whatever affine the normalizer applies.
     if blur > 1:
         blur_images(batch, blur, blur_cams)
+    # Cloned HERE, before the preprocessor: the scorer's ResNet applies its own
+    # ImageNet normalization and was trained on raw [0, 1] frames, so whatever
+    # affine the policy's pipeline puts on images is the wrong space for it.
+    # Cloned rather than referenced because the pipeline may write in place.
+    raw_images = {k: v.clone() for k, v in batch.items()
+                  if k.startswith("observation.images.")}
     batch = preprocessor(batch)
 
     if state_noise > 0.0:
@@ -700,7 +706,7 @@ def build_batch(obs_list, tasks, hist: StateHistory, preprocessor, device,
             keep[list(state_noise_dims)] = 1.0
             off = off * keep
         batch["observation.state"] = s + off.expand_as(s)
-    return batch
+    return batch, raw_images
 
 
 @torch.no_grad()
@@ -967,10 +973,12 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
                 # The batch dim stays at num_envs even as envs finish: the action
                 # queue inside select_action is keyed on batch size, and resizing
                 # it mid-chunk would drop the actions the live envs still owe.
-                batch = build_batch(obs_list, [told] * num_envs, hist,
-                                    preprocessor, device,
-                                    state_noise, state_noise_dims,
-                                    blur, blur_cams)
+                batch, raw_images = build_batch(obs_list, [told] * num_envs, hist,
+                                                preprocessor, device,
+                                                state_noise, state_noise_dims,
+                                                blur, blur_cams)
+                if hasattr(policy, "set_selection_images"):
+                    policy.set_selection_images(raw_images)
                 # An empty queue means this call will run the prefix. Counting
                 # it here rather than after the call keeps it correct at
                 # n_action_steps=1, where the queue is empty again on return.
@@ -1124,6 +1132,24 @@ def main():
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--suites", nargs="+",
                    default=["libero_spatial", "libero_object", "libero_goal", "libero_10"])
+    p.add_argument("--scorer", default=None,
+                   help="scorer.pt from train_scorer.py. Turns each chunk into "
+                        "a best-of-N choice instead of accepting the first "
+                        "draw. Only meaningful if that run's rank_acc reached "
+                        "0.65+; below that the scorer cannot tell two "
+                        "candidates apart and this is an expensive no-op.")
+    p.add_argument("--best_of_n", type=int, default=4,
+                   help="Draws per chunk. The VLM/ResNet forward is NOT shared "
+                        "across them in this implementation, so wall clock "
+                        "scales with N -- try one suite, or --task_ids, first.")
+    p.add_argument("--scorer_min_spread", type=float, default=0.0,
+                   help="Per env, fall back to draw 0 when the N scores differ "
+                        "by less than this. A ranker that cannot separate the "
+                        "candidates must not pick: a BIASED one is worse than "
+                        "none, because consistently picking the same kind of "
+                        "sample makes the policy quasi-deterministic and "
+                        "destroys the per-chunk re-draw this benchmark prices "
+                        "at 25 points. 0 disables the guard.")
     p.add_argument("--task_ids", nargs="+", type=int, default=None,
                    help="Default: every task in each suite.")
     p.add_argument("--episodes", type=int, default=50,
@@ -1441,6 +1467,21 @@ def main():
     report_new_config_fields(policy.config, ckpt)
     report_missing_weights(policy, ckpt, a.allow_missing_weights)
     pre, post = load_processors(ckpt, device, a.dataset_id)
+    if a.scorer:
+        from scorer_select import build_selector
+        _score_fn, _sc_info = build_selector(a.scorer, pre, device)
+        if not hasattr(policy, "attach_scorer"):
+            raise SystemExit(
+                f"{type(policy).__name__} has no attach_scorer; best-of-N is "
+                f"implemented for wilro_moe only.")
+        if int(_sc_info["horizon"]) != int(policy.config.horizon):
+            raise SystemExit(
+                f"scorer was trained at horizon {_sc_info['horizon']} but the "
+                f"policy's horizon is {policy.config.horizon}; it would be "
+                f"scoring chunks of a length it has never seen.")
+        policy.attach_scorer(_score_fn, a.best_of_n, a.scorer_min_spread)
+        print(f"[scorer] best-of-{a.best_of_n}, min_spread "
+              f"{a.scorer_min_spread:g}")
     cams = _policy_cameras(policy.config)
     print(f"[eval] {ckpt}  device={device}  cameras={cams}\n"
           f"[eval] horizon={policy.config.horizon} "
@@ -1684,6 +1725,14 @@ def main():
                "temporal_ensemble_coeff": getattr(
                    policy.config, "temporal_ensemble_coeff", None),
                "stall_noise_scale": getattr(policy.config, "stall_noise_scale", None),
+               # `picked` is the diagnostic that says whether selection HAPPENED.
+               # All mass on index 0, or all on one index, means the scorer is
+               # not choosing -- it is either blind or biased, and those look
+               # identical in the success rate alone.
+               "scorer": (None if not a.scorer else
+                          {"path": a.scorer, "best_of_n": a.best_of_n,
+                           "min_spread": a.scorer_min_spread,
+                           "step": _sc_info["step"], **policy.bon_stats}),
                "fixed_episode_noise": bool(a.fixed_episode_noise),
                "policy_type": getattr(policy.config, "type", None),
                "sample_noise_scale": getattr(

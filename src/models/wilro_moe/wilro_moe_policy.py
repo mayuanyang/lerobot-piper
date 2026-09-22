@@ -20,6 +20,68 @@ class WilroMoEPolicy(PreTrainedPolicy):
         self.model = WilroMoETransformer(config)
         self.reset()
 
+    # ------------------------------------------------------------------
+    # Best-of-N ticket selection
+    # ------------------------------------------------------------------
+    def attach_scorer(self, score_fn, k: int, min_spread: float = 0.0):
+        """Rank K draws per chunk instead of accepting the first one.
+
+        `score_fn(raw_images, batch, candidates) -> (B, K)`, LOWER IS BETTER.
+        `min_spread` is the guard: when the K scores for an env differ by less
+        than this, that env falls back to draw 0. A ranker that cannot tell the
+        candidates apart must not be allowed to pick, because a BIASED ranker
+        is worse than no ranker -- it makes the policy quasi-deterministic and
+        destroys the per-chunk re-draw, which this benchmark prices at 25
+        points. Declining to choose keeps that intact.
+        """
+        self._score_fn = score_fn
+        self._bon_k = int(k)
+        self._bon_min_spread = float(min_spread)
+        self._bon_stats = {"draws": 0, "fallback": 0, "chose_0": 0,
+                           "spread_sum": 0.0, "picked": [0] * int(k)}
+
+    def set_selection_images(self, raw_images):
+        """Raw [0, 1] camera frames for the scorer, keyed by camera.
+
+        Passed in rather than read from `batch`: by the time select_action sees
+        the batch it has been through the policy's preprocessor, and whatever
+        affine that applies to images is not the one the scorer was trained
+        under. The eval loop has the untouched frames; it hands them over.
+        """
+        self._bon_raw_images = raw_images
+
+    @property
+    def bon_stats(self) -> dict:
+        st = dict(getattr(self, "_bon_stats", {}) or {})
+        if st.get("draws"):
+            st["mean_spread"] = st.pop("spread_sum") / st["draws"]
+            st["fallback_frac"] = st["fallback"] / st["draws"]
+            st["chose_0_frac"] = st["chose_0"] / st["draws"]
+        return st
+
+    def _draw_best_of_n(self, batch: dict) -> torch.Tensor:
+        """(B, horizon, action_dim) -- the selected chunk, full horizon."""
+        K = self._bon_k
+        cands = torch.stack(
+            [self.model.sample_actions(batch, full=True) for _ in range(K)], dim=1)
+        scores = self._score_fn(getattr(self, "_bon_raw_images", None), batch, cands)
+        B = cands.shape[0]
+        spread = (scores.max(dim=1).values - scores.min(dim=1).values)
+        pick = scores.argmin(dim=1)
+        # Per env, not per batch: one env being in a region the scorer cannot
+        # read says nothing about the other nine.
+        weak = spread < self._bon_min_spread
+        pick = torch.where(weak, torch.zeros_like(pick), pick)
+
+        st = self._bon_stats
+        st["draws"] += B
+        st["fallback"] += int(weak.sum())
+        st["chose_0"] += int((pick == 0).sum())
+        st["spread_sum"] += float(spread.sum())
+        for i in pick.tolist():
+            st["picked"][i] += 1
+        return cands[torch.arange(B, device=cands.device), pick]
+
     def get_optim_params(self) -> dict:
         return self.model.parameters()
 
@@ -42,6 +104,7 @@ class WilroMoEPolicy(PreTrainedPolicy):
         # count by n_action_steps and change what the 2 mm still-threshold is
         # measured over.
         self._drew_chunk = False
+        self._bon_raw_images = None
 
     def forward(self, batch: dict) -> tuple:
         loss = self.model.compute_loss(batch)
@@ -103,7 +166,11 @@ class WilroMoEPolicy(PreTrainedPolicy):
             # Unchanged path, bit-identical to before temporal ensembling existed.
             self._drew_chunk = not self._action_queue
             if len(self._action_queue) == 0:
-                actions = self.model.sample_actions(batch)[:, : self.config.n_action_steps]
+                if getattr(self, "_score_fn", None) is not None and self._bon_k > 1:
+                    chunk = self._draw_best_of_n(batch)
+                else:
+                    chunk = self.model.sample_actions(batch)
+                actions = chunk[:, : self.config.n_action_steps]
                 self._action_queue.extend(actions.transpose(0, 1))
             return self._action_queue.popleft()
 
