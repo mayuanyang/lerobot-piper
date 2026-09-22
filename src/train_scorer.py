@@ -239,12 +239,36 @@ def main() -> int:
 
     train_dl, val_dl = loaders()
 
+    # A single-element delta_timestamps window comes back WITHOUT a time
+    # dimension, so a camera is (B, 3, H, W) and not (B, 1, 3, H, W). The repo
+    # already handles this -- smolvlm_encoder.py:291 is `imgs[:, -1] if
+    # imgs.dim() == 5 else imgs`. Indexing [:, 0] unconditionally takes the
+    # CHANNEL off an image (which at least crashes) and takes one SCALAR off
+    # the state vector (which does not: it trains silently on garbage).
+    _last = lambda x, nd: (x[:, -1] if x.dim() == nd + 1 else x)
+    shapes_reported = []
+
     def unpack(b):
-        imgs = torch.stack([b[c][:, 0] for c in first_cams], dim=1).to(device)
-        state = ((b["observation.state"][:, 0] - s_mean) / s_std).to(device)
-        A = ((b["action"] - a_mean) / a_std).to(device)
+        imgs = torch.stack([_last(b[c], 4) for c in first_cams], dim=1)
+        state = _last(b["observation.state"], 2)
+        A = b["action"]
+        if not shapes_reported:
+            shapes_reported.append(True)
+            print(f"[shapes] images {tuple(imgs.shape)}  state {tuple(state.shape)}  "
+                  f"action {tuple(A.shape)}")
+            if imgs.dim() != 5 or state.dim() != 2 or A.dim() != 3:
+                raise ValueError(
+                    f"expected images (B,C,3,H,W), state (B,D), action (B,W,A); "
+                    f"got {tuple(imgs.shape)}, {tuple(state.shape)}, {tuple(A.shape)}")
+            if A.shape[1] != window:
+                raise ValueError(
+                    f"action window is {A.shape[1]}, expected {window} "
+                    f"(--horizon {args.horizon} + --max_shift {args.max_shift}); "
+                    f"the hard negative would read past the end.")
         rows = b["_row"].numpy()
-        return imgs, state, A, torch.tensor(tgt[rows], device=device), rows
+        return (imgs.to(device), ((state - s_mean) / s_std).to(device),
+                ((A - a_mean) / a_std).to(device),
+                torch.tensor(tgt[rows], device=device), rows)
 
     def evaluate():
         model.eval()
