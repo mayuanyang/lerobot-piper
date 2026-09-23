@@ -123,12 +123,21 @@ def main() -> int:
     D = int(policy.config.action_dim)
 
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
-    cost = 2 * a.tickets * a.envs_per_tier
+    eps, _a = 0, a.tickets
+    for _t in range(a.tiers):
+        eps += _a * a.envs_per_tier
+        if _t < a.tiers - 1:
+            _a = max(1, _a // 2)
+    batches = -(-eps // a.num_envs) + a.envs_per_tier     # + the Gaussian tier
+    hours = batches * 12 * ((a.max_episode_steps or 300) / 300) / 60
     print(f"ticket shape ({H}, {D}) = {H * D} dims\n"
-          f"{a.tickets} candidates, tiers {a.tiers} x {a.envs_per_tier} layouts "
+          f"{a.tickets} candidates, {a.tiers} tiers x {a.envs_per_tier} layouts "
           f"from id {a.init_state_offset}\n"
-          f"~{cost} search episodes per task (flat would be "
-          f"{a.tickets * a.tiers * a.envs_per_tier})", flush=True)
+          f"{eps} search episodes = ~{batches} batches of {a.num_envs}\n"
+          f"BATCHES ARE THE COST, NOT EPISODES: a batch runs until its slowest "
+          f"env finishes and most reach the cap. At this project's measured "
+          f"12 min/batch at cap 300, that is ~{hours:.1f} h for this task.",
+          flush=True)
 
     rng = np.random.default_rng(a.seed)
     results = {}
@@ -143,7 +152,7 @@ def main() -> int:
             # Built ONCE per task and handed to every eval_task call.
             # Construction takes seconds per env and the search makes hundreds
             # of calls, so building them per call would dominate the run.
-            n_par = min(a.num_envs, a.envs_per_tier)
+            n_par = a.num_envs
             print(f"  building {n_par} envs...", end="", flush=True)
             _tb = time.time()
             envs = [LiberoEnv(task_suite=suite, task_id=tid,
@@ -160,32 +169,63 @@ def main() -> int:
             wins = np.zeros(a.tickets); runs = np.zeros(a.tickets)
 
             def score(idx_list, tier):
-                off = a.init_state_offset + tier * a.envs_per_tier
-                for i in idx_list:
-                    policy.model._noise_ticket = (
-                        None if i < 0 else torch.from_numpy(cands[i]).to(device))
+                """One batch = n_par CANDIDATES on ONE layout.
+
+                Wall clock is set by the number of BATCHES, not episodes: a
+                batch runs until its slowest env finishes, and at a 70%
+                success rate 97% of ten-env batches reach the cap. Scoring one
+                candidate per batch therefore burns a whole batch on five
+                episodes. A per-env ticket puts a different candidate in every
+                env against the same layout -- which is also the fairest
+                comparison available: identical problem, identical seed, only
+                the ticket differs.
+                """
+                desc = None
+                for k in range(a.envs_per_tier):
+                    layout = a.init_state_offset + tier * a.envs_per_tier + k
+                    for g0 in range(0, len(idx_list), n_par):
+                        grp = idx_list[g0:g0 + n_par]
+                        tk = torch.from_numpy(
+                            np.stack([cands[i] for i in grp])).to(device)
+                        policy.model._noise_ticket = tk
+                        sink = (contextlib.nullcontext() if a.verbose
+                                else contextlib.redirect_stdout(io.StringIO()))
+                        with sink:
+                            _, _, _, _, desc, ep_ok = ev.eval_task(
+                                policy, pre, post, suite, suite_name, tid,
+                                len(grp), len(grp), device,
+                                a.max_episode_steps, a.seed, cams,
+                                envs=envs[:len(grp)],
+                                init_state_offset=layout, init_state_stride=0)
+                        for j, i in enumerate(grp):
+                            wins[i] += ep_ok[j]; runs[i] += 1
+                return desc
+
+            def score_baseline(tier):
+                """The Gaussian reference, on the SAME layouts as this tier."""
+                policy.model._noise_ticket = None
+                for k in range(a.envs_per_tier):
+                    layout = a.init_state_offset + tier * a.envs_per_tier + k
                     sink = (contextlib.nullcontext() if a.verbose
                             else contextlib.redirect_stdout(io.StringIO()))
                     with sink:
-                        n_ok, n_ep, _, _, desc, _ = ev.eval_task(
+                        n_ok, n_ep, _, _, _, _ = ev.eval_task(
                             policy, pre, post, suite, suite_name, tid,
-                            a.envs_per_tier, n_par,
-                            device, a.max_episode_steps, a.seed, cams,
-                            envs=envs, init_state_offset=off)
-                    if i >= 0:
-                        wins[i] += n_ok; runs[i] += n_ep
-                    else:
-                        base_w[0] += n_ok; base_r[0] += n_ep
-                return desc
+                            n_par, n_par, device, a.max_episode_steps,
+                            a.seed, cams, envs=envs,
+                            init_state_offset=layout, init_state_stride=0)
+                    base_w[0] += n_ok; base_r[0] += n_ep
 
             base_w, base_r = [0.0], [0.0]
             for tier in range(a.tiers):
                 print(f"  tier {tier + 1}/{a.tiers}: {len(alive)} candidates "
-                      f"x {a.envs_per_tier} layouts "
+                      f"on {a.envs_per_tier} layouts "
                       f"(ids {a.init_state_offset + tier * a.envs_per_tier}"
                       f"..{a.init_state_offset + (tier + 1) * a.envs_per_tier - 1})",
                       flush=True)
-                desc = score(alive + ([-1] if tier == 0 else []), tier)
+                desc = score(alive, tier)
+                if tier == 0:
+                    score_baseline(tier)
                 rate = np.where(runs > 0, wins / np.maximum(runs, 1), -1.0)
                 alive = sorted(alive, key=lambda i: -rate[i])
                 if tier < a.tiers - 1:

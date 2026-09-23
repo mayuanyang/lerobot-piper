@@ -655,7 +655,12 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
                 # the whole episode's noise, flips outcomes. A constant ticket
                 # acts at the level that was measured to matter.
                 x_t = ticket.to(device=device, dtype=torch.float32)
-                x_t = x_t.unsqueeze(0).expand(B, -1, -1).contiguous()
+                if x_t.dim() == 2:
+                    x_t = x_t.unsqueeze(0).expand(B, -1, -1).contiguous()
+                elif x_t.shape[0] != B:
+                    raise ValueError(
+                        f"_noise_ticket has batch {x_t.shape[0]} but the batch "
+                        f"is {B}; a per-env ticket must name every env.")
             else:
                 x_t = self.sample_noise(
                     (B, self.config.horizon, self.config.action_dim), device=device,

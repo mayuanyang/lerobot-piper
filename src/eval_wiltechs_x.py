@@ -855,7 +855,8 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
               instruction: str | None = None, state_noise: float = 0.0,
               state_noise_dims=None, blur: int = 0, blur_cams=None,
               history_mode: str = "real", routing_acc=None, motion_acc=None,
-              action_offset=None, envs=None, init_state_offset: int = 0):
+              action_offset=None, envs=None, init_state_offset: int = 0,
+              init_state_stride: int = 1):
     """-> (n_success, n_episodes, mean_success_steps, n_chunks, task_description,
     per_episode_success).
 
@@ -964,7 +965,12 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
                 # in the tracker. Searching and reporting on the same layouts
                 # would measure how well a ticket was fitted, not how well it
                 # generalises.
-                envs[i]._init_state_id = (init_state_offset + start + i) % n_states
+                # stride 0 puts EVERY env on the same layout, which is how
+                # ticket search scores N candidates against one another: the
+                # tickets differ per env, the problem does not. With stride 1
+                # this is the ordinary episode -> layout mapping.
+                envs[i]._init_state_id = (
+                    init_state_offset + (start + i) * init_state_stride) % n_states
                 o, _ = envs[i].reset(seed=seed + start + i)
                 obs_list.append(o)
                 hist.reset(i, o["agent_pos"])
