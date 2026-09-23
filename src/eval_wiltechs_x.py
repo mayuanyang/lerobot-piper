@@ -607,6 +607,58 @@ def patch_control_freq(control_freq: int, render_gpu: int):
 # ---------------------------------------------------------------------------
 # Rollout
 # ---------------------------------------------------------------------------
+# The inference knobs a LIBERO result is only valid under. Anything that
+# outlives a single run -- a golden ticket, say -- is stamped with these and
+# checked against them on reuse. max_episode_steps is deliberately NOT here:
+# it is a search-budget choice, not a property of the policy.
+MUST_MATCH = ("n_action_steps", "num_inference_steps", "horizon",
+              "control_freq", "stock_init")
+
+
+def setup_libero_env(control_freq: int = 10, render_gpu: int = 0,
+                     stock_init: bool = False) -> dict:
+    """Every env-side patch LIBERO needs, in one call, in this order.
+
+    It is one function because two scripts have now shipped a bug by copying
+    one of these and not the other. Without patch_lerobot_libero, reset()
+    sets the init state and robosuite then re-samples the BDDL placement
+    initializer over it, so rollouts land on placements ~10x wider than the
+    canonical 50 -- never seen in training, reported by nobody. Without
+    patch_control_freq the env runs at 20 Hz against 10 Hz data.
+
+    Neither failure announces itself; both just make the policy look broken.
+    """
+    canonical = patch_lerobot_libero(enable=not stock_init)
+    patch_control_freq(control_freq, render_gpu)
+    print(f"[env] control_freq={control_freq}  render_gpu={render_gpu}  "
+          f"init states={'canonical 50' if canonical else 'SAMPLER ORDER (stock lerobot)'}",
+          flush=True)
+    return {"control_freq": int(control_freq), "stock_init": bool(stock_init),
+            "canonical_init_states": bool(canonical)}
+
+
+def inference_config(policy, control_freq: int, max_episode_steps: int = 0,
+                     stock_init: bool = False) -> dict:
+    """What the policy will actually do, read off the loaded config.
+
+    Read from `policy.config`, never from the CLI defaults: the checkpoint
+    ships n_action_steps=64 and every eval here overrides it to 2, so the
+    argument and the effective value routinely differ.
+    """
+    c = policy.config
+    return {"n_action_steps": int(c.n_action_steps),
+            "num_inference_steps": int(c.num_inference_steps),
+            "horizon": int(c.horizon),
+            "control_freq": int(control_freq),
+            "max_episode_steps": int(max_episode_steps or 0),
+            "stock_init": bool(stock_init)}
+
+
+def report_inference_config(cfg: dict, note: str = "") -> None:
+    print("[inference] " + "  ".join(f"{k}={v}" for k, v in cfg.items())
+          + (f"\n  -> {note}" if note else ""), flush=True)
+
+
 def state_scale(preprocessor):
     """Per-dimension std of observation.state, for printing sigma in real units.
 
@@ -1445,8 +1497,7 @@ def main():
 
     ckpt = resolve_checkpoint(a.checkpoint, for_resume=False)
 
-    patch_lerobot_libero(enable=not a.stock_init)
-    patch_control_freq(a.control_freq, a.render_gpu)
+    setup_libero_env(a.control_freq, a.render_gpu, a.stock_init)
 
     policy = load_policy(ckpt, device, a.num_inference_steps,
                          a.n_action_steps, a.fixed_episode_noise,
@@ -1513,12 +1564,10 @@ def main():
         # under. n_action_steps is the one that bites: the checkpoint says 64
         # and every eval here passes 2, so a search that forgot the override
         # optimised a policy that replans twice an episode.
-        _now = {"control_freq": a.control_freq,
-                "n_action_steps": int(policy.config.n_action_steps),
-                "num_inference_steps": int(policy.config.num_inference_steps),
-                "stock_init": bool(a.stock_init)}
+        _now = inference_config(policy, a.control_freq, a.max_episode_steps,
+                                a.stock_init)
         for k, m in sorted(_tmeta.items()):
-            diff = {f: (m[f], _now[f]) for f in _now
+            diff = {f: (m[f], _now[f]) for f in MUST_MATCH
                     if m.get(f) is not None and m[f] != _now[f]}
             if diff:
                 print(f"WARNING: {k} was searched under "

@@ -181,18 +181,9 @@ def main() -> int:
 
     device = a.device or ("cuda" if torch.cuda.is_available() else "cpu")
     from checkpoint_utils import resolve_checkpoint
-    from libero_env_fixed import patch_lerobot_libero
-    # BOTH env patches, in the same order eval_wiltechs_x.main() applies them.
-    # Missing this one is not a subtle error: lerobot's LiberoEnv.reset() calls
-    # set_init_state() BEFORE _env.reset(), and robosuite's reset re-samples the
-    # BDDL placement initializer and throws the init state away. The rollouts
-    # then run on the SAMPLER distribution -- object placements about 10x wider
-    # than the canonical 50, never seen in training, reported by nobody. A
-    # search run without it optimises a ticket for layouts that do not exist in
-    # the benchmark, and the symptom is a Gaussian baseline near zero on a task
-    # the policy otherwise does at 90%.
-    patch_lerobot_libero(enable=not a.stock_init)
-    ev.patch_control_freq(a.control_freq, a.render_gpu)
+    # One call, the same one eval_wiltechs_x.main() makes. Copying the patches
+    # individually is how this script shipped two separate bugs.
+    ev.setup_libero_env(a.control_freq, a.render_gpu, a.stock_init)
     ckpt = resolve_checkpoint(a.checkpoint, for_resume=False)
     policy = ev.load_policy(ckpt, device, a.num_inference_steps,
                             n_action_steps=a.n_action_steps,
@@ -207,16 +198,14 @@ def main() -> int:
         return 1
     H = int(policy.config.horizon)
     D = int(policy.config.action_dim)
-    # Printed because a ticket is only valid for the inference config it was
-    # searched under, and a silent mismatch here looks exactly like "the
-    # method does not work".
-    print(f"inference config: n_action_steps="
-          f"{policy.config.n_action_steps}  num_inference_steps="
-          f"{policy.config.num_inference_steps}  horizon={H}  "
-          f"control_freq={a.control_freq}  max_episode_steps="
-          f"{a.max_episode_steps or 'env default'}\n"
-          f"  -> these must match the eval command you will report with",
-          flush=True)
+    # A ticket is only valid for the inference config it was searched under,
+    # and a silent mismatch looks exactly like "the method does not work".
+    infcfg = ev.inference_config(policy, a.control_freq, a.max_episode_steps,
+                                 a.stock_init)
+    ev.report_inference_config(
+        infcfg, "these must match the eval command you will report with; "
+                "eval refuses a ticket whose " + "/".join(ev.MUST_MATCH) +
+                " differ")
 
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     eps, _a = 0, a.tickets
@@ -446,11 +435,7 @@ def main() -> int:
                 "tickets": a.tickets, "tiers": a.tiers,
                 "envs_per_tier": a.envs_per_tier,
                 "init_state_offset": a.init_state_offset,
-                "max_episode_steps": a.max_episode_steps,
-                "control_freq": a.control_freq,
-                "n_action_steps": int(policy.config.n_action_steps),
-                "num_inference_steps": int(policy.config.num_inference_steps),
-                "stock_init": bool(a.stock_init),
+                **infcfg,
                 "checkpoint": str(a.checkpoint), "horizon": H, "action_dim": D,
             }
             # Banked the moment the task finishes, before the next one starts.
