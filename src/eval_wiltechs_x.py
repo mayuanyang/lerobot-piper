@@ -855,7 +855,7 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
               instruction: str | None = None, state_noise: float = 0.0,
               state_noise_dims=None, blur: int = 0, blur_cams=None,
               history_mode: str = "real", routing_acc=None, motion_acc=None,
-              action_offset=None):
+              action_offset=None, envs=None, init_state_offset: int = 0):
     """-> (n_success, n_episodes, mean_success_steps, n_chunks, task_description,
     per_episode_success).
 
@@ -895,13 +895,18 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
     # them PER TASK (LiberoEnv binds its bddl file at construction, so they
     # cannot be reused across tasks). Say so: this is minutes of silence
     # before a single rollout step happens.
-    t_build = time.time()
-    print(f"  task {task_id:2d}: building {num_envs} envs...", end="", flush=True)
-    envs = [LiberoEnv(task_suite=suite, task_id=task_id,
-                      task_suite_name=suite_name, obs_type="pixels_agent_pos",
-                      init_states=True, episode_index=0)
-            for _ in range(num_envs)]
-    print(f" {time.time() - t_build:.0f}s", flush=True)
+    # A caller that evaluates the SAME task many times -- golden-ticket search
+    # runs hundreds of rollout sets per task -- passes its own envs in and pays
+    # the build once instead of once per call.
+    own_envs = envs is None
+    if own_envs:
+        t_build = time.time()
+        print(f"  task {task_id:2d}: building {num_envs} envs...", end="", flush=True)
+        envs = [LiberoEnv(task_suite=suite, task_id=task_id,
+                          task_suite_name=suite_name, obs_type="pixels_agent_pos",
+                          init_states=True, episode_index=0)
+                for _ in range(num_envs)]
+        print(f" {time.time() - t_build:.0f}s", flush=True)
     try:
         probe, _ = envs[0].reset(seed=seed)
         got = sorted(probe["pixels"].keys())
@@ -952,7 +957,14 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
                 # Episode index -> init state. Explicit, not seed-derived: the
                 # canonical set is 50 layouts and coverage should be exact and
                 # reproducible, not a hash of the seed.
-                envs[i]._init_state_id = (start + i) % n_states
+                # init_state_offset separates SEARCH layouts from EVAL
+                # layouts. A standard 20-episode eval uses ids 0-19 of the
+                # canonical 50, so searching at offset 20 leaves the reported
+                # numbers uncontaminated and directly comparable to every row
+                # in the tracker. Searching and reporting on the same layouts
+                # would measure how well a ticket was fitted, not how well it
+                # generalises.
+                envs[i]._init_state_id = (init_state_offset + start + i) % n_states
                 o, _ = envs[i].reset(seed=seed + start + i)
                 obs_list.append(o)
                 hist.reset(i, o["agent_pos"])
@@ -1073,11 +1085,12 @@ def eval_task(policy, preprocessor, postprocessor, suite, suite_name: str,
         return (sum(successes), len(successes), mean_steps, n_chunks, task_desc,
                 [int(s) for s in successes])
     finally:
-        for e in envs:
-            try:
-                e.close()
-            except Exception:
-                pass
+        if own_envs:
+            for e in envs:
+                try:
+                    e.close()
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -1124,6 +1137,20 @@ def main():
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--suites", nargs="+",
                    default=["libero_spatial", "libero_object", "libero_goal", "libero_10"])
+    p.add_argument("--noise_ticket", default=None,
+                   help=".npy of shape (horizon, action_dim) used as the "
+                        "CONSTANT initial noise for every action step and "
+                        "every episode, instead of drawing x_1 ~ N(0,I) -- the "
+                        "golden ticket of Patil et al. 2026. Training is "
+                        "untouched; this only changes sampling, so it applies "
+                        "to a frozen checkpoint. Produced by "
+                        "search_golden_ticket.py.")
+    p.add_argument("--init_state_offset", type=int, default=0,
+                   help="Shift which of the canonical 50 layouts the episodes "
+                        "use. A standard 20-episode eval takes ids 0-19, so a "
+                        "ticket SEARCHED at offset 20 can be REPORTED at "
+                        "offset 0 without having been fitted to the layouts it "
+                        "is scored on. Leave at 0 for anything reportable.")
     p.add_argument("--task_ids", nargs="+", type=int, default=None,
                    help="Default: every task in each suite.")
     p.add_argument("--episodes", type=int, default=50,
@@ -1441,6 +1468,22 @@ def main():
     report_new_config_fields(policy.config, ckpt)
     report_missing_weights(policy, ckpt, a.allow_missing_weights)
     pre, post = load_processors(ckpt, device, a.dataset_id)
+    if a.noise_ticket:
+        _tk = np.load(a.noise_ticket)
+        _want = (int(policy.config.horizon), int(policy.config.action_dim))
+        if tuple(_tk.shape) != _want:
+            raise SystemExit(
+                f"--noise_ticket has shape {tuple(_tk.shape)} but this policy "
+                f"needs {_want} (horizon x action_dim). A ticket is bound to "
+                f"the horizon it was searched at.")
+        policy.model._noise_ticket = torch.from_numpy(_tk).float().to(device)
+        print(f"[ticket] {a.noise_ticket}  shape {_want}  "
+              f"norm {float(np.linalg.norm(_tk)):.2f} "
+              f"(a N(0,I) draw of this size averages "
+              f"{np.sqrt(_want[0] * _want[1]):.1f})")
+    if a.init_state_offset:
+        print(f"[init] layouts offset by {a.init_state_offset} -- NOT the "
+              f"canonical 0-19, so this run is not comparable to the tracker")
     cams = _policy_cameras(policy.config)
     print(f"[eval] {ckpt}  device={device}  cameras={cams}\n"
           f"[eval] horizon={policy.config.horizon} "
@@ -1547,7 +1590,8 @@ def main():
                 a.videos_per_task, a.heartbeat, wrong.get(tid),
                 a.state_noise, a.state_noise_dims,
                 a.image_blur, a.image_blur_cams, a.history_mode,
-                routing_acc, motion_acc, action_offset)
+                routing_acc, motion_acc, action_offset,
+                init_state_offset=a.init_state_offset)
             sr = 100.0 * n_ok / max(n_ep, 1)
             per_task[tid] = {"success_rate": sr, "n_success": n_ok,
                              "n_episodes": n_ep, "mean_success_steps": mean_steps,
@@ -1684,6 +1728,8 @@ def main():
                "temporal_ensemble_coeff": getattr(
                    policy.config, "temporal_ensemble_coeff", None),
                "stall_noise_scale": getattr(policy.config, "stall_noise_scale", None),
+               "noise_ticket": a.noise_ticket,
+               "init_state_offset": a.init_state_offset,
                "fixed_episode_noise": bool(a.fixed_episode_noise),
                "policy_type": getattr(policy.config, "type", None),
                "sample_noise_scale": getattr(

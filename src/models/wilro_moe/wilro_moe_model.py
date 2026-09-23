@@ -639,9 +639,27 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
             latents = self._generate_latents(batch, B, device, torch.bfloat16)
 
             N = int(getattr(self.config, "num_inference_steps", 10))
-            x_t = self.sample_noise(
-                (B, self.config.horizon, self.config.action_dim), device=device,
-            )
+            ticket = getattr(self, "_noise_ticket", None)
+            if ticket is not None:
+                # The golden-ticket hypothesis (Patil et al. 2026): a frozen
+                # generative policy can be improved by replacing x_1 ~ N(0,I)
+                # with ONE well-chosen constant vector, reused at every action
+                # step and every episode. Only sampling changes; compute_loss
+                # still draws from the prior, which is what keeps this
+                # applicable to an already-trained checkpoint.
+                #
+                # This is the EPISODE-level intervention. The 2026-09-23
+                # best-of-N null established that per-chunk selection buys
+                # nothing here -- four draws at one state are interchangeable
+                # -- while a policy_seed change, which is exactly a change of
+                # the whole episode's noise, flips outcomes. A constant ticket
+                # acts at the level that was measured to matter.
+                x_t = ticket.to(device=device, dtype=torch.float32)
+                x_t = x_t.unsqueeze(0).expand(B, -1, -1).contiguous()
+            else:
+                x_t = self.sample_noise(
+                    (B, self.config.horizon, self.config.action_dim), device=device,
+                )
             # Applied HERE and not inside sample_noise(): compute_loss calls the
             # same helper and training must keep x_1 ~ N(0, I).
             #
@@ -650,6 +668,10 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
             # healthy ones are untouched. A batch-wide scalar cannot do that.
             ov = getattr(self, "_noise_scale_override", None)
             ns = float(getattr(self.config, "sample_noise_scale", 1.0) or 1.0)
+            if ticket is not None:
+                # Scaling a ticket produces a DIFFERENT ticket, and the one
+                # that was searched is the one that was scored. Leave it alone.
+                ov, ns = None, 1.0
             if ov is not None:
                 x_t = x_t * ov.to(x_t.device, x_t.dtype).view(-1, 1, 1)
             elif ns != 1.0:
