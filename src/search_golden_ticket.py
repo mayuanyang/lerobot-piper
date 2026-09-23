@@ -233,6 +233,11 @@ def main() -> int:
                 cands, wins, runs = z["cands"], z["wins"], z["runs"]
                 alive, first_tier = [int(x) for x in z["alive"]], int(z["next_tier"])
                 base_w0, base_r0 = float(z["base_w"]), float(z["base_r"])
+                # Kept in the progress file because a run killed BETWEEN the
+                # last tier's save and the bundle write resumes with an empty
+                # tier loop: the ticket is recovered correctly but nothing
+                # would re-read the task string.
+                desc0 = str(z["desc"]) if "desc" in z.files else None
                 print(f"  resuming from {prog.name}: tier {first_tier + 1}, "
                       f"{len(alive)} candidates still alive", flush=True)
             else:
@@ -240,6 +245,7 @@ def main() -> int:
                 alive, first_tier = list(range(a.tickets)), 0
                 wins = np.zeros(a.tickets); runs = np.zeros(a.tickets)
                 base_w0 = base_r0 = 0.0
+                desc0 = None
 
             def score(idx_list, tier):
                 """One batch = n_par CANDIDATES on ONE layout.
@@ -290,7 +296,7 @@ def main() -> int:
                     base_w[0] += n_ok; base_r[0] += n_ep
 
             base_w, base_r = [base_w0], [base_r0]
-            desc = None
+            desc = desc0
             for tier in range(first_tier, a.tiers):
                 print(f"  tier {tier + 1}/{a.tiers}: {len(alive)} candidates "
                       f"on {a.envs_per_tier} layouts "
@@ -312,7 +318,8 @@ def main() -> int:
                       flush=True)
                 np.savez(prog, cands=cands, wins=wins, runs=runs,
                          alive=np.array(alive, dtype=np.int64),
-                         next_tier=tier + 1, base_w=base_w[0], base_r=base_r[0])
+                         next_tier=tier + 1, base_w=base_w[0], base_r=base_r[0],
+                         desc=np.array(desc or ""))
                 # The full distribution, not just the winner. After tier 1 the
                 # SPREAD across candidates is what says whether this policy is
                 # steerable at all, and the winner of a 5-episode tier is
