@@ -1509,11 +1509,23 @@ def main():
                 f"this policy needs {_want}; a ticket is bound to the horizon "
                 f"it was searched at. Offending keys: {sorted(bad)[:5]}")
         print(f"[tickets] {len(_tickets)} in bundle: {sorted(_tickets)}")
+        # A ticket is only valid for the inference config it was searched
+        # under. n_action_steps is the one that bites: the checkpoint says 64
+        # and every eval here passes 2, so a search that forgot the override
+        # optimised a policy that replans twice an episode.
+        _now = {"control_freq": a.control_freq,
+                "n_action_steps": int(policy.config.n_action_steps),
+                "num_inference_steps": int(policy.config.num_inference_steps),
+                "stock_init": bool(a.stock_init)}
         for k, m in sorted(_tmeta.items()):
-            if m.get("control_freq") not in (None, a.control_freq):
-                print(f"WARNING: {k} was searched at control_freq "
-                      f"{m['control_freq']} but this eval runs at "
-                      f"{a.control_freq}; it optimises a different policy.")
+            diff = {f: (m[f], _now[f]) for f in _now
+                    if m.get(f) is not None and m[f] != _now[f]}
+            if diff:
+                print(f"WARNING: {k} was searched under "
+                      + ", ".join(f"{f}={was} (now {now})"
+                                  for f, (was, now) in sorted(diff.items()))
+                      + " -- that ticket was optimised for a different policy "
+                        "than the one about to run.")
     if a.init_state_offset:
         print(f"[init] layouts offset by {a.init_state_offset} -- NOT the "
               f"canonical 0-19, so this run is not comparable to the tracker")

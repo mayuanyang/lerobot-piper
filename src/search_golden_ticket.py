@@ -132,7 +132,15 @@ def main() -> int:
                         "the env's own cap.")
     p.add_argument("--dataset_id", default=None)
     p.add_argument("--num_inference_steps", type=int, default=None)
-    p.add_argument("--n_action_steps", type=int, default=None)
+    p.add_argument("--n_action_steps", type=int, default=2,
+                   help="Steps of each chunk executed before replanning. The "
+                        "CHECKPOINT SAYS 64 AND EVERY EVAL IN THIS PROJECT "
+                        "PASSES 2 -- leaving it at the checkpoint's value runs "
+                        "a policy that replans twice per episode instead of "
+                        "150, which is the same mismatch that made the RFT "
+                        "collector return 0/200. A ticket is only valid for "
+                        "the inference config it was searched under, so this "
+                        "must match the eval command.")
     p.add_argument("--vision_input_size", type=int, default=None)
     p.add_argument("--device", default=None)
     p.add_argument("--control_freq", type=int, default=10,
@@ -199,6 +207,16 @@ def main() -> int:
         return 1
     H = int(policy.config.horizon)
     D = int(policy.config.action_dim)
+    # Printed because a ticket is only valid for the inference config it was
+    # searched under, and a silent mismatch here looks exactly like "the
+    # method does not work".
+    print(f"inference config: n_action_steps="
+          f"{policy.config.n_action_steps}  num_inference_steps="
+          f"{policy.config.num_inference_steps}  horizon={H}  "
+          f"control_freq={a.control_freq}  max_episode_steps="
+          f"{a.max_episode_steps or 'env default'}\n"
+          f"  -> these must match the eval command you will report with",
+          flush=True)
 
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     eps, _a = 0, a.tickets
@@ -430,6 +448,9 @@ def main() -> int:
                 "init_state_offset": a.init_state_offset,
                 "max_episode_steps": a.max_episode_steps,
                 "control_freq": a.control_freq,
+                "n_action_steps": int(policy.config.n_action_steps),
+                "num_inference_steps": int(policy.config.num_inference_steps),
+                "stock_init": bool(a.stock_init),
                 "checkpoint": str(a.checkpoint), "horizon": H, "action_dim": D,
             }
             # Banked the moment the task finishes, before the next one starts.
