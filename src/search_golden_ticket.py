@@ -59,7 +59,17 @@ def dispersion(wins, runs):
     normal-approximation score, which is accurate at these df.
 
     Also returns sd_between, the between-ticket sd left after subtracting the
-    binomial part -- the effect size, in success-rate units.
+    binomial part. It is the effect size in success-rate units, and it can sit
+    BELOW sd_binomial_only while dispersion is large -- that is not a
+    contradiction. When most tickets score zero and a few score high, chi2
+    responds to the tail and the variance decomposition does not.
+
+    Fed the CUMULATIVE totals, including tickets already eliminated. The
+    halving selects on score, so that looks like it should inflate the
+    statistic; simulated under H0 (64 tickets all at p=0.03, three tiers with
+    halving) it does not -- cumulative dispersion runs 0.64-0.69, if anything
+    conservative -- and cumulative has more episodes behind it than one tier
+    does.
     """
     import math
     w = np.asarray(wins, float); r = np.asarray(runs, float)
@@ -130,6 +140,17 @@ def main() -> int:
                         "stock env is 20, so a search at 20 optimises a ticket "
                         "for a policy that is not the one being reported.")
     p.add_argument("--render_gpu", type=int, default=0)
+    p.add_argument("--stock_init", action="store_true",
+                   help="Use lerobot's unpatched reset order, i.e. the sampler "
+                        "distribution. Matches --stock_init in eval and is not "
+                        "for anything reportable.")
+    p.add_argument("--allow_zero_baseline", action="store_true",
+                   help="Search on even when the Gaussian reference scores 0. "
+                        "Without it the run aborts, because a zero baseline "
+                        "almost always means the env is misconfigured rather "
+                        "than the task being hard -- and finding that out "
+                        "after 8 hours instead of 30 minutes is the expensive "
+                        "version of the mistake.")
     p.add_argument("--overwrite", action="store_true",
                    help="Re-search tasks already in the bundle. Off by "
                         "default: a Colab session dies at 24 h and losing "
@@ -152,8 +173,17 @@ def main() -> int:
 
     device = a.device or ("cuda" if torch.cuda.is_available() else "cpu")
     from checkpoint_utils import resolve_checkpoint
-    # Before any env is built, and with the same value the evals use: the
-    # dataset is 10 Hz and the stock LiberoEnv is 20.
+    from libero_env_fixed import patch_lerobot_libero
+    # BOTH env patches, in the same order eval_wiltechs_x.main() applies them.
+    # Missing this one is not a subtle error: lerobot's LiberoEnv.reset() calls
+    # set_init_state() BEFORE _env.reset(), and robosuite's reset re-samples the
+    # BDDL placement initializer and throws the init state away. The rollouts
+    # then run on the SAMPLER distribution -- object placements about 10x wider
+    # than the canonical 50, never seen in training, reported by nobody. A
+    # search run without it optimises a ticket for layouts that do not exist in
+    # the benchmark, and the symptom is a Gaussian baseline near zero on a task
+    # the policy otherwise does at 90%.
+    patch_lerobot_libero(enable=not a.stock_init)
     ev.patch_control_freq(a.control_freq, a.render_gpu)
     ckpt = resolve_checkpoint(a.checkpoint, for_resume=False)
     policy = ev.load_policy(ckpt, device, a.num_inference_steps,
@@ -327,9 +357,27 @@ def main() -> int:
                       f"(ids {a.init_state_offset + tier * a.envs_per_tier}"
                       f"..{a.init_state_offset + (tier + 1) * a.envs_per_tier - 1})",
                       flush=True)
-                desc = score(alive, tier, start_k0 if tier == first_tier else 0)
                 if tier == 0:
+                    # BEFORE the candidates, not after. This is the only cheap
+                    # check that the env is set up the way the reported evals
+                    # set it up, and it has to happen before hours are spent.
                     score_baseline(tier)
+                    if base_w[0] == 0 and not a.allow_zero_baseline:
+                        raise SystemExit(
+                            f"\nGaussian baseline scored 0/{base_r[0]:.0f} on "
+                            f"layouts {a.init_state_offset}-"
+                            f"{a.init_state_offset + a.envs_per_tier - 1} of "
+                            f"{suite_name} task {tid}.\n"
+                            f"This policy is not at 0% on this task, so the "
+                            f"env is almost certainly not the one the evals "
+                            f"use. Check that patch_lerobot_libero and "
+                            f"--control_freq {a.control_freq} match the eval "
+                            f"command, and that --max_episode_steps "
+                            f"{a.max_episode_steps} is not cutting successes "
+                            f"off.\nSearching for a ticket on a task the "
+                            f"policy cannot do at all learns nothing. "
+                            f"--allow_zero_baseline to override.")
+                desc = score(alive, tier, start_k0 if tier == first_tier else 0)
                 rate = np.where(runs > 0, wins / np.maximum(runs, 1), -1.0)
                 alive = sorted(alive, key=lambda i: -rate[i])
                 if tier < a.tiers - 1:
@@ -355,8 +403,9 @@ def main() -> int:
                                "NO real spread: the observed range is what "
                                "binomial noise alone produces. This policy is "
                                "not steerable by the initial noise")
-                    print(f"    dispersion {disp['dispersion']:.2f} "
-                          f"(1.00 = tickets interchangeable)  z={disp['z']:+.1f}  "
+                    print(f"    dispersion {disp['dispersion']:.2f} over "
+                          f"{disp['n']} candidates (1.00 = interchangeable)  "
+                          f"z={disp['z']:+.1f}  "
                           f"sd_between {disp['sd_between']:.3f} vs "
                           f"binomial {disp['sd_binomial_only']:.3f}\n"
                           f"    -> {verdict}", flush=True)
