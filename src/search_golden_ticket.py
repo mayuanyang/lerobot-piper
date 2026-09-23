@@ -42,6 +42,7 @@ import numpy as np
 import torch
 
 import eval_wiltechs_x as ev
+import ticket_bundle as tb
 
 
 def main() -> int:
@@ -87,6 +88,11 @@ def main() -> int:
                         "stock env is 20, so a search at 20 optimises a ticket "
                         "for a policy that is not the one being reported.")
     p.add_argument("--render_gpu", type=int, default=0)
+    p.add_argument("--overwrite", action="store_true",
+                   help="Re-search tasks already in the bundle. Off by "
+                        "default: a Colab session dies at 24 h and losing "
+                        "finished tasks to a restart is the expensive mistake "
+                        "this file is arranged around.")
     p.add_argument("--verbose", action="store_true",
                    help="Let eval_task print its per-call banner. Off by "
                         "default: the search makes hundreds of calls and the "
@@ -148,6 +154,16 @@ def main() -> int:
         ids = a.task_ids if a.task_ids is not None else list(range(n_tasks))
         for tid in ids:
             t0 = time.time()
+            if not a.overwrite:
+                try:
+                    done, _ = tb.load_bundle(out)
+                    if tb.key(suite_name, tid) in done:
+                        print(f"\n=== {suite_name} task {tid}: already in the "
+                              f"bundle, skipping (--overwrite to redo) ===",
+                              flush=True)
+                        continue
+                except FileNotFoundError:
+                    pass
             print(f"\n=== {suite_name} task {tid} ===", flush=True)
             # Built ONCE per task and handed to every eval_task call.
             # Construction takes seconds per env and the search makes hundreds
@@ -164,9 +180,24 @@ def main() -> int:
             # Candidates are fixed up front so every tier scores the SAME
             # tickets, and the baseline (all-Gaussian) is not among them: it is
             # measured separately, at the same layouts, as ticket id -1.
-            cands = rng.standard_normal((a.tickets, H, D)).astype(np.float32)
-            alive = list(range(a.tickets))
-            wins = np.zeros(a.tickets); runs = np.zeros(a.tickets)
+            # Within-task progress, rewritten after EVERY tier. A task is
+            # hours; losing it at tier 3 to a 24 h cutoff is what this guards
+            # against. `cands` is saved too, so a resumed run scores the SAME
+            # candidates -- otherwise the accumulated wins/runs would describe
+            # tickets that no longer exist.
+            prog = out / f"_progress_{suite_name}_t{tid}.npz"
+            if prog.exists() and not a.overwrite:
+                z = np.load(prog)
+                cands, wins, runs = z["cands"], z["wins"], z["runs"]
+                alive, first_tier = [int(x) for x in z["alive"]], int(z["next_tier"])
+                base_w0, base_r0 = float(z["base_w"]), float(z["base_r"])
+                print(f"  resuming from {prog.name}: tier {first_tier + 1}, "
+                      f"{len(alive)} candidates still alive", flush=True)
+            else:
+                cands = rng.standard_normal((a.tickets, H, D)).astype(np.float32)
+                alive, first_tier = list(range(a.tickets)), 0
+                wins = np.zeros(a.tickets); runs = np.zeros(a.tickets)
+                base_w0 = base_r0 = 0.0
 
             def score(idx_list, tier):
                 """One batch = n_par CANDIDATES on ONE layout.
@@ -216,8 +247,9 @@ def main() -> int:
                             init_state_offset=layout, init_state_stride=0)
                     base_w[0] += n_ok; base_r[0] += n_ep
 
-            base_w, base_r = [0.0], [0.0]
-            for tier in range(a.tiers):
+            base_w, base_r = [base_w0], [base_r0]
+            desc = None
+            for tier in range(first_tier, a.tiers):
                 print(f"  tier {tier + 1}/{a.tiers}: {len(alive)} candidates "
                       f"on {a.envs_per_tier} layouts "
                       f"(ids {a.init_state_offset + tier * a.envs_per_tier}"
@@ -236,12 +268,42 @@ def main() -> int:
                       f"{100 * rate[top]:.0f}%   "
                       f"(baseline Gaussian {base_w[0]:.0f}/{base_r[0]:.0f})",
                       flush=True)
+                np.savez(prog, cands=cands, wins=wins, runs=runs,
+                         alive=np.array(alive, dtype=np.int64),
+                         next_tier=tier + 1, base_w=base_w[0], base_r=base_r[0])
+                # The full distribution, not just the winner. After tier 1 the
+                # SPREAD across candidates is what says whether this policy is
+                # steerable at all, and the winner of a 5-episode tier is
+                # mostly luck: 128 identical tickets at p=0.7 throw ~21 perfect
+                # scores by chance.
+                (out / f"scores_{suite_name}_t{tid}.json").write_text(json.dumps(
+                    {"tier": tier + 1, "task": desc,
+                     "baseline": f"{base_w[0]:.0f}/{base_r[0]:.0f}",
+                     "candidates": {str(i): [int(wins[i]), int(runs[i])]
+                                    for i in range(a.tickets) if runs[i] > 0}},
+                    indent=1))
 
             best = alive[0]
             f = out / f"{suite_name}_t{tid}_ticket.npy"
             np.save(f, cands[best])
+            meta = {
+                "task": desc, "ticket_index": int(best),
+                "search_success": f"{wins[best]:.0f}/{runs[best]:.0f}",
+                "search_rate": float(wins[best] / max(runs[best], 1)),
+                "baseline_search": f"{base_w[0]:.0f}/{base_r[0]:.0f}",
+                "tickets": a.tickets, "tiers": a.tiers,
+                "envs_per_tier": a.envs_per_tier,
+                "init_state_offset": a.init_state_offset,
+                "max_episode_steps": a.max_episode_steps,
+                "control_freq": a.control_freq,
+                "checkpoint": str(a.checkpoint), "horizon": H, "action_dim": D,
+            }
+            # Banked the moment the task finishes, before the next one starts.
+            bf = tb.save_ticket(out, suite_name, tid, cands[best], meta)
+            prog.unlink(missing_ok=True)
             results[f"{suite_name}_t{tid}"] = {
-                "file": str(f), "task": desc, "ticket_index": int(best),
+                "file": str(f), "bundle": str(bf), "task": desc,
+                "ticket_index": int(best),
                 "search_success": f"{wins[best]:.0f}/{runs[best]:.0f}",
                 "search_rate": float(wins[best] / max(runs[best], 1)),
                 "baseline_search_rate": float(base_w[0] / max(base_r[0], 1)),
@@ -251,6 +313,7 @@ def main() -> int:
                 "init_state_offset": a.init_state_offset,
                 "minutes": round((time.time() - t0) / 60, 1),
             }
+            (out / "search_summary.json").write_text(json.dumps(results, indent=1))
             print(f"  -> {f}  search {wins[best]:.0f}/{runs[best]:.0f} vs "
                   f"Gaussian {base_w[0]:.0f}/{base_r[0]:.0f}  "
                   f"({(time.time() - t0) / 60:.0f} min)", flush=True)
@@ -261,8 +324,10 @@ def main() -> int:
                 except Exception:
                     pass
 
-    (out / "search_summary.json").write_text(json.dumps(results, indent=1))
-    print(f"\nwrote {out / 'search_summary.json'}")
+    print(f"\nbundle: {out / tb.BUNDLE}   (+ {tb.META})")
+    print("Upload both next to the checkpoint so eval can find them by task id:")
+    print(f"  huggingface-cli upload <repo> {out / tb.BUNDLE} {tb.BUNDLE}")
+    print(f"  huggingface-cli upload <repo> {out / tb.META} {tb.META}")
     print("The search rate is NOT the result -- it is the number the ticket was "
           "selected on, and selecting on it is what makes it optimistic. Report "
           "the ticket with eval_wiltechs_x.py at --init_state_offset 0.")

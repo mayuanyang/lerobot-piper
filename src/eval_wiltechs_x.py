@@ -1151,6 +1151,14 @@ def main():
                         "untouched; this only changes sampling, so it applies "
                         "to a frozen checkpoint. Produced by "
                         "search_golden_ticket.py.")
+    p.add_argument("--noise_tickets", default=None,
+                   help="A golden_tickets.safetensors bundle, or 'auto' to "
+                        "look for one in the checkpoint directory. Each task "
+                        "is evaluated with ITS OWN ticket; tasks the bundle "
+                        "does not cover fall back to Gaussian sampling, and "
+                        "which ones did what is recorded in the result JSON "
+                        "-- a suite average that silently mixes the two is "
+                        "not comparable to anything.")
     p.add_argument("--init_state_offset", type=int, default=0,
                    help="Shift which of the canonical 50 layouts the episodes "
                         "use. A standard 20-episode eval takes ids 0-19, so a "
@@ -1487,6 +1495,25 @@ def main():
               f"norm {float(np.linalg.norm(_tk)):.2f} "
               f"(a N(0,I) draw of this size averages "
               f"{np.sqrt(_want[0] * _want[1]):.1f})")
+    _tickets, _tmeta = {}, {}
+    if a.noise_tickets:
+        import ticket_bundle as tb
+        _tickets, _tmeta = tb.load_bundle(ckpt if a.noise_tickets == "auto"
+                                          else a.noise_tickets)
+        _want = (int(policy.config.horizon), int(policy.config.action_dim))
+        bad = {k: tuple(v.shape) for k, v in _tickets.items()
+               if tuple(v.shape) != _want}
+        if bad:
+            raise SystemExit(
+                f"bundle holds tickets of shape {sorted(set(bad.values()))} but "
+                f"this policy needs {_want}; a ticket is bound to the horizon "
+                f"it was searched at. Offending keys: {sorted(bad)[:5]}")
+        print(f"[tickets] {len(_tickets)} in bundle: {sorted(_tickets)}")
+        for k, m in sorted(_tmeta.items()):
+            if m.get("control_freq") not in (None, a.control_freq):
+                print(f"WARNING: {k} was searched at control_freq "
+                      f"{m['control_freq']} but this eval runs at "
+                      f"{a.control_freq}; it optimises a different policy.")
     if a.init_state_offset:
         print(f"[init] layouts offset by {a.init_state_offset} -- NOT the "
               f"canonical 0-19, so this run is not comparable to the tracker")
@@ -1532,6 +1559,7 @@ def main():
     from lerobot.envs.libero import _get_suite
 
     results, t0 = {}, time.time()
+    _ticketed = {}
     for suite_name in a.suites:
         suite = _get_suite(suite_name)
         n_tasks = getattr(suite, "n_tasks", None) or len(suite.tasks)
@@ -1587,8 +1615,21 @@ def main():
         print(f"\n=== {suite_name}: {len(task_ids)} tasks x {a.episodes} episodes"
               f"{tag} ===")
         per_task = {}
+        ticketed = []
         for k, tid in enumerate(task_ids):
             t_task = time.time()
+            if a.noise_tickets:
+                import ticket_bundle as tb
+                _tk = _tickets.get(tb.key(suite_name, tid))
+                policy.model._noise_ticket = (
+                    None if _tk is None else torch.from_numpy(_tk).float().to(device))
+                if _tk is not None:
+                    ticketed.append(tid)
+                print(f"  [ticket] task {tid}: "
+                      + (f"{tb.key(suite_name, tid)} "
+                         f"(searched {_tmeta.get(tb.key(suite_name, tid), {}).get('search_success', '?')}"
+                         f" on layouts {_tmeta.get(tb.key(suite_name, tid), {}).get('init_state_offset', '?')}+)"
+                         if _tk is not None else "NONE in bundle -> Gaussian"))
             n_ok, n_ep, mean_steps, n_chunks, desc, ep_ok = eval_task(
                 policy, pre, post, suite, suite_name, tid, a.episodes,
                 a.num_envs, device, a.max_episode_steps, a.seed, cams,
@@ -1612,6 +1653,12 @@ def main():
                   f"{(time.time() - t_task) / 60:.1f} min, ETA {eta:.0f} min]  "
                   f"{desc}", flush=True)
         rates = [v["success_rate"] for v in per_task.values()]
+        _ticketed[suite_name] = ticketed
+        if a.noise_tickets and len(ticketed) not in (0, len(task_ids)):
+            print(f"  NOTE: {len(ticketed)}/{len(task_ids)} tasks had a ticket "
+                  f"({ticketed}); the rest ran Gaussian. The suite average "
+                  f"below mixes two policies and is NOT comparable to a "
+                  f"uniform run -- read the per-task numbers.")
         results[suite_name] = {
             "per_task": per_task,
             "avg": float(np.mean(rates)),
@@ -1735,6 +1782,12 @@ def main():
                    policy.config, "temporal_ensemble_coeff", None),
                "stall_noise_scale": getattr(policy.config, "stall_noise_scale", None),
                "noise_ticket": a.noise_ticket,
+               "noise_tickets": a.noise_tickets,
+               # Which tasks ran with a ticket and which fell back. A suite
+               # average over a PARTIAL bundle is two policies added together,
+               # so it must never be reported without this line.
+               "ticketed_tasks": (None if not a.noise_tickets else
+                                  {sn: sorted(v) for sn, v in _ticketed.items()}),
                "init_state_offset": a.init_state_offset,
                "fixed_episode_noise": bool(a.fixed_episode_noise),
                "policy_type": getattr(policy.config, "type", None),
