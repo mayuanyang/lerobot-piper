@@ -1533,6 +1533,11 @@ def main():
     report_new_config_fields(policy.config, ckpt)
     report_missing_weights(policy, ckpt, a.allow_missing_weights)
     pre, post = load_processors(ckpt, device, a.dataset_id)
+    # The same line the ticket search prints, from the same function,
+    # so a mismatch between the two is visible by reading two logs
+    # side by side.
+    report_inference_config(inference_config(
+        policy, a.control_freq, a.max_episode_steps, a.stock_init))
     if a.noise_ticket:
         _tk = np.load(a.noise_ticket)
         _want = (int(policy.config.horizon), int(policy.config.action_dim))
