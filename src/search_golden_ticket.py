@@ -41,6 +41,48 @@ from pathlib import Path
 import numpy as np
 import torch
 
+def dispersion(wins, runs):
+    """Do the tickets actually DIFFER, or is the spread just binomial noise?
+
+    This is the question tier 1 exists to answer, and eyeballing the spread
+    cannot answer it: with 5 layouts per ticket, 64 IDENTICAL tickets at p=0.7
+    still produce observed rates with sd 0.205, i.e. a typical range of
+    29%-100%. Any histogram of that looks convincingly "spread out".
+
+    The test is for overdispersion. Under H0 every ticket has the same true
+    rate p, so w_i ~ Bin(M, p) and
+
+        chi2 = sum_i (w_i - M p)^2 / (M p (1-p))   ~   chi2(N-1)
+
+    dispersion = chi2/df is 1.0 when the tickets are interchangeable and grows
+    with real between-ticket variance. z = (chi2-df)/sqrt(2 df) is the
+    normal-approximation score, which is accurate at these df.
+
+    Also returns sd_between, the between-ticket sd left after subtracting the
+    binomial part -- the effect size, in success-rate units.
+    """
+    import math
+    w = np.asarray(wins, float); r = np.asarray(runs, float)
+    keep = r > 0
+    w, r = w[keep], r[keep]
+    N = len(w)
+    if N < 2 or r.sum() == 0:
+        return None
+    pbar = w.sum() / r.sum()
+    if not (0 < pbar < 1):
+        return {"n": N, "p_bar": pbar, "note": "every ticket identical "
+                "(all 0 or all 1); no variance to test"}
+    chi2 = float((((w - r * pbar) ** 2) / (r * pbar * (1 - pbar))).sum())
+    df = N - 1
+    var_obs = float(np.var(w / r, ddof=1))
+    var_bin = float(pbar * (1 - pbar) * np.mean(1.0 / r))
+    return {"n": N, "p_bar": round(pbar, 4), "chi2": round(chi2, 1), "df": df,
+            "dispersion": round(chi2 / df, 3),
+            "z": round((chi2 - df) / math.sqrt(2 * df), 2),
+            "sd_between": round(max(0.0, var_obs - var_bin) ** 0.5, 4),
+            "sd_binomial_only": round(var_bin ** 0.5, 4)}
+
+
 import eval_wiltechs_x as ev
 import ticket_bundle as tb
 
@@ -276,9 +318,24 @@ def main() -> int:
                 # steerable at all, and the winner of a 5-episode tier is
                 # mostly luck: 128 identical tickets at p=0.7 throw ~21 perfect
                 # scores by chance.
+                disp = dispersion(wins, runs)
+                if disp and "dispersion" in disp:
+                    verdict = ("TICKETS DIFFER -- worth continuing"
+                               if disp["z"] >= 3 else
+                               "suggestive, needs more layouts per ticket"
+                               if disp["z"] >= 1.5 else
+                               "NO real spread: the observed range is what "
+                               "binomial noise alone produces. This policy is "
+                               "not steerable by the initial noise")
+                    print(f"    dispersion {disp['dispersion']:.2f} "
+                          f"(1.00 = tickets interchangeable)  z={disp['z']:+.1f}  "
+                          f"sd_between {disp['sd_between']:.3f} vs "
+                          f"binomial {disp['sd_binomial_only']:.3f}\n"
+                          f"    -> {verdict}", flush=True)
                 (out / f"scores_{suite_name}_t{tid}.json").write_text(json.dumps(
                     {"tier": tier + 1, "task": desc,
                      "baseline": f"{base_w[0]:.0f}/{base_r[0]:.0f}",
+                     "dispersion_test": disp,
                      "candidates": {str(i): [int(wins[i]), int(runs[i])]
                                     for i in range(a.tickets) if runs[i] > 0}},
                     indent=1))
