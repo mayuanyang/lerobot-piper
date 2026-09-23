@@ -266,6 +266,28 @@ def main() -> int:
             # tickets that no longer exist.
             prog = out / f"_progress_{suite_name}_t{tid}.npz"
             if prog.exists() and not a.overwrite:
+                # Progress from a differently-configured run is WORSE than no
+                # progress: it carries that run's counts and its base_done
+                # flag, so the Gaussian reference is never re-measured and the
+                # zero-baseline guard fires on stale numbers without a single
+                # new rollout. That is exactly what happened on the first run
+                # after the patch_lerobot_libero and n_action_steps fixes --
+                # the env was finally right and the abort still read 0/50 from
+                # the broken run's file.
+                _z = np.load(prog, allow_pickle=True)
+                if "infcfg" not in _z.files:
+                    _bad = {"(unstamped)": ("pre-dates the config stamp", "")}
+                else:
+                    _was = json.loads(str(_z["infcfg"]))
+                    _bad = {k: (_was.get(k), infcfg[k]) for k in ev.MUST_MATCH
+                            if _was.get(k) != infcfg[k]}
+                if _bad:
+                    print(f"  DISCARDING {prog.name}: written under "
+                          + ", ".join(f"{k}={w}{f' (now {n_})' if n_ != '' else ''}"
+                                      for k, (w, n_) in _bad.items())
+                          + " -- starting this task fresh.", flush=True)
+                    prog.unlink()
+            if prog.exists() and not a.overwrite:
                 z = np.load(prog)
                 cands, wins, runs = z["cands"], z["wins"], z["runs"]
                 alive, first_tier = [int(x) for x in z["alive"]], int(z["next_tier"])
@@ -298,7 +320,8 @@ def main() -> int:
                          alive=np.array(alive_now, dtype=np.int64),
                          next_tier=tier, done_k=done_k,
                          base_w=base_w[0], base_r=base_r[0],
-                         base_done=base_done[0], desc=np.array(desc or ""))
+                         base_done=base_done[0], desc=np.array(desc or ""),
+                         infcfg=np.array(json.dumps(infcfg)))
 
             def score(idx_list, tier, start_k=0):
                 """One batch = n_par CANDIDATES on ONE layout.
@@ -370,6 +393,11 @@ def main() -> int:
                     # set it up, and it has to happen before hours are spent.
                     score_baseline(tier)
                     if base_w[0] == 0 and not a.allow_zero_baseline:
+                        for _e in envs:
+                            try:
+                                _e.close()
+                            except Exception:
+                                pass
                         raise SystemExit(
                             f"\nGaussian baseline scored 0/{base_r[0]:.0f} on "
                             f"layouts {a.init_state_offset}-"
