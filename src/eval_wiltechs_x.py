@@ -1467,7 +1467,34 @@ def main():
     report_new_config_fields(policy.config, ckpt)
     report_missing_weights(policy, ckpt, a.allow_missing_weights)
     pre, post = load_processors(ckpt, device, a.dataset_id)
-    if a.scorer:
+    _sc_info = {"step": None}
+    if a.best_of_n > 1 and not a.scorer:
+        # THE CONTROL, and it is the whole reason best_of_n works without a
+        # scorer: drawing N chunks consumes a different RNG stream than drawing
+        # one, so a K=4 run differs from a K=1 run even when the selection is
+        # meaningless. Comparing K=4-with-scorer against K=1 therefore mixes
+        # "the scorer chose well" with "the noise was re-rolled", and this
+        # benchmark prices re-rolling at 25 points. Replacing the scorer with
+        # noise holds the draws fixed and isolates the choice.
+        #
+        # Its own generator, so picking does not perturb the action noise
+        # stream that the scorer run left untouched.
+        _pick_gen = torch.Generator(device=device)
+        _pick_gen.manual_seed(a.seed)
+
+        def _score_fn(raw_images, batch, candidates):
+            return torch.rand(candidates.shape[0], candidates.shape[1],
+                              device=candidates.device, generator=_pick_gen)
+
+        print(f"[scorer] NO scorer given -- running best-of-{a.best_of_n} with "
+              f"RANDOM selection. This is the control, not a policy: use it to "
+              f"subtract the re-draw effect from a scorer run at the same N.")
+        if not hasattr(policy, "attach_scorer"):
+            raise SystemExit(
+                f"{type(policy).__name__} has no attach_scorer; best-of-N is "
+                f"implemented for wilro_moe only.")
+        policy.attach_scorer(_score_fn, a.best_of_n, 0.0)
+    elif a.scorer:
         from scorer_select import build_selector
         _score_fn, _sc_info = build_selector(a.scorer, pre, device)
         if not hasattr(policy, "attach_scorer"):
@@ -1729,10 +1756,11 @@ def main():
                # All mass on index 0, or all on one index, means the scorer is
                # not choosing -- it is either blind or biased, and those look
                # identical in the success rate alone.
-               "scorer": (None if not a.scorer else
-                          {"path": a.scorer, "best_of_n": a.best_of_n,
+               "scorer": (None if a.best_of_n <= 1 else
+                          {"path": a.scorer or "RANDOM (control)",
+                           "best_of_n": a.best_of_n,
                            "min_spread": a.scorer_min_spread,
-                           "step": _sc_info["step"], **policy.bon_stats}),
+                           "step": _sc_info.get("step"), **policy.bon_stats}),
                "fixed_episode_noise": bool(a.fixed_episode_noise),
                "policy_type": getattr(policy.config, "type", None),
                "sample_noise_scale": getattr(
