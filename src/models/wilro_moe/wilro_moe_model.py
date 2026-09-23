@@ -253,6 +253,17 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
         self.action_in_proj = nn.Linear(config.action_dim, h)
         self.action_pos_emb = nn.Parameter(torch.zeros(1, config.horizon, h))
         nn.init.normal_(self.action_pos_emb, std=0.02)
+        # action_head="l1": one forward from learned queries to the chunk, no
+        # noise, no ODE. The sequence, the experts, the cross-attention and
+        # action_out_proj are all unchanged -- only what enters the action
+        # slots and what the loss compares them against.
+        self.action_head = str(getattr(config, "action_head", "flow"))
+        if self.action_head not in ("flow", "l1"):
+            raise ValueError(f"action_head must be 'flow' or 'l1', got "
+                             f"{self.action_head!r}")
+        if self.action_head == "l1":
+            self.action_queries = nn.Parameter(torch.zeros(1, config.horizon, h))
+            nn.init.normal_(self.action_queries, std=0.02)
         self.final_norm = RMSNorm(h, eps=self.rms_norm_eps)
         self.action_out_proj = nn.Linear(h, config.action_dim)
         nn.init.zeros_(self.action_out_proj.weight)
@@ -371,21 +382,44 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
             if prefix_len > 0:
                 action_prefix = actions[:, :prefix_len]
 
-        # ── Flow matching: build noisy actions, predict velocity ────
-        noise = self.sample_noise(actions.shape, device)
-        t = self.sample_time(B, device)
-        t_exp = t[:, None, None]
-        x_t = t_exp * noise + (1.0 - t_exp) * actions
-        u_t = noise - actions
+        if self.action_head == "l1":
+            # Conditional MEDIAN, not mean. L2 would average between two valid
+            # ways of doing the task and emit a trajectory that does neither;
+            # L1 lands on one of them. t is kept and passed as zero rather than
+            # ripped out: the adaLN modulation then reduces to a learned
+            # per-layer affine, which is harmless, and the plumbing stays
+            # identical to the flow path.
+            x_t = torch.zeros_like(actions)
+            t = torch.zeros(B, device=device, dtype=torch.float32)
+            v_t = self._run_dit(
+                batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask,
+                vision_tokens, latents, action_prefix, lang_embeddings,
+                L_vis=L_vis, L_lang=L_lang,
+            ).float()
+            u_t = actions
+            loss = F.l1_loss(v_t, u_t, reduction="none")
+            # "Predicted nothing" baseline: E|a| for L1, against E[u^2] for
+            # flow. The diagnostics below divide by this, so handing them the
+            # flow quantity would make every normalized reading wrong by the
+            # square.
+            ref = u_t.abs()
+        else:
+            # ── Flow matching: build noisy actions, predict velocity ────
+            noise = self.sample_noise(actions.shape, device)
+            t = self.sample_time(B, device)
+            t_exp = t[:, None, None]
+            x_t = t_exp * noise + (1.0 - t_exp) * actions
+            u_t = noise - actions
 
-        v_t = self._run_dit(
-            batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask,
-            vision_tokens, latents, action_prefix, lang_embeddings,
-            L_vis=L_vis, L_lang=L_lang,
-        ).float()
+            v_t = self._run_dit(
+                batch, x_t.to(torch.bfloat16), t, kv_cache, vlm_kv_pad_mask,
+                vision_tokens, latents, action_prefix, lang_embeddings,
+                L_vis=L_vis, L_lang=L_lang,
+            ).float()
 
-        # ── Per-position / per-dim weighting ────────────────────────
-        loss = F.mse_loss(v_t, u_t, reduction="none")
+            # ── Per-position / per-dim weighting ────────────────────
+            loss = F.mse_loss(v_t, u_t, reduction="none")
+            ref = u_t ** 2
         if self.config.action_dim_weights:
             dim_w = torch.tensor(self.config.action_dim_weights, device=loss.device, dtype=loss.dtype)
             loss = loss * dim_w[None, None, :]
@@ -461,7 +495,7 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
                            else torch.zeros(Hn, dtype=torch.float32))
                 self._position_loss = (
                     (loss_raw * valid_cells).sum(dim=(0, 2)).detach().float().cpu(),
-                    ((u_t ** 2) * valid_cells).sum(dim=(0, 2)).detach().float().cpu(),
+                    (ref * valid_cells).sum(dim=(0, 2)).detach().float().cpu(),
                     valid_cells.sum(dim=(0, 2)).detach().float().cpu(),
                     amb_sum,
                 )
@@ -473,7 +507,7 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
                 # after it has located each row's transitions.
                 self._cell_loss = (
                     (loss_raw * valid_cells).sum(dim=2).detach().float().cpu(),
-                    ((u_t ** 2) * valid_cells).sum(dim=2).detach().float().cpu(),
+                    (ref * valid_cells).sum(dim=2).detach().float().cpu(),
                     valid_cells.sum(dim=2).detach().float().cpu(),
                     ((amb.float() * valid_cells).sum(dim=2).detach().float().cpu()
                      if amb is not None else torch.zeros(Bn, Hn)),
@@ -638,6 +672,19 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
             vision_tokens = self._compute_vision_tokens(batch, vlm_vision_features)
             latents = self._generate_latents(batch, B, device, torch.bfloat16)
 
+            if self.action_head == "l1":
+                B_ = batch["observation.state"].shape[0]
+                a = self._run_dit(
+                    batch,
+                    torch.zeros(B_, self.config.horizon, self.config.action_dim,
+                                device=device, dtype=torch.bfloat16),
+                    torch.zeros(B_, device=device, dtype=torch.float32),
+                    kv_cache, vlm_kv_pad_mask, vision_tokens, latents,
+                    action_prefix=None, lang_tokens=lang_embeddings,
+                    L_vis=L_vis, L_lang=L_lang,
+                ).float()
+                return a if full else a[:, : self.config.n_action_steps]
+
             N = int(getattr(self.config, "num_inference_steps", 10))
             x_t = self.sample_noise(
                 (B, self.config.horizon, self.config.action_dim), device=device,
@@ -718,8 +765,13 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
         state_tok = self.state_encoder(state).to(dtype)
         if state_tok.shape[1] > 1 and not self.use_state_history:
             state_tok = state_tok[:, -1:]
-        action_emb = (self.action_in_proj(noisy_actions)
-                      + self.action_pos_emb[:, :H]).to(dtype)
+        if self.action_head == "l1":
+            # noisy_actions is a zero placeholder here and carries only shape.
+            action_emb = (self.action_queries[:, :H].expand(B, -1, -1)
+                          + self.action_pos_emb[:, :H]).to(dtype)
+        else:
+            action_emb = (self.action_in_proj(noisy_actions)
+                          + self.action_pos_emb[:, :H]).to(dtype)
         parts = [sink, state_tok]
         if vision_tokens is not None:
             parts.append(vision_tokens.to(dtype))

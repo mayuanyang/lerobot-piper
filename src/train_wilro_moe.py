@@ -541,11 +541,21 @@ def _log_gradient_analysis(policy, step: int) -> None:
                     verdict = ("  <- the mixture is doing real work; check the "
                                "flow loss too, since 'all bad in different "
                                "ways' looks the same here")
+                # Named for the head in use: under --action_head l1 this is
+                # an L1 loss against the action, not a squared velocity error,
+                # and the Krogh-Vedelsby decomposition that "ambiguity" comes
+                # from is exact only for the squared loss. The number is still
+                # the expert scatter, but "mixture loss = average individual -
+                # ambiguity" is an identity only in the flow case.
+                _hd = str(getattr(policy.model.config, "action_head", "flow"))
+                _nm = "flow" if _hd == "flow" else "l1"
                 print(f"                      expert ambiguity={amb:.5f} "
-                      f"= {pct:.1f}% of flow {flow:.4f}{verdict}")
+                      f"= {pct:.1f}% of {_nm} {flow:.4f}{verdict}"
+                      + ("" if _hd == "flow" else
+                         "   [l1: scatter only, the identity does not hold]"))
             elif amb is not None:
                 print(f"                      expert ambiguity={amb:.5f} "
-                      f"(no flow loss recorded to compare against)")
+                      f"(no main loss recorded to compare against)")
             if dis is not None:
                 E = int(u.numel())
                 iid = {2: 0.997, 4: 1.155, 6: 1.193, 8: 1.209}.get(E)
@@ -650,6 +660,8 @@ def _log_gradient_analysis(policy, step: int) -> None:
 # ---------------------------------------------------------------------------
 def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None,
           gradient_checkpointing=False, max_episode_index=None, batch_size=64,
+          action_head: str = "flow",
+          stall_escape_noise: float = 0.0,
           contrastive_loss_weight=0.1, contrastive_margin=0.05,
           contrastive_hard_negatives=False,
           lock_joint_index: int | None = None, kv_capture_strategy: str = "last",
@@ -1205,6 +1217,8 @@ def train(output_dir, dataset_id="ISdept/piper_arm", resume_from_checkpoint=None
         action_dim_weights=action_dim_weights,
         # n_action_steps == horizon → no exponential decay needed.
         pos_decay_lambda=0.0,
+        action_head=action_head,
+        stall_escape_noise=stall_escape_noise,
         contrastive_loss_weight=contrastive_loss_weight,
         contrastive_margin=contrastive_margin,
         contrastive_hard_negatives=contrastive_hard_negatives,
@@ -2418,6 +2432,31 @@ if __name__ == "__main__":
                              "never annealed. On resume an explicit value "
                              "overrides the checkpoint's and rebuilds the "
                              "schedule.")
+    parser.add_argument("--action_head", default="flow", choices=("flow", "l1"),
+                        help="'flow' integrates a velocity field from noise over "
+                             "--num_inference_steps. 'l1' goes straight from "
+                             "learned queries to the chunk in ONE forward and "
+                             "regresses the conditional MEDIAN -- no noise, no "
+                             "ODE, deterministic, and roughly 2x faster to "
+                             "evaluate. Everything else (VLM, ResNet, experts, "
+                             "cross-attention, w_pos) is untouched. L1 rather "
+                             "than L2 because L2 averages BETWEEN two valid "
+                             "ways of doing the task and emits a trajectory "
+                             "that does neither. WARNING: l1 deletes the "
+                             "draw-to-draw variation that this benchmark "
+                             "measured the per-chunk re-draw at 25 points for, "
+                             "and with --n_obs_steps 2 --use_state_history a "
+                             "stalled arm gives an IDENTICAL observation and "
+                             "therefore an identical action forever. Pair it "
+                             "with --stall_escape_noise.")
+    parser.add_argument("--stall_escape_noise", type=float, default=0.0,
+                        help="Gaussian sigma added to the PREDICTED chunk, in "
+                             "normalized units, for envs the stall detector has "
+                             "fired on (stall_rel_threshold / stall_patience). "
+                             "This is the explicit replacement for the escape "
+                             "that flow noise provided for free. Note "
+                             "--stall_noise_scale cannot do this job for l1: it "
+                             "scales the INPUT noise, and l1 has none.")
     parser.add_argument("--contrastive_loss_weight", type=float, default=0.1,
                         help="Weight for the language-permute contrastive loss "
                              "(default: 0.1). Bump to ~0.5 for LIBERO / datasets "

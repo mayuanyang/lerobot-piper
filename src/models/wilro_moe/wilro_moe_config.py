@@ -144,6 +144,19 @@ class WilroMoEConfig(PreTrainedConfig):
     # observed state step, so it needs no units and no dataset stats.
     # 0.0 = OFF. UNTESTED -- it is a hypothesis from the motion column, not a
     # measured result.
+    # "flow": x_1 ~ N(0,I) integrated over num_inference_steps. "l1": one
+    # forward from learned queries straight to the chunk, trained against the
+    # conditional MEDIAN. l1 removes the draw-to-draw variation entirely --
+    # which is the point, and also the risk: this benchmark measured the
+    # per-chunk re-draw at 25 points, and its mechanism is escaping a stall.
+    # With n_obs_steps=2 + use_state_history a stalled arm produces an
+    # IDENTICAL observation, so a deterministic head repeats the same action
+    # forever. Pair l1 with stall_escape_noise; it is not optional.
+    action_head: str = "flow"
+    # Gaussian sigma added to the PREDICTED action (normalized units) for envs
+    # the stall detector has fired on. stall_noise_scale scales the INPUT noise
+    # and therefore does nothing when there is no input noise.
+    stall_escape_noise: float = 0.0
     stall_noise_scale: float = 0.0
     stall_rel_threshold: float = 0.1   # "still" = step < this x the episode max
     stall_patience: int = 5            # consecutive still chunks before firing

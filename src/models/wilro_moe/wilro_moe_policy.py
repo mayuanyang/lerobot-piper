@@ -133,18 +133,31 @@ class WilroMoEPolicy(PreTrainedPolicy):
         hi = float(getattr(self.config, "stall_noise_scale", 0.0) or 0.0)
         if hi <= 0.0:
             return None
+        base = float(getattr(self.config, "sample_noise_scale", 1.0) or 1.0)
+        scale = torch.full((B,), base, device=device, dtype=dtype)
+        fire = self._stall_fire(batch, B, device)
+        if fire is None:
+            return scale
+        return torch.where(fire, torch.full_like(scale, hi), scale)
+
+    def _stall_fire(self, batch: dict, B: int, device):
+        """-> (B,) bool, or None on the first call of an episode.
+
+        Split out of `_stall_scale` so the l1 head can reuse the detector: it
+        has no input noise to scale, so it needs the same "this env has stopped
+        moving" signal applied to the OUTPUT instead. The detection itself is
+        unchanged and still judges "still" RELATIVE to the largest state step
+        this episode has produced, which needs no unit conversion.
+        """
         st = batch.get("observation.state")
         if st is None:
             return None
         st = (st[:, -1] if st.dim() == 3 else st).detach().float()
-
-        base = float(getattr(self.config, "sample_noise_scale", 1.0) or 1.0)
-        scale = torch.full((B,), base, device=device, dtype=dtype)
         if self._stall_prev is None or self._stall_prev.shape != st.shape:
             self._stall_prev = st
             self._stall_max = torch.zeros(B, device=st.device, dtype=st.dtype)
             self._stall_count = torch.zeros(B, device=st.device, dtype=torch.long)
-            return scale
+            return None
 
         step = (st - self._stall_prev).norm(dim=-1)
         self._stall_prev = st
@@ -152,8 +165,26 @@ class WilroMoEPolicy(PreTrainedPolicy):
         still = step < float(self.config.stall_rel_threshold) * self._stall_max
         self._stall_count = torch.where(
             still, self._stall_count + 1, torch.zeros_like(self._stall_count))
-        fire = self._stall_count >= int(self.config.stall_patience)
-        return torch.where(fire.to(device), torch.full_like(scale, hi), scale)
+        return (self._stall_count >= int(self.config.stall_patience)).to(device)
+
+    def _stall_escape(self, batch: dict, chunk: torch.Tensor) -> torch.Tensor:
+        """Additive noise on the PREDICTED chunk, for envs that have stopped.
+
+        The deterministic head's failure mode is exact: a stalled arm produces
+        an identical observation, which produces an identical action, forever.
+        The benchmark's 25-point per-chunk re-draw was buying escape from
+        precisely that, and l1 deletes it -- so it has to be put back
+        explicitly rather than hoped away.
+        """
+        sig = float(getattr(self.config, "stall_escape_noise", 0.0) or 0.0)
+        if sig <= 0.0:
+            return chunk
+        fire = self._stall_fire(batch, chunk.shape[0], chunk.device)
+        if fire is None or not bool(fire.any()):
+            return chunk
+        self._stall_escapes = getattr(self, "_stall_escapes", 0) + int(fire.sum())
+        noise = torch.randn_like(chunk) * sig
+        return chunk + noise * fire.view(-1, 1, 1).to(chunk.dtype)
 
     # ------------------------------------------------------------------
     # Action selection
@@ -169,7 +200,8 @@ class WilroMoEPolicy(PreTrainedPolicy):
                 if getattr(self, "_score_fn", None) is not None and self._bon_k > 1:
                     chunk = self._draw_best_of_n(batch)
                 else:
-                    chunk = self.model.sample_actions(batch)
+                    chunk = self.model.sample_actions(batch, full=True)
+                chunk = self._stall_escape(batch, chunk)
                 actions = chunk[:, : self.config.n_action_steps]
                 self._action_queue.extend(actions.transpose(0, 1))
             return self._action_queue.popleft()
