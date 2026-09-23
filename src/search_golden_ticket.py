@@ -238,6 +238,12 @@ def main() -> int:
                 # tier loop: the ticket is recovered correctly but nothing
                 # would re-read the task string.
                 desc0 = str(z["desc"]) if "desc" in z.files else None
+                # Layouts already finished INSIDE next_tier, and whether the
+                # Gaussian reference has run. Tier 1 is 3.7 of a task's 6.1
+                # hours, so checkpointing only between tiers leaves 3.7 hours
+                # exposed to a Colab cutoff; per layout it is about 40 min.
+                start_k0 = int(z["done_k"]) if "done_k" in z.files else 0
+                base_done0 = bool(z["base_done"]) if "base_done" in z.files else False
                 print(f"  resuming from {prog.name}: tier {first_tier + 1}, "
                       f"{len(alive)} candidates still alive", flush=True)
             else:
@@ -246,8 +252,18 @@ def main() -> int:
                 wins = np.zeros(a.tickets); runs = np.zeros(a.tickets)
                 base_w0 = base_r0 = 0.0
                 desc0 = None
+                start_k0, base_done0 = 0, False
 
-            def score(idx_list, tier):
+            base_done = [base_done0]
+
+            def _save(tier, done_k, alive_now):
+                np.savez(prog, cands=cands, wins=wins, runs=runs,
+                         alive=np.array(alive_now, dtype=np.int64),
+                         next_tier=tier, done_k=done_k,
+                         base_w=base_w[0], base_r=base_r[0],
+                         base_done=base_done[0], desc=np.array(desc or ""))
+
+            def score(idx_list, tier, start_k=0):
                 """One batch = n_par CANDIDATES on ONE layout.
 
                 Wall clock is set by the number of BATCHES, not episodes: a
@@ -259,8 +275,8 @@ def main() -> int:
                 comparison available: identical problem, identical seed, only
                 the ticket differs.
                 """
-                desc = None
-                for k in range(a.envs_per_tier):
+                nonlocal desc
+                for k in range(start_k, a.envs_per_tier):
                     layout = a.init_state_offset + tier * a.envs_per_tier + k
                     for g0 in range(0, len(idx_list), n_par):
                         grp = idx_list[g0:g0 + n_par]
@@ -278,10 +294,16 @@ def main() -> int:
                                 init_state_offset=layout, init_state_stride=0)
                         for j, i in enumerate(grp):
                             wins[i] += ep_ok[j]; runs[i] += 1
+                    # `alive` is not touched until score() returns, so saving
+                    # it here records the tier's INPUT list -- which is what a
+                    # mid-tier resume has to continue from.
+                    _save(tier, k + 1, idx_list)
                 return desc
 
             def score_baseline(tier):
                 """The Gaussian reference, on the SAME layouts as this tier."""
+                if base_done[0]:
+                    return
                 policy.model._noise_ticket = None
                 for k in range(a.envs_per_tier):
                     layout = a.init_state_offset + tier * a.envs_per_tier + k
@@ -294,6 +316,8 @@ def main() -> int:
                             a.seed, cams, envs=envs,
                             init_state_offset=layout, init_state_stride=0)
                     base_w[0] += n_ok; base_r[0] += n_ep
+                base_done[0] = True
+                _save(tier, a.envs_per_tier, alive)
 
             base_w, base_r = [base_w0], [base_r0]
             desc = desc0
@@ -303,7 +327,7 @@ def main() -> int:
                       f"(ids {a.init_state_offset + tier * a.envs_per_tier}"
                       f"..{a.init_state_offset + (tier + 1) * a.envs_per_tier - 1})",
                       flush=True)
-                desc = score(alive, tier)
+                desc = score(alive, tier, start_k0 if tier == first_tier else 0)
                 if tier == 0:
                     score_baseline(tier)
                 rate = np.where(runs > 0, wins / np.maximum(runs, 1), -1.0)
@@ -316,10 +340,7 @@ def main() -> int:
                       f"{100 * rate[top]:.0f}%   "
                       f"(baseline Gaussian {base_w[0]:.0f}/{base_r[0]:.0f})",
                       flush=True)
-                np.savez(prog, cands=cands, wins=wins, runs=runs,
-                         alive=np.array(alive, dtype=np.int64),
-                         next_tier=tier + 1, base_w=base_w[0], base_r=base_r[0],
-                         desc=np.array(desc or ""))
+                _save(tier + 1, 0, alive)
                 # The full distribution, not just the winner. After tier 1 the
                 # SPREAD across candidates is what says whether this policy is
                 # steerable at all, and the winner of a 5-episode tier is
