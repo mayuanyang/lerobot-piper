@@ -1589,7 +1589,7 @@ def main():
           f"n_action_steps={policy.config.n_action_steps} "
           f"NFE={policy.config.num_inference_steps} "
           f"state_history={policy.config.n_obs_steps} "
-          f"noise={'fixed/episode' if a.fixed_episode_noise else 'per-chunk'}")
+          f"noise={'GOLDEN TICKET (constant x_1)' if (a.noise_ticket or a.noise_tickets) else 'fixed/episode' if a.fixed_episode_noise else 'per-chunk'}")
 
     if a.state_noise > 0.0:
         # Report the physical size too. A sigma the arm cannot actually be off
