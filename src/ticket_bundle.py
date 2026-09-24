@@ -32,7 +32,13 @@ def key(suite: str, task_id: int) -> str:
 
 def save_ticket(out_dir, suite: str, task_id: int, ticket: np.ndarray, meta: dict):
     """Read-modify-write. Bundles are a few hundred KB; rewriting is free and
-    it means a run killed mid-search still leaves every finished task on disk."""
+    it means a run killed mid-search still leaves every finished task on disk.
+
+    NOT SAFE FOR CONCURRENT SEARCHES ON ONE DIRECTORY, and there is no lock.
+    Two processes that both read {goal.0}, then write {goal.0, goal.1} and
+    {goal.0, object.0}, leave whichever finished first erased. Give each
+    concurrent search its own --out and `merge()` them at the end.
+    """
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     f, m = out / BUNDLE, out / META
     tensors = load_file(str(f)) if f.exists() else {}
@@ -64,3 +70,40 @@ def coverage(tensors, suite: str, task_ids) -> dict:
     miss = [t for t in task_ids if key(suite, t) not in tensors]
     return {"with_ticket": have, "gaussian": miss,
             "n_with_ticket": len(have), "n_tasks": len(list(task_ids))}
+
+
+def merge(out_dir, *in_dirs):
+    """Combine bundles from concurrent searches into one.
+
+    Refuses to silently drop a ticket: a key present in two inputs is an
+    error, because the two were searched separately and picking one by
+    directory order would make the result depend on argument order.
+    """
+    tensors, info, src = {}, {}, {}
+    for d in in_dirs:
+        t, m = load_bundle(d)
+        dup = [k for k in t if k in tensors]
+        if dup:
+            raise ValueError(
+                f"{d} and {src[dup[0]]} both define {dup}; merging would pick "
+                f"one by argument order. Delete the one you do not want.")
+        for k in t:
+            src[k] = d
+        tensors.update(t)
+        info.update(m)
+    out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+    save_file(tensors, str(out / BUNDLE))
+    (out / META).write_text(json.dumps(info, indent=1, sort_keys=True))
+    print(f"{len(tensors)} tickets -> {out / BUNDLE}")
+    for k in sorted(tensors):
+        print(f"  {k:<24} from {src[k]}")
+    return out / BUNDLE
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 4 or sys.argv[1] != "merge":
+        print("usage: python ticket_bundle.py merge <out_dir> <in_dir> [<in_dir> ...]",
+              file=sys.stderr)
+        raise SystemExit(2)
+    merge(sys.argv[2], *sys.argv[3:])
