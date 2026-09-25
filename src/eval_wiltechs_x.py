@@ -1211,6 +1211,14 @@ def main():
                         "which ones did what is recorded in the result JSON "
                         "-- a suite average that silently mixes the two is "
                         "not comparable to anything.")
+    p.add_argument("--use_weak_tickets", action="store_true",
+                   help="Use tickets the search marked beats_baseline=false, "
+                        "i.e. ones that did not beat Gaussian at all. "
+                        "Off by default: a ticket that only MATCHES Gaussian "
+                        "is strictly worse than not using one, because it also "
+                        "removes the per-chunk re-draw this benchmark measured "
+                        "at 25 points. Those tasks fall back to Gaussian and "
+                        "say so.")
     p.add_argument("--init_state_offset", type=int, default=0,
                    help="Shift which of the canonical 50 layouts the episodes "
                         "use. A standard 20-episode eval takes ids 0-19, so a "
@@ -1686,7 +1694,23 @@ def main():
             t_task = time.time()
             if a.noise_tickets:
                 import ticket_bundle as tb
-                _tk = _tickets.get(tb.key(suite_name, tid))
+                _k = tb.key(suite_name, tid)
+                _tk = _tickets.get(_k)
+                _md = _tmeta.get(_k, {})
+                _bb = _md.get("beats_baseline", True)
+                if _tk is not None and _bb is False and not a.use_weak_tickets:
+                    print(f"  [ticket] task {tid}: {_k} did NOT beat its search "
+                          f"baseline ({_md.get('search_success')} vs "
+                          f"{_md.get('baseline_rate')}) -- falling back to "
+                          f"Gaussian. A ticket that only matches Gaussian is "
+                          f"worse than none: it also removes the per-chunk "
+                          f"re-draw. --use_weak_tickets to force.")
+                    _tk = None
+                elif _tk is not None and _bb is None:
+                    print(f"  [ticket] task {tid}: {_k} beat its search "
+                          f"baseline but not significantly (p="
+                          f"{_md.get('p_vs_baseline')}) -- using it; this run "
+                          f"IS the test.")
                 policy.model._noise_ticket = (
                     None if _tk is None else torch.from_numpy(_tk).float().to(device))
                 if _tk is not None:

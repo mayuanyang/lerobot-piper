@@ -41,6 +41,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
+def binom_sf(k, n, p):
+    """P(X >= k) for X ~ Bin(n, p), exact, no scipy."""
+    from math import comb
+    return sum(comb(n, i) * p ** i * (1 - p) ** (n - i) for i in range(k, n + 1))
+
+
 def dispersion(wins, runs):
     """Do the tickets actually DIFFER, or is the spread just binomial noise?
 
@@ -455,8 +461,44 @@ def main() -> int:
             best = alive[0]
             f = out / f"{suite_name}_t{tid}_ticket.npy"
             np.save(f, cands[best])
+            # DOES THE WINNER ACTUALLY BEAT GAUSSIAN? Nothing checked this
+            # before, and `best = alive[0]` banks a ticket unconditionally --
+            # so a task where the search simply fails still produces one, and
+            # using it is WORSE than not: a ticket that only matches the
+            # baseline still removes the per-chunk re-draw, which this
+            # benchmark prices at 25 points. object T4 ketchup is the case
+            # that surfaced it: 32 survivors averaged 26.9% against a 72%
+            # baseline and the best was 8/10, which a baseline-quality ticket
+            # produces 44% of the time.
+            base_rate = base_w[0] / max(base_r[0], 1)
+            win_rate = wins[best] / max(runs[best], 1)
+            p_raw = binom_sf(int(wins[best]), int(runs[best]), base_rate)
+            # THREE-VALUED, because "not significant" and "not better" are
+            # different and only one of them is a reason to discard the ticket.
+            # 15 episodes cannot detect an improvement over a 90% baseline, so
+            # a two-valued test would mark object T9's 15/15 weak -- while its
+            # REPORTABLE baseline is 70% and the headroom is real. The search
+            # baseline and the eval headroom are measured on different layouts
+            # and routinely disagree by 20 points.
+            if win_rate <= base_rate:
+                beats, verdict = False, ("NOT BETTER than Gaussian -- eval will "
+                                         "fall back to Gaussian for this task")
+            elif p_raw < 0.05:
+                beats, verdict = True, "BEATS the baseline"
+            else:
+                beats, verdict = None, ("better but not significantly; 15 "
+                                        "episodes cannot resolve this against "
+                                        "a high baseline. Banked, and eval "
+                                        "will use it and say so -- the 20-episode "
+                                        "held-out run is the real test")
+            print(f"  winner {win_rate:.0%} vs Gaussian {base_rate:.0%}   "
+                  f"one-sided p={p_raw:.4f} (uncorrected; {a.tickets} candidates "
+                  f"searched)  ->  {verdict}", flush=True)
             meta = {
                 "task": desc, "ticket_index": int(best),
+                "beats_baseline": beats,
+                "baseline_rate": round(base_rate, 4),
+                "p_vs_baseline": round(p_raw, 5),
                 "search_success": f"{wins[best]:.0f}/{runs[best]:.0f}",
                 "search_rate": float(wins[best] / max(runs[best], 1)),
                 "baseline_search": f"{base_w[0]:.0f}/{base_r[0]:.0f}",
