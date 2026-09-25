@@ -72,6 +72,28 @@ def coverage(tensors, suite: str, task_ids) -> dict:
             "n_with_ticket": len(have), "n_tasks": len(list(task_ids))}
 
 
+def top_k(done_npz, k: int = 8, min_rate: float = 0.0):
+    """-> (k, H, D) of the best-scoring candidates from a finished search.
+
+    The bundle keeps one ticket per task; this recovers the rest from the
+    _done_*.npz the search now leaves behind. The paper (D.6.2) finds that
+    drawing uniformly from the top-k performs as well as the single best while
+    restoring stochasticity -- which matters here, because one fixed ticket
+    makes the policy deterministic and removes the per-chunk re-draw this
+    benchmark measured at 25 points.
+
+    Ranked on CUMULATIVE wins/runs, so candidates eliminated early (5 episodes)
+    are compared against survivors (15). That favours survivors, which is the
+    intent: an early exit means the evidence stopped at "not promising".
+    """
+    z = np.load(done_npz, allow_pickle=True)
+    w, r, cands = z["wins"], z["runs"], z["cands"]
+    rate = np.where(r > 0, w / np.maximum(r, 1), -1.0)
+    order = sorted(range(len(rate)), key=lambda i: (-rate[i], -r[i]))
+    keep = [i for i in order if rate[i] >= min_rate][:k]
+    return cands[keep], [(int(i), int(w[i]), int(r[i])) for i in keep]
+
+
 def merge(out_dir, *in_dirs):
     """Combine bundles from concurrent searches into one.
 
