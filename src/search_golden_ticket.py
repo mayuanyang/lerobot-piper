@@ -468,7 +468,16 @@ def main() -> int:
             }
             # Banked the moment the task finishes, before the next one starts.
             bf = tb.save_ticket(out, suite_name, tid, cands[best], meta)
-            prog.unlink(missing_ok=True)
+            # KEPT, not deleted. The bundle stores one ticket per task, but
+            # the runner-up VECTORS exist only here -- scores_*.json records
+            # every candidate's wins/runs and none of the noise. Discarding
+            # them forecloses top-k sampling, which the paper (D.6.2) shows
+            # performs as well as a single ticket while restoring
+            # stochasticity. That matters more here than in the paper: one
+            # fixed ticket makes this policy fully deterministic, and the
+            # per-chunk re-draw it removes is worth 25 points by this
+            # project's own measurement. 64 x 64 x 7 float32 is 115 KB.
+            prog.replace(prog.with_name(prog.name.replace('_progress_', '_done_')))
             results[f"{suite_name}_t{tid}"] = {
                 "file": str(f), "bundle": str(bf), "task": desc,
                 "ticket_index": int(best),
