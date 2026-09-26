@@ -540,16 +540,35 @@ def main() -> int:
                                "NO real spread: the observed range is what "
                                "binomial noise alone produces. This policy is "
                                "not steerable by the initial noise")
-                    ratio = (disp["sd_between"] / disp["sd_binomial_only"]
-                             if disp["sd_binomial_only"] > 0 else float("inf"))
+                    # NORMALISED TO 5 LAYOUTS PER TIER. sd_binomial is
+                    # sqrt(pq/M), so the raw ratio is proportional to sqrt(M)
+                    # and a threshold calibrated at M=5 is 1.58x too strict at
+                    # M=2. goal T0 -- the only task whose ticket has held up
+                    # out of sample -- reads 1.33 at M=5 and would read 0.84
+                    # at M=2, i.e. a gate at 1.15 would have killed it.
+                    raw = (disp["sd_between"] / disp["sd_binomial_only"]
+                           if disp["sd_binomial_only"] > 0 else float("inf"))
+                    ratio = raw * (5.0 / max(a.envs_per_tier, 1)) ** 0.5
                     print(f"    dispersion {disp['dispersion']:.2f} over "
                           f"{disp['n']} candidates (1.00 = interchangeable)  "
                           f"z={disp['z']:+.1f}  "
                           f"sd_between {disp['sd_between']:.3f} vs "
                           f"binomial {disp['sd_binomial_only']:.3f}  "
-                          f"ratio {ratio:.2f}\n"
+                          f"ratio {ratio:.2f}"
+                          + (f" (raw {raw:.2f} at M={a.envs_per_tier}, "
+                             f"normalised to M=5)" if a.envs_per_tier != 5
+                             else "") + "\n"
                           f"    -> {verdict}", flush=True)
-                    if (tier == 0 and a.abort_below_ratio > 0
+                    _br = base_w[0] / max(base_r[0], 1)
+                    if (tier == 0 and a.abort_below_ratio > 0 and _br >= 0.95):
+                        print(f"    gate SKIPPED: the Gaussian baseline is "
+                              f"{_br:.0%}, so there is no room for "
+                              f"between-ticket variance to show and the ratio "
+                              f"cannot discriminate. Searching on -- but a task "
+                              f"this close to ceiling has no headroom to win "
+                              f"either, and should probably not be in "
+                              f"--task_ids.", flush=True)
+                    elif (tier == 0 and a.abort_below_ratio > 0
                             and ratio < a.abort_below_ratio):
                         print(f"    ABANDONING this task: effect size "
                               f"{ratio:.2f} < --abort_below_ratio "
