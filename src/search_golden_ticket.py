@@ -179,6 +179,14 @@ def main() -> int:
                    help="Use lerobot's unpatched reset order, i.e. the sampler "
                         "distribution. Matches --stock_init in eval and is not "
                         "for anything reportable.")
+    p.add_argument("--baseline_layouts", type=int, default=0,
+                   help="Layouts the Gaussian reference is measured on. 0 "
+                        "means --envs_per_tier, which is fine at 5 and wrong "
+                        "at 2: splitting tier 1 finer to save time would drop "
+                        "the baseline to two layouts while the winner is "
+                        "judged on ten, and the beats_baseline comparison "
+                        "would then be across different layout sets. Set it to "
+                        "5 whenever --envs_per_tier is below 5.")
     p.add_argument("--keep_frac", type=float, default=0.5,
                    help="Fraction of survivors carried to the next tier. 0.5 "
                         "is plain sequential halving. 0.25 cuts the later "
@@ -242,7 +250,8 @@ def main() -> int:
                         "lines worth watching.")
     a = p.parse_args()
 
-    if a.init_state_offset + a.tiers * a.envs_per_tier > 50:
+    if a.init_state_offset + max(a.tiers * a.envs_per_tier,
+                                 a.baseline_layouts or 0) > 50:
         print(f"ERROR: tiers x envs_per_tier = "
               f"{a.tiers * a.envs_per_tier} layouts starting at "
               f"{a.init_state_offset} runs past the canonical 50 and would "
@@ -432,11 +441,12 @@ def main() -> int:
                 return desc
 
             def score_baseline(tier):
-                """The Gaussian reference, on the SAME layouts as this tier."""
+                """The Gaussian reference, from the first search layout on."""
                 if base_done[0]:
                     return
                 policy.model._noise_ticket = None
-                for k in range(a.envs_per_tier):
+                n_lay = a.baseline_layouts or a.envs_per_tier
+                for k in range(n_lay):
                     layout = a.init_state_offset + tier * a.envs_per_tier + k
                     sink = (contextlib.nullcontext() if a.verbose
                             else contextlib.redirect_stdout(io.StringIO()))
