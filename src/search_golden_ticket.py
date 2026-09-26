@@ -628,7 +628,20 @@ def main() -> int:
             # REPORTABLE baseline is 70% and the headroom is real. The search
             # baseline and the eval headroom are measured on different layouts
             # and routinely disagree by 20 points.
-            if win_rate <= base_rate:
+            if win_rate >= 1.0 and base_rate >= 1.0:
+                # A TIE AT THE CEILING IS THE ONE TIE WORTH TAKING. Both score
+                # every episode, but the ticket does so DETERMINISTICALLY: its
+                # result does not depend on the noise stream, while Gaussian's
+                # 20/20 is one draw and a --policy_seed change flips 20.5% of
+                # episodes on this benchmark. Same number, and one of them
+                # survives someone re-running it. Everywhere below the ceiling
+                # a tie is still a loss, because the ticket also gives up the
+                # per-chunk re-draw.
+                beats, verdict = None, ("ties Gaussian at 100% -- banked "
+                                        "anyway: identical success, but "
+                                        "deterministic rather than one draw "
+                                        "from a stochastic policy")
+            elif win_rate <= base_rate:
                 beats, verdict = False, ("NOT BETTER than Gaussian -- eval will "
                                          "fall back to Gaussian for this task")
             elif p_raw < 0.05:
