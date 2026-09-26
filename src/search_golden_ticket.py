@@ -197,6 +197,18 @@ def main() -> int:
                         "risk of dropping a ticket that might be good. 0.90 is "
                         "a sensible value; on goal T0's tier 1 it takes the "
                         "survivors from 32 to 24. 0 disables it.")
+    p.add_argument("--prune_floor", type=float, default=0.0,
+                   help="Also drop candidates whose upper bound cannot reach "
+                        "this ABSOLUTE rate -- for when the aim is a "
+                        "high final number rather than merely beating "
+                        "Gaussian. Still an upper bound, not the point "
+                        "estimate: at five episodes a truly-85%% ticket scores "
+                        "3/5 about 14%% of the time, and a rule that dropped "
+                        "everything under 4/5 would discard it. The bound "
+                        "keeps 3/5 (upper bound 0.888) and drops 2/5 (0.753). "
+                        "Stacks with --prune_confidence, which uses the task's "
+                        "own baseline instead of a fixed number; the stricter "
+                        "of the two wins.")
     p.add_argument("--abort_below_ratio", type=float, default=0.0,
                    help="After tier 1, give up on a task whose "
                         "sd_between / sd_binomial_only is below this and move "
@@ -477,11 +489,16 @@ def main() -> int:
                 if tier < a.tiers - 1:
                     n_before = len(alive)
                     alive = alive[:max(1, int(len(alive) * a.keep_frac))]
+                    floor = 0.0
                     if a.prune_confidence > 0 and base_r[0] > 0:
-                        br = base_w[0] / base_r[0]
+                        floor = base_w[0] / base_r[0]
+                    floor = max(floor, a.prune_floor)
+                    if floor > 0:
+                        conf = a.prune_confidence or 0.90
+                        br = floor
                         kept = [i for i in alive
                                 if binom_ub(int(wins[i]), int(runs[i]),
-                                            a.prune_confidence) >= br]
+                                            conf) >= floor]
                         if kept:                    # never prune to nothing
                             dropped = len(alive) - len(kept)
                             alive = kept
