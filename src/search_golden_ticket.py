@@ -41,6 +41,27 @@ from pathlib import Path
 import numpy as np
 import torch
 
+def binom_ub(k, n, conf=0.90):
+    """One-sided Clopper-Pearson upper bound on the true rate given k of n.
+
+    Used to prune candidates that CANNOT plausibly reach the baseline, which
+    is the only pruning rule that carries no risk of dropping a good ticket.
+    A flat threshold does carry that risk and is also mis-calibrated: 80% sits
+    12 points ABOVE goal's 68% search baseline and 6 points BELOW object's
+    86.5%, so the same number is too strict on one suite and keeps
+    worse-than-Gaussian tickets on the other. At 5 episodes a flat 80% drops a
+    truly-75% ticket 37% of the time and a truly-89% ticket 10% of the time --
+    and goal T0's winning ticket sits at 0.81-0.89 posterior.
+    """
+    from math import comb
+    lo, hi = 0.0, 1.0
+    for _ in range(60):
+        m = (lo + hi) / 2
+        cdf = sum(comb(n, i) * m ** i * (1 - m) ** (n - i) for i in range(k + 1))
+        lo, hi = (m, hi) if cdf > 1 - conf else (lo, m)
+    return (lo + hi) / 2
+
+
 def binom_sf(k, n, p):
     """P(X >= k) for X ~ Bin(n, p), exact, no scipy."""
     from math import comb
@@ -158,6 +179,24 @@ def main() -> int:
                    help="Use lerobot's unpatched reset order, i.e. the sampler "
                         "distribution. Matches --stock_init in eval and is not "
                         "for anything reportable.")
+    p.add_argument("--keep_frac", type=float, default=0.5,
+                   help="Fraction of survivors carried to the next tier. 0.5 "
+                        "is plain sequential halving. 0.25 cuts the later "
+                        "tiers by about 40%% and on goal T0's real tier-1 "
+                        "distribution the top quarter still contains every "
+                        "4/5 and 5/5 -- but this is a BUDGET knob, not a "
+                        "correctness one: a smaller fraction can drop a good "
+                        "ticket that had a bad five episodes.")
+    p.add_argument("--prune_confidence", type=float, default=0.0,
+                   help="Also drop candidates whose one-sided upper confidence "
+                        "bound at this level is BELOW the Gaussian baseline -- "
+                        "tickets that statistically cannot be as good as not "
+                        "using one. Unlike a flat threshold this is calibrated "
+                        "to the task's own baseline and to how many episodes "
+                        "each candidate has actually run, so it carries no "
+                        "risk of dropping a ticket that might be good. 0.90 is "
+                        "a sensible value; on goal T0's tier 1 it takes the "
+                        "survivors from 32 to 24. 0 disables it.")
     p.add_argument("--abort_below_ratio", type=float, default=0.0,
                    help="After tier 1, give up on a task whose "
                         "sd_between / sd_binomial_only is below this and move "
@@ -436,7 +475,23 @@ def main() -> int:
                 rate = np.where(runs > 0, wins / np.maximum(runs, 1), -1.0)
                 alive = sorted(alive, key=lambda i: -rate[i])
                 if tier < a.tiers - 1:
-                    alive = alive[:max(1, len(alive) // 2)]
+                    n_before = len(alive)
+                    alive = alive[:max(1, int(len(alive) * a.keep_frac))]
+                    if a.prune_confidence > 0 and base_r[0] > 0:
+                        br = base_w[0] / base_r[0]
+                        kept = [i for i in alive
+                                if binom_ub(int(wins[i]), int(runs[i]),
+                                            a.prune_confidence) >= br]
+                        if kept:                    # never prune to nothing
+                            dropped = len(alive) - len(kept)
+                            alive = kept
+                            if dropped:
+                                print(f"    pruned {dropped} more whose "
+                                      f"{a.prune_confidence:.0%} upper bound is "
+                                      f"below the {br:.0%} baseline -- they "
+                                      f"cannot be worth using", flush=True)
+                    print(f"    {n_before} -> {len(alive)} carried forward",
+                          flush=True)
                 top = alive[0]
                 print(f"    best so far: ticket {top} "
                       f"{wins[top]:.0f}/{runs[top]:.0f} = "
