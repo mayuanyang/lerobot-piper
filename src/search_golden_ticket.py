@@ -365,6 +365,15 @@ def main() -> int:
                 # baseline keeps the generous cap while the candidates get the
                 # strict one. That biases the prune floor against every
                 # survivor.
+                # The search's OWN geometry has to match too, and none of it
+                # is in infcfg. `layout = init_state_offset + tier *
+                # envs_per_tier + k`, so resuming goal T2's M=4 tier 1 under
+                # M=2 put tier 2 back on layouts 22-23, which tier 1 had
+                # already scored: the survivor's 6/6 was four distinct layouts
+                # and two repeats, and sequential halving's whole argument is
+                # that the tiers are disjoint.
+                _geom = {"envs_per_tier": a.envs_per_tier, "tickets": a.tickets,
+                         "init_state_offset": a.init_state_offset}
                 _resume_match = ev.MUST_MATCH + ("max_episode_steps",)
                 _z = np.load(prog, allow_pickle=True)
                 if "infcfg" not in _z.files:
@@ -373,6 +382,11 @@ def main() -> int:
                     _was = json.loads(str(_z["infcfg"]))
                     _bad = {k: (_was.get(k), infcfg[k]) for k in _resume_match
                             if _was.get(k) != infcfg[k]}
+                    _wasg = (json.loads(str(_z["geom"]))
+                             if "geom" in _z.files else {})
+                    _bad.update({k: (_wasg.get(k, "(unstamped)"), v)
+                                 for k, v in _geom.items()
+                                 if _wasg.get(k, v) != v})
                 if _bad:
                     print(f"  DISCARDING {prog.name}: written under "
                           + ", ".join(f"{k}={w}{f' (now {n_})' if n_ != '' else ''}"
@@ -421,7 +435,11 @@ def main() -> int:
                          next_tier=tier, done_k=done_k,
                          base_w=base_w[0], base_r=base_r[0],
                          base_done=base_done[0], desc=np.array(desc or ""),
-                         infcfg=np.array(json.dumps(infcfg)))
+                         infcfg=np.array(json.dumps(infcfg)),
+                         geom=np.array(json.dumps(
+                             {"envs_per_tier": a.envs_per_tier,
+                              "tickets": a.tickets,
+                              "init_state_offset": a.init_state_offset})))
 
             def score(idx_list, tier, start_k=0):
                 """One batch = n_par CANDIDATES on ONE layout.
