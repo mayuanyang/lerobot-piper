@@ -158,6 +158,20 @@ def main() -> int:
                    help="Use lerobot's unpatched reset order, i.e. the sampler "
                         "distribution. Matches --stock_init in eval and is not "
                         "for anything reportable.")
+    p.add_argument("--abort_below_ratio", type=float, default=0.0,
+                   help="After tier 1, give up on a task whose "
+                        "sd_between / sd_binomial_only is below this and move "
+                        "to the next one. THE RATIO IS THE EFFECT SIZE; the "
+                        "dispersion z is not -- z is driven by how many "
+                        "episodes were run and does not separate the cases "
+                        "(goal T0 z=9.85 succeeded, object T4 z=10.25 failed), "
+                        "while the ratio does: 1.33 and 2.07 on the two tasks "
+                        "that produced a working ticket against 1.07 on the "
+                        "one that did not. THAT IS THREE DATA POINTS, so this "
+                        "is off by default; 1.15 is the value those three "
+                        "suggest. Worth enabling when a task costs 12 h, as "
+                        "libero_10 does -- it turns a failed search into a "
+                        "2 h answer instead of a 12 h one.")
     p.add_argument("--allow_zero_baseline", action="store_true",
                    help="Search on even when the Gaussian reference scores 0. "
                         "Without it the run aborts, because a zero baseline "
@@ -386,7 +400,7 @@ def main() -> int:
                 _save(tier, a.envs_per_tier, alive)
 
             base_w, base_r = [base_w0], [base_r0]
-            desc = desc0
+            desc, abandoned = desc0, False
             for tier in range(first_tier, a.tiers):
                 print(f"  tier {tier + 1}/{a.tiers}: {len(alive)} candidates "
                       f"on {a.envs_per_tier} layouts "
@@ -444,12 +458,26 @@ def main() -> int:
                                "NO real spread: the observed range is what "
                                "binomial noise alone produces. This policy is "
                                "not steerable by the initial noise")
+                    ratio = (disp["sd_between"] / disp["sd_binomial_only"]
+                             if disp["sd_binomial_only"] > 0 else float("inf"))
                     print(f"    dispersion {disp['dispersion']:.2f} over "
                           f"{disp['n']} candidates (1.00 = interchangeable)  "
                           f"z={disp['z']:+.1f}  "
                           f"sd_between {disp['sd_between']:.3f} vs "
-                          f"binomial {disp['sd_binomial_only']:.3f}\n"
+                          f"binomial {disp['sd_binomial_only']:.3f}  "
+                          f"ratio {ratio:.2f}\n"
                           f"    -> {verdict}", flush=True)
+                    if (tier == 0 and a.abort_below_ratio > 0
+                            and ratio < a.abort_below_ratio):
+                        print(f"    ABANDONING this task: effect size "
+                              f"{ratio:.2f} < --abort_below_ratio "
+                              f"{a.abort_below_ratio:g}. Almost all of the "
+                              f"spread between candidates is binomial noise, "
+                              f"which is what a failed search looks like at "
+                              f"tier 1 (object T4 read 1.07 and cost 12 h to "
+                              f"confirm). No ticket is banked.", flush=True)
+                        abandoned = True
+                        break
                 (out / f"scores_{suite_name}_t{tid}.json").write_text(json.dumps(
                     {"tier": tier + 1, "task": desc,
                      "baseline": f"{base_w[0]:.0f}/{base_r[0]:.0f}",
@@ -457,6 +485,25 @@ def main() -> int:
                      "candidates": {str(i): [int(wins[i]), int(runs[i])]
                                     for i in range(a.tickets) if runs[i] > 0}},
                     indent=1))
+
+            if abandoned:
+                # No ticket, and the progress file is kept: the candidates are
+                # still on disk if a later run wants to resume with a lower
+                # threshold or more tiers.
+                results[f"{suite_name}_t{tid}"] = {
+                    "task": desc, "abandoned_at_tier": 1,
+                    "reason": f"effect size below --abort_below_ratio "
+                              f"{a.abort_below_ratio:g}",
+                    "baseline_search": f"{base_w[0]:.0f}/{base_r[0]:.0f}",
+                    "minutes": round((time.time() - t0) / 60, 1)}
+                (out / "search_summary.json").write_text(json.dumps(results, indent=1))
+                for e_ in (envs or []):
+                    try:
+                        e_.close()
+                    except Exception:
+                        pass
+                policy.model._noise_ticket = None
+                continue
 
             best = alive[0]
             f = out / f"{suite_name}_t{tid}_ticket.npy"
