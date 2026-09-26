@@ -354,12 +354,24 @@ def main() -> int:
                 # after the patch_lerobot_libero and n_action_steps fixes --
                 # the env was finally right and the abort still read 0/50 from
                 # the broken run's file.
+                # STRICTER than ev.MUST_MATCH, and deliberately so. MUST_MATCH
+                # asks "is this ticket still valid for this policy", and a cap
+                # is not part of that: a ticket searched at 150 steps is fine to
+                # eval at 300, it was merely selected for speed. Resuming counts
+                # asks a different question -- "are these wins commensurable" --
+                # and there the cap matters, because adding 2 episodes at cap
+                # 150 to 2 already banked at cap 300 puts two different success
+                # rates in one numerator, and leaves base_done set so the
+                # baseline keeps the generous cap while the candidates get the
+                # strict one. That biases the prune floor against every
+                # survivor.
+                _resume_match = ev.MUST_MATCH + ("max_episode_steps",)
                 _z = np.load(prog, allow_pickle=True)
                 if "infcfg" not in _z.files:
                     _bad = {"(unstamped)": ("pre-dates the config stamp", "")}
                 else:
                     _was = json.loads(str(_z["infcfg"]))
-                    _bad = {k: (_was.get(k), infcfg[k]) for k in ev.MUST_MATCH
+                    _bad = {k: (_was.get(k), infcfg[k]) for k in _resume_match
                             if _was.get(k) != infcfg[k]}
                 if _bad:
                     print(f"  DISCARDING {prog.name}: written under "
