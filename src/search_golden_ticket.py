@@ -139,13 +139,19 @@ def main() -> int:
                    help="Layouts a candidate is scored on in its first tier. "
                         "Survivors accumulate another --envs_per_tier at each "
                         "subsequent tier.")
-    p.add_argument("--tiers", type=int, default=4,
+    p.add_argument("--tiers", type=int, default=3,
                    help="Sequential halving: every candidate is scored on tier "
                         "1, the bottom half is dropped, survivors get a fresh "
                         "disjoint tier, and so on. Cost is about 2 x tickets x "
                         "envs_per_tier instead of tickets x (tiers x "
                         "envs_per_tier), and the deepest survivors are still "
-                        "scored at full fidelity.")
+                        "scored at full fidelity. 3 tiers x 5 layouts "
+                        "beats 5 x 2 under --prune_mode point: that rule "
+                        "compares a RATE to the baseline, and n=2 can only "
+                        "express 0, 0.5 and 1, so every task above a 50%% "
+                        "baseline collapses to the same 2/2 threshold. n=5 "
+                        "separates 5/5, 4/5, 3/5 and 2/5, which is what lets "
+                        "one rule serve a 96%% task and a 40%% task at once.")
     p.add_argument("--init_state_offset", type=int, default=20,
                    help="First canonical layout used for SEARCH. 20 keeps the "
                         "reportable 0-19 out of the search entirely. Lower it "
@@ -179,6 +185,16 @@ def main() -> int:
                    help="Use lerobot's unpatched reset order, i.e. the sampler "
                         "distribution. Matches --stock_init in eval and is not "
                         "for anything reportable.")
+    p.add_argument("--exact_prune", type=int, default=1,
+                   help="Inside a tier, drop a candidate the moment its BEST "
+                        "remaining outcome falls below the floor: after r of M "
+                        "layouts it can finish no higher than (w + M - r) / "
+                        "((tier + 1) * M). Arithmetic, not inference, so it "
+                        "cannot discard a candidate the tier would have kept. "
+                        "It is also what pays for M=5: against a 96%% baseline "
+                        "(floor 5/5) one loss is fatal, so tier 1 goes 64 -> "
+                        "29 -> 13 -> 6 -> 3 and costs 14 batches instead of "
+                        "35. Point mode only; 0 disables.")
     p.add_argument("--baseline_layouts", type=int, default=0,
                    help="Layouts the Gaussian reference is measured on. 0 "
                         "means --envs_per_tier, which is fine at 5 and wrong "
@@ -187,14 +203,34 @@ def main() -> int:
                         "judged on ten, and the beats_baseline comparison "
                         "would then be across different layout sets. Set it to "
                         "5 whenever --envs_per_tier is below 5.")
-    p.add_argument("--keep_frac", type=float, default=0.5,
+    p.add_argument("--prune_mode", choices=("point", "bound"),
+                   default="point",
+                   help="How a candidate is compared to its tier's baseline. "
+                        "'bound' keeps anything whose --prune_confidence upper "
+                        "bound reaches the baseline -- right when the question "
+                        "is 'might this ticket be worth using', far too "
+                        "lenient when the question is determinism: at n=2 a "
+                        "1/2 candidate has a 0.949 bound and survives a 0.96 "
+                        "baseline. 'point' keeps only wins/runs >= baseline, "
+                        "which self-adapts: 5/5 on a 96%% task, 4/5 on 80%%, "
+                        "2/5 on 40%%. libero_10 cannot reach zero failures, so "
+                        "a flat 'perfect' rule would search it forever, while "
+                        "better-than-Gaussian is the progress available there. "
+                        "The cost is recall -- a truly-85%% ticket scores "
+                        "below a 0.90 floor about a quarter of the time -- "
+                        "which is acceptable only because you need ONE ticket, "
+                        "not all of them.")
+    p.add_argument("--keep_frac", type=float, default=1.0,
                    help="Fraction of survivors carried to the next tier. 0.5 "
                         "is plain sequential halving. 0.25 cuts the later "
                         "tiers by about 40%% and on goal T0's real tier-1 "
                         "distribution the top quarter still contains every "
                         "4/5 and 5/5 -- but this is a BUDGET knob, not a "
                         "correctness one: a smaller fraction can drop a good "
-                        "ticket that had a bad five episodes.")
+                        "ticket that had a bad five episodes. Default 1.0, "
+                        "because under --prune_mode point the baseline floor "
+                        "IS the selection rule and halving on top of it "
+                        "discards candidates that already qualified.")
     p.add_argument("--prune_confidence", type=float, default=0.0,
                    help="Also drop candidates whose one-sided upper confidence "
                         "bound at this level is BELOW the Gaussian baseline -- "
@@ -288,17 +324,24 @@ def main() -> int:
                 " differ")
 
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
-    eps, _a = 0, a.tickets
+    # Batches per tier are M x ceil(alive / num_envs), NOT ceil(M x alive /
+    # num_envs): score() loops layout-outer, candidate-inner, so a tier with 4
+    # survivors still pays a full batch per layout. Summing episodes and
+    # dividing once undercounted every deep tier.
+    n_base = a.baseline_layouts or (a.tiers * a.envs_per_tier)
+    batches, _a = n_base, a.tickets
     for _t in range(a.tiers):
-        eps += _a * a.envs_per_tier
+        batches += a.envs_per_tier * -(-_a // a.num_envs)
         if _t < a.tiers - 1:
-            _a = max(1, _a // 2)
-    batches = -(-eps // a.num_envs) + a.envs_per_tier     # + the Gaussian tier
+            _a = max(1, int(_a * a.keep_frac))
     hours = batches * 12 * ((a.max_episode_steps or 300) / 300) / 60
     print(f"ticket shape ({H}, {D}) = {H * D} dims\n"
           f"{a.tickets} candidates, {a.tiers} tiers x {a.envs_per_tier} layouts "
-          f"from id {a.init_state_offset}\n"
-          f"{eps} search episodes = ~{batches} batches of {a.num_envs}\n"
+          f"from id {a.init_state_offset}, baseline on {n_base} layouts\n"
+          f"~{batches} batches of {a.num_envs} ({n_base} of them baseline)\n"
+          f"WORST CASE: --prune_mode {a.prune_mode} and --exact_prune drop "
+          f"candidates the moment they cannot reach the floor, and on a "
+          f"high-baseline task that removes most of tier 1.\n"
           f"BATCHES ARE THE COST, NOT EPISODES: a batch runs until its slowest "
           f"env finishes and most reach the cap. At this project's measured "
           f"12 min/batch at cap 300, that is ~{hours:.1f} h for this task.",
@@ -373,7 +416,10 @@ def main() -> int:
                 # and two repeats, and sequential halving's whole argument is
                 # that the tiers are disjoint.
                 _geom = {"envs_per_tier": a.envs_per_tier, "tickets": a.tickets,
-                         "init_state_offset": a.init_state_offset}
+                         "init_state_offset": a.init_state_offset,
+                         "baseline_layouts": (a.baseline_layouts or
+                                              a.tiers * a.envs_per_tier),
+                         "prune_mode": a.prune_mode}
                 _resume_match = ev.MUST_MATCH + ("max_episode_steps",)
                 _z = np.load(prog, allow_pickle=True)
                 if "infcfg" not in _z.files:
@@ -398,6 +444,10 @@ def main() -> int:
                 cands, wins, runs = z["cands"], z["wins"], z["runs"]
                 alive, first_tier = [int(x) for x in z["alive"]], int(z["next_tier"])
                 base_w0, base_r0 = float(z["base_w"]), float(z["base_r"])
+                base_lw0 = (z["base_lw"].astype(float) if "base_lw" in z.files
+                            else None)
+                base_lr0 = (z["base_lr"].astype(float) if "base_lr" in z.files
+                            else None)
                 # Kept in the progress file because a run killed BETWEEN the
                 # last tier's save and the bundle write resumes with an empty
                 # tier loop: the ticket is recovered correctly but nothing
@@ -409,6 +459,10 @@ def main() -> int:
                 # exposed to a Colab cutoff; per layout it is about 40 min.
                 start_k0 = int(z["done_k"]) if "done_k" in z.files else 0
                 base_done0 = bool(z["base_done"]) if "base_done" in z.files else False
+                # How many baseline layouts are finished. Older files only say
+                # "done / not done", so an unfinished one there restarts the
+                # baseline -- which is what it used to do in every case.
+                base_k0 = int(z["base_k"]) if "base_k" in z.files else None
                 if start_k0 > 0 and float(runs.sum()) == 0.0:
                     # Written by the pre-fix score_baseline: the tier is marked
                     # part-done while no candidate has run an episode. Heal it
@@ -424,22 +478,43 @@ def main() -> int:
                 alive, first_tier = list(range(a.tickets)), 0
                 wins = np.zeros(a.tickets); runs = np.zeros(a.tickets)
                 base_w0 = base_r0 = 0.0
+                base_lw0 = base_lr0 = None
+                base_k0 = None
                 desc0 = None
                 start_k0, base_done0 = 0, False
 
-            base_done = [base_done0]
+            # PER LAYOUT, not pooled. The floor is a hard gate now, and the
+            # tiers run on DIFFERENT layouts: if the Gaussian goes 10/10 on
+            # layout 24 and 6/10 on 25, tier 3's real reference is 0.80, and
+            # gating it on the pooled 0.96 kills every candidate on the harder
+            # half of the search. Indexed by layout - init_state_offset.
+            n_base_lay = a.baseline_layouts or (a.tiers * a.envs_per_tier)
+            base_lw = (base_lw0 if base_lw0 is not None and
+                       len(base_lw0) == n_base_lay else np.zeros(n_base_lay))
+            base_lr = (base_lr0 if base_lr0 is not None and
+                       len(base_lr0) == n_base_lay else np.zeros(n_base_lay))
+            # PER LAYOUT rather than a done/not-done flag. 15 baseline layouts
+            # is 90 minutes, and checkpointing only at the end left all of it
+            # exposed: a cutoff mid-baseline resumed by running the whole
+            # baseline again, which on a short Colab lease never finishes.
+            base_k = [base_k0 if base_k0 is not None
+                      else (n_base_lay if base_done0 else 0)]
 
             def _save(tier, done_k, alive_now):
                 np.savez(prog, cands=cands, wins=wins, runs=runs,
                          alive=np.array(alive_now, dtype=np.int64),
                          next_tier=tier, done_k=done_k,
                          base_w=base_w[0], base_r=base_r[0],
-                         base_done=base_done[0], desc=np.array(desc or ""),
+                         base_done=base_k[0] >= n_base_lay,
+                         base_k=base_k[0], desc=np.array(desc or ""),
+                         base_lw=base_lw, base_lr=base_lr,
                          infcfg=np.array(json.dumps(infcfg)),
                          geom=np.array(json.dumps(
                              {"envs_per_tier": a.envs_per_tier,
                               "tickets": a.tickets,
-                              "init_state_offset": a.init_state_offset})))
+                              "init_state_offset": a.init_state_offset,
+                              "baseline_layouts": n_base_lay,
+                              "prune_mode": a.prune_mode})))
 
             def score(idx_list, tier, start_k=0):
                 """One batch = n_par CANDIDATES on ONE layout.
@@ -454,6 +529,9 @@ def main() -> int:
                 the ticket differs.
                 """
                 nonlocal desc
+                M, floor = a.envs_per_tier, floor_for(tier)
+                n_end = (tier + 1) * M            # runs each survivor ends on
+                idx_list = list(idx_list)
                 for k in range(start_k, a.envs_per_tier):
                     layout = a.init_state_offset + tier * a.envs_per_tier + k
                     for g0 in range(0, len(idx_list), n_par):
@@ -472,11 +550,38 @@ def main() -> int:
                                 init_state_offset=layout, init_state_stride=0)
                         for j, i in enumerate(grp):
                             wins[i] += ep_ok[j]; runs[i] += 1
+                    # Arithmetic elimination, not a statistical call: with
+                    # M - (k+1) layouts left a candidate can finish no higher
+                    # than (wins + remaining) / n_end, and if that is already
+                    # under the floor the rest of the tier is wasted on it.
+                    # NOT in the final tier. That tier ranks the survivors
+                    # rather than filtering them -- the bank-or-not call is
+                    # made afterwards on the CUMULATIVE rate against the pooled
+                    # baseline -- so eliminating against the final tier's local
+                    # floor can throw away the candidate that would have won.
+                    if a.exact_prune and a.prune_mode == "point" and floor > 0 \
+                            and k + 1 < M and tier < a.tiers - 1:
+                        rem = M - (k + 1)
+                        live = [i for i in idx_list
+                                if (wins[i] + rem) / n_end >= floor - 1e-9]
+                        if not live:              # never prune to nothing
+                            live = [max(idx_list, key=lambda i: wins[i])]
+                            print(f"    layout {k + 1}/{M}: NO candidate can "
+                                  f"still reach the {floor:.0%} floor -- "
+                                  f"carrying the best one ({int(wins[live[0]])}"
+                                  f"/{int(runs[live[0]])}) so the tier still "
+                                  f"returns something", flush=True)
+                        elif len(live) < len(idx_list):
+                            print(f"    layout {k + 1}/{M}: "
+                                  f"{len(idx_list)} -> {len(live)} "
+                                  f"(cannot reach {floor:.0%} any more)",
+                                  flush=True)
+                        idx_list = live
                     # `alive` is not touched until score() returns, so saving
-                    # it here records the tier's INPUT list -- which is what a
+                    # it here records the tier's live list -- which is what a
                     # mid-tier resume has to continue from.
                     _save(tier, k + 1, idx_list)
-                return desc
+                return desc, idx_list
 
             def score_baseline(tier, cand_k):
                 """The Gaussian reference, from the first search layout on.
@@ -489,12 +594,16 @@ def main() -> int:
                 skipped tier 1's candidate scoring entirely -- every ticket
                 then carried 0/0 into the halving.
                 """
-                if base_done[0]:
+                if base_k[0] >= n_base_lay:
                     return
                 policy.model._noise_ticket = None
-                n_lay = a.baseline_layouts or a.envs_per_tier
-                for k in range(n_lay):
-                    layout = a.init_state_offset + tier * a.envs_per_tier + k
+                # NOT offset by `tier`. The baseline has to cover every layout
+                # the search will use, and on a resume at tier > 0 the old
+                # `tier * envs_per_tier + k` slid the whole reference off the
+                # layouts tier 1 had been measured against.
+                n_lay = n_base_lay
+                for k in range(base_k[0], n_lay):
+                    layout = a.init_state_offset + k
                     sink = (contextlib.nullcontext() if a.verbose
                             else contextlib.redirect_stdout(io.StringIO()))
                     with sink:
@@ -504,10 +613,33 @@ def main() -> int:
                             a.seed, cams, envs=envs,
                             init_state_offset=layout, init_state_stride=0)
                     base_w[0] += n_ok; base_r[0] += n_ep
-                base_done[0] = True
-                _save(tier, cand_k, alive)
+                    base_lw[k] += n_ok; base_lr[k] += n_ep
+                    base_k[0] = k + 1
+                    _save(tier, cand_k, alive)
 
             base_w, base_r = [base_w0], [base_r0]
+
+            def tier_floor(tier):
+                """The Gaussian rate on the layouts THIS tier runs on.
+
+                Falls back to the pooled rate when the baseline does not reach
+                that far -- which is what --baseline_layouts smaller than
+                tiers x envs_per_tier buys you, and why the default is the
+                full span.
+                """
+                lo, hi = tier * a.envs_per_tier, (tier + 1) * a.envs_per_tier
+                seg_r = base_lr[lo:hi].sum() if hi <= len(base_lr) else 0.0
+                if seg_r > 0:
+                    return float(base_lw[lo:hi].sum() / seg_r)
+                return float(base_w[0] / base_r[0]) if base_r[0] > 0 else 0.0
+
+            def floor_for(tier):
+                f = 0.0
+                if (a.prune_confidence > 0 or a.prune_mode == "point") \
+                        and base_r[0] > 0:
+                    f = tier_floor(tier)
+                return max(f, a.prune_floor)
+
             desc, abandoned = desc0, False
             for tier in range(first_tier, a.tiers):
                 print(f"  tier {tier + 1}/{a.tiers}: {len(alive)} candidates "
@@ -540,30 +672,52 @@ def main() -> int:
                             f"off.\nSearching for a ticket on a task the "
                             f"policy cannot do at all learns nothing. "
                             f"--allow_zero_baseline to override.")
-                desc = score(alive, tier, start_k0 if tier == first_tier else 0)
+                desc, alive = score(alive, tier,
+                                    start_k0 if tier == first_tier else 0)
                 rate = np.where(runs > 0, wins / np.maximum(runs, 1), -1.0)
                 alive = sorted(alive, key=lambda i: -rate[i])
                 if tier < a.tiers - 1:
                     n_before = len(alive)
-                    alive = alive[:max(1, int(len(alive) * a.keep_frac))]
-                    floor = 0.0
-                    if a.prune_confidence > 0 and base_r[0] > 0:
-                        floor = base_w[0] / base_r[0]
-                    floor = max(floor, a.prune_floor)
+                    # FLOOR FIRST, cap second. The old order halved by rank and
+                    # only then applied the floor, so a candidate that met the
+                    # baseline could be cut by keep_frac before the rule that
+                    # decides membership ever looked at it.
+                    floor = floor_for(tier)
                     if floor > 0:
                         conf = a.prune_confidence or 0.90
-                        br = floor
-                        kept = [i for i in alive
-                                if binom_ub(int(wins[i]), int(runs[i]),
-                                            conf) >= floor]
-                        if kept:                    # never prune to nothing
-                            dropped = len(alive) - len(kept)
+                        if a.prune_mode == "point":
+                            kept = [i for i in alive
+                                    if runs[i] > 0
+                                    and wins[i] / runs[i] >= floor - 1e-9]
+                            how = (f"below the {floor:.0%} baseline for "
+                                   f"layouts {a.init_state_offset + tier * a.envs_per_tier}"
+                                   f"-{a.init_state_offset + (tier + 1) * a.envs_per_tier - 1}")
+                        else:
+                            kept = [i for i in alive
+                                    if binom_ub(int(wins[i]), int(runs[i]),
+                                                conf) >= floor]
+                            how = (f"whose {conf:.0%} upper bound is below the "
+                                   f"{floor:.0%} baseline")
+                        dropped = len(alive) - len(kept)
+                        if kept:
                             alive = kept
                             if dropped:
-                                print(f"    pruned {dropped} more whose "
-                                      f"{a.prune_confidence:.0%} upper bound is "
-                                      f"below the {br:.0%} baseline -- they "
-                                      f"cannot be worth using", flush=True)
+                                print(f"    pruned {dropped} {how}", flush=True)
+                        else:
+                            # Loud, because it used to be silent: the tier
+                            # carries its best candidate purely so the task
+                            # still produces a ticket, and that ticket has NOT
+                            # beaten Gaussian.
+                            alive = alive[:1]
+                            print(f"    NO candidate met the {floor:.0%} "
+                                  f"floor. Carrying the best "
+                                  f"({int(wins[alive[0]])}/"
+                                  f"{int(runs[alive[0]])}) so the task still "
+                                  f"finishes, but it is NOT better than "
+                                  f"Gaussian and should not be banked.",
+                                  flush=True)
+                    if a.keep_frac < 1.0:
+                        alive = alive[:max(1, int(len(alive) * a.keep_frac))]
                     print(f"    {n_before} -> {len(alive)} carried forward",
                           flush=True)
                 top = alive[0]
