@@ -383,6 +383,14 @@ def main() -> int:
                 # exposed to a Colab cutoff; per layout it is about 40 min.
                 start_k0 = int(z["done_k"]) if "done_k" in z.files else 0
                 base_done0 = bool(z["base_done"]) if "base_done" in z.files else False
+                if start_k0 > 0 and float(runs.sum()) == 0.0:
+                    # Written by the pre-fix score_baseline: the tier is marked
+                    # part-done while no candidate has run an episode. Heal it
+                    # rather than skipping the tier and halving on all-zeros.
+                    print(f"  progress claims {start_k0} layouts done but no "
+                          f"candidate has run an episode -- resetting to the "
+                          f"start of the tier (pre-fix file)", flush=True)
+                    start_k0 = 0
                 print(f"  resuming from {prog.name}: tier {first_tier + 1}, "
                       f"{len(alive)} candidates still alive", flush=True)
             else:
@@ -440,8 +448,17 @@ def main() -> int:
                     _save(tier, k + 1, idx_list)
                 return desc
 
-            def score_baseline(tier):
-                """The Gaussian reference, from the first search layout on."""
+            def score_baseline(tier, cand_k):
+                """The Gaussian reference, from the first search layout on.
+
+                `cand_k` is how many layouts the CANDIDATES have finished, not
+                how many the baseline just ran. Saving the baseline's count
+                here claimed the candidates were done with the tier while they
+                had not started it, so a run that died between the baseline and
+                the end of scoring resumed with start_k == envs_per_tier and
+                skipped tier 1's candidate scoring entirely -- every ticket
+                then carried 0/0 into the halving.
+                """
                 if base_done[0]:
                     return
                 policy.model._noise_ticket = None
@@ -458,7 +475,7 @@ def main() -> int:
                             init_state_offset=layout, init_state_stride=0)
                     base_w[0] += n_ok; base_r[0] += n_ep
                 base_done[0] = True
-                _save(tier, a.envs_per_tier, alive)
+                _save(tier, cand_k, alive)
 
             base_w, base_r = [base_w0], [base_r0]
             desc, abandoned = desc0, False
@@ -472,7 +489,7 @@ def main() -> int:
                     # BEFORE the candidates, not after. This is the only cheap
                     # check that the env is set up the way the reported evals
                     # set it up, and it has to happen before hours are spent.
-                    score_baseline(tier)
+                    score_baseline(tier, start_k0 if tier == first_tier else 0)
                     if base_w[0] == 0 and not a.allow_zero_baseline:
                         for _e in envs:
                             try:
@@ -520,6 +537,12 @@ def main() -> int:
                     print(f"    {n_before} -> {len(alive)} carried forward",
                           flush=True)
                 top = alive[0]
+                if runs[top] == 0:
+                    raise SystemExit(
+                        f"the best candidate has run 0 episodes, so the tier "
+                        f"scored nothing and the halving just kept the first "
+                        f"{len(alive)} indices. Delete "
+                        f"{prog.name} and restart this task.")
                 print(f"    best so far: ticket {top} "
                       f"{wins[top]:.0f}/{runs[top]:.0f} = "
                       f"{100 * rate[top]:.0f}%   "
