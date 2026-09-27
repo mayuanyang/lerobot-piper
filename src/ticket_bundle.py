@@ -94,6 +94,41 @@ def top_k(done_npz, k: int = 8, min_rate: float = 0.0):
     return cands[keep], [(int(i), int(w[i]), int(r[i])) for i in keep]
 
 
+def report(path) -> int:
+    """Print what a bundle actually contains. -> number of weak entries.
+
+    Search banks a ticket for every task it finishes, including the ones it
+    could not beat Gaussian on -- deliberately, so the candidates and the
+    metadata survive -- and the search log then reports every finished task
+    the same way. object T5 went in at 53% against an 85% baseline and reads
+    as "already in the bundle" next to T9's 15/15.
+    """
+    tensors, info = load_bundle(path)
+    rows, weak = [], 0
+    for k in sorted(tensors):
+        m = info.get(k, {})
+        b = m.get("beats_baseline")
+        verdict = {True: "BEATS", False: "weak -- eval falls back to Gaussian",
+                   None: "banked, unresolved"}[b if b in (True, False) else None]
+        if b is False:
+            weak += 1
+        rows.append((k, m.get("search_success", "?"),
+                     m.get("baseline_search", "?"), verdict))
+    w0 = max([len(r[0]) for r in rows] + [4])
+    print(f"{'task':<{w0}}  {'search':>8}  {'gaussian':>9}  verdict")
+    for k, sc, bl, v in rows:
+        print(f"{k:<{w0}}  {sc:>8}  {bl:>9}  {v}")
+    print(f"\n{len(rows)} tickets, {weak} weak.")
+    if weak:
+        print("The weak ones are inert at eval time -- it checks "
+              "beats_baseline and uses Gaussian -- so they cost nothing to "
+              "leave in place. Re-search them with more --tickets; the search "
+              "skips them by default, --retry_failed redoes them.")
+    print("SEARCH RATE IS NOT THE RESULT. It is the number the ticket was "
+          "selected on. Report with eval_wiltechs_x.py --init_state_offset 0.")
+    return weak
+
+
 def merge(out_dir, *in_dirs):
     """Combine bundles from concurrent searches into one.
 
@@ -124,8 +159,11 @@ def merge(out_dir, *in_dirs):
 
 if __name__ == "__main__":
     import sys
+    if len(sys.argv) >= 3 and sys.argv[1] == "report":
+        raise SystemExit(0 if report(sys.argv[2]) == 0 else 0)
     if len(sys.argv) < 4 or sys.argv[1] != "merge":
-        print("usage: python ticket_bundle.py merge <out_dir> <in_dir> [<in_dir> ...]",
+        print("usage: python ticket_bundle.py report <dir>\n"
+              "       python ticket_bundle.py merge <out_dir> <in_dir> [<in_dir> ...]",
               file=sys.stderr)
         raise SystemExit(2)
     merge(sys.argv[2], *sys.argv[3:])

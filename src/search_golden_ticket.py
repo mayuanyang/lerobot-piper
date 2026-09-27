@@ -187,6 +187,14 @@ def main() -> int:
                    help="Use lerobot's unpatched reset order, i.e. the sampler "
                         "distribution. Matches --stock_init in eval and is not "
                         "for anything reportable.")
+    p.add_argument("--retry_failed", action="store_true",
+                   help="Re-search tasks whose banked ticket is marked "
+                        "beats_baseline false. Off by default because the "
+                        "candidates are seeded per task: the same command "
+                        "would redraw the same tickets and reach the same "
+                        "answer, hours later. Pair it with more --tickets or "
+                        "a different --seed, which are the only two things "
+                        "that change the draw.")
     p.add_argument("--abandon_on_empty_floor", type=int, default=1,
                    help="Stop a task the moment a tier eliminates every "
                         "candidate. Whatever is carried forward is already "
@@ -367,8 +375,32 @@ def main() -> int:
             t0 = time.time()
             if not a.overwrite:
                 try:
-                    done, _ = tb.load_bundle(out)
-                    if tb.key(suite_name, tid) in done:
+                    done, dmeta = tb.load_bundle(out)
+                    _k = tb.key(suite_name, tid)
+                    _m = dmeta.get(_k, {}) if _k in done else None
+                    # A BANKED TICKET IS NOT THE SAME AS A WON ONE. Search
+                    # banks whatever it finished, including tasks it could not
+                    # beat Gaussian on, and the old message read the same for
+                    # both: object T5 at 53% against an 85% baseline printed
+                    # "already in the bundle" next to T9's 15/15. Those need
+                    # different follow-ups -- one is done, the other needs an
+                    # order of magnitude more candidates.
+                    if _m is not None and _m.get("beats_baseline") is False \
+                            and a.retry_failed:
+                        print(f"\n=== {suite_name} task {tid}: in the bundle "
+                              f"but marked NOT BETTER than Gaussian "
+                              f"({_m.get('search_success', '?')} vs "
+                              f"{_m.get('baseline_search', '?')}) -- "
+                              f"--retry_failed, re-searching ===", flush=True)
+                    elif _m is not None and _m.get("beats_baseline") is False:
+                        print(f"\n=== {suite_name} task {tid}: in the bundle "
+                              f"but NOT BETTER than Gaussian "
+                              f"({_m.get('search_success', '?')} vs "
+                              f"{_m.get('baseline_search', '?')}). Skipping. "
+                              f"Eval ignores it; redo with --retry_failed and "
+                              f"more --tickets ===", flush=True)
+                        continue
+                    elif _m is not None:
                         print(f"\n=== {suite_name} task {tid}: already in the "
                               f"bundle, skipping (--overwrite to redo) ===",
                               flush=True)
