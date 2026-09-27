@@ -136,14 +136,29 @@ def merge(out_dir, *in_dirs):
     error, because the two were searched separately and picking one by
     directory order would make the result depend on argument order.
     """
-    tensors, info, src = {}, {}, {}
+    tensors, info, src, missing = {}, {}, {}, []
     for d in in_dirs:
-        t, m = load_bundle(d)
+        try:
+            t, m = load_bundle(d)
+        except FileNotFoundError:
+            # Searches finish at different times and merging is how a partial
+            # set gets evaluated, so a directory with nothing in it yet is an
+            # ordinary state, not an error.
+            missing.append(d)
+            continue
         dup = [k for k in t if k in tensors]
         if dup:
+            def _v(meta, k):
+                b = meta.get(k, {}).get("beats_baseline")
+                return (f"{meta.get(k, {}).get('search_success', '?')} "
+                        + {True: "BEATS", False: "weak",
+                           None: "unresolved"}[b if b in (True, False) else None])
             raise ValueError(
                 f"{d} and {src[dup[0]]} both define {dup}; merging would pick "
-                f"one by argument order. Delete the one you do not want.")
+                f"one by argument order.\n"
+                + "\n".join(f"  {k}: {src[k]} -> {_v(info, k)};  "
+                            f"{d} -> {_v(m, k)}" for k in dup)
+                + "\nDelete the one you do not want, then merge again.")
         for k in t:
             src[k] = d
         tensors.update(t)
@@ -153,7 +168,12 @@ def merge(out_dir, *in_dirs):
     (out / META).write_text(json.dumps(info, indent=1, sort_keys=True))
     print(f"{len(tensors)} tickets -> {out / BUNDLE}")
     for k in sorted(tensors):
-        print(f"  {k:<24} from {src[k]}")
+        b = info.get(k, {}).get("beats_baseline")
+        tag = {True: "", False: "   (weak -- eval uses Gaussian)",
+               None: "   (unresolved)"}[b if b in (True, False) else None]
+        print(f"  {k:<24} from {src[k]}{tag}")
+    for d in missing:
+        print(f"  (no bundle yet in {d})")
     return out / BUNDLE
 
 
