@@ -38,6 +38,9 @@ import sys
 import time
 from pathlib import Path
 
+import zlib
+from math import comb
+
 import numpy as np
 import torch
 
@@ -53,7 +56,6 @@ def binom_ub(k, n, conf=0.90):
     truly-75% ticket 37% of the time and a truly-89% ticket 10% of the time --
     and goal T0's winning ticket sits at 0.81-0.89 posterior.
     """
-    from math import comb
     lo, hi = 0.0, 1.0
     for _ in range(60):
         m = (lo + hi) / 2
@@ -185,6 +187,14 @@ def main() -> int:
                    help="Use lerobot's unpatched reset order, i.e. the sampler "
                         "distribution. Matches --stock_init in eval and is not "
                         "for anything reportable.")
+    p.add_argument("--abandon_on_empty_floor", type=int, default=1,
+                   help="Stop a task the moment a tier eliminates every "
+                        "candidate. Whatever is carried forward is already "
+                        "under the floor and the final check will say NOT "
+                        "BETTER than Gaussian, so the remaining tiers only "
+                        "confirm it -- an hour, on object T5. 0 keeps going, "
+                        "which is only useful for reading the full "
+                        "distribution.")
     p.add_argument("--exact_prune", type=int, default=1,
                    help="Inside a tier, drop a candidate the moment its BEST "
                         "remaining outcome falls below the floor: after r of M "
@@ -347,7 +357,6 @@ def main() -> int:
           f"12 min/batch at cap 300, that is ~{hours:.1f} h for this task.",
           flush=True)
 
-    rng = np.random.default_rng(a.seed)
     results = {}
     from lerobot.envs.libero import LiberoEnv, _get_suite
     for suite_name in a.suites:
@@ -474,6 +483,16 @@ def main() -> int:
                 print(f"  resuming from {prog.name}: tier {first_tier + 1}, "
                       f"{len(alive)} candidates still alive", flush=True)
             else:
+                # SEEDED PER TASK, not from one stream shared by the run.
+                # Tasks already in the bundle `continue` before this line, so
+                # a shared stream handed task 4 the candidates task 0 drew on
+                # the previous pass -- which candidate set a task got depended
+                # on what else happened to be finished, and "delete the
+                # progress and run it again" was neither a no-op nor a fresh
+                # draw. Keyed on the task, --seed is now the only thing that
+                # changes the candidates.
+                rng = np.random.default_rng(
+                    [a.seed, zlib.crc32(suite_name.encode()), tid])
                 cands = rng.standard_normal((a.tickets, H, D)).astype(np.float32)
                 alive, first_tier = list(range(a.tickets)), 0
                 wins = np.zeros(a.tickets); runs = np.zeros(a.tickets)
@@ -576,6 +595,39 @@ def main() -> int:
                                   f"{len(idx_list)} -> {len(live)} "
                                   f"(cannot reach {floor:.0%} any more)",
                                   flush=True)
+                        # THE CHEAP VERDICT, 40 minutes in instead of 4
+                        # hours. One layout scored by EVERY candidate gives
+                        # the per-layout pass rate, and the tier's floor says
+                        # how many of M a candidate has to win; together they
+                        # say how many candidates the task needs. object T5
+                        # read 27% against a 5-of-5 floor -- one in 700 -- and
+                        # 64 candidates spent 3.7 hours confirming it.
+                        if tier == 0 and k == 0 and idx_list:
+                            need = int(np.ceil(floor * M - 1e-9))
+                            # From the wins, not from the survivor count: a low
+                            # floor eliminates nobody after one layout and the
+                            # survivor count would read 100%.
+                            phat = float(np.mean([wins[i] for i in idx_list]))
+                            q = sum(comb(M, j) * phat ** j * (1 - phat) ** (M - j)
+                                    for j in range(need, M + 1))
+                            msg = (f"    layout 1 pass rate {phat:.0%} vs "
+                                   f"Gaussian {floor:.0%}; the floor needs "
+                                   f"{need}/{M}, ")
+                            if q <= 0:
+                                print(msg + "which nothing at this rate "
+                                      "reaches -- more candidates will not "
+                                      "help, the ticket effect is the "
+                                      "problem", flush=True)
+                            else:
+                                print(msg + f"so about {1 / q:.0f} candidates "
+                                      f"per survivor", flush=True)
+                                if a.tickets * q < 0.5:
+                                    print(f"    -> --tickets {a.tickets} "
+                                          f"expects {a.tickets * q:.2f} "
+                                          f"survivors. Killing this now and "
+                                          f"restarting with ~{int(1.5 / q)} "
+                                          f"costs less than finishing.",
+                                          flush=True)
                         idx_list = live
                     # `alive` is not touched until score() returns, so saving
                     # it here records the tier's live list -- which is what a
@@ -641,6 +693,7 @@ def main() -> int:
                 return max(f, a.prune_floor)
 
             desc, abandoned = desc0, False
+            floor_empty = False
             for tier in range(first_tier, a.tiers):
                 print(f"  tier {tier + 1}/{a.tiers}: {len(alive)} candidates "
                       f"on {a.envs_per_tier} layouts "
@@ -709,6 +762,7 @@ def main() -> int:
                             # still produces a ticket, and that ticket has NOT
                             # beaten Gaussian.
                             alive = alive[:1]
+                            floor_empty = True
                             print(f"    NO candidate met the {floor:.0%} "
                                   f"floor. Carrying the best "
                                   f"({int(wins[alive[0]])}/"
@@ -720,6 +774,18 @@ def main() -> int:
                         alive = alive[:max(1, int(len(alive) * a.keep_frac))]
                     print(f"    {n_before} -> {len(alive)} carried forward",
                           flush=True)
+                    if floor_empty and a.abandon_on_empty_floor:
+                        # The remaining tiers cannot rescue it. Whatever is
+                        # carried forward is already below the floor, the
+                        # bank-or-not check at the end will read
+                        # NOT BETTER than Gaussian, and object T5 spent an
+                        # hour on tiers 2 and 3 arriving there.
+                        print(f"    ABANDONING this task: no candidate met "
+                              f"tier {tier + 1}'s floor, so the remaining "
+                              f"{a.tiers - tier - 1} tiers can only confirm "
+                              f"it. No ticket is banked.", flush=True)
+                        abandoned = True
+                        break
                 top = alive[0]
                 if runs[top] == 0:
                     raise SystemExit(
@@ -738,7 +804,26 @@ def main() -> int:
                 # steerable at all, and the winner of a 5-episode tier is
                 # mostly luck: 128 identical tickets at p=0.7 throw ~21 perfect
                 # scores by chance.
+                # THE TEST NEEDS EQUAL RUNS PER CANDIDATE, and --exact_prune
+                # takes that away: a candidate is stopped BECAUSE it lost, so
+                # the survivors' rates are truncated upward and the spread
+                # collapses. object T5 printed sd_between 0.000, dispersion
+                # 0.62 and "not steerable by the initial noise" off a sample
+                # where 47 candidates had one episode, 10 had two and one had
+                # fifteen. That conclusion had no support: the only layout
+                # every candidate ran gives w/r in {0, 1}, which cannot carry
+                # between-candidate variance at all.
+                r_alive = [runs[i] for i in range(a.tickets) if runs[i] > 0]
+                truncated = (a.exact_prune and a.prune_mode == "point"
+                             and len(set(r_alive)) > 1)
                 disp = dispersion(wins, runs)
+                if truncated:
+                    print(f"    dispersion test SKIPPED: --exact_prune stopped "
+                          f"candidates on their results, so runs per candidate "
+                          f"range {min(r_alive)}-{max(r_alive)} and the spread "
+                          f"is truncated, not measured. The survival curve "
+                          f"above is the readable signal.", flush=True)
+                    disp = None
                 if disp and "dispersion" in disp:
                     verdict = ("TICKETS DIFFER -- worth continuing"
                                if disp["z"] >= 3 else
@@ -800,8 +885,10 @@ def main() -> int:
                 # threshold or more tiers.
                 results[f"{suite_name}_t{tid}"] = {
                     "task": desc, "abandoned_at_tier": 1,
-                    "reason": f"effect size below --abort_below_ratio "
-                              f"{a.abort_below_ratio:g}",
+                    "reason": ("no candidate met the tier floor"
+                               if floor_empty else
+                               f"effect size below --abort_below_ratio "
+                               f"{a.abort_below_ratio:g}"),
                     "baseline_search": f"{base_w[0]:.0f}/{base_r[0]:.0f}",
                     "minutes": round((time.time() - t0) / 60, 1)}
                 (out / "search_summary.json").write_text(json.dumps(results, indent=1))
