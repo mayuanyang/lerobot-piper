@@ -187,6 +187,17 @@ def main() -> int:
                    help="Use lerobot's unpatched reset order, i.e. the sampler "
                         "distribution. Matches --stock_init in eval and is not "
                         "for anything reportable.")
+    p.add_argument("--stratify_layouts", type=int, default=1,
+                   help="Deal the search layouts to tiers by measured "
+                        "difficulty instead of in id order. Layout difficulty "
+                        "varies enormously inside one task -- libero_10 T0 "
+                        "Gaussian scored 45/50 on ids 20-24 and 20/50 on "
+                        "25-29 -- so in id order the floor a tier enforces is "
+                        "whatever its block happened to contain, and tier 1, "
+                        "the tier that filters all the candidates, drew a 5/5 "
+                        "bar on that task purely by position. Needs the "
+                        "baseline to cover tiers x envs_per_tier layouts, "
+                        "which the default does. 0 keeps id order.")
     p.add_argument("--retry_failed", action="store_true",
                    help="Re-search tasks whose banked ticket is marked "
                         "beats_baseline false. Off by default because the "
@@ -504,6 +515,8 @@ def main() -> int:
                 # "done / not done", so an unfinished one there restarts the
                 # baseline -- which is what it used to do in every case.
                 base_k0 = int(z["base_k"]) if "base_k" in z.files else None
+                lay_order0 = (z["lay_order"].astype(int)
+                              if "lay_order" in z.files else None)
                 if start_k0 > 0 and float(runs.sum()) == 0.0:
                     # Written by the pre-fix score_baseline: the tier is marked
                     # part-done while no candidate has run an episode. Heal it
@@ -531,6 +544,7 @@ def main() -> int:
                 base_w0 = base_r0 = 0.0
                 base_lw0 = base_lr0 = None
                 base_k0 = None
+                lay_order0 = None
                 desc0 = None
                 start_k0, base_done0 = 0, False
 
@@ -550,6 +564,16 @@ def main() -> int:
             # baseline again, which on a short Colab lease never finishes.
             base_k = [base_k0 if base_k0 is not None
                       else (n_base_lay if base_done0 else 0)]
+            # WHICH LAYOUT GOES IN WHICH TIER. Identity until the baseline has
+            # run; --stratify_layouts then deals them out so no tier draws all
+            # the easy ones. libero_10 T0 measured 45/50 on layouts 20-24 and
+            # 20/50 on 25-29 -- a 50 point spread inside one task -- and tier
+            # 1, the widest tier, happened to get the easy five and a 5/5
+            # floor. Which five land in tier 1 should not decide the search.
+            n_srch = a.tiers * a.envs_per_tier
+            lay_order = (lay_order0 if lay_order0 is not None
+                         and len(lay_order0) == n_srch
+                         else np.arange(n_srch))
 
             def _save(tier, done_k, alive_now):
                 np.savez(prog, cands=cands, wins=wins, runs=runs,
@@ -558,6 +582,7 @@ def main() -> int:
                          base_w=base_w[0], base_r=base_r[0],
                          base_done=base_k[0] >= n_base_lay,
                          base_k=base_k[0], desc=np.array(desc or ""),
+                         lay_order=np.asarray(lay_order, dtype=np.int64),
                          base_lw=base_lw, base_lr=base_lr,
                          infcfg=np.array(json.dumps(infcfg)),
                          geom=np.array(json.dumps(
@@ -584,7 +609,8 @@ def main() -> int:
                 n_end = (tier + 1) * M            # runs each survivor ends on
                 idx_list = list(idx_list)
                 for k in range(start_k, a.envs_per_tier):
-                    layout = a.init_state_offset + tier * a.envs_per_tier + k
+                    layout = a.init_state_offset + int(
+                        lay_order[tier * a.envs_per_tier + k])
                     for g0 in range(0, len(idx_list), n_par):
                         grp = idx_list[g0:g0 + n_par]
                         tk = torch.from_numpy(
@@ -700,21 +726,46 @@ def main() -> int:
                     base_lw[k] += n_ok; base_lr[k] += n_ep
                     base_k[0] = k + 1
                     _save(tier, cand_k, alive)
+                if a.stratify_layouts and n_base_lay >= n_srch:
+                    # Hardest first, dealt round robin, so every tier gets a
+                    # comparable mix and the floors come out within a few
+                    # points of each other instead of 90% against 40%.
+                    rate = np.where(base_lr[:n_srch] > 0,
+                                    base_lw[:n_srch] / np.maximum(base_lr[:n_srch], 1),
+                                    0.0)
+                    order = list(np.argsort(rate, kind="stable"))
+                    dealt = [[] for _ in range(a.tiers)]
+                    for j, L in enumerate(order):
+                        dealt[j % a.tiers].append(int(L))
+                    lay_order[:] = [L for grp in dealt for L in grp]
+                    for t in range(a.tiers):
+                        seg = lay_order[t * a.envs_per_tier:
+                                        (t + 1) * a.envs_per_tier]
+                        f = (base_lw[seg].sum() / max(base_lr[seg].sum(), 1))
+                        print(f"    tier {t + 1} layouts "
+                              + " ".join(str(a.init_state_offset + int(L))
+                                         for L in sorted(seg))
+                              + f"  Gaussian {f:.0%}", flush=True)
+                _save(tier, cand_k, alive)
 
             base_w, base_r = [base_w0], [base_r0]
 
             def tier_floor(tier):
-                """The Gaussian rate on the layouts THIS tier runs on.
+                """Gaussian over every layout a survivor of `tier` has RUN.
 
-                Falls back to the pooled rate when the baseline does not reach
-                that far -- which is what --baseline_layouts smaller than
-                tiers x envs_per_tier buys you, and why the default is the
-                full span.
+                NOT the layouts of this tier alone. wins/runs is cumulative
+                across tiers, so comparing it to one tier's local rate puts a
+                numerator spanning ten layouts over a denominator describing
+                five. On libero_10 T0 that meant a 3/10 record -- layouts
+                20-29, where Gaussian scores 65 -- judged against tier 2's
+                local 40%.
                 """
-                lo, hi = tier * a.envs_per_tier, (tier + 1) * a.envs_per_tier
-                seg_r = base_lr[lo:hi].sum() if hi <= len(base_lr) else 0.0
+                n = min((tier + 1) * a.envs_per_tier, len(lay_order))
+                seg = lay_order[:n]
+                seg = seg[seg < len(base_lr)]
+                seg_r = base_lr[seg].sum() if len(seg) else 0.0
                 if seg_r > 0:
-                    return float(base_lw[lo:hi].sum() / seg_r)
+                    return float(base_lw[seg].sum() / seg_r)
                 return float(base_w[0] / base_r[0]) if base_r[0] > 0 else 0.0
 
             def floor_for(tier):
@@ -727,11 +778,12 @@ def main() -> int:
             desc, abandoned = desc0, False
             floor_empty = False
             for tier in range(first_tier, a.tiers):
+                _seg = lay_order[tier * a.envs_per_tier:
+                                 (tier + 1) * a.envs_per_tier]
                 print(f"  tier {tier + 1}/{a.tiers}: {len(alive)} candidates "
-                      f"on {a.envs_per_tier} layouts "
-                      f"(ids {a.init_state_offset + tier * a.envs_per_tier}"
-                      f"..{a.init_state_offset + (tier + 1) * a.envs_per_tier - 1})",
-                      flush=True)
+                      f"on {a.envs_per_tier} layouts (ids "
+                      + " ".join(str(a.init_state_offset + int(L))
+                                 for L in sorted(_seg)) + ")", flush=True)
                 if tier == 0:
                     # BEFORE the candidates, not after. This is the only cheap
                     # check that the env is set up the way the reported evals
@@ -746,7 +798,7 @@ def main() -> int:
                         raise SystemExit(
                             f"\nGaussian baseline scored 0/{base_r[0]:.0f} on "
                             f"layouts {a.init_state_offset}-"
-                            f"{a.init_state_offset + a.envs_per_tier - 1} of "
+                            f"{a.init_state_offset + n_base_lay - 1} of "
                             f"{suite_name} task {tid}.\n"
                             f"This policy is not at 0% on this task, so the "
                             f"env is almost certainly not the one the evals "
@@ -774,9 +826,9 @@ def main() -> int:
                             kept = [i for i in alive
                                     if runs[i] > 0
                                     and wins[i] / runs[i] >= floor - 1e-9]
-                            how = (f"below the {floor:.0%} baseline for "
-                                   f"layouts {a.init_state_offset + tier * a.envs_per_tier}"
-                                   f"-{a.init_state_offset + (tier + 1) * a.envs_per_tier - 1}")
+                            how = (f"below the {floor:.0%} Gaussian rate "
+                                   f"over the {(tier + 1) * a.envs_per_tier} "
+                                   f"layouts they have run")
                         else:
                             kept = [i for i in alive
                                     if binom_ub(int(wins[i]), int(runs[i]),
