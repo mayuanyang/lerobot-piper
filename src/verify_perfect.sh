@@ -2,10 +2,20 @@
 # Verify that an existing ticket solves layouts 35-49, the only ones it has
 # never run.
 #
-# object T0, T7 and T8 do not need a search. A ticket is one fixed vector and a
-# rollout from a given init state is deterministic, so every episode already
-# run is a permanent fact about that layout, and these three have 35 of the 50
-# on record:
+# THIS IS OPTIONAL, AND IT IS NOT THE FIRST THING TO RUN. A task already at
+# 20/20 on the reported layouts is finished: a ticket is one fixed vector and a
+# rollout from a given init state is deterministic, so that 20/20 reproduces
+# exactly, and it is unbiased because the search ran on 20-34 and never touched
+# 0-19. Nothing here can change the reported number.
+#
+# What it buys is the stronger CLAIM -- "solves all 50 canonical layouts"
+# rather than "solves the 20 reported ones" -- and evidence that the ticket is
+# not narrowly fitted. Worth 35 minutes eventually; worth less than running
+# try_runners.py on a task that is NOT at 20/20 and could be, where the banked
+# ticket has a permanent failure and a tied runner-up has not been ruled out.
+#
+# A ticket is one fixed vector, so every episode already run is a permanent
+# fact about that layout, and these three have 35 of the 50 on record:
 #
 #     layouts 20-34   searched 15/15   (the search log said so)
 #     layouts  0-19   evalled  20/20   (the reported run)
