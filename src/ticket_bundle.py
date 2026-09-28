@@ -112,12 +112,16 @@ def report(path) -> int:
                    None: "banked, unresolved"}[b if b in (True, False) else None]
         if b is False:
             weak += 1
+        c = m.get("certification")
+        cert = (f"{c['ticket']} vs {c['gaussian']}" if c else "not certified")
         rows.append((k, m.get("search_success", "?"),
-                     m.get("baseline_search", "?"), verdict))
+                     m.get("baseline_search", "?"), cert, verdict))
     w0 = max([len(r[0]) for r in rows] + [4])
-    print(f"{'task':<{w0}}  {'search':>8}  {'gaussian':>9}  verdict")
-    for k, sc, bl, v in rows:
-        print(f"{k:<{w0}}  {sc:>8}  {bl:>9}  {v}")
+    w3 = max([len(r[3]) for r in rows] + [13])
+    print(f"{'task':<{w0}}  {'search':>8}  {'gaussian':>9}  "
+          f"{'certified':<{w3}}  verdict")
+    for k, sc, bl, ct, v in rows:
+        print(f"{k:<{w0}}  {sc:>8}  {bl:>9}  {ct:<{w3}}  {v}")
     print(f"\n{len(rows)} tickets, {weak} weak.")
     if weak:
         print("The weak ones are inert at eval time -- it checks "

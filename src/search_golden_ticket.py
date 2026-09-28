@@ -187,6 +187,26 @@ def main() -> int:
                    help="Use lerobot's unpatched reset order, i.e. the sampler "
                         "distribution. Matches --stock_init in eval and is not "
                         "for anything reportable.")
+    p.add_argument("--certify_layouts", type=int, default=0,
+                   help="After the winner is picked, run IT and Gaussian on "
+                        "this many further layouts that took no part in the "
+                        "selection, and refuse to bank a ticket that does not "
+                        "win there. This is the gate goal T5/T6/T9 needed: all "
+                        "three passed a 15-episode check on the search layouts "
+                        "and then scored 70/75/55 on the held-out 0-19, "
+                        "because the search rate is a MAXIMUM over candidates "
+                        "and a maximum is optimistic by construction. "
+                        "Certification episodes never enter the selection, so "
+                        "the number is unbiased. Cheap: one batch covers "
+                        "--num_envs layouts at a time (init_state_stride=1), "
+                        "so 15 layouts for the ticket plus 15 for Gaussian is "
+                        "4 batches. 15 with the default geometry uses ids "
+                        "35-49 and exactly fills the canonical 50.")
+    p.add_argument("--certify_min_margin", type=float, default=0.0,
+                   help="How far above Gaussian the ticket must land on the "
+                        "certification layouts, in rate. 0.0 means a tie is "
+                        "enough (which is what determinism wants at the "
+                        "ceiling); 0.05 asks for real headroom.")
     p.add_argument("--stratify_layouts", type=int, default=1,
                    help="Deal the search layouts to tiers by measured "
                         "difficulty instead of in id order. Layout difficulty "
@@ -315,13 +335,16 @@ def main() -> int:
                         "lines worth watching.")
     a = p.parse_args()
 
-    if a.init_state_offset + max(a.tiers * a.envs_per_tier,
+    if a.init_state_offset + max(a.tiers * a.envs_per_tier
+                                 + a.certify_layouts,
                                  a.baseline_layouts or 0) > 50:
         print(f"ERROR: tiers x envs_per_tier = "
               f"{a.tiers * a.envs_per_tier} layouts starting at "
               f"{a.init_state_offset} runs past the canonical 50 and would "
+              f"plus {a.certify_layouts} certification layouts, "
               f"wrap into the reportable 0-19. Reduce --tiers, "
-              f"--envs_per_tier, or --init_state_offset.", file=sys.stderr)
+              f"--envs_per_tier, --certify_layouts, or "
+              f"--init_state_offset.", file=sys.stderr)
         return 1
 
     device = a.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -974,6 +997,7 @@ def main() -> int:
                                f"effect size below --abort_below_ratio "
                                f"{a.abort_below_ratio:g}"),
                     "baseline_search": f"{base_w[0]:.0f}/{base_r[0]:.0f}",
+                "certification": cert,
                     "minutes": round((time.time() - t0) / 60, 1)}
                 (out / "search_summary.json").write_text(json.dumps(results, indent=1))
                 for e_ in (envs or []):
@@ -999,6 +1023,51 @@ def main() -> int:
             base_rate = base_w[0] / max(base_r[0], 1)
             win_rate = wins[best] / max(runs[best], 1)
             p_raw = binom_sf(int(wins[best]), int(runs[best]), base_rate)
+
+            # CERTIFICATION: the winner and Gaussian on layouts that took no
+            # part in choosing it. `win_rate` is a MAXIMUM over --tickets
+            # candidates and a maximum is optimistic by construction, so it
+            # cannot be compared to a baseline that was not selected on. goal
+            # T5/T6/T9 are what that costs: all three cleared the 15-episode
+            # search check and then scored 70/75/55 on the held-out 0-19.
+            # One batch covers --num_envs layouts here, because the ticket is
+            # fixed and the LAYOUT varies (init_state_stride=1) -- the inverse
+            # of the search, where the layout is fixed and the ticket varies.
+            cert = None
+            if a.certify_layouts > 0:
+                c0 = a.init_state_offset + a.tiers * a.envs_per_tier
+                print(f"  certifying on layouts {c0}-{c0 + a.certify_layouts - 1}"
+                      f" (took no part in the selection)", flush=True)
+                cw = {}
+                for tag, tk in (("ticket", cands[best]), ("gaussian", None)):
+                    policy.model._noise_ticket = (
+                        torch.from_numpy(np.asarray(tk)).to(device)
+                        if tk is not None else None)
+                    ok = ep = 0
+                    for g0 in range(0, a.certify_layouts, n_par):
+                        n_lay = min(n_par, a.certify_layouts - g0)
+                        sink = (contextlib.nullcontext() if a.verbose
+                                else contextlib.redirect_stdout(io.StringIO()))
+                        with sink:
+                            n_ok, n_ep, _, _, _, _ = ev.eval_task(
+                                policy, pre, post, suite, suite_name, tid,
+                                n_lay, n_lay, device, a.max_episode_steps,
+                                a.seed, cams, envs=envs[:n_lay],
+                                init_state_offset=c0 + g0,
+                                init_state_stride=1)
+                        ok += n_ok; ep += n_ep
+                    cw[tag] = (ok, ep)
+                    print(f"    {tag:<8} {ok}/{ep} = {ok / max(ep, 1):.0%}",
+                          flush=True)
+                policy.model._noise_ticket = None
+                tk_r = cw["ticket"][0] / max(cw["ticket"][1], 1)
+                gs_r = cw["gaussian"][0] / max(cw["gaussian"][1], 1)
+                cert = {"layouts": f"{c0}-{c0 + a.certify_layouts - 1}",
+                        "ticket": f"{cw['ticket'][0]}/{cw['ticket'][1]}",
+                        "gaussian": f"{cw['gaussian'][0]}/{cw['gaussian'][1]}",
+                        "ticket_rate": round(tk_r, 4),
+                        "gaussian_rate": round(gs_r, 4),
+                        "passed": bool(tk_r >= gs_r + a.certify_min_margin)}
             # THREE-VALUED, because "not significant" and "not better" are
             # different and only one of them is a reason to discard the ticket.
             # 15 episodes cannot detect an improvement over a 90% baseline, so
@@ -1006,7 +1075,18 @@ def main() -> int:
             # REPORTABLE baseline is 70% and the headroom is real. The search
             # baseline and the eval headroom are measured on different layouts
             # and routinely disagree by 20 points.
-            if win_rate >= 1.0 and base_rate >= 1.0:
+            if cert is not None and not cert["passed"]:
+                # Overrides every verdict below. The search number said this
+                # ticket was better; unselected layouts say it is not, and
+                # those are the ones that resemble the eval.
+                beats, verdict = False, (
+                    f"FAILED CERTIFICATION on layouts {cert['layouts']}: "
+                    f"{cert['ticket']} against Gaussian {cert['gaussian']}. "
+                    f"The search rate {win_rate:.0%} was a maximum over "
+                    f"{a.tickets} candidates and did not survive contact with "
+                    f"layouts it was not chosen on. Banked as weak; eval will "
+                    f"use Gaussian")
+            elif win_rate >= 1.0 and base_rate >= 1.0:
                 # A TIE AT THE CEILING IS THE ONE TIE WORTH TAKING. Both score
                 # every episode, but the ticket does so DETERMINISTICALLY: its
                 # result does not depend on the noise stream, while Gaussian's
