@@ -400,6 +400,13 @@ def main() -> int:
           flush=True)
 
     results = {}
+    # --overwrite USED TO DISABLE RESUME. Every `not a.overwrite` guard below
+    # covered both the bundle skip and the progress file, so an --overwrite run
+    # killed at hour 10 of 12 restarted from zero, forever, on a platform whose
+    # sessions end at 24 h. Progress written BEFORE this process started is the
+    # run being overwritten and is discarded; progress written after is this
+    # run's own checkpoint and is resumed.
+    t_start = time.time()
     from lerobot.envs.libero import LiberoEnv, _get_suite
     for suite_name in a.suites:
         suite = _get_suite(suite_name)
@@ -463,7 +470,13 @@ def main() -> int:
             # candidates -- otherwise the accumulated wins/runs would describe
             # tickets that no longer exist.
             prog = out / f"_progress_{suite_name}_t{tid}.npz"
-            if prog.exists() and not a.overwrite:
+            if prog.exists() and a.overwrite and prog.stat().st_mtime < t_start:
+                print(f"  --overwrite: discarding {prog.name} from the "
+                      f"previous run", flush=True)
+                prog.unlink()
+            resume_ok = prog.exists() and (not a.overwrite
+                                           or prog.stat().st_mtime >= t_start)
+            if resume_ok:
                 # Progress from a differently-configured run is WORSE than no
                 # progress: it carries that run's counts and its base_done
                 # flag, so the Gaussian reference is never re-measured and the
@@ -514,7 +527,7 @@ def main() -> int:
                                       for k, (w, n_) in _bad.items())
                           + " -- starting this task fresh.", flush=True)
                     prog.unlink()
-            if prog.exists() and not a.overwrite:
+            if prog.exists():
                 z = np.load(prog)
                 cands, wins, runs = z["cands"], z["wins"], z["runs"]
                 alive, first_tier = [int(x) for x in z["alive"]], int(z["next_tier"])
