@@ -1250,7 +1250,22 @@ def main() -> int:
             # fixed ticket makes this policy fully deterministic, and the
             # per-chunk re-draw it removes is worth 25 points by this
             # project's own measurement. 64 x 64 x 7 float32 is 115 KB.
-            prog.replace(prog.with_name(prog.name.replace('_progress_', '_done_')))
+            done_f = prog.with_name(prog.name.replace('_progress_', '_done_'))
+            # THE CANDIDATE POOL IS THE ASSET, not the banked ticket. A rerun
+            # in the same directory renames its progress over the old _done_
+            # file and takes 64 vectors with it -- including the runner-ups
+            # try_runners mines for a clean sweep of the reported layouts,
+            # which is the cheapest route to a deterministic 100% there is.
+            # Unlike the ticket, this cannot be recovered from anything else.
+            if done_f.exists():
+                n_ = 1
+                while done_f.with_name(f"{done_f.stem}_prev{n_}.npz").exists():
+                    n_ += 1
+                keep = done_f.with_name(f"{done_f.stem}_prev{n_}.npz")
+                done_f.replace(keep)
+                print(f"  kept the previous candidate pool as {keep.name}",
+                      flush=True)
+            prog.replace(done_f)
             results[f"{suite_name}_t{tid}"] = {
                 "file": str(f), "bundle": str(bf), "task": desc,
                 "ticket_index": int(best),
