@@ -183,10 +183,45 @@ def merge(out_dir, *in_dirs):
 
 if __name__ == "__main__":
     import sys
+    if len(sys.argv) >= 3 and sys.argv[1] == "runners":
+        # THE BUNDLE KEEPS ONE TICKET; THE SEARCH KEPT ALL OF THEM. Sequential
+        # halving usually leaves several candidates tied at the top tier's
+        # score, and only the first was banked. When the banked one turns out
+        # not to solve every canonical layout, a tied runner-up may -- and
+        # testing one is 35 episodes (the layouts it has never run) against
+        # hours for a fresh search.
+        import numpy as _np
+        z = _np.load(sys.argv[2], allow_pickle=True)
+        w, r, cands = z["wins"], z["runs"], z["cands"]
+        rate = _np.where(r > 0, w / _np.maximum(r, 1), -1.0)
+        order = sorted(range(len(rate)), key=lambda i: (-rate[i], -r[i]))
+        k = int(sys.argv[3]) if len(sys.argv) > 3 else 8
+        top = [i for i in order if r[i] > 0][:k]
+        best = rate[top[0]]
+        tied = [i for i in top if rate[i] >= best - 1e-9 and r[i] == r[top[0]]]
+        print(f"{str(z['desc'])}\n")
+        print(f"{'rank':>4}  {'ticket':>6}  {'score':>7}  rate")
+        for n, i in enumerate(top):
+            print(f"{n:>4}  {i:>6}  {int(w[i]):>3}/{int(r[i]):<3}  "
+                  f"{rate[i]:.0%}" + ("   <- banked" if n == 0 else ""))
+        print(f"\n{len(tied)} candidate(s) tied at {int(w[top[0]])}/"
+              f"{int(r[top[0]])} on the same number of layouts.")
+        if len(sys.argv) > 4 and sys.argv[4] == "--export":
+            out = Path(sys.argv[2]).parent
+            for n, i in enumerate(tied):
+                f = out / f"{Path(sys.argv[2]).stem.replace('_done_', 'alt_')}_c{i}.npy"
+                _np.save(f, cands[i])
+                print(f"  wrote {f}")
+            print("\nTest one with eval_wiltechs_x.py --noise_ticket <file> "
+                  "--task_ids <id> --episodes 20 --init_state_offset 0,\n"
+                  "then again at --init_state_offset 35 --episodes 15. A "
+                  "candidate that takes both is 50/50.")
+        raise SystemExit(0)
     if len(sys.argv) >= 3 and sys.argv[1] == "report":
         raise SystemExit(0 if report(sys.argv[2]) == 0 else 0)
     if len(sys.argv) < 4 or sys.argv[1] != "merge":
         print("usage: python ticket_bundle.py report <dir>\n"
+              "       python ticket_bundle.py runners <_done_*.npz> [k] [--export]\n"
               "       python ticket_bundle.py merge <out_dir> <in_dir> [<in_dir> ...]",
               file=sys.stderr)
         raise SystemExit(2)
