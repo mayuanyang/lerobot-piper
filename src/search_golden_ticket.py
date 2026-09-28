@@ -239,6 +239,16 @@ def main() -> int:
                         "bar on that task purely by position. Needs the "
                         "baseline to cover tiers x envs_per_tier layouts, "
                         "which the default does. 0 keeps id order.")
+    p.add_argument("--allow_downgrade", action="store_true",
+                   help="Permit replacing a WORKING ticket in --out. "
+                        "save_ticket overwrites unconditionally, so "
+                        "--overwrite pointed at the live bundle can retire a "
+                        "ticket that is earning episodes and put a worse one "
+                        "in its place, with the eval that proved the old one "
+                        "already spent. A ticket marked beats_baseline false "
+                        "is replaced freely -- eval ignores it, so there is "
+                        "nothing to lose. The usual answer is a separate "
+                        "--out, which also removes the need for --overwrite.")
     p.add_argument("--retry_failed", action="store_true",
                    help="Re-search tasks whose banked ticket is marked "
                         "beats_baseline false. Off by default because the "
@@ -1189,6 +1199,46 @@ def main() -> int:
                 **infcfg,
                 "checkpoint": str(a.checkpoint), "horizon": H, "action_dim": D,
             }
+            # WOULD THIS RETIRE A WORKING TICKET? Only asked when the new
+            # search is writing into a bundle that already holds one for this
+            # task, which is what --overwrite against the live directory does.
+            # The old ticket's standing comes from an eval that has already
+            # been paid for; the new one's search rate is a maximum over
+            # candidates on different layouts, so the two numbers cannot be
+            # compared and the safe default is to keep what is proven.
+            if not a.allow_downgrade:
+                try:
+                    _ex_t, _ex_m = tb.load_bundle(out)
+                    _ex = _ex_m.get(tb.key(suite_name, tid), {}) \
+                        if tb.key(suite_name, tid) in _ex_t else None
+                except FileNotFoundError:
+                    _ex = None
+                if _ex is not None and _ex.get("beats_baseline") is not False:
+                    print(f"  REFUSING to replace the ticket already in "
+                          f"{out}: it is marked beats_baseline "
+                          f"{_ex.get('beats_baseline')} with search "
+                          f"{_ex.get('search_success')}, and its standing "
+                          f"comes from an eval that has been run. The new "
+                          f"ticket is at {out / f'{suite_name}_t{tid}_ticket.npy'}"
+                          f".\n  Search into a separate --out and compare, or "
+                          f"pass --allow_downgrade if you mean to retire it.",
+                          flush=True)
+                    results[f"{suite_name}_t{tid}"] = {
+                        "task": desc, "not_banked": "would replace a working "
+                        "ticket; --allow_downgrade to force",
+                        "search_success": f"{wins[best]:.0f}/{runs[best]:.0f}",
+                        "minutes": round((time.time() - t0) / 60, 1)}
+                    (out / "search_summary.json").write_text(
+                        json.dumps(results, indent=1))
+                    prog.replace(prog.with_name(
+                        prog.name.replace('_progress_', '_done_')))
+                    for e_ in (envs or []):
+                        try:
+                            e_.close()
+                        except Exception:
+                            pass
+                    policy.model._noise_ticket = None
+                    continue
             # Banked the moment the task finishes, before the next one starts.
             bf = tb.save_ticket(out, suite_name, tid, cands[best], meta)
             # KEPT, not deleted. The bundle stores one ticket per task, but
