@@ -1546,6 +1546,20 @@ def main():
     # side by side.
     report_inference_config(inference_config(
         policy, a.control_freq, a.max_episode_steps, a.stock_init))
+    # THE SILENT DEFAULT THAT HAS COST THIS PROJECT THREE RESULTS. The
+    # checkpoint ships n_action_steps=64 and every reported eval passes 2, so
+    # --n_action_steps left at 0 runs a policy that replans a handful of times
+    # per episode instead of every two steps. It does not error, it does not
+    # look wrong in the log, it just returns zero: an 0/50 ticket search, an
+    # 0/200 RFT collect, and an 0/20 random-ticket control that read as
+    # "tickets do not work on libero_10" until the field was checked.
+    if a.n_action_steps == 0 and int(policy.config.n_action_steps) > 8:
+        print(f"\n*** WARNING: n_action_steps={int(policy.config.n_action_steps)}, "
+              f"the checkpoint's own value, because --n_action_steps was not\n"
+              f"    passed. Every reported eval in this project uses 2. At "
+              f"{int(policy.config.n_action_steps)} the policy replans a few\n"
+              f"    times per episode and the usual result is 0%. Pass "
+              f"--n_action_steps 2 unless you mean this.\n", flush=True)
     if a.noise_ticket:
         _tk = np.load(a.noise_ticket)
         _want = (int(policy.config.horizon), int(policy.config.action_dim))
