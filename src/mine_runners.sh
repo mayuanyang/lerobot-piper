@@ -68,7 +68,7 @@ for T in $TASKS; do
     --checkpoint "$CKPT" \
     --suite "$SUITE" --task_id "$T" \
     --done "$NPZ" --k 6 \
-    --bank "$OUT" || echo "  (task $T failed, continuing)"
+    --seed_from "$SRC" --bank "$OUT" || echo "  (task $T failed, continuing)"
 done
 
 echo

@@ -58,7 +58,20 @@ def main() -> int:
                    help="How many top candidates to try, banked one first.")
     p.add_argument("--bank", default=None,
                    help="Bundle directory to write a verified ticket into. "
-                        "Omitted, the run only reports.")
+                        "Omitted, the run only reports. NOT the directory the "
+                        "candidates came from: these are selected in-sample "
+                        "and the original bundle's tickets are held-out, so "
+                        "keeping them apart keeps both numbers quotable.")
+    p.add_argument("--seed_from", default=None,
+                   help="Copy this bundle into --bank before writing, so the "
+                        "result is COMPLETE and can be evaluated directly. "
+                        "Without it --bank holds only the tasks that were "
+                        "mined, and evaluating that bundle silently drops "
+                        "every other task to Gaussian -- which on object would "
+                        "cost the four 20/20 tickets that are already there. "
+                        "Copying is idempotent: tickets already in --bank are "
+                        "left alone, so it is safe to pass on every task in a "
+                        "loop.")
     p.add_argument("--eval_layouts", type=int, default=20,
                    help="The reported span, tested first because a candidate "
                         "that fails here is done after two batches.")
@@ -203,12 +216,36 @@ def main() -> int:
         print(f"  ticket {i:>3}   0-{a.eval_layouts - 1}: {o1}/{e1}{tail}")
 
     if winner is None:
-        print(f"\nNone of the {len(top)} solves every canonical layout. The "
-              f"banked ticket stays. A --require_perfect search over "
-              f"--init_state_offset 0 is the remaining option, and its cost is "
-              f"1/p^50 candidates for a per-layout pass rate p -- check the "
-              f"first-hour line before committing hours to it.")
+        best = max(results, key=lambda r: r[1])
+        print(f"\nNone of the {len(top)} takes all {a.eval_layouts} reported "
+              f"layouts; the best was ticket {best[0]} at {best[1]}/{best[2]}. "
+              f"NOTHING IS BANKED, deliberately: a candidate that merely scores "
+              f"higher, picked as the max over {len(top)} tried on the layouts "
+              f"being reported, is a selection artefact worth no more than the "
+              f"ticket already in the bundle. A clean sweep is different -- "
+              f"'solves all {a.eval_layouts}' is exact and cannot be inflated "
+              f"by trying more candidates.\nThe remaining option is a "
+              f"--require_perfect search over --init_state_offset 0, which "
+              f"costs 1/p^50 candidates at per-layout pass rate p; read the "
+              f"first-hour line before committing to it.")
         return 0
+
+    if a.bank and a.seed_from:
+        # BEFORE the write, and only for keys --bank does not already have, so
+        # a loop over tasks does not undo the previous task's result.
+        src_t, src_m = tb.load_bundle(a.seed_from)
+        try:
+            have, _ = tb.load_bundle(a.bank)
+        except FileNotFoundError:
+            have = {}
+        added = [k for k in src_t if k not in have]
+        for k in added:
+            suite_, tid_ = k.rsplit(".", 1)
+            tb.save_ticket(a.bank, suite_, int(tid_), src_t[k],
+                           src_m.get(k, {}))
+        if added:
+            print(f"\nseeded {a.bank} with {len(added)} ticket(s) from "
+                  f"{a.seed_from}: {', '.join(sorted(added))}", flush=True)
 
     if a.bank:
         meta = {"task": str(z["desc"]) if "desc" in z.files else None,
