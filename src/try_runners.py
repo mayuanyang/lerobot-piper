@@ -145,6 +145,24 @@ def main() -> int:
                                  a.stock_init)
     ev.report_inference_config(infcfg)
 
+    # DOES THIS POOL BELONG TO THIS TASK? Nothing downstream would notice if
+    # it did not: the candidates load, the MUST_MATCH check passes because the
+    # checkpoint is the same, the rollouts run, and a ticket searched for
+    # libero_goal task 2 gets banked under libero_spatial.2. The filename is
+    # the only place the pool's identity is written down.
+    stem = Path(a.done).name
+    if stem.startswith("_done_") or stem.startswith("_progress_"):
+        core = stem.split("_", 2)[2].rsplit(".npz", 1)[0]
+        core = core.split("_prev")[0]
+        f_suite, _, f_tid = core.rpartition("_t")
+        if f_suite and f_tid.isdigit() and \
+                (f_suite != a.suite or int(f_tid) != a.task_id):
+            print(f"ERROR: {stem} holds candidates for {f_suite} task {f_tid}, "
+                  f"but --suite {a.suite} --task_id {a.task_id} was given. "
+                  f"Those candidates were searched against a different task "
+                  f"and would be banked under the wrong key.", file=sys.stderr)
+            return 1
+
     z = np.load(a.done, allow_pickle=True)
     cands, wins, runs = z["cands"], z["wins"], z["runs"]
     # The search's config, not this one. A candidate scored under a different
@@ -210,6 +228,19 @@ def main() -> int:
                     init_state_stride=1)
             ok += n_ok; ep += n_ep; per += list(e_ok)
         return ok, ep, per
+
+    pool_desc = str(z["desc"]) if "desc" in z.files else ""
+    env_desc = getattr(envs[0], "task_description", None) \
+        or getattr(getattr(envs[0], "task", None), "language", None) or ""
+    if pool_desc and env_desc and pool_desc.strip() != str(env_desc).strip():
+        print(f"ERROR: the pool was searched on '{pool_desc}' but this env is "
+              f"'{env_desc}'. Wrong file for this task.", file=sys.stderr)
+        for e in envs:
+            try:
+                e.close()
+            except Exception:
+                pass
+        return 1
 
     print(f"\n{a.suite} task {a.task_id}: trying {len(top)} candidates, "
           f"{a.eval_layouts} layouts from 0 then {a.rest_layouts} from "
