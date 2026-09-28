@@ -114,6 +114,16 @@ def report(path) -> int:
             weak += 1
         c = m.get("certification")
         cert = (f"{c['ticket']} vs {c['gaussian']}" if c else "not certified")
+        # PROVENANCE, because the two kinds of ticket produce numbers that look
+        # identical. One was searched on layouts the eval never touches and its
+        # suite average is a held-out result; the other was picked by running
+        # candidates on the reported layouts, so its average is exact but
+        # in-sample. A bundle holding both is fine -- the workflow wants one
+        # bundle -- as long as the report says which is which.
+        if m.get("selected_on_reported_layouts"):
+            verdict = ("SWEPT the reported layouts (in-sample)"
+                       if m.get("swept_reported_layouts")
+                       else "better on the reported layouts (in-sample)")
         rows.append((k, m.get("search_success", "?"),
                      m.get("baseline_search", "?"), cert, verdict))
     w0 = max([len(r[0]) for r in rows] + [4])

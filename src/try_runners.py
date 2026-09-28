@@ -327,6 +327,27 @@ def main() -> int:
                 "claim": "solves all 50 canonical layouts; generalisation "
                          "to unseen init states is untested",
                 **infcfg, "checkpoint": str(a.checkpoint)}
+        # KEEP WHAT IS BEING REPLACED. save_ticket overwrites the key and its
+        # metadata together, so the old ticket_index goes with it and the old
+        # vector becomes recoverable only by cross-referencing an eval JSON.
+        # Banking into the live bundle is the simple workflow; this is what
+        # makes it reversible.
+        try:
+            _old_t, _old_m = tb.load_bundle(a.bank)
+            _k = tb.key(a.suite, a.task_id)
+        except FileNotFoundError:
+            _old_t, _k = {}, None
+        if _k is not None and _k in _old_t:
+            bak = Path(a.bank) / f"prev_{a.suite}_t{a.task_id}.npy"
+            np.save(bak, _old_t[_k])
+            log = Path(a.bank) / "replaced.json"
+            hist = json.loads(log.read_text()) if log.exists() else {}
+            hist.setdefault(_k, []).append(
+                {"when": time.strftime("%Y-%m-%d %H:%M"),
+                 "vector": bak.name, "meta": _old_m.get(_k, {})})
+            log.write_text(json.dumps(hist, indent=1, sort_keys=True))
+            print(f"  previous ticket kept as {bak.name}, its metadata in "
+                  f"replaced.json", flush=True)
         f = tb.save_ticket(a.bank, a.suite, a.task_id, cands[winner], meta)
         print(f"\nbanked ticket {winner} -> {f}")
         print("The metadata records that this ticket was selected by running "
