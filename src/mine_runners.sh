@@ -42,10 +42,10 @@ SUITE_SHORT=${1:?usage: $0 object|spatial|goal|10 [task ids...]}
 shift || true
 
 case "$SUITE_SHORT" in
-  object)  SUITE=libero_object;  SRC=$DRIVE/object_tickets;  CAP=280; DEF="2 9 4 3 5" ;;
-  spatial) SUITE=libero_spatial; SRC=$DRIVE/spatial_tickets; CAP=280; DEF="2 3 7 9 8" ;;
-  goal)    SUITE=libero_goal;    SRC=$DRIVE/goal_tickets;    CAP=300; DEF="3 7 5 6 9" ;;
-  10|long) SUITE=libero_10;      SRC=$DRIVE/long_tickets;    CAP=0;   DEF="" ;;
+  object)  SUITE=libero_object;  SRC=$DRIVE/object_tickets;  DEF="2 9 4 3 5" ;;
+  spatial) SUITE=libero_spatial; SRC=$DRIVE/spatial_tickets; DEF="2 3 7 9 8" ;;
+  goal)    SUITE=libero_goal;    SRC=$DRIVE/goal_tickets;    DEF="3 7 5 6 9" ;;
+  10|long) SUITE=libero_10;      SRC=$DRIVE/long_tickets;    DEF="" ;;
   *) echo "unknown suite $SUITE_SHORT" >&2; exit 2 ;;
 esac
 
@@ -68,7 +68,6 @@ for T in $TASKS; do
     --checkpoint "$CKPT" \
     --suite "$SUITE" --task_id "$T" \
     --done "$NPZ" --k 6 \
-    --max_episode_steps "$CAP" \
     --bank "$OUT" || echo "  (task $T failed, continuing)"
 done
 
