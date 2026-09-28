@@ -194,18 +194,50 @@ if __name__ == "__main__":
         z = _np.load(sys.argv[2], allow_pickle=True)
         w, r, cands = z["wins"], z["runs"], z["cands"]
         rate = _np.where(r > 0, w / _np.maximum(r, 1), -1.0)
-        order = sorted(range(len(rate)), key=lambda i: (-rate[i], -r[i]))
+        # DEPTH FIRST, then rate. Ranking by rate alone put candidates that
+        # were eliminated in tier 1 above the deep survivors: object T5 listed
+        # six tickets at 2/3 -- three layouts each, barely tested -- above the
+        # 8/15 that the search actually banked, and object T3 listed a 7/9
+        # above its 9/15. Runs differ BECAUSE the search stopped the weak ones
+        # early, so a high rate over few layouts is the absence of evidence.
+        order = sorted(range(len(rate)), key=lambda i: (-r[i], -rate[i]))
         k = int(sys.argv[3]) if len(sys.argv) > 3 else 8
         top = [i for i in order if r[i] > 0][:k]
-        best = rate[top[0]]
-        tied = [i for i in top if rate[i] >= best - 1e-9 and r[i] == r[top[0]]]
-        print(f"{str(z['desc'])}\n")
+        deep = max(r)
+        # The banked one is named in the bundle metadata, not inferred from the
+        # ranking -- which is what produced the wrong "<- banked" marks.
+        banked = None
+        d = Path(sys.argv[2])
+        m = d.parent / META
+        if m.exists():
+            stem = d.stem.replace("_done_", "")
+            suite_, tid_ = stem.rsplit("_t", 1)
+            info = json.loads(m.read_text()).get(key(suite_, int(tid_)), {})
+            banked = info.get("ticket_index")
+        g = json.loads(str(z["geom"])) if "geom" in z.files else None
+        print(f"{str(z['desc'])}")
+        if g:
+            print(f"  searched with {g.get('tickets')} tickets, "
+                  f"{g.get('envs_per_tier')} layouts per tier, from id "
+                  f"{g.get('init_state_offset')}")
+        print(f"  deepest candidates ran {int(deep)} layouts\n")
         print(f"{'rank':>4}  {'ticket':>6}  {'score':>7}  rate")
         for n, i in enumerate(top):
+            mark = "   <- banked" if banked is not None and i == banked else ""
+            if r[i] < deep:
+                mark += f"   (only {int(r[i])} layouts -- eliminated early)"
             print(f"{n:>4}  {i:>6}  {int(w[i]):>3}/{int(r[i]):<3}  "
-                  f"{rate[i]:.0%}" + ("   <- banked" if n == 0 else ""))
-        print(f"\n{len(tied)} candidate(s) tied at {int(w[top[0]])}/"
-              f"{int(r[top[0]])} on the same number of layouts.")
+                  f"{rate[i]:.0%}{mark}")
+        at_depth = [i for i in range(len(r)) if r[i] == deep]
+        best_at_depth = max(rate[i] for i in at_depth)
+        tied = [i for i in at_depth if rate[i] >= best_at_depth - 1e-9]
+        print(f"\n{len(at_depth)} candidate(s) reached {int(deep)} layouts; "
+              f"{len(tied)} of them tied at the top score "
+              f"{int(w[tied[0]])}/{int(deep)}.")
+        if best_at_depth < 1.0:
+            print("  The best full-depth candidate is not perfect even on the "
+                  "layouts it was searched on, so no runner-up here is a "
+                  "likely 20/20. Re-searching this task is the honest option.")
         if len(sys.argv) > 4 and sys.argv[4] == "--export":
             out = Path(sys.argv[2]).parent
             for n, i in enumerate(tied):

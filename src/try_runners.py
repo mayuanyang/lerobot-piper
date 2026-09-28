@@ -55,7 +55,21 @@ def main() -> int:
     p.add_argument("--suite", required=True)
     p.add_argument("--task_id", type=int, required=True)
     p.add_argument("--k", type=int, default=4,
-                   help="How many top candidates to try, banked one first.")
+                   help="How many candidates to try, deepest first. Depth is "
+                        "the primary key because runs differ BECAUSE the "
+                        "search stopped the weak ones early: object T5's "
+                        "npz holds six candidates at 2/3, which is three "
+                        "layouts each, and ranking those by rate put them "
+                        "above the 8/15 the search actually banked.")
+    p.add_argument("--bank_if_better", action="store_true",
+                   help="Also bank a candidate that beats the currently "
+                        "banked ticket on the reported layouts without "
+                        "sweeping them. Off by default because a +1 chosen as "
+                        "the max over everything tried, ON the layouts being "
+                        "reported, is a selection artefact; a clean sweep is "
+                        "exact and cannot be inflated by trying more "
+                        "candidates. The banked ticket is measured here first "
+                        "so the comparison is same-run and same-cap.")
     p.add_argument("--bank", default=None,
                    help="Bundle directory to write a verified ticket into. "
                         "Omitted, the run only reports. NOT the directory the "
@@ -129,8 +143,26 @@ def main() -> int:
             return 1
     rate = np.where(runs > 0, wins / np.maximum(runs, 1), -1.0)
     order = [i for i in sorted(range(len(rate)),
-                               key=lambda i: (-rate[i], -runs[i])) if runs[i] > 0]
+                               key=lambda i: (-runs[i], -rate[i])) if runs[i] > 0]
     top = order[:a.k]
+    # The banked ticket is named in the metadata. Inferring it from the ranking
+    # is what mislabelled object T3 and T5, whose top-by-rate candidates were
+    # tier-1 casualties with three and nine layouts against the survivor's
+    # fifteen. It goes first so --bank_if_better compares like with like.
+    banked_idx = None
+    try:
+        _, bmeta = tb.load_bundle(Path(a.done).parent)
+        banked_idx = bmeta.get(tb.key(a.suite, a.task_id), {}).get("ticket_index")
+    except FileNotFoundError:
+        pass
+    if banked_idx is not None and banked_idx in order:
+        top = [banked_idx] + [i for i in top if i != banked_idx][:a.k - 1]
+    deepest = max(runs)
+    shallow = [i for i in top if runs[i] < deepest]
+    if shallow:
+        print(f"  NOTE: {len(shallow)} of these ran fewer than {int(deepest)} "
+              f"layouts and were eliminated early -- their scores are the "
+              f"absence of evidence, not evidence.", flush=True)
 
     from lerobot.envs.libero import LiberoEnv, _get_suite
     suite = _get_suite(a.suite)
@@ -166,7 +198,7 @@ def main() -> int:
           f"{a.rest_offset}", flush=True)
     winner, results = None, []
     for n, i in enumerate(top):
-        tag = "banked" if n == 0 else f"runner-up {n}"
+        tag = ("banked" if i == banked_idx else f"runner-up {n}")
         print(f"\n  ticket {i} ({tag}, searched "
               f"{int(wins[i])}/{int(runs[i])})", flush=True)
         ok1, ep1, per1 = run(cands[i], 0, a.eval_layouts)
@@ -215,8 +247,22 @@ def main() -> int:
                 "  (stopped: those failures are permanent for this vector)")
         print(f"  ticket {i:>3}   0-{a.eval_layouts - 1}: {o1}/{e1}{tail}")
 
+    best = max(results, key=lambda r: r[1]) if results else None
+    if winner is None and a.bank_if_better and a.bank and best is not None:
+        cur = next((o for i, o, _, _, _ in results if i == banked_idx), None)
+        if cur is not None and best[1] > cur:
+            winner = best[0]
+            print(f"\n--bank_if_better: ticket {winner} takes {best[1]}/"
+                  f"{best[2]} against the banked ticket's {cur}/{best[2]} in "
+                  f"this same run. Banking it. This is a selection over "
+                  f"{len(results)} candidates on the layouts being reported, "
+                  f"so the gain is an upper bound on what it is worth.",
+                  flush=True)
+        elif cur is None:
+            print(f"\n--bank_if_better: the banked ticket was not among the "
+                  f"candidates measured here, so there is nothing to compare "
+                  f"against. Nothing banked.", flush=True)
     if winner is None:
-        best = max(results, key=lambda r: r[1])
         print(f"\nNone of the {len(top)} takes all {a.eval_layouts} reported "
               f"layouts; the best was ticket {best[0]} at {best[1]}/{best[2]}. "
               f"NOTHING IS BANKED, deliberately: a candidate that merely scores "
@@ -224,7 +270,8 @@ def main() -> int:
               f"being reported, is a selection artefact worth no more than the "
               f"ticket already in the bundle. A clean sweep is different -- "
               f"'solves all {a.eval_layouts}' is exact and cannot be inflated "
-              f"by trying more candidates.\nThe remaining option is a "
+              f"by trying more candidates; --bank_if_better writes the higher "
+              f"score anyway.\nThe remaining option is a "
               f"--require_perfect search over --init_state_offset 0, which "
               f"costs 1/p^50 candidates at per-layout pass rate p; read the "
               f"first-hour line before committing to it.")
@@ -256,6 +303,9 @@ def main() -> int:
                              f"layouts_{a.rest_offset}_plus":
                                  f"{a.rest_layouts}/{a.rest_layouts}"},
                 "selected_on_reported_layouts": True,
+                "swept_reported_layouts": bool(
+                    next((o == e for i, o, e, _, _ in results
+                          if i == winner), False)),
                 "claim": "solves all 50 canonical layouts; generalisation "
                          "to unseen init states is untested",
                 **infcfg, "checkpoint": str(a.checkpoint)}
