@@ -113,6 +113,24 @@ def main() -> int:
     p.add_argument("--verbose", action="store_true")
     a = p.parse_args()
 
+    if a.bank and not a.seed_from:
+        src = Path(a.done).parent
+        try:
+            n_src = len(tb.load_bundle(src)[0])
+        except FileNotFoundError:
+            n_src = 0
+        try:
+            n_bank = len(tb.load_bundle(a.bank)[0])
+        except FileNotFoundError:
+            n_bank = 0
+        if n_src > n_bank + 1:
+            print(f"WARNING: --bank {a.bank} holds {n_bank} ticket(s) while "
+                  f"{src} holds {n_src}.\n  Evaluating the --bank bundle would "
+                  f"drop every task missing from it to Gaussian, which on a "
+                  f"suite\n  with 20/20 tickets in it is a loss, not a "
+                  f"no-op. Pass --seed_from {src} to copy them in.\n",
+                  flush=True)
+
     device = a.device or ("cuda" if torch.cuda.is_available() else "cpu")
     from checkpoint_utils import resolve_checkpoint
     ev.setup_libero_env(a.control_freq, a.render_gpu, a.stock_init)
