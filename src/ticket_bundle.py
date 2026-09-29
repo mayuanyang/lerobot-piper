@@ -193,6 +193,29 @@ def merge(out_dir, *in_dirs):
 
 if __name__ == "__main__":
     import sys
+    if len(sys.argv) >= 4 and sys.argv[1] in ("disable", "enable"):
+        # NOT a delete. A ticket that loses to Gaussian on the reported
+        # layouts is still the output of a search that has been paid for, and
+        # the call can be wrong: goal T9's ticket reads 11/20 against a
+        # Gaussian draw of 14/20, which is p=0.13, not proof. Flipping
+        # beats_baseline makes eval fall back to Gaussian while the vector,
+        # the search record and the decision stay on disk and reversible.
+        d, keys = sys.argv[2], sys.argv[3:]
+        t, m = load_bundle(d)
+        want = sys.argv[1] == "enable"
+        for k in keys:
+            if k not in t:
+                print(f"  {k}: not in this bundle", file=sys.stderr)
+                continue
+            was = m.setdefault(k, {}).get("beats_baseline")
+            m[k]["beats_baseline"] = True if want else False
+            m[k]["disabled_note" if not want else "enabled_note"] = (
+                "beats_baseline set by hand; see the eval that motivated it")
+            print(f"  {k}: beats_baseline {was} -> {m[k]['beats_baseline']}"
+                  + ("   eval will use Gaussian" if not want
+                     else "   eval will use the ticket"))
+        (Path(d) / META).write_text(json.dumps(m, indent=1, sort_keys=True))
+        raise SystemExit(0)
     if len(sys.argv) >= 3 and sys.argv[1] == "runners":
         # THE BUNDLE KEEPS ONE TICKET; THE SEARCH KEPT ALL OF THEM. Sequential
         # halving usually leaves several candidates tied at the top tier's
@@ -263,6 +286,7 @@ if __name__ == "__main__":
         raise SystemExit(0 if report(sys.argv[2]) == 0 else 0)
     if len(sys.argv) < 4 or sys.argv[1] != "merge":
         print("usage: python ticket_bundle.py report <dir>\n"
+              "       python ticket_bundle.py disable|enable <dir> <suite.task> ...\n"
               "       python ticket_bundle.py runners <_done_*.npz> [k] [--export]\n"
               "       python ticket_bundle.py merge <out_dir> <in_dir> [<in_dir> ...]",
               file=sys.stderr)
