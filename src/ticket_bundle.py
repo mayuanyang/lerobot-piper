@@ -193,6 +193,26 @@ def merge(out_dir, *in_dirs):
 
 if __name__ == "__main__":
     import sys
+    if len(sys.argv) >= 5 and sys.argv[1] == "put":
+        # Put a vector or an m-tuple into a bundle under a key. The search
+        # writes its own winners; this is for one measured by hand -- a random
+        # m=4 cycle that matched the per-chunk draw on goal T9 where the
+        # searched single ticket scored 15 points below it. Records that it
+        # was not searched, so `report` cannot present it as one.
+        import numpy as _np
+        d, k, f = sys.argv[2], sys.argv[3], sys.argv[4]
+        suite_, tid_ = k.rsplit(".", 1)
+        v = _np.load(f)
+        meta = {"task": None, "beats_baseline": True,
+                "search_success": "not searched",
+                "baseline_search": "n/a",
+                "source": f, "cycle": int(v.shape[0]) if v.ndim == 3 else 1,
+                "hand_placed": True,
+                "note": " ".join(sys.argv[5:]) or "placed by hand"}
+        print(f"  {k}: shape {tuple(v.shape)}"
+              + (f", a {v.shape[0]}-vector cycle" if v.ndim == 3 else ""))
+        print(f"  -> {save_ticket(d, suite_, int(tid_), v, meta)}")
+        raise SystemExit(0)
     if len(sys.argv) >= 4 and sys.argv[1] in ("disable", "enable"):
         # NOT a delete. A ticket that loses to Gaussian on the reported
         # layouts is still the output of a search that has been paid for, and
@@ -287,6 +307,7 @@ if __name__ == "__main__":
     if len(sys.argv) < 4 or sys.argv[1] != "merge":
         print("usage: python ticket_bundle.py report <dir>\n"
               "       python ticket_bundle.py disable|enable <dir> <suite.task> ...\n"
+              "       python ticket_bundle.py put <dir> <suite.task> <vec.npy> [note...]\n"
               "       python ticket_bundle.py runners <_done_*.npz> [k] [--export]\n"
               "       python ticket_bundle.py merge <out_dir> <in_dir> [<in_dir> ...]",
               file=sys.stderr)
