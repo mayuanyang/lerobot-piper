@@ -639,7 +639,26 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
             latents = self._generate_latents(batch, B, device, torch.bfloat16)
 
             N = int(getattr(self.config, "num_inference_steps", 10))
+            # A CYCLE OF m VECTORS, chunk k taking t[k % m]. Still fully
+            # deterministic -- the same layout replays bit for bit -- but the
+            # noise is no longer identical from one chunk to the next, which
+            # is the one thing a single ticket cannot be.
+            #
+            # It exists because a single frozen vector costs long T0 about 50
+            # points (13-15% against Gaussian's 60-73%) while costing the
+            # short suites little, and the suites line up by chunks per
+            # successful episode: spatial 29.0, goal 29.5, object 39.4 all
+            # yield 20/20 tickets, long's 79.2 yields nothing. Training never
+            # showed the model two consecutive chunks with the same x_1, so
+            # whether the damage is the VECTOR or its repetition is a real
+            # question, and m is the dial that answers it: m=1 is the ticket,
+            # large m with random vectors is ordinary sampling.
+            cyc = getattr(self, "_noise_cycle", None)
             ticket = getattr(self, "_noise_ticket", None)
+            if cyc is not None:
+                k = int(getattr(self, "_noise_cycle_k", 0))
+                self._noise_cycle_k = k + 1
+                ticket = cyc[k % cyc.shape[0]]
             if ticket is not None:
                 # The golden-ticket hypothesis (Patil et al. 2026): a frozen
                 # generative policy can be improved by replacing x_1 ~ N(0,I)

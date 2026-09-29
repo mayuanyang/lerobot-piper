@@ -1244,6 +1244,18 @@ def main():
     p.add_argument("--num_inference_steps", type=int, default=0,
                    help="0 = the checkpoint's config (4). Re-run at 16 to test "
                         "whether the shortcut term made few-step inference valid.")
+    p.add_argument("--noise_cycle", default=None,
+                   help="An (m, horizon, action_dim) .npy used one vector per "
+                        "chunk in turn, so chunk k takes t[k %% m]. m=1 is a "
+                        "plain ticket and large m of random vectors "
+                        "approximates ordinary sampling, which makes m the "
+                        "dial that separates two explanations for why a "
+                        "frozen x_1 costs long T0 about 50 points while "
+                        "costing the short suites little: the vector, or the "
+                        "fact that 79 consecutive chunks share it. Training "
+                        "never showed the model two chunks with the same x_1. "
+                        "Still deterministic, so the same layout replays bit "
+                        "for bit.")
     p.add_argument("--n_action_steps", type=int, default=0,
                    help="0 = the checkpoint's config (8). Steps of each chunk "
                         "executed open-loop before replanning. At 10 Hz, 8 is "
@@ -1560,6 +1572,21 @@ def main():
               f"{int(policy.config.n_action_steps)} the policy replans a few\n"
               f"    times per episode and the usual result is 0%. Pass "
               f"--n_action_steps 2 unless you mean this.\n", flush=True)
+    if a.noise_cycle:
+        _cy = np.load(a.noise_cycle)
+        _want = (int(policy.config.horizon), int(policy.config.action_dim))
+        if _cy.ndim != 3 or tuple(_cy.shape[1:]) != _want:
+            raise SystemExit(
+                f"--noise_cycle has shape {tuple(_cy.shape)}; it must be "
+                f"(m, {_want[0]}, {_want[1]}) -- m vectors of horizon x "
+                f"action_dim, used one per chunk in turn.")
+        policy.model._noise_cycle = torch.from_numpy(
+            _cy.astype(np.float32)).to(device)
+        policy.model._noise_cycle_k = 0
+        print(f"[cycle] {_cy.shape[0]} vectors, chunk k uses t[k % "
+              f"{_cy.shape[0]}]. Deterministic -- the same layout replays "
+              f"identically -- but consecutive chunks differ, which a single "
+              f"ticket cannot do.", flush=True)
     if a.noise_ticket:
         _tk = np.load(a.noise_ticket)
         _want = (int(policy.config.horizon), int(policy.config.action_dim))
@@ -1886,6 +1913,9 @@ def main():
                    policy.config, "temporal_ensemble_coeff", None),
                "stall_noise_scale": getattr(policy.config, "stall_noise_scale", None),
                "noise_ticket": a.noise_ticket,
+               "noise_cycle": a.noise_cycle,
+               "noise_cycle_m": (int(np.load(a.noise_cycle).shape[0])
+                                 if a.noise_cycle else None),
                "noise_tickets": a.noise_tickets,
                # Which tasks ran with a ticket and which fell back. A suite
                # average over a PARTIAL bundle is two policies added together,

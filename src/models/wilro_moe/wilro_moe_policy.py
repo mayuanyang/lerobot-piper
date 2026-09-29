@@ -32,6 +32,11 @@ class WilroMoEPolicy(PreTrainedPolicy):
         # every chunk still covering the current timestep.
         self._te_buf: deque = deque()
         self._te_t = 0
+        # Where a --noise_cycle restarts. Without this the cycle phase would
+        # depend on how many chunks the PREVIOUS episode used, so the same
+        # layout would replay differently depending on what ran before it --
+        # and a deterministic replay is the whole reason for a fixed cycle.
+        self.model._noise_cycle_k = 0
         # Stall escape state, per env.
         self._stall_prev = None
         self._stall_max = None
