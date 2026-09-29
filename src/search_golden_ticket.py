@@ -454,7 +454,18 @@ def main() -> int:
         if _t < a.tiers - 1:
             _a = max(1, int(_a * a.keep_frac))
     hours = batches * 12 * ((a.max_episode_steps or 300) / 300) / 60
-    print(f"ticket shape ({H}, {D}) = {H * D} dims\n"
+    # SAY WHICH MODE THIS IS. A --cycle 4 run and a single-ticket run produce
+    # the same log otherwise, and the first-layout pass rate is the only tell:
+    # about 6-12% at m=1 on libero_10 against about 65% at m=4. Reading a 6%
+    # and concluding "cycles do not help" when --cycle was simply not passed
+    # is a cheap mistake to make and an expensive one to find.
+    print(f"NOISE: " + ("one constant vector per chunk (m=1, the plain golden "
+                        "ticket)" if a.cycle == 1 else
+                        f"a cycle of {a.cycle} vectors, chunk k uses "
+                        f"t[k mod {a.cycle}]"), flush=True)
+    print(f"candidate shape "
+          + (f"({H}, {D})" if a.cycle == 1 else f"({a.cycle}, {H}, {D})")
+          + f" = {a.cycle * H * D} dims\n"
           f"{a.tickets} candidates, {a.tiers} tiers x {a.envs_per_tier} layouts "
           f"from id {a.init_state_offset}, baseline on {n_base} layouts\n"
           f"~{batches} batches of {a.num_envs} ({n_base} of them baseline)\n"
@@ -1097,7 +1108,6 @@ def main() -> int:
                                f"effect size below --abort_below_ratio "
                                f"{a.abort_below_ratio:g}"),
                     "baseline_search": f"{base_w[0]:.0f}/{base_r[0]:.0f}",
-                "certification": cert,
                     "minutes": round((time.time() - t0) / 60, 1)}
                 (out / "search_summary.json").write_text(json.dumps(results, indent=1))
                 for e_ in (envs or []):
@@ -1224,6 +1234,7 @@ def main() -> int:
                 "search_success": f"{wins[best]:.0f}/{runs[best]:.0f}",
                 "search_rate": float(wins[best] / max(runs[best], 1)),
                 "baseline_search": f"{base_w[0]:.0f}/{base_r[0]:.0f}",
+                "certification": cert,
                 "tickets": a.tickets, "tiers": a.tiers, "cycle": a.cycle,
                 "envs_per_tier": a.envs_per_tier,
                 "init_state_offset": a.init_state_offset,
