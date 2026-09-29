@@ -658,7 +658,12 @@ class WilroMoETransformer(SmolVLMEncoderMixin, nn.Module):
             if cyc is not None:
                 k = int(getattr(self, "_noise_cycle_k", 0))
                 self._noise_cycle_k = k + 1
-                ticket = cyc[k % cyc.shape[0]]
+                # (m, H, D) is one cycle for every env. (B, m, H, D) is a
+                # DIFFERENT cycle per env, which is what the search needs: one
+                # batch scores n_par candidates against the same layout, and a
+                # candidate is now an m-tuple rather than a vector.
+                ticket = (cyc[:, k % cyc.shape[1]] if cyc.dim() == 4
+                          else cyc[k % cyc.shape[0]])
             if ticket is not None:
                 # The golden-ticket hypothesis (Patil et al. 2026): a frozen
                 # generative policy can be improved by replacing x_1 ~ N(0,I)

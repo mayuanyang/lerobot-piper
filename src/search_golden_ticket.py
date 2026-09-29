@@ -187,6 +187,22 @@ def main() -> int:
                    help="Use lerobot's unpatched reset order, i.e. the sampler "
                         "distribution. Matches --stock_init in eval and is not "
                         "for anything reportable.")
+    p.add_argument("--cycle", type=int, default=1,
+                   help="Search an m-tuple instead of a single vector; chunk "
+                        "k uses element k mod m. m=1 is the paper's golden "
+                        "ticket. Higher m exists because a single frozen x_1 "
+                        "costs libero_10 T0 fifty points through REPETITION "
+                        "rather than through being the wrong vector: a sweep "
+                        "of RANDOM cycles read 15%% at m=1, 35%% at 2, and 70%% "
+                        "from m=4 on, against Gaussian's 60-73%%, and the "
+                        "curve is flat past 4. Four fixed vectors decorrelate "
+                        "the noise across chunks while keeping the rollout "
+                        "deterministic, which is what training always had and "
+                        "a ticket takes away. It also decides whether a task "
+                        "is searchable at all: the per-layout pass rate of a "
+                        "candidate goes 0.15 -> 0.70, so a 5/5 tier floor is "
+                        "cleared once per 13,169 candidates at m=1 and once "
+                        "per 6 at m=4.")
     p.add_argument("--require_perfect", action="store_true",
                    help="Floor is 1.0 at every tier, whatever the baseline. "
                         "Use it with --init_state_offset 0 and tiers x "
@@ -555,6 +571,7 @@ def main() -> int:
                 # and two repeats, and sequential halving's whole argument is
                 # that the tiers are disjoint.
                 _geom = {"envs_per_tier": a.envs_per_tier, "tickets": a.tickets,
+                         "cycle": a.cycle,
                          "init_state_offset": a.init_state_offset,
                          "baseline_layouts": (a.baseline_layouts or
                                               a.tiers * a.envs_per_tier),
@@ -625,7 +642,9 @@ def main() -> int:
                 # changes the candidates.
                 rng = np.random.default_rng(
                     [a.seed, zlib.crc32(suite_name.encode()), tid])
-                cands = rng.standard_normal((a.tickets, H, D)).astype(np.float32)
+                shape = ((a.tickets, H, D) if a.cycle == 1
+                         else (a.tickets, a.cycle, H, D))
+                cands = rng.standard_normal(shape).astype(np.float32)
                 alive, first_tier = list(range(a.tickets)), 0
                 wins = np.zeros(a.tickets); runs = np.zeros(a.tickets)
                 base_w0 = base_r0 = 0.0
@@ -681,6 +700,7 @@ def main() -> int:
                          geom=np.array(json.dumps(
                              {"envs_per_tier": a.envs_per_tier,
                               "tickets": a.tickets,
+                              "cycle": a.cycle,
                               "init_state_offset": a.init_state_offset,
                               "baseline_layouts": n_base_lay,
                               "prune_mode": a.prune_mode})))
@@ -708,7 +728,14 @@ def main() -> int:
                         grp = idx_list[g0:g0 + n_par]
                         tk = torch.from_numpy(
                             np.stack([cands[i] for i in grp])).to(device)
-                        policy.model._noise_ticket = tk
+                        if a.cycle == 1:
+                            policy.model._noise_ticket = tk
+                        else:
+                            # (n_par, m, H, D): a different cycle per env, so
+                            # one batch still scores n_par candidates against
+                            # one layout.
+                            policy.model._noise_cycle = tk
+                            policy.model._noise_ticket = None
                         sink = (contextlib.nullcontext() if a.verbose
                                 else contextlib.redirect_stdout(io.StringIO()))
                         with sink:
@@ -800,6 +827,7 @@ def main() -> int:
                 if base_k[0] >= n_base_lay:
                     return
                 policy.model._noise_ticket = None
+                policy.model._noise_cycle = None
                 # NOT offset by `tier`. The baseline has to cover every layout
                 # the search will use, and on a resume at tier > 0 the old
                 # `tier * envs_per_tier + k` slid the whole reference off the
@@ -1112,9 +1140,11 @@ def main() -> int:
                       f" (took no part in the selection)", flush=True)
                 cw = {}
                 for tag, tk in (("ticket", cands[best]), ("gaussian", None)):
-                    policy.model._noise_ticket = (
-                        torch.from_numpy(np.asarray(tk)).to(device)
-                        if tk is not None else None)
+                    v = (torch.from_numpy(np.asarray(tk)).to(device)
+                         if tk is not None else None)
+                    policy.model._noise_ticket = v if a.cycle == 1 else None
+                    policy.model._noise_cycle = v if a.cycle > 1 else None
+                    policy.model._noise_cycle_k = 0
                     ok = ep = 0
                     for g0 in range(0, a.certify_layouts, n_par):
                         n_lay = min(n_par, a.certify_layouts - g0)
@@ -1132,6 +1162,7 @@ def main() -> int:
                     print(f"    {tag:<8} {ok}/{ep} = {ok / max(ep, 1):.0%}",
                           flush=True)
                 policy.model._noise_ticket = None
+                policy.model._noise_cycle = None
                 tk_r = cw["ticket"][0] / max(cw["ticket"][1], 1)
                 gs_r = cw["gaussian"][0] / max(cw["gaussian"][1], 1)
                 cert = {"layouts": f"{c0}-{c0 + a.certify_layouts - 1}",
@@ -1193,7 +1224,7 @@ def main() -> int:
                 "search_success": f"{wins[best]:.0f}/{runs[best]:.0f}",
                 "search_rate": float(wins[best] / max(runs[best], 1)),
                 "baseline_search": f"{base_w[0]:.0f}/{base_r[0]:.0f}",
-                "tickets": a.tickets, "tiers": a.tiers,
+                "tickets": a.tickets, "tiers": a.tiers, "cycle": a.cycle,
                 "envs_per_tier": a.envs_per_tier,
                 "init_state_offset": a.init_state_offset,
                 **infcfg,

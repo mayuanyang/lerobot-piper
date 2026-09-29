@@ -1590,11 +1590,21 @@ def main():
     if a.noise_ticket:
         _tk = np.load(a.noise_ticket)
         _want = (int(policy.config.horizon), int(policy.config.action_dim))
-        if tuple(_tk.shape) != _want:
+        if _tk.ndim == 3 and tuple(_tk.shape[1:]) == _want:
+            # An m-tuple saved by a --cycle search. Route it to the cycling
+            # path rather than rejecting it; the shapes are unambiguous.
+            policy.model._noise_cycle = torch.from_numpy(
+                _tk.astype(np.float32)).to(device)
+            policy.model._noise_cycle_k = 0
+            print(f"[cycle] --noise_ticket holds {_tk.shape[0]} vectors; "
+                  f"using them as a cycle", flush=True)
+            a.noise_ticket = None
+        elif tuple(_tk.shape) != _want:
             raise SystemExit(
                 f"--noise_ticket has shape {tuple(_tk.shape)} but this policy "
-                f"needs {_want} (horizon x action_dim). A ticket is bound to "
-                f"the horizon it was searched at.")
+                f"needs {_want} (horizon x action_dim), or (m, {_want[0]}, "
+                f"{_want[1]}) for a cycle. A ticket is bound to the horizon it "
+                f"was searched at.")
         policy.model._noise_ticket = torch.from_numpy(_tk).float().to(device)
         print(f"[ticket] {a.noise_ticket}  shape {_want}  "
               f"norm {float(np.linalg.norm(_tk)):.2f} "
