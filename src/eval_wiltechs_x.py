@@ -1616,13 +1616,27 @@ def main():
         _tickets, _tmeta = tb.load_bundle(ckpt if a.noise_tickets == "auto"
                                           else a.noise_tickets)
         _want = (int(policy.config.horizon), int(policy.config.action_dim))
+        # (H, D) is one constant vector; (m, H, D) is a CYCLE, chunk k
+        # taking element k mod m, which --cycle searches and which a
+        # hand-placed 4-tuple uses. Both live in the same bundle under the
+        # same key, and the shapes tell them apart, so rejecting the second
+        # was just the single-vector path never having been taught about the
+        # other. goal T9 sat at 55% behind this error while the 4-cycle that
+        # scores 70% was already in the bundle.
         bad = {k: tuple(v.shape) for k, v in _tickets.items()
-               if tuple(v.shape) != _want}
+               if tuple(v.shape) != _want
+               and not (v.ndim == 3 and tuple(v.shape[1:]) == _want)}
         if bad:
             raise SystemExit(
                 f"bundle holds tickets of shape {sorted(set(bad.values()))} but "
-                f"this policy needs {_want}; a ticket is bound to the horizon "
-                f"it was searched at. Offending keys: {sorted(bad)[:5]}")
+                f"this policy needs {_want}, or (m, {_want[0]}, {_want[1]}) for "
+                f"a cycle; a ticket is bound to the horizon it was searched "
+                f"at. Offending keys: {sorted(bad)[:5]}")
+        _cyc_keys = sorted(k for k, v in _tickets.items() if v.ndim == 3)
+        if _cyc_keys:
+            print(f"[cycle] {len(_cyc_keys)} of these are cycles: "
+                  + ", ".join(f"{k} (m={_tickets[k].shape[0]})"
+                              for k in _cyc_keys))
         print(f"[tickets] {len(_tickets)} in bundle: {sorted(_tickets)}")
         # A ticket is only valid for the inference config it was searched
         # under. n_action_steps is the one that bites: the checkpoint says 64
@@ -1762,8 +1776,12 @@ def main():
                           f"baseline but not significantly (p="
                           f"{_md.get('p_vs_baseline')}) -- using it; this run "
                           f"IS the test.")
-                policy.model._noise_ticket = (
-                    None if _tk is None else torch.from_numpy(_tk).float().to(device))
+                _v = (None if _tk is None
+                      else torch.from_numpy(_tk).float().to(device))
+                _is_cyc = _tk is not None and _tk.ndim == 3
+                policy.model._noise_ticket = None if _is_cyc else _v
+                policy.model._noise_cycle = _v if _is_cyc else None
+                policy.model._noise_cycle_k = 0
                 if _tk is not None:
                     ticketed.append(tid)
                 print(f"  [ticket] task {tid}: "
