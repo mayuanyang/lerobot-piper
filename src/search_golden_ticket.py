@@ -442,6 +442,26 @@ def main() -> int:
                   f"  verified on {span} layouts and still only ESTIMATED on "
                   f"the\n  reported ones. 30/30 leaves P(20/20) at 61%.",
                   flush=True)
+    _nb = a.baseline_layouts or (5 if a.require_perfect
+                                 else a.tiers * a.envs_per_tier)
+    if not a.require_perfect and _nb < a.tiers * a.envs_per_tier:
+        print(f"\n*** --baseline_layouts {_nb} is below tiers x envs_per_tier "
+              f"({a.tiers * a.envs_per_tier}), which costs two things.\n"
+              f"    --stratify_layouts is SKIPPED, so each tier gets whichever "
+              f"layouts sit at its ids;\n"
+              f"    per-task difficulty varies enormously -- libero_10 T0 reads "
+              f"90% on 20-24 and\n"
+              f"    40% on 25-29 -- so tier 1, the tier that filters every "
+              f"candidate, draws its\n"
+              f"    floor by position.\n"
+              f"    And the pooled baseline describes only the layouts it "
+              f"measured, so the final\n"
+              f"    'winner X% vs Gaussian Y%' verdict is computed against a "
+              f"Y that omits the rest.\n"
+              f"    Read --certify_layouts instead: it runs the ticket and "
+              f"Gaussian head to head on\n"
+              f"    layouts that took no part in the selection, so it does not "
+              f"depend on this.\n", flush=True)
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     # Batches per tier are M x ceil(alive / num_envs), NOT ceil(M x alive /
     # num_envs): score() loops layout-outer, candidate-inner, so a tier with 4
