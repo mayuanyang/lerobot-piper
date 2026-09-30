@@ -1214,26 +1214,36 @@ def main() -> int:
                     policy.model._noise_cycle = v if a.cycle > 1 else None
                     policy.model._noise_cycle_k = 0
                     ok = ep = 0
+                    per = []
                     for g0 in range(0, a.certify_layouts, n_par):
                         n_lay = min(n_par, a.certify_layouts - g0)
                         sink = (contextlib.nullcontext() if a.verbose
                                 else contextlib.redirect_stdout(io.StringIO()))
                         with sink:
-                            n_ok, n_ep, _, _, _, _ = ev.eval_task(
+                            n_ok, n_ep, _, _, _, e_ok = ev.eval_task(
                                 policy, pre, post, suite, suite_name, tid,
                                 n_lay, n_lay, device, a.max_episode_steps,
                                 a.seed, cams, envs=envs[:n_lay],
                                 init_state_offset=c0 + g0,
                                 init_state_stride=1)
-                        ok += n_ok; ep += n_ep
-                    cw[tag] = (ok, ep)
+                        ok += n_ok; ep += n_ep; per += [int(x) for x in e_ok]
+                    cw[tag] = (ok, ep, per)
                     print(f"    {tag:<8} {ok}/{ep} = {ok / max(ep, 1):.0%}",
                           flush=True)
                 policy.model._noise_ticket = None
                 policy.model._noise_cycle = None
                 tk_r = cw["ticket"][0] / max(cw["ticket"][1], 1)
                 gs_r = cw["gaussian"][0] / max(cw["gaussian"][1], 1)
+                # PER LAYOUT, not just the totals. Certification is the only
+                # unbiased number the search produces and both arms run the
+                # SAME layouts in the same order, so it is a paired sample --
+                # and storing two counts threw the pairing away. long T0's
+                # 11/15 against 9/15 is p=0.43 unpaired; McNemar on the
+                # discordant layouts is the sharper test, and it also names
+                # which layouts the ticket wins and loses.
                 cert = {"layouts": f"{c0}-{c0 + a.certify_layouts - 1}",
+                        "ticket_per_layout": cw["ticket"][2],
+                        "gaussian_per_layout": cw["gaussian"][2],
                         "ticket": f"{cw['ticket'][0]}/{cw['ticket'][1]}",
                         "gaussian": f"{cw['gaussian'][0]}/{cw['gaussian'][1]}",
                         "ticket_rate": round(tk_r, 4),
