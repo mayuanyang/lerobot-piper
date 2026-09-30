@@ -187,6 +187,19 @@ def main() -> int:
                    help="Use lerobot's unpatched reset order, i.e. the sampler "
                         "distribution. Matches --stock_init in eval and is not "
                         "for anything reportable.")
+    p.add_argument("--reported_rate", type=float, default=None,
+                   help="This task's success rate in the eval you report, as a "
+                        "fraction, e.g. 0.70. The search then checks its own "
+                        "Gaussian baseline against it and says so when the two "
+                        "diverge, because the search layouts and the reported "
+                        "layouts are different scenes and can differ enormously "
+                        "in difficulty. goal T9 reads 39%% over layouts 20-34 "
+                        "and 70%% over 0-19, so its floor asked candidates to "
+                        "clear a 34%% bar while the eval asked them to beat "
+                        "70%% -- and its ticket duly beat the search baseline "
+                        "and then lost 15 points on the reported set. The three "
+                        "tasks whose baselines agreed within 6 points all "
+                        "behaved.")
     p.add_argument("--cycle", type=int, default=1,
                    help="Search an m-tuple instead of a single vector; chunk "
                         "k uses element k mod m. m=1 is the paper's golden "
@@ -943,6 +956,31 @@ def main() -> int:
                     # check that the env is set up the way the reported evals
                     # set it up, and it has to happen before hours are spent.
                     score_baseline(tier, start_k0 if tier == first_tier else 0)
+                    if a.reported_rate is not None and base_r[0] > 0:
+                        _br = base_w[0] / base_r[0]
+                        _gap = a.reported_rate - _br
+                        print(f"    calibration: the per-chunk draw scores "
+                              f"{_br:.0%} on these search layouts against "
+                              f"{a.reported_rate:.0%} on the reported ones, a "
+                              f"gap of {_gap:+.0%}.", flush=True)
+                        if abs(_gap) > 0.15:
+                            print(f"    *** THE TWO SETS ARE NOT THE SAME "
+                                  f"DIFFICULTY. The floor below is calibrated "
+                                  f"to {_br:.0%}, so a\n"
+                                  f"    candidate that clears it has cleared "
+                                  f"that bar and not the {a.reported_rate:.0%} "
+                                  f"the eval will ask for.\n"
+                                  f"    goal T9 failed exactly this way: a "
+                                  f"39%%-vs-70%% gap produced a ticket that "
+                                  f"beat its\n"
+                                  f"    search baseline and then scored 15 "
+                                  f"points BELOW the per-chunk draw on the "
+                                  f"reported\n"
+                                  f"    layouts. Certification on unselected "
+                                  f"layouts is a fair head-to-head but does "
+                                  f"not\n"
+                                  f"    fix the calibration. Consider stopping "
+                                  f"here.\n", flush=True)
                     if base_w[0] == 0 and not a.allow_zero_baseline:
                         for _e in envs:
                             try:
