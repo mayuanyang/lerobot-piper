@@ -963,24 +963,34 @@ def main() -> int:
                               f"{_br:.0%} on these search layouts against "
                               f"{a.reported_rate:.0%} on the reported ones, a "
                               f"gap of {_gap:+.0%}.", flush=True)
-                        if abs(_gap) > 0.15:
-                            print(f"    *** THE TWO SETS ARE NOT THE SAME "
-                                  f"DIFFICULTY. The floor below is calibrated "
-                                  f"to {_br:.0%}, so a\n"
-                                  f"    candidate that clears it has cleared "
-                                  f"that bar and not the {a.reported_rate:.0%} "
-                                  f"the eval will ask for.\n"
-                                  f"    goal T9 failed exactly this way: a "
-                                  f"39%%-vs-70%% gap produced a ticket that "
-                                  f"beat its\n"
-                                  f"    search baseline and then scored 15 "
-                                  f"points BELOW the per-chunk draw on the "
-                                  f"reported\n"
-                                  f"    layouts. Certification on unselected "
-                                  f"layouts is a fair head-to-head but does "
-                                  f"not\n"
-                                  f"    fix the calibration. Consider stopping "
+                        if _gap > 0.15:
+                            print(f"    *** THE SEARCH LAYOUTS ARE HARDER THAN "
+                                  f"THE ONES YOU REPORT ON. The floor is\n"
+                                  f"    calibrated to {_br:.0%}, so a candidate "
+                                  f"that clears it has cleared that bar and\n"
+                                  f"    not the {a.reported_rate:.0%} the eval "
+                                  f"will ask for -- and a low bar is a weak\n"
+                                  f"    filter, so the winner is mostly "
+                                  f"whichever candidate got lucky. goal T9\n"
+                                  f"    failed exactly this way at 39% against "
+                                  f"70%: its ticket beat the search\n"
+                                  f"    baseline and then scored 15 points "
+                                  f"BELOW the per-chunk draw where it\n"
+                                  f"    counted. Certification is a fair "
+                                  f"head-to-head on unselected layouts but\n"
+                                  f"    does not fix this. Consider stopping "
                                   f"here.\n", flush=True)
+                        elif _gap < -0.15:
+                            print(f"    note: the search layouts are EASIER "
+                                  f"than the reported ones, so the floor\n"
+                                  f"    ({_br:.0%}) is a stricter bar than the "
+                                  f"eval applies. That is the direction that\n"
+                                  f"    has worked -- goal T6's ticket came "
+                                  f"out of an 81%-against-60% gap and beat\n"
+                                  f"    the per-chunk draw by 15 points. Only "
+                                  f"two tasks have been measured either\n"
+                                  f"    way, so this is a weak prior, not a "
+                                  f"rule. Carry on.\n", flush=True)
                     if base_w[0] == 0 and not a.allow_zero_baseline:
                         for _e in envs:
                             try:
