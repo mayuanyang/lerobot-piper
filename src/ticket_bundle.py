@@ -175,7 +175,34 @@ def _describe(meta: dict) -> str:
     return ", ".join(bits)
 
 
-def merge(out_dir, *in_dirs, prefer_certified: bool = False):
+def _copy_pool(key, src_dir, out) -> str | None:
+    """Bring the _done_*.npz for one key along with its ticket.
+
+    The bundle carries one vector per task; the pool carries every candidate
+    the search drew, and two tools need it -- try_runners mines the runner-ups
+    for a clean sweep of the reported layouts, and plot_tickets reads it for
+    three of its four panels, looking for it BESIDE the bundle. A merged
+    directory without the pools is a bundle that cannot be examined or mined,
+    and after merging four machines nobody remembers which directory held
+    which task.
+    """
+    import shutil
+    suite, tid = key.rsplit(".", 1)
+    name = f"_done_{suite}_t{int(tid)}.npz"
+    src = Path(src_dir)
+    src = src.parent if src.is_file() else src
+    f = src / name
+    if not f.exists():
+        return None
+    dst = Path(out) / name
+    if dst.exists() and dst.stat().st_size == f.stat().st_size:
+        return name
+    shutil.copy2(f, dst)
+    return name
+
+
+def merge(out_dir, *in_dirs, prefer_certified: bool = False,
+          pools: bool = True):
     """Combine bundles from separate searches into one.
 
     Duplicate keys are COLLECTED, not raised on the first one. Splitting one
@@ -232,6 +259,10 @@ def merge(out_dir, *in_dirs, prefer_certified: bool = False):
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     save_file(tensors, str(out / BUNDLE))
     (out / META).write_text(json.dumps(info, indent=1, sort_keys=True))
+    copied, nopool = [], []
+    if pools:
+        for k in sorted(tensors):
+            (copied if _copy_pool(k, src[k], out) else nopool).append(k)
     print(f"{len(tensors)} tickets -> {out / BUNDLE}")
     for k in sorted(tensors):
         b = info.get(k, {}).get("beats_baseline")
@@ -242,6 +273,14 @@ def merge(out_dir, *in_dirs, prefer_certified: bool = False):
         print(f"  {k:<24} from {src[k]}{cyc}{tag}")
     for d in missing:
         print(f"  (no bundle yet in {d})")
+    if pools:
+        mb = sum((out / f"_done_{k.rsplit('.', 1)[0]}_t{int(k.rsplit('.', 1)[1])}.npz")
+                 .stat().st_size for k in copied) / 1e6
+        print(f"copied {len(copied)} candidate pool(s), {mb:.1f} MB, so "
+              f"try_runners and plot_tickets work against this directory")
+        if nopool:
+            print(f"  no pool found for {', '.join(nopool)} -- those tickets "
+                  f"cannot be mined for runner-ups from here")
     return out / BUNDLE
 
 
@@ -359,15 +398,17 @@ if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "report":
         raise SystemExit(0 if report(sys.argv[2]) == 0 else 0)
     if sys.argv[1:2] == ["merge"] and len(sys.argv) >= 4:
-        args = [x for x in sys.argv[2:] if x != "--prefer-certified"]
+        flags = {"--prefer-certified", "--no-pools"}
+        args = [x for x in sys.argv[2:] if x not in flags]
         merge(args[0], *args[1:],
-              prefer_certified="--prefer-certified" in sys.argv)
+              prefer_certified="--prefer-certified" in sys.argv,
+              pools="--no-pools" not in sys.argv)
         raise SystemExit(0)
     print("usage: python ticket_bundle.py report <dir>\n"
           "       python ticket_bundle.py disable|enable <dir> <suite.task> ...\n"
           "       python ticket_bundle.py put <dir> <suite.task> <vec.npy> [note...]\n"
           "       python ticket_bundle.py runners <_done_*.npz> [k] [--export]\n"
           "       python ticket_bundle.py merge <out_dir> <in_dir> ... "
-          "[--prefer-certified]",
+          "[--prefer-certified] [--no-pools]",
           file=sys.stderr)
     raise SystemExit(2)
