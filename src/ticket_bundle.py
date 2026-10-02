@@ -260,8 +260,29 @@ def merge(out_dir, *in_dirs, prefer_certified: bool = False,
             raise ValueError("\n".join(msg))
 
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+    # A HAND DECISION OUTLIVES THE MERGE. `disable` records a judgement made
+    # from an eval -- libero_10.1 searched 14/15 and then cost 20 points on
+    # the reported layouts -- and the source bundle it came from knows nothing
+    # about that. Merging the sources back over the destination silently put
+    # the ticket back in service and took two points off the suite.
+    try:
+        _prev_t, _prev_m = load_bundle(out)
+    except FileNotFoundError:
+        _prev_t, _prev_m = {}, {}
+    kept_decisions = []
+    for k, pm in _prev_m.items():
+        if k in info and pm.get("disabled_note") and not info[k].get("disabled_note"):
+            info[k] = dict(info[k], beats_baseline=False,
+                           disabled_note=pm["disabled_note"])
+            kept_decisions.append(k)
+    if _prev_t:
+        print(f"note: {out} already held {len(_prev_t)} ticket(s); they are "
+              f"being replaced by the inputs.")
     save_file(tensors, str(out / BUNDLE))
     (out / META).write_text(json.dumps(info, indent=1, sort_keys=True))
+    for k in kept_decisions:
+        print(f"  kept the hand-disable on {k} -- the inputs do not know it "
+              f"lost on the reported layouts")
     copied, nopool = [], []
     if pools:
         for k in sorted(tensors):
