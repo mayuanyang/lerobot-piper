@@ -1764,12 +1764,30 @@ def main():
                 _md = _tmeta.get(_k, {})
                 _bb = _md.get("beats_baseline", True)
                 if _tk is not None and _bb is False and not a.use_weak_tickets:
-                    print(f"  [ticket] task {tid}: {_k} did NOT beat its search "
-                          f"baseline ({_md.get('search_success')} vs "
-                          f"{_md.get('baseline_rate')}) -- falling back to "
-                          f"Gaussian. A ticket that only matches Gaussian is "
-                          f"worse than none: it also removes the per-chunk "
-                          f"re-draw. --use_weak_tickets to force.")
+                    # beats_baseline false has TWO sources and they want
+                    # opposite explanations. The search sets it when its
+                    # winner did not clear the search baseline. A person sets
+                    # it, through `ticket_bundle.py disable`, when the ticket
+                    # DID clear that baseline and then lost on the reported
+                    # layouts -- libero_10.1 searched 14/15 against 0.81 and
+                    # cost 20 points at eval. Printing the search's wording
+                    # there says the opposite of what happened, and quotes
+                    # numbers that contradict it in the same line.
+                    _why = _md.get("disabled_note")
+                    if _why:
+                        print(f"  [ticket] task {tid}: {_k} is DISABLED by "
+                              f"hand -- falling back to Gaussian. It searched "
+                              f"{_md.get('search_success')}, so this is not a "
+                              f"search failure; see the eval that motivated "
+                              f"it. --use_weak_tickets to force.")
+                    else:
+                        print(f"  [ticket] task {tid}: {_k} did NOT beat its "
+                              f"search baseline ({_md.get('search_success')} "
+                              f"vs {_md.get('baseline_rate')}) -- falling back "
+                              f"to Gaussian. A ticket that only matches "
+                              f"Gaussian is worse than none: it also removes "
+                              f"the per-chunk re-draw. --use_weak_tickets to "
+                              f"force.")
                     _tk = None
                 elif _tk is not None and _bb is None:
                     print(f"  [ticket] task {tid}: {_k} beat its search "

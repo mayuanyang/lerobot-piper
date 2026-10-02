@@ -112,6 +112,9 @@ def report(path) -> int:
                    None: "banked, unresolved"}[b if b in (True, False) else None]
         if b is False:
             weak += 1
+            if m.get("disabled_note"):
+                verdict = ("disabled by hand -- it beat its search baseline "
+                           "and lost on the reported layouts")
         c = m.get("certification")
         cert = (f"{c['ticket']} vs {c['gaussian']}" if c else "not certified")
         # PROVENANCE, because the two kinds of ticket produce numbers that look
