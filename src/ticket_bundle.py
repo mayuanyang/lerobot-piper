@@ -143,40 +143,92 @@ def report(path) -> int:
     return weak
 
 
-def merge(out_dir, *in_dirs):
-    """Combine bundles from concurrent searches into one.
+def _cert_margin(meta: dict):
+    """-> ticket rate minus Gaussian rate on the certification layouts, or None.
 
-    Refuses to silently drop a ticket: a key present in two inputs is an
-    error, because the two were searched separately and picking one by
-    directory order would make the result depend on argument order.
+    The one number that is comparable across bundles searched on different
+    machines under different settings. A search rate is not: it is a maximum
+    over however many candidates that run drew, on whichever layouts its
+    geometry happened to assign. Certification runs the ticket and the
+    per-chunk draw over the SAME unselected layouts, so its margin means the
+    same thing wherever it was measured.
     """
-    tensors, info, src, missing = {}, {}, {}, []
+    c = meta.get("certification")
+    if not c or c.get("ticket_rate") is None or c.get("gaussian_rate") is None:
+        return None
+    return float(c["ticket_rate"]) - float(c["gaussian_rate"])
+
+
+def _describe(meta: dict) -> str:
+    b = meta.get("beats_baseline")
+    tag = {True: "BEATS", False: "weak", None: "unresolved"}[
+        b if b in (True, False) else None]
+    m = _cert_margin(meta)
+    bits = [f"search {meta.get('search_success', '?')}", tag]
+    if m is not None:
+        c = meta["certification"]
+        bits.append(f"certified {c['ticket']} vs {c['gaussian']} ({m:+.0%})")
+    else:
+        bits.append("not certified")
+    if meta.get("cycle", 1) != 1:
+        bits.append(f"cycle m={meta['cycle']}")
+    return ", ".join(bits)
+
+
+def merge(out_dir, *in_dirs, prefer_certified: bool = False):
+    """Combine bundles from separate searches into one.
+
+    Duplicate keys are COLLECTED, not raised on the first one. Splitting one
+    suite across four machines makes collisions the normal case, and failing on
+    the first means four round trips to see all of them.
+    """
+    tensors, info, src, missing, dups = {}, {}, {}, [], {}
     for d in in_dirs:
         try:
             t, m = load_bundle(d)
         except FileNotFoundError:
             # Searches finish at different times and merging is how a partial
-            # set gets evaluated, so a directory with nothing in it yet is an
-            # ordinary state, not an error.
+            # set gets evaluated, so an empty directory is an ordinary state.
             missing.append(d)
             continue
-        dup = [k for k in t if k in tensors]
-        if dup:
-            def _v(meta, k):
-                b = meta.get(k, {}).get("beats_baseline")
-                return (f"{meta.get(k, {}).get('search_success', '?')} "
-                        + {True: "BEATS", False: "weak",
-                           None: "unresolved"}[b if b in (True, False) else None])
-            raise ValueError(
-                f"{d} and {src[dup[0]]} both define {dup}; merging would pick "
-                f"one by argument order.\n"
-                + "\n".join(f"  {k}: {src[k]} -> {_v(info, k)};  "
-                            f"{d} -> {_v(m, k)}" for k in dup)
-                + "\nDelete the one you do not want, then merge again.")
         for k in t:
-            src[k] = d
-        tensors.update(t)
-        info.update(m)
+            if k in tensors:
+                dups.setdefault(k, [(src[k], info.get(k, {}))]).append(
+                    (d, m.get(k, {})))
+                continue
+            tensors[k], info[k], src[k] = t[k], m.get(k, {}), d
+
+    if dups:
+        unresolved = {}
+        for k, sides in dups.items():
+            margins = [_cert_margin(mm) for _, mm in sides]
+            if prefer_certified and all(x is not None for x in margins):
+                best = max(range(len(sides)), key=lambda i: margins[i])
+                d_, m_ = sides[best]
+                t_, _ = load_bundle(d_)
+                tensors[k], info[k], src[k] = t_[k], m_, d_
+                print(f"  {k}: kept {d_} on certification margin "
+                      f"{margins[best]:+.0%}")
+                for i, (dd, mm) in enumerate(sides):
+                    if i != best:
+                        print(f"      dropped {dd} ({margins[i]:+.0%})")
+            else:
+                unresolved[k] = sides
+        if unresolved:
+            msg = [f"{len(unresolved)} key(s) defined by more than one input; "
+                   f"picking by argument order would make the result depend on "
+                   f"how you typed the command."]
+            for k, sides in sorted(unresolved.items()):
+                msg.append(f"  {k}")
+                for dd, mm in sides:
+                    msg.append(f"    {dd}\n      {_describe(mm)}")
+            msg.append("Delete the ones you do not want, or pass "
+                       "--prefer-certified to resolve by certification margin "
+                       "-- the only number comparable across separately "
+                       "configured searches. Keys where a side is uncertified "
+                       "cannot be resolved that way.")
+            raise ValueError("\n".join(msg))
+
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     save_file(tensors, str(out / BUNDLE))
     (out / META).write_text(json.dumps(info, indent=1, sort_keys=True))
@@ -185,7 +237,9 @@ def merge(out_dir, *in_dirs):
         b = info.get(k, {}).get("beats_baseline")
         tag = {True: "", False: "   (weak -- eval uses Gaussian)",
                None: "   (unresolved)"}[b if b in (True, False) else None]
-        print(f"  {k:<24} from {src[k]}{tag}")
+        shp = tuple(tensors[k].shape)
+        cyc = f"   cycle m={shp[0]}" if len(shp) == 3 else ""
+        print(f"  {k:<24} from {src[k]}{cyc}{tag}")
     for d in missing:
         print(f"  (no bundle yet in {d})")
     return out / BUNDLE
@@ -304,12 +358,16 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if len(sys.argv) >= 3 and sys.argv[1] == "report":
         raise SystemExit(0 if report(sys.argv[2]) == 0 else 0)
-    if len(sys.argv) < 4 or sys.argv[1] != "merge":
-        print("usage: python ticket_bundle.py report <dir>\n"
-              "       python ticket_bundle.py disable|enable <dir> <suite.task> ...\n"
-              "       python ticket_bundle.py put <dir> <suite.task> <vec.npy> [note...]\n"
-              "       python ticket_bundle.py runners <_done_*.npz> [k] [--export]\n"
-              "       python ticket_bundle.py merge <out_dir> <in_dir> [<in_dir> ...]",
-              file=sys.stderr)
-        raise SystemExit(2)
-    merge(sys.argv[2], *sys.argv[3:])
+    if sys.argv[1:2] == ["merge"] and len(sys.argv) >= 4:
+        args = [x for x in sys.argv[2:] if x != "--prefer-certified"]
+        merge(args[0], *args[1:],
+              prefer_certified="--prefer-certified" in sys.argv)
+        raise SystemExit(0)
+    print("usage: python ticket_bundle.py report <dir>\n"
+          "       python ticket_bundle.py disable|enable <dir> <suite.task> ...\n"
+          "       python ticket_bundle.py put <dir> <suite.task> <vec.npy> [note...]\n"
+          "       python ticket_bundle.py runners <_done_*.npz> [k] [--export]\n"
+          "       python ticket_bundle.py merge <out_dir> <in_dir> ... "
+          "[--prefer-certified]",
+          file=sys.stderr)
+    raise SystemExit(2)
