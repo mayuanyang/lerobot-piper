@@ -310,6 +310,39 @@ def merge(out_dir, *in_dirs, prefer_certified: bool = False,
 
 if __name__ == "__main__":
     import sys
+    if len(sys.argv) >= 3 and sys.argv[1] == "revert":
+        # Rebuild the held-out bundle. try_runners selects candidates by
+        # running them on the layouts the benchmark reports, which is exact
+        # but in-sample, and it saves what it replaced to replaced.json. A
+        # paper wants both numbers -- spatial reads 97.5 with three mined
+        # tickets in and about 95.0 without -- and without this the held-out
+        # one is only recoverable by re-running the searches.
+        import numpy as _np
+        d = Path(sys.argv[2])
+        keys = sys.argv[3:]
+        log = d / "replaced.json"
+        if not log.exists():
+            print(f"no replaced.json in {d}; nothing was ever replaced here",
+                  file=sys.stderr)
+            raise SystemExit(1)
+        hist = json.loads(log.read_text())
+        t, m = load_bundle(d)
+        todo = keys or sorted(hist)
+        for k in todo:
+            if k not in hist or not hist[k]:
+                print(f"  {k}: no replacement on record")
+                continue
+            last = hist[k][-1]
+            f = d / last["vector"]
+            if not f.exists():
+                print(f"  {k}: {last['vector']} is gone", file=sys.stderr)
+                continue
+            suite_, tid_ = k.rsplit(".", 1)
+            save_ticket(d, suite_, int(tid_), _np.load(f), last["meta"])
+            print(f"  {k}: restored the ticket replaced on {last['when']} "
+                  f"({_describe(last['meta'])})")
+        print("\nRe-run the eval; this bundle is the held-out one again.")
+        raise SystemExit(0)
     if len(sys.argv) >= 5 and sys.argv[1] == "put":
         # Put a vector or an m-tuple into a bundle under a key. The search
         # writes its own winners; this is for one measured by hand -- a random
@@ -431,6 +464,7 @@ if __name__ == "__main__":
     print("usage: python ticket_bundle.py report <dir>\n"
           "       python ticket_bundle.py disable|enable <dir> <suite.task> ...\n"
           "       python ticket_bundle.py put <dir> <suite.task> <vec.npy> [note...]\n"
+          "       python ticket_bundle.py revert <dir> [suite.task ...]\n"
           "       python ticket_bundle.py runners <_done_*.npz> [k] [--export]\n"
           "       python ticket_bundle.py merge <out_dir> <in_dir> ... "
           "[--prefer-certified] [--no-pools]",
