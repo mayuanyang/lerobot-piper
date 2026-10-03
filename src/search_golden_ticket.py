@@ -963,34 +963,30 @@ def main() -> int:
                               f"{_br:.0%} on these search layouts against "
                               f"{a.reported_rate:.0%} on the reported ones, a "
                               f"gap of {_gap:+.0%}.", flush=True)
-                        if _gap > 0.15:
-                            print(f"    *** THE SEARCH LAYOUTS ARE HARDER THAN "
-                                  f"THE ONES YOU REPORT ON. The floor is\n"
-                                  f"    calibrated to {_br:.0%}, so a candidate "
-                                  f"that clears it has cleared that bar and\n"
-                                  f"    not the {a.reported_rate:.0%} the eval "
-                                  f"will ask for -- and a low bar is a weak\n"
-                                  f"    filter, so the winner is mostly "
-                                  f"whichever candidate got lucky. goal T9\n"
-                                  f"    failed exactly this way at 39% against "
-                                  f"70%: its ticket beat the search\n"
-                                  f"    baseline and then scored 15 points "
-                                  f"BELOW the per-chunk draw where it\n"
-                                  f"    counted. Certification is a fair "
-                                  f"head-to-head on unselected layouts but\n"
-                                  f"    does not fix this. Consider stopping "
-                                  f"here.\n", flush=True)
-                        elif _gap < -0.15:
-                            print(f"    note: the search layouts are EASIER "
-                                  f"than the reported ones, so the floor\n"
-                                  f"    ({_br:.0%}) is a stricter bar than the "
-                                  f"eval applies. That is the direction that\n"
-                                  f"    has worked -- goal T6's ticket came "
-                                  f"out of an 81%-against-60% gap and beat\n"
-                                  f"    the per-chunk draw by 15 points. Only "
-                                  f"two tasks have been measured either\n"
-                                  f"    way, so this is a weak prior, not a "
-                                  f"rule. Carry on.\n", flush=True)
+                        if abs(_gap) > 0.15:
+                            # A FACT, NOT A PREDICTION. This was a warning
+                            # that said to consider stopping, built on two
+                            # tasks: goal T9 at +31% lost 15 points and goal
+                            # T6 at -21% gained 15. Two more broke it --
+                            # libero_10 T0 at ~0% gained 25 and T1 at +4%
+                            # lost 20 -- so the gap does not separate the
+                            # cases and nothing here forecasts the outcome.
+                            # What does catch a bad ticket is measuring the
+                            # per-chunk draw on the reported layouts, two
+                            # batches, after the search. That has caught all
+                            # three tickets that were costing points.
+                            print(f"    the two layout sets differ in "
+                                  f"difficulty by {abs(_gap):.0%}; the floor "
+                                  f"below is calibrated to {_br:.0%}, not to "
+                                  f"the {a.reported_rate:.0%} the eval asks "
+                                  f"for.\n"
+                                  f"    Across four tasks this gap has not "
+                                  f"predicted whether the resulting ticket "
+                                  f"helps or hurts, so it is\n"
+                                  f"    not a reason to stop. Run the "
+                                  f"per-chunk control on layouts 0-19 after "
+                                  f"the search and compare there.\n",
+                                  flush=True)
                     if base_w[0] == 0 and not a.allow_zero_baseline:
                         for _e in envs:
                             try:
